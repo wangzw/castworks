@@ -41,5 +41,6 @@
 | 出站流 | outbound stream | 看守进程运行时始终维持的一条主动外连控制面的 gRPC 双向流，承载全部协议消息与投递；重连后发送方重放未确认消息，Hello 与 HelloAck 做状态对账 |
 | 汇入契约 | ingestion contract | runcontroller 向事件源模块暴露的唯一写入接口，用于写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约；runcontroller 不反向调用事件源模块 |
 | 效果记录 | effect record | runcontroller 与产生它的状态转移或汇入写入在同一数据库事务内写入、提交后按幂等键执行的副作用记录，副作用举例为调用沙箱提供者、workspace 与 secrets 模块，或经出站流发送消息；滞留超过截止时间由对账器重驱动 |
+| 对账器 | reconciler | runcontroller 的纠正性后台组件，按 T_reconcile 周期扫描持久化状态，对过渡态超时、唤醒遗漏、沙箱丢失等停住的运行实例以同一标识幂等重驱动；以持久化状态为准，不以事件历史为准（I10） |
 | 恢复句柄 | resume handle | 销毁重建后续接 Agent 会话所需的标识，随 ReadyToSuspend 上报并在销毁执行前落库；Claude Code 驱动器下为 session_id（[REF-claude-code-headless](references.md)） |
 | 状态式轮询 | state reconcile poll | 连接器按活动订阅周期查询外部对象当前状态、只产生订阅完成事件的轮询，兜底丢失或乱序的 webhook |
