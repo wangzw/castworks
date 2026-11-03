@@ -16,7 +16,7 @@
 | REF-mcp | Model Context Protocol 规范 | Agent 与工具服务器之间的开放协议规范：服务器、工具与传输 | <https://modelcontextprotocol.io/specification/2026-07-28> | 2026-07-28 |
 | REF-linux-cgroup-v2 | Control Group v2（Linux 内核文档） | cgroup v2 的层级、接口文件与控制器，含 cgroup.freeze 冻结接口 | <https://docs.kernel.org/admin-guide/cgroup-v2.html> | Linux 5.2 |
 | REF-linux-psi | PSI - Pressure Stall Information（Linux 内核文档） | 以任务在 CPU、内存与 IO 上的停滞时间度量资源压力的内核接口 | <https://docs.kernel.org/accounting/psi.html> | Linux 4.20 |
-| REF-k8s-in-place-pod-resize | Resize CPU and Memory Resources assigned to Containers（Kubernetes 文档） | In-Place Pod Resize：不重建 Pod 修改容器资源，含 resize 子资源、resizePolicy 与 Deferred 状态 | <https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/> | Kubernetes 1.35 |
+| REF-k8s-in-place-pod-resize | Resize CPU and Memory Resources assigned to Containers（Kubernetes 文档） | In-Place Pod Resize：无需重建 Pod 即可修改容器资源，含 resize 子资源、resizePolicy 与 Deferred 状态 | <https://kubernetes.io/docs/tasks/configure-pod-container/resize-container-resources/> | Kubernetes 1.35 |
 | REF-cluster-autoscaler-faq | Cluster Autoscaler FAQ | Kubernetes Cluster Autoscaler 的常见问题文档，含 Pod 注解 cluster-autoscaler.kubernetes.io/safe-to-evict | <https://github.com/kubernetes/autoscaler/blob/master/cluster-autoscaler/FAQ.md> | — |
 | REF-otel-genai-semconv | OpenTelemetry GenAI semantic conventions | 生成式 AI 调用的追踪、指标与事件属性约定（gen_ai.*） | <https://github.com/open-telemetry/semantic-conventions-genai> | — |
 | REF-anthropic-streaming | Streaming Messages（Claude API 文档） | Claude Messages API 的服务器发送事件流格式，含内容事件与 ping 保活事件 | <https://platform.claude.com/docs/en/build-with-claude/streaming> | anthropic-version 2023-06-01 |
