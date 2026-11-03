@@ -1,9 +1,9 @@
 # 术语表
 
-项目级术语，在全部文档类型中含义一致。文档正文使用中文术语，"英文对应"列是源语言或代码中的写法；模块 slug、文件路径、ADR 标识与协议字段名保留代码中的英文写法。
+项目级术语，在全部文档类型中含义一致。文档正文使用中文术语，"英文对照"列是源语言或代码中的写法；模块 slug、文件路径、ADR 标识与协议字段名保留代码中的英文写法。
 
-| 术语 | 英文对应 | 定义 |
-|---|---|---|
+| 术语 | 英文对照 | 定义 |
+| --- | --- | --- |
 | 运行实例 | Run | 一次 Agent 任务的执行实体；拥有工作区、收件箱、等待状态与当前代，生命周期跨越沙箱的多次创建与销毁 |
 | 沙箱 | Sandbox | 承载 Agent 进程的隔离计算实例（容器或 actor），生命周期短于运行实例 |
 | 工作区 | Workspace | 运行实例的持久化文件系统目录，在沙箱销毁与重建之间保留 |
@@ -39,7 +39,7 @@
 | 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, expires_at} 记录；看守进程以首次续约绑定持有者并周期续约，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除后接管工作区 |
 | 运行实例令牌 | Run token | 短期 JWT {run_id, generation, exp}，只由看守进程持有并按控制面的 TokenRotate 轮换；LLM 网关与连接器以它换取真实凭据并校验其中的代，k8s 路径的平台出口代理以它逐请求校验代；令牌在签名、过期时间与 run_id 校验通过，且令牌中的代等于运行实例当前代、运行实例未进入终态、本代沙箱未被判定作废时有效 |
 | 出站流 | outbound stream | 看守进程运行时始终维持的一条主动外连控制面的 gRPC 双向流，承载全部协议消息与投递；重连后发送方重放未确认消息，Hello 与 HelloAck 做状态对账 |
-| 摄入契约 | ingestion contract | runcontroller 向事件源模块暴露的唯一写入接口，用于写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约；runcontroller 不反向调用事件源模块 |
-| 效果记录 | effect record | runcontroller 与产生它的状态转移或摄入写入在同一数据库事务内写入、提交后按幂等键执行的副作用记录，副作用举例为调用沙箱提供者、workspace 与 secrets 模块，或经出站流发送消息；滞留超过截止时间由对账器重驱动 |
+| 汇入契约 | ingestion contract | runcontroller 向事件源模块暴露的唯一写入接口，用于写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约；runcontroller 不反向调用事件源模块 |
+| 效果记录 | effect record | runcontroller 与产生它的状态转移或汇入写入在同一数据库事务内写入、提交后按幂等键执行的副作用记录，副作用举例为调用沙箱提供者、workspace 与 secrets 模块，或经出站流发送消息；滞留超过截止时间由对账器重驱动 |
 | 恢复句柄 | resume handle | 销毁重建后续接 Agent 会话所需的标识，随 ReadyToSuspend 上报并在销毁执行前落库；Claude Code 驱动器下为 session_id（[REF-claude-code-headless](references.md)） |
 | 状态式轮询 | state reconcile poll | 连接器按活动订阅周期查询外部对象当前状态、只产生订阅完成事件的轮询，兜底丢失或乱序的 webhook |

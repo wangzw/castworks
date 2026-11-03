@@ -5,18 +5,18 @@
 ## 等待与唤醒
 
 | 决策 |
-|---|
+| --- |
 | [在持久化收件箱上等待](adr-wait-on-durable-inbox.md) |
 
 ## 一致性与围栏
 
 | 决策 |
-|---|
+| --- |
 | [以代围栏沙箱消息与副作用](adr-generation-fencing.md) |
 | [投递幂等状态随工作区持久化](adr-delivery-intent-log.md) |
 
 ## 租户
 
 | 决策 |
-|---|
+| --- |
 | [保留租户维度而不实现跨租户隔离](adr-tenant-dimension-without-enforcement.md) |

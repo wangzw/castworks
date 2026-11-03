@@ -2,17 +2,17 @@
 
 ## 职责
 
-`runcontroller` 是控制面中运行实例状态机的写者。除摄入事务的条件 UPDATE（`suspended` 转 `wake_queued`）外，运行实例的状态转移由持有该运行实例所有者租约的副本在 `run` 行锁内执行；摄入事务可由任一副本执行，其写入范围与所有权规则见并发与事务边界。职责穷举如下：
+`runcontroller` 是控制面中运行实例状态机的写者。除汇入事务的条件 UPDATE（`suspended` 转 `wake_queued`）外，运行实例的状态转移由持有该运行实例所有者租约的副本在 `run` 行锁内执行；汇入事务可由任一副本执行，其写入范围与所有权规则见并发与事务边界。职责穷举如下：
 
 - 运行实例状态机的状态、子状态、挂起相位与转移，以及每次转移的持久化点。
 - 收件箱、唤醒信号、等待、定时器、效果记录、运行实例事实（实时接入、恢复提示、结束请求、裁决请求、在途请求）、事件源实例租约与运行实例所有者租约的持久化。
 - 运行实例所有者租约的获取、续租与认领。
 - 收件箱、唤醒信号与在途请求过期行的清理，收件箱以 `durable_cursor` 为下界（见过期行的清理）。
-- 唤醒谓词在 `run` 行锁内的评估，以及摄入事务内的条件 UPDATE（I5，见[架构不变量](../architecture.md#架构不变量)）。
+- 唤醒谓词在 `run` 行锁内的评估，以及汇入事务内的条件 UPDATE（I5，见[架构不变量](../architecture.md#架构不变量)）。
 - 挂起决策与冻结中复评的调用点：向 `suspendpolicy` 提供上下文、持久化决策结果，并经效果记录驱动 `sandboxprovider` 的挂起、解冻与销毁。
 - 常规投递与定向投递、两级确认与跨代重投（I4）。
 - 代递增与围栏（含经效果记录撤销作废代与旧代的出口策略），以及供令牌校验方使用的代查询接口（I7）。
-- 摄入契约。
+- 汇入契约。
 - 定时器的登记、到期扫描与触发，以及所有者侧截止时间的调度。
 - 恢复准入的调用点与重建衔接：经效果记录驱动 `sandboxprovider` 的预配、恢复与销毁，`workspace` 的租约建立、保持与释放，`secrets` 的令牌签发与轮换。
 - 事件源实例失联时合成失败唤醒信号。
@@ -34,23 +34,23 @@
 
 ## 术语表
 
-| 术语 | 适用范围 | 定义 |
-|---|---|---|
-| 摄入事务 | runcontroller | 由任一控制面副本执行、不校验运行实例所有权的写事务，写入范围只限摄入写入集合（见并发与事务边界） |
-| 所有者事务 | runcontroller | 摄入事务、所有权获取事务（「创建」的插入、通过 Hello 公共校验的接管、所有者租约过期后的认领）与清理任务的删除之外的写事务，含定时器触发，由持有运行实例所有者租约的副本执行，开头在行锁内校验 `owner_epoch` |
-| 常规投递 | runcontroller | 按 `inbox_seq` 区间选取收件箱事件、作为下一条用户消息送达、以 `Accepted` 推进 `cursor_accepted` 的投递 |
-| 定向投递 | runcontroller | 只含一条事件、按 `Deliver.target` 送达一个等待点（回合中的阻塞型审批或 `wait_for`，或回合边界上以 hook 的 defer 推迟的审批，[REF-claude-code-hooks](../../references.md)）、不推进 `cursor_accepted` 的投递 |
-| 待定向目标 | runcontroller | 回合中登记、等待以定向投递送达审批决定或订阅完成的阻塞型审批与阻塞型 `wait_for`，存于 `run.pending_targets` |
-| 续接决定 | runcontroller | 与 `run.deferred_permission_id` 匹配（`kind=approval_decision` 且 `correlation.permission_id` 相等）、未被定向投递占用、未送达且未放弃的收件箱事件；只以回合边界续接的定向投递送达，不进入常规批 |
-| 冻结记录 | runcontroller | Agent 进程树冻结期间保留在 `run` 行上的冻结标识 `freeze_id`、冻结变体 `freeze_variant`、冻结时刻 `frozen_since` 与冻结上限 `freeze_deadline`；冻结中升级不改写 |
+| 术语 | 英文对照 | 适用范围 | 定义 |
+| --- | --- | --- | --- |
+| 汇入事务 | ingestion transaction | runcontroller | 由任一控制面副本执行、不校验运行实例所有权的写事务，写入范围只限汇入写入集合（见并发与事务边界） |
+| 所有者事务 | owner transaction | runcontroller | 汇入事务、所有权获取事务（「创建」的插入、通过 Hello 公共校验的接管、所有者租约过期后的认领）与清理任务的删除之外的写事务，含定时器触发，由持有运行实例所有者租约的副本执行，开头在行锁内校验 `owner_epoch` |
+| 常规投递 | regular delivery | runcontroller | 按 `inbox_seq` 区间选取收件箱事件、作为下一条用户消息送达、以 `Accepted` 推进 `cursor_accepted` 的投递 |
+| 定向投递 | targeted delivery | runcontroller | 只含一条事件、按 `Deliver.target` 送达一个等待点（回合中的阻塞型审批或 `wait_for`，或回合边界上以 hook 的 defer 推迟的审批，[REF-claude-code-hooks](../../references.md)）、不推进 `cursor_accepted` 的投递 |
+| 待定向目标 | pending target | runcontroller | 回合中登记、等待以定向投递送达审批决定或订阅完成的阻塞型审批与阻塞型 `wait_for`，存于 `run.pending_targets` |
+| 续接决定 | resume decision | runcontroller | 与 `run.deferred_permission_id` 匹配（`kind=approval_decision` 且 `correlation.permission_id` 相等）、未被定向投递占用、未送达且未放弃的收件箱事件；只以回合边界续接的定向投递送达，不进入常规批 |
+| 冻结记录 | freeze record | runcontroller | Agent 进程树冻结期间保留在 `run` 行上的冻结标识 `freeze_id`、冻结变体 `freeze_variant`、冻结时刻 `frozen_since` 与冻结上限 `freeze_deadline`；冻结中升级不改写 |
 
 ## 外部接口契约
 
-稳定性承诺按接口类别给出：摄入契约对事件源模块稳定，满足扩展点所列条件的新增事件源不修改本模块；控制面服务接口 `RunService` 与代查询接口 `Generations` 对平台界面、运维接口与依赖本模块的事件源模块稳定；协议面受 `agentprotocol` 的协议版本约束，本模块声明每条消息的状态机效果。
+稳定性承诺按接口类别给出：汇入契约对事件源模块稳定，满足扩展点所列条件的新增事件源不修改本模块；控制面服务接口 `RunService` 与代查询接口 `Generations` 对平台界面、运维接口与依赖本模块的事件源模块稳定；协议面受 `agentprotocol` 的协议版本约束，本模块声明每条消息的状态机效果。
 
-### 摄入契约
+### 汇入契约
 
-摄入契约是事件源模块写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约的唯一入口，全部方法幂等，由接收请求的副本以摄入事务执行（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
+汇入契约是事件源模块写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约的唯一入口，全部方法幂等，由接收请求的副本以汇入事务执行（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
 
 ```go
 type Ingest interface {
@@ -103,9 +103,9 @@ type SourceLease struct {
 - **载荷上限**：`InboxEvent.Payload` 不超过 `S_max`（与投递批的字节上限相同，单个事件因而总能装入一批）。超过上限的内容由事件源自行存放，`Payload` 内只放附件引用（可取回的 URI 与内容哈希）；Agent 经平台 MCP 服务器取回附件：平台 MCP 服务器附运行实例令牌向存放方请求引用中的 URI，存放方按令牌有效的条件校验后返回内容，Agent 进程因而不需要直连存放方（I6）。存放附件的事件源承担提供这一取回接口的义务；本模块不解析、不取回附件。
 - **事件源实例标识**：`InFlightRequest.Instance` 与 `SourceLease.Instance` 对事件源进程的每次启动唯一（Pod 名加启动时生成的随机串为举例），进程重启后不沿用旧标识登记在途请求或续租；「事件源实例失联」守卫依赖这一唯一性判定重启前登记的在途请求失联。
 - **错误语义**：错误按类别穷举。不可重试错误：运行实例已终态；代不匹配；冲突（`dedup_key` 命中而关联键不同）；运行实例不存在；参数非法（`Kind` 越出闭集、写入只由本模块写入的种类、必填字段缺失、`Payload` 不是合法 JSON 或超过 `S_max`）。暂时性错误：数据库不可用、超时、锁等待超时、所有者通知失败。调用方收到不可重试错误时丢弃该写入并计入围栏拒绝或审计（终态拒绝时 `connectorhub` 的订阅处置见调用方义务），收到暂时性错误时按幂等键退避重试。
-- **调用方义务**：对摄入契约的调用为至少一次。已在事件源自身事务中提交、尚未写入摄入契约的事实（已认领的连接器事件、已完成的在途请求为举例），事件源必须能从自身持久化状态重驱动对应写入，直到成功或收到不可重试错误；`AppendInbox` 因运行实例已终态被拒时，`connectorhub` 把对应订阅置为 `cancelled`。
-- **读取边界**：作为摄入契约调用方的事件源模块不读取 `run`、`inbox`、`wake_signal`、`wait`、`timer`、`outbox`、`run_fact`、`source_request` 与 `source_lease` 表；事件源模块自有的表（`subscription`、`llm_request` 与连接器事件日志为举例）由所属模块在自身事务内写入。
-- **写入路径**：本模块写入自有表的路径穷举为：摄入契约；协议面，看守进程的消息由所有者事务处理；所有者自身的调度，即定时器触发、截止时间与对账器；所有权的获取与续租，即 `Hello` 接管、效果执行器、定时器扫描与对账器以条件 UPDATE 对过期所有者租约的认领，以及所有者以 `owner_id=self AND owner_epoch=held` 为条件对 `owner_lease_expires_at` 与 `stream_seen_at` 的批量刷新（单条 UPDATE，逐行取得 `run` 行锁，只写这两列）；内部摄入路径，即事件源实例失联的合成信号、实时接入到期的事实失效、「悬挂唤醒」守卫的条件 UPDATE、节点内存压力的复评请求与 `End`、`Resolve` 的请求登记；`RunService.Create` 的插入，受理副本成为首个所有者；效果记录的领取与完成事务，由所有者或认领者执行；清理任务对过期行的删除。全部写入在 `run` 行锁事务内执行，例外穷举为：不改变状态与谓词的 `RenewSourceLease` 与 `SetRunFact{inflight_request}` 都不加行锁；清理任务的执行者、锁与删除条件见过期行的清理。
+- **调用方义务**：对汇入契约的调用为至少一次。已在事件源自身事务中提交、尚未写入汇入契约的事实（已认领的连接器事件、已完成的在途请求为举例），事件源必须能从自身持久化状态重驱动对应写入，直到成功或收到不可重试错误；`AppendInbox` 因运行实例已终态被拒时，`connectorhub` 把对应订阅置为 `cancelled`。
+- **读取边界**：作为汇入契约调用方的事件源模块不读取 `run`、`inbox`、`wake_signal`、`wait`、`timer`、`outbox`、`run_fact`、`source_request` 与 `source_lease` 表；事件源模块自有的表（`subscription`、`llm_request` 与连接器事件日志为举例）由所属模块在自身事务内写入。
+- **写入路径**：本模块写入自有表的路径穷举为：汇入契约；协议面，看守进程的消息由所有者事务处理；所有者自身的调度，即定时器触发、截止时间与对账器；所有权的获取与续租，即 `Hello` 接管、效果执行器、定时器扫描与对账器以条件 UPDATE 对过期所有者租约的认领，以及所有者以 `owner_id=self AND owner_epoch=held` 为条件对 `owner_lease_expires_at` 与 `stream_seen_at` 的批量刷新（单条 UPDATE，逐行取得 `run` 行锁，只写这两列）；内部汇入路径，即事件源实例失联的合成信号、实时接入到期的事实失效、「悬挂唤醒」守卫的条件 UPDATE、节点内存压力的复评请求与 `End`、`Resolve` 的请求登记；`RunService.Create` 的插入，受理副本成为首个所有者；效果记录的领取与完成事务，由所有者或认领者执行；清理任务对过期行的删除。全部写入在 `run` 行锁事务内执行，例外穷举为：不改变状态与谓词的 `RenewSourceLease` 与 `SetRunFact{inflight_request}` 都不加行锁；清理任务的执行者、锁与删除条件见过期行的清理。
 
 ### 控制面服务接口
 
@@ -147,11 +147,11 @@ type CurrentGeneration struct {
 `turn_ended` 由 Agent 驱动器在 `result` 与 `idle` 齐备且 `result.queued_turn_count` 为 0 之后发出（[REF-claude-agent-sdk-typescript](../../references.md)）；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合（task-notification 回合为举例）为空。除 `Hello`（见 Hello 的处理）外，入站消息一律由所有者事务处理。下表穷举本模块处理的消息：
 
 | 方向 | 消息 | 处理 |
-|---|---|---|
+| --- | --- | --- |
 | 入站 | `Hello` | 见 Hello 的处理 |
 | 入站 | `AgentEvent` | `active` 中：`turn_started`（「回合开始」）、`turn_ended`（「回合结束」「Agent 进程退出」，`draining` 中为「排空完成」）、`state_changed`（只更新 `agent_state`）、`tool_started`、`tool_ended`、`bg_jobs_changed`（「工具进展」）、`permission_requested`（「进入阻塞」或只记录，`draining` 中为「排空中回合进展」）、`subscription_created`（「订阅创建」）、`timer_requested`（「定时请求」）、`wait_started`（「进入阻塞」或「进入即满足」，`draining` 中为「排空中回合进展」）；「非 Active 回合进展」所列起点中回合进展事件按该转移；本代作废的状态按本代作废围栏处理；其余非终态（快照态为举例）计数丢弃 |
 | 入站 | `llm.request.started`、`llm.first_token` | `active` 中按「进入阻塞」或「进入即满足」，门控不成立或 L0 时只登记在途请求，`draining` 中按「排空中回合进展」只登记在途请求；「非 Active 回合进展」所列起点中按该转移；本代作废的状态按本代作废围栏处理；其余非终态计数丢弃；`llm.first_token` 只用于预测性恢复提示与预测重估 |
-| 入站 | `llm.request.completed`、`llm.request.failed`、`request.completed`、`request.failed` | 本代未作废的非终态中：所有者事务写唤醒信号（来源为本地代理或看守进程），同一事务把该 `request_id` 的全部来源 `source_request` 行置 `done`；`active.blocked_on` 时同一事务执行「阻塞满足」；`suspended` 时同一事务按摄入写入集合的条件判定转 `wake_queued` 并入队；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」 |
+| 入站 | `llm.request.completed`、`llm.request.failed`、`request.completed`、`request.failed` | 本代未作废的非终态中：所有者事务写唤醒信号（来源为本地代理或看守进程），同一事务把该 `request_id` 的全部来源 `source_request` 行置 `done`；`active.blocked_on` 时同一事务执行「阻塞满足」；`suspended` 时同一事务按汇入写入集合的条件判定转 `wake_queued` 并入队；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」 |
 | 入站 | `WaitDeclared` | 「等待声明」 |
 | 入站 | `Activity` | 所有者内存保留最近摘要与累计时长（接管后从零累计）；看守进程按固定周期发送；L0 空闲证据成立时执行「看门狗空闲」；`active` 中报告 `frozen=true` 时：冻结标识等于 `aborted_suspend_id` 则不处置（由「迟到的挂起应答」与重连解除），否则计数、告警并执行「本代沙箱作废」 |
 | 入站 | `Accepted`、`Consumed`、`DeliveryFailed` | 见 Accepted 与 Consumed、DeliveryFailed |
@@ -190,7 +190,7 @@ type CurrentGeneration struct {
 **按状态的效果**：
 
 | 状态 | 效果 | `desired_state` |
-|---|---|---|
+| --- | --- | --- |
 | `provisioning` | 「预配完成」 | `running` |
 | `resuming(warm_claim)`、`resuming(cold_start)`（新代） | 「重建完成」 | `running` |
 | `resuming(snapshot_restore)` | 「快照恢复完成」 | `running` |
@@ -205,7 +205,7 @@ type CurrentGeneration struct {
 
 ## 依赖
 
-依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖基础层（`agentprotocol`、`suspendpolicy`、`secrets`、`workspace`）与 `sandboxprovider`，存储为 PostgreSQL；`llmgateway`、`connectorhub` 经摄入契约与代查询接口依赖本模块，`humanchannel` 经摄入契约与 `RunService` 依赖本模块；本模块不反向调用事件源模块。
+依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖基础层（`agentprotocol`、`suspendpolicy`、`secrets`、`workspace`）与 `sandboxprovider`，存储为 PostgreSQL；`llmgateway`、`connectorhub` 经汇入契约与代查询接口依赖本模块，`humanchannel` 经汇入契约与 `RunService` 依赖本模块；本模块不反向调用事件源模块。
 
 - `agentprotocol`：信封、消息类型、出站流服务端、按 `(generation, msg_seq)` 去重，以及出站 `msg_seq` 跨所有者副本单调的规则。
 - `suspendpolicy`：以库的形式在进程内调用。`decide`、`review`、`mechanism`、`reacquire_slot`、`on_resumed`、`pick_for_pressure` 与各估计函数在 `run` 行锁内同步调用；`admit`、`release` 与「显式结束」的「从准入队列移除」只修改进程内队列，在事务提交后调用（副本在提交后、调用前崩溃时由 `slot_expires_at` 到期回收）。接口提供 `decide`、`review`、`mechanism`、`admit`、`reacquire_slot`（槽位到期后的重驱动同步重新取得并发槽位，不入队）、`release`、`on_resumed`、`pick_for_pressure`（由节点压力值与该节点的冻结运行实例列表选出升级对象，不读 `run` 表）、看门狗空闲证据、唤醒原因优先级、预测性恢复的批准、定时类等待与退避的随机抖动、依 `policy_state` 给出的退避时刻、准入排队估计，以及节点内存压力的阈值 ρ_soft；策略参数与各机制的超时见参数表。
@@ -225,7 +225,7 @@ type CurrentGeneration struct {
 **被依赖方与调用方承担的约束**：除依赖清单所列接口的语义外，本模块的正确性依赖下列由其他模块承担的约束，按模块穷举如下。
 
 - 看守进程：首次 `RenewLease` 成功之后才发 `Hello`，在 `expires_at` 减时钟余量之前停止写入；`Hello.agent_state` 如实反映回合位置；`Hello.cursor_accepted` 只计常规投递的已接受前缀；每个 `tool_started` 都有配对的 `tool_ended`，被 hook 拒绝或超时的调用同样发出；`permission_requested`、`wait_started` 携带 `call_id`；本地代理为每次上游请求（含客户端重发）生成在同一运行实例、同一代内唯一的 `request_id`，不从 `request_hash` 派生；以单次回放缓存应答重发时不发 `llm.request.started`，仍发时必须用新的 `request_id` 并随后发出同一 `request_id` 的完成或失败。本地代理随转发给 `llmgateway` 的请求携带与 `llm.request.started` 相同的 `request_id`，平台 MCP 服务器随同步连接器操作携带与 `wait_started.ref` 相同的 `request_id`；`wait_started{kind=wait_for}` 的 `ref` 只取 `lifetime: once` 的订阅；`timer_requested` 只以 `scope=run` 发出；已接受的常规投递与回合边界续接只在 Agent 回合之间喂入（L1、L2），回合进行中 `Accepted` 的输入等该回合 `turn_ended` 之后才喂入；`Accepted.fed` 如实报告本批按投递意图日志去重之后是否仍有事件喂给 Agent；常规批与回合边界续接批在 `fed=true` 时随后发出带该 `delivery_id` 的 `turn_started`（L0 为 `Consumed`）或报告 Agent 进程退出，`fed=false` 时不为本批启动 Agent、不发 `turn_started`；以恢复句柄启动 Agent 失败时先发该投递的 `Accepted`，再报 `turn_ended{agent_exited=true}`；L0 在事件交给 Agent 后写消费记录并发 `Consumed`；接受记录同步写入工作区之后才回 `Accepted`，消费记录同步写入工作区之后才发 `Consumed`，写入失败时都不发；`Consumed` 只针对 `target=next_user_message` 的常规投递发出，`through_seq` 取已开始处理的常规批的 `through_seq`，定向投递（含回合边界续接）的消费只写入投递意图日志、不发 `Consumed`；`Hello.cursor_consumed` 只计常规投递的已消费前缀；`Activity` 按固定周期发送，携带 Agent 进程树的冻结状态（`cgroup` 与 `signal` 两种变体都计入）与冻结标识；`PrepareSuspend.force` 只终止 Agent 主进程之外的进程；`ReadyToSuspend` 销毁模式的 `session_id` 取本代 Agent 进程使用的恢复句柄，本代未启动 Agent 进程时取最近一次收到的 `resume_session_id`，没有收到过时为空；`Resumed.drain` 按 `suspend_id` 幂等处理，收到 `Resumed{drain=true}` 时，已在等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 都按 DRAIN 规则立即返回，之后发起的阻塞型 `sleep_until` 照常发出 `wait_started{kind=timer}`；收到 `Thaw{freeze_id}` 后上报 `Thawed`，按 `freeze_id` 幂等：`signal` 变体在自行解冻进程树之后，`cgroup` 变体在读取 Agent 子 cgroup 观察到未冻结之后（进程树从未冻结时立即）；取消定向后以常规投递重送的事件按投递意图日志去重；`LiveState` 与 `HelloAck` 的实时接入状态按 `as_of` 取最新；令牌已过期而重连时，收到 `TokenRotate` 之前不访问 `llmgateway` 与 `connectorhub`；收到可重试拒绝时不终止 Agent 进程树，收到不可重试认证失败关闭时停止重连并上报；目标等待点已在沙箱内失效时以 `DeliveryFailed{reason=target_gone}` 应答；`CancelSuspend` 以 `Busy{cancelled}` 或 `ReadyToSuspend` 确认，对从未收到过 `PrepareSuspend` 的 `suspend_id` 同样回 `Busy{cancelled}`；租约续约失败时上报 `LeaseLost{lease_id, expires_at}`。
-- `connectorhub`：`subscription_completed` 的 `dedup_key` 以订阅标识与外部事件标识共同派生；订阅超时以 CAS 置 `expired` 并经 `AppendInbox` 写入 `subscription_completed(subscription_status=expired)`；摄入因终态被拒或代查询返回终态时取消订阅；同步请求经 `SetRunFact{inflight_request}` 登记并按实例续租，实例标识对每次进程启动唯一；平台出口代理对 k8s 路径的每个出口请求按附带的运行实例令牌经 `Generations.Current` 校验，不使用缓存，不通过时拒绝并计入围栏拒绝；`InFlight.RequestID` 与 `WakeSignal.Ref` 取平台 MCP 服务器随请求携带的 `request_id`；超过 `S_max` 的原始负载自行存放，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口。
+- `connectorhub`：`subscription_completed` 的 `dedup_key` 以订阅标识与外部事件标识共同派生；订阅超时以 CAS 置 `expired` 并经 `AppendInbox` 写入 `subscription_completed(subscription_status=expired)`；汇入因终态被拒或代查询返回终态时取消订阅；同步请求经 `SetRunFact{inflight_request}` 登记并按实例续租，实例标识对每次进程启动唯一；平台出口代理对 k8s 路径的每个出口请求按附带的运行实例令牌经 `Generations.Current` 校验，不使用缓存，不通过时拒绝并计入围栏拒绝；`InFlight.RequestID` 与 `WakeSignal.Ref` 取平台 MCP 服务器随请求携带的 `request_id`；超过 `S_max` 的原始负载自行存放，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口。
 - `llmgateway`：转发上游前经 `SetRunFact{inflight_request}` 登记在途请求并按实例续租，实例标识对每次进程启动唯一；`InFlight.RequestID` 与 `WakeSignal.Ref` 取本地代理随请求携带的 `request_id`；完成与失败经 `AppendWakeSignal`；拒绝过期令牌与代查询报告作废的令牌。
 - `humanchannel`：实时接入按通道经 `SetRunFact` 写入，接入期间按小于 `LiveAttach.TTL` 的周期以更大的 `SourceSeq` 续写，进程重启后以更大的 `SourceSeq` 重报全部有效接入；人类事件填 `Actor`；审批决定的 `dedup_key` 每个决定唯一；终端请求与经沙箱的文件访问按恢复准入与实时接入所列条件转发或等待；超过 `S_max` 的内容自行存放，并提供与 `connectorhub` 相同的附件取回接口。
 - `suspendpolicy`：`review` 在实时接入有效值为真时只返回 KEEP，或在冻结上限到达时返回 DRAIN；冻结上限到达时只返回 SNAPSHOT 或 DRAIN；`decide` 对已过冻结上限的阻塞不返回冻结，FREEZE_SHRINK 只与 `cgroup` 变体组合；`admit` 对冻结态携带的截止之前放行；`admit` 对同一 `run_id` 幂等、不重置老化，携带的机制或截止与已有条目不同时把条目改到新的机制与截止；放行回调携带该条目的机制；`Activity` 累计不足 Q_quiet 时空闲证据不成立。
@@ -286,7 +286,7 @@ stateDiagram-v2
     Suspending --> Active: Busy、取消确认或中止，含冻结中升级解冻之后的回退
     Suspending --> Suspended: ReadyToSuspend 与提供者确认后重评估为假，或沙箱丢失且无可投递事件、无终端或文件通道接入
     Suspending --> WakeQueued: 重评估为真、提供者冻结调用结果不确定，或沙箱丢失且有可投递事件或终端、文件通道接入
-    Suspended --> WakeQueued: 摄入事务的条件 UPDATE；所有者执行的冻结上限、接入、预测性恢复与回合进展；快照保留期临近且有可投递事件或接入
+    Suspended --> WakeQueued: 汇入事务的条件 UPDATE；所有者执行的冻结上限、接入、预测性恢复与回合进展；快照保留期临近且有可投递事件或接入
     Suspended --> Active: 快照态带外恢复
     WakeQueued --> WakeQueued: 快照保留期临近或冻结沙箱丢失，转 Destroyed 与重建意图
     WakeQueued --> Active: 快照态带外恢复
@@ -312,7 +312,7 @@ stateDiagram-v2
 - 沙箱丢失经「本代沙箱作废」转为 `Destroyed`，起点穷举为：「沙箱丢失」守卫的候选集，即 `Active`、`Suspending` 的解冻相位与待就绪相位、冻结类的提供者待确认相位、`Suspended{Frozen}`、`WakeQueued{Frozen}`、解冻中的 `Resuming`；以及快照模式的提供者待确认相位，由 `provider_suspend` 报告沙箱不存在时到达。起点为 `WakeQueued` 或 `Resuming` 时一律到达 `WakeQueued`（重建意图，保留原唤醒原因与排队时刻）；其余起点在有可投递事件、其他满足的条件或终端、文件通道接入时到达 `WakeQueued`，否则到达 `Suspended{Destroyed}`。快照保留期临近与快照恢复对象不存在按同一规则处置。
 - `WakeQueued{Frozen}` 保留冻结上限，由恢复准入在冻结上限之前截止放行。
 - 回合进展事件在非 `Active` 状态下只改写回合字段，不产生子状态边；其结果由之后的转移按更新后的回合字段路由。
-- 进入 `Suspended` 的每条边都在 `run` 行锁内重评估唤醒谓词，为真时改走 `WakeQueued`（I5）；`Suspended` 转 `WakeQueued` 除摄入事务的条件 UPDATE 外，冻结上限、终端或文件通道接入、预测性恢复与回合进展导致的唤醒由所有者执行。
+- 进入 `Suspended` 的每条边都在 `run` 行锁内重评估唤醒谓词，为真时改走 `WakeQueued`（I5）；`Suspended` 转 `WakeQueued` 除汇入事务的条件 UPDATE 外，冻结上限、终端或文件通道接入、预测性恢复与回合进展导致的唤醒由所有者执行。
 - `Degraded` 只经 `WakeQueued` 与恢复准入以新代重建回到 `Active`，不直接进入 `Active`。
 - 过渡态 `Provisioning`、`Suspending`、`Resuming` 与子状态 `Delivering`、`Draining` 都带截止时间，由对账器幂等重驱动（I10）；`Draining` 的截止只重发 `Resumed{drain=true}`，不约束回合时长，只经 `turn_ended` 离开。
 
@@ -431,7 +431,7 @@ flowchart TD
     P --> Q{"行锁内 must_wake"}
     Q -->|"真"| L
     Q -->|"假"| O
-    O --> R["摄入事务内条件 UPDATE，谓词为真"]
+    O --> R["汇入事务内条件 UPDATE，谓词为真"]
     R --> L
     L --> S["准入放行；重建类模式执行 fence_and_bump"]
     S --> T{"resume_mode"}
@@ -488,7 +488,7 @@ flowchart TD
 ### 状态与回合字段的闭集
 
 | 字段 | 取值（闭集） | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `state` | `provisioning`、`active`、`suspending`、`suspended`、`wake_queued`、`resuming`、`degraded`、`ended`、`failed` | `ended`、`failed` 为终态 |
 | `substate`（`active`） | `in_turn`、`blocked_on`、`boundary`、`idle`、`delivering`、`draining` | |
 | `substate`（`suspended`、`wake_queued`、`resuming`） | `frozen`、`snapshotted`、`destroyed` | 沙箱的物理形态；`resuming` 中表示从哪种形态恢复 |
@@ -518,10 +518,10 @@ flowchart TD
 
 ### 运行实例行（`run`）
 
-**身份、租户与创建**
+#### 身份、租户与创建
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `run_id` | uuid | 主键 | 「创建」 | — |
 | `tenant_id` | text | 租户维度 | 「创建」 | — |
 | `project_id`、`idempotency_key` | uuid、text | 唯一键，创建幂等 | 「创建」 | — |
@@ -531,10 +531,10 @@ flowchart TD
 | `created_at`、`ended_at` | timestamptz | 创建与结束时刻 | 「创建」；「显式结束」 | — |
 | `end_reason` | text | 显式结束原因 | 「显式结束」（取 `end_request` 事实） | — |
 
-**生命周期与回合**
+#### 生命周期与回合
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `state`、`substate` | text | 见状态与回合字段的闭集 | 每条转移；「非 Active 回合进展」改写 `suspending`（`suspend_origin=active`）的 `substate` | 终态时 `substate=∅` |
 | `turn_phase` | text | `in_turn`、`boundary`、`idle` | 「创建」写 `idle`；「回合开始」、「投递接受」（`fed=true`）写 `in_turn`（L0 恒为 `idle`）；「回合结束」「排空完成」、`interrupt_turn`、「兜底」写 `boundary`（L0 为 `idle`）；进入 `Idle` 时写 `idle`；「非 Active 回合进展」按回合进展事件同步写入；挂起、恢复与 `Boundary`、`Idle` 转 `Delivering` 不改 | 不清除 |
 | `reason` | text | 最近一次进入回合边界、降级或失败的原因 | 「回合结束」「排空完成」（取 `turn_ended.reason`）；「进入降级」；「放弃」 | 不清除 |
@@ -553,10 +553,10 @@ flowchart TD
 | `flap_counter` | integer | 预测失准的连续计数，作为 `decide` 的上下文 | `enter_active` 的恢复路径（取 `suspendpolicy.on_resumed` 的返回值） | 同左，由 `suspendpolicy` 复位 |
 | `start_failures` | integer | Agent 进程启动后在开始处理输入之前退出的连续次数 | 「Agent 进程退出」加一 | 「回合开始」「兜底」、L0 的 `Consumed` 置 0 |
 
-**挂起**
+#### 挂起
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `suspend_id` | uuid | 当前或最近一次挂起尝试；挂起落地后保留，作为恢复后 `Resumed{suspend_id}` 的取值 | 「发起挂起」「冻结中升级」；「就绪应答」的 `freeze_signal` 落地与转 `wake_queued`、「提供者挂起失败」的冻结类分支时与 `freeze_id` 相同 | `enter_active`、「本代沙箱作废」、`fence_and_bump`、「显式结束」 |
 | `aborted_suspend_id` | uuid | 待就绪相位因无应答回退的挂起尝试；看守进程之后对它的 `ReadyToSuspend` 或冻结报告由「迟到的挂起应答」与同代 `Hello` 解除；非空期间「发起挂起」不发起新尝试 | 「挂起截止」的 `await_ready` 回退（取当时的 `suspend_id`） | 「迟到的挂起应答」（`Busy`、未冻结的 `ReadyToSuspend` 与 `Thawed`）、「进入降级」「本代沙箱作废」、`fence_and_bump`、「显式结束」 |
 | `suspend_mode` | text | 挂起尝试的模式 | 「发起挂起」「冻结中升级」 | 离开 `suspending` 的同一事务 |
@@ -568,17 +568,17 @@ flowchart TD
 | `freeze_cap` | interval | 挂起尝试的冻结上限时长，取自 `suspendpolicy.decide` 的 `f_cap`：`blocked_on.kind=llm` 且 `blocked_on.mode=passthrough` 时为 F_stream，`blocked_on` 非空的其余情形为 F_cap(`blocked_on.kind`)，`blocked_on` 为空时为空；冻结落地时据此写 `freeze_deadline` | 「发起挂起」（取 `d.f_cap`）；「非 Active 回合进展」（`suspending` 中改写 `blocked_on` 时按同一规则重算） | 离开 `suspending` 的同一事务 |
 | `freeze_deadline` | timestamptz | 回合中且 `blocked_on` 非空的冻结上限 `blocked_on.since+freeze_cap`，冻结中进入新阻塞时按 `freeze_cap` 的取值规则直接计算；回合边界冻结与 L2 声明等待下的冻结为空；在 `suspended.frozen` 中供谓词子句 E 判定，在 `wake_queued.frozen` 中作为恢复准入的截止放行时刻，冻结中升级的解冻期间保留 | 「就绪应答」「提供者确认」（冻结落地或转 `wake_queued`）、「提供者挂起失败」、「非 Active 回合进展」（冻结中进入新阻塞） | 「非 Active 回合进展」（冻结中回合结束）；其余与 `freeze_id` 相同 |
 | `grace_deadline` | timestamptz | 回合边界宽限期截止；作为 `maybe_suspend` 与 `frozen_review` 的上下文传给 `suspendpolicy`，由其判定宽限期是否已过并给出复评时刻；不进入谓词 | 「发起挂起」（边界冻结，取 `now()+d.grace`，`d.grace` 为 `suspendpolicy.decide` 给出的宽限期）、「排空完成」（取 `now()`） | 「投递接受」（`fed=true`）、「回合开始」、`enter_active`、「进入降级」「本代沙箱作废」「显式结束」 |
-| `review_at` | timestamptz | 所有者侧下一次复评时刻（策略复评、D_min、Busy 的 `retry_after`（`reason=cancelled` 除外）、提供者失败与无应答的退避、冻结中复评、原地放大迁移）；只在 `active` 与 `suspended.frozen` 中有效 | `resume`（`cgroup` 解冻）与 `thaw` 的完成事务（`state=active` 且写入非空 `resize_deferred_since` 时）、`maybe_suspend` 返回 NONE（L0 除外）、「就绪应答」（`signal` 落地）、「提供者确认」（冻结落地）、「挂起回退」（`reason≠cancelled`）、「提供者挂起失败」「挂起截止」「冻结保持」、「非 Active 回合进展」（冻结中回合结束时取 `now()`） | 「回合开始」、「投递接受」（`fed=true`）、「发起挂起」「冻结中升级」「摄入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」、`enter_active`（「挂起回退」「提供者挂起失败」「挂起截止」在其后另写）、「进入降级」「本代沙箱作废」、到期处理事务、「显式结束」 |
+| `review_at` | timestamptz | 所有者侧下一次复评时刻（策略复评、D_min、Busy 的 `retry_after`（`reason=cancelled` 除外）、提供者失败与无应答的退避、冻结中复评、原地放大迁移）；只在 `active` 与 `suspended.frozen` 中有效 | `resume`（`cgroup` 解冻）与 `thaw` 的完成事务（`state=active` 且写入非空 `resize_deferred_since` 时）、`maybe_suspend` 返回 NONE（L0 除外）、「就绪应答」（`signal` 落地）、「提供者确认」（冻结落地）、「挂起回退」（`reason≠cancelled`）、「提供者挂起失败」「挂起截止」「冻结保持」、「非 Active 回合进展」（冻结中回合结束时取 `now()`） | 「回合开始」、「投递接受」（`fed=true`）、「发起挂起」「冻结中升级」「汇入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」、`enter_active`（「挂起回退」「提供者挂起失败」「挂起截止」在其后另写）、「进入降级」「本代沙箱作废」、到期处理事务、「显式结束」 |
 | `resize_deferred_since` | timestamptz | 原地放大进入 `Deferred` 的时刻，取自沙箱提供者对放大请求的返回 | `resume`（`cgroup` 解冻）与 `thaw` 效果的完成事务（`resume` 与 `thaw` 的完成事务只校验运行实例非终态与效果的代，状态已为 `active` 或升级尝试已中止时照常写入） | 复评时 `sandboxprovider` 报告放大完成；`fence_and_bump`；「显式结束」 |
 | `snapshot_expires_at` | timestamptz | 快照保留期限；`HoldLease` 的期限取它加 `T_hold_margin`；临近时转销毁态 | 「提供者确认」（快照落地） | `enter_active`、「进入降级」「本代沙箱作废」、`fence_and_bump`、「显式结束」 |
 
-**唤醒、准入与恢复**
+#### 唤醒、准入与恢复
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
-| `wake_reason` | text | 见唤醒原因的派生 | 「就绪应答」「提供者确认」「提供者挂起失败」「非 Active 回合进展」「摄入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」「兜底」「本代沙箱作废」；「入队」升级 | `enter_active`；「本代沙箱作废」（转 `suspended` 时）；「显式结束」 |
+| --- | --- | --- | --- | --- |
+| `wake_reason` | text | 见唤醒原因的派生 | 「就绪应答」「提供者确认」「提供者挂起失败」「非 Active 回合进展」「汇入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」「兜底」「本代沙箱作废」；「入队」升级 | `enter_active`；「本代沙箱作废」（转 `suspended` 时）；「显式结束」 |
 | `queued_at` | timestamptz | 进入 `wake_queued` 的时刻，老化依据；重建意图与重新入队保留原值 | 同 `wake_reason` 的转移（「入队」除外） | `enter_active`；「本代沙箱作废」（转 `suspended` 时）；「显式结束」 |
-| `resume_intent` | text | `normal`、`drain`、`rebuild`、`fallback` | 「就绪应答」「提供者确认」「提供者挂起失败」「非 Active 回合进展」「摄入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」「兜底」「本代沙箱作废」 | `enter_active`；「进入降级」；「本代沙箱作废」（转 `suspended` 时）；「显式结束」 |
+| `resume_intent` | text | `normal`、`drain`、`rebuild`、`fallback` | 「就绪应答」「提供者确认」「提供者挂起失败」「非 Active 回合进展」「汇入唤醒」「冻结上限处置」「接入唤醒」「预测性恢复」「兜底」「本代沙箱作废」 | `enter_active`；「进入降级」；「本代沙箱作废」（转 `suspended` 时）；「显式结束」 |
 | `resume_id` | uuid | 当前或最近一次恢复、预配尝试；离开 `provisioning`、`resuming` 后保留，供 `provision` 与 `resume` 的完成事务核对，只被下一次尝试覆盖 | 「创建」「准入放行」、「恢复失败或超时」与「预配失败或超时」的新尝试 | 「进入降级」「本代沙箱作废」「显式结束」 |
 | `resume_mode` | text | 放行之前由 `suspendpolicy` 依子状态、能力与意图确定；`AdmissionState.Mechanism` 取该列 | 「创建」（`cold_start`）、「入队」、「兜底」 | `enter_active`；「进入降级」；「本代沙箱作废」（转 `wake_queued` 与转 `suspended` 均清空，入队时重算）；「显式结束」 |
 | `resume_attempts` | integer | 同一次唤醒中预配或恢复失败的次数（租约前置的等待、连接宽限、`signal` 变体解冻的无流等待与槽位重新取得的等待不计） | 「恢复失败或超时」与「预配失败或超时」加一 | `enter_active`、「兜底」置 0 |
@@ -589,11 +589,11 @@ flowchart TD
 | `sandbox_gone_at` | timestamptz | 沙箱提供者确认本代沙箱不存在的时刻；「沙箱丢失」守卫据此直接判定丢失 | 「沙箱丢失」守卫（按 `sandbox_id` 逐个查询确认之后）、「提供者确认」（销毁确认）、「恢复对象不存在」、`destroy` 效果完成（被销毁对象含 `run.sandbox_id` 且代相同时，终态行同样写入） | `fence_and_bump` |
 | `degraded_deadline` | timestamptz | 自动兜底时刻 | 「进入降级」 | 「兜底」「放弃」「显式结束」 |
 
-**投递与游标**
+#### 投递与游标
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
-| `head_seq` | bigint | 收件箱最大序号 | 插入 `inbox` 行的事务：摄入事务，以及所有者写内部通知时（`interrupt_turn`、`enter_active` 的新代路径与「投递接受」的回合边界续接 `fed=false` 分支写入的回合被中断通知、「投递不可重试失败」「兜底」、运行实例范围定时器触发）；一律取新插入行的 `inbox_seq`，`(run_id, dedup_key)` 幂等命中、未插入新行时不写 | — |
+| --- | --- | --- | --- | --- |
+| `head_seq` | bigint | 收件箱最大序号 | 插入 `inbox` 行的事务：汇入事务，以及所有者写内部通知时（`interrupt_turn`、`enter_active` 的新代路径与「投递接受」的回合边界续接 `fed=false` 分支写入的回合被中断通知、「投递不可重试失败」「兜底」、运行实例范围定时器触发）；一律取新插入行的 `inbox_seq`，`(run_id, dedup_key)` 幂等命中、未插入新行时不写 | — |
 | `cursor_accepted` | bigint | 常规投递累计接受的前缀 | 「投递接受」常规分支的 CAS；同代 `Hello` 在常规批在途时按同代重连规则前进；新代 `Hello` 按跨代重投规则前进（只取常规投递的已接受序号） | — |
 | `cursor_consumed` | bigint | 常规投递累计消费的前缀，不超过 `cursor_accepted` | `Consumed` 的 CAS（只针对常规投递；L0 在事件交给 Agent 后发出）；同代 `Hello` 按同代重连规则前进；新代 `Hello`（「预配完成」「重建完成」）按跨代重投对账：`sync` 语义下前进，`on_suspend` 语义下置为 `Hello.cursor_consumed`（允许回退，不低于 `durable_cursor`） | — |
 | `idle_cursor` | bigint | L0 最近一次看门狗空闲证据成立时的 `cursor_consumed`；只用于判定 L0 是否处理中，不作为重投起点 | 「创建」（0）、「看门狗空闲」；新代 `Hello`（L0，取 `min(idle_cursor, cursor_consumed)`） | — |
@@ -606,10 +606,10 @@ flowchart TD
 | `delivery_attempts` | integer | 同一批连续可重试失败的次数 | 「投递可重试失败」 | 「投递接受」、`cancel_delivery`、「显式结束」 |
 | `next_delivery_at` | timestamptz | 退避重投时刻；只在 `active.delivering` 中有效 | 「投递可重试失败」 | 「退避重发」「投递接受」、`cancel_delivery`、「显式结束」 |
 
-**沙箱、出站流、令牌与租约**
+#### 沙箱、出站流、令牌与租约
 
 | 字段 | 类型 | 含义 | 写入 | 清除 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `generation` | integer | 代，单调递增，只在 `fence_and_bump` 中加一 | 「创建」（1）、`fence_and_bump` | — |
 | `sandbox_id` | text | 本代沙箱标识；`provision`、`resume` 完成事务与首个被接受的本代 `Hello` 中先到者写入，后到者核对相等；不等时以租约持有者为准：后到者为 `Hello`（已通过租约持有者校验）时以 `Hello.sandbox_id` 覆盖，并在同一事务清空完成事务写入的 `placement`；后到者为完成事务时保留原值且不写 `placement`；不一致时 `placement` 一律由「沙箱丢失」守卫的批量列举补写；无论哪一方后到，都为效果返回的沙箱写 `destroy(ref=g<generation>:<该沙箱>)` 并告警 | `provision`、`resume` 完成事务；「预配完成」「快照带外恢复」「排队中带外恢复」「快照恢复完成」「重建完成」 | `fence_and_bump`；「准入放行」（`snapshot_restore`） |
 | `placement` | jsonb | 节点与可用区，供内存压力复评选取候选；为空的运行实例不在候选之列 | `provision`、`resume` 完成事务（结果写回类，状态已为 `active` 时照常写入；效果返回的沙箱与 `run.sandbox_id` 不等时不写）；「沙箱丢失」守卫的批量列举（`placement` 为空且列举到的沙箱等于 `run.sandbox_id` 时补写） | `fence_and_bump`；`Hello` 按 `sandbox_id` 的不一致规则覆盖 `sandbox_id` 的同一事务 |
@@ -629,7 +629,7 @@ flowchart TD
 ### 收件箱（`inbox`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `run_id`、`inbox_seq` | 复合主键；`inbox_seq` 在持有 `run` 行锁之后由数据库序列分配，同一运行实例内按提交顺序递增；全局序列不连续，与序号相关的阈值一律用时间量 |
 | `event_id`、`dedup_key` | `(run_id, dedup_key)` 唯一；`subscription_completed` 的 `dedup_key` 由 `connectorhub` 以订阅标识与外部事件标识共同派生，同一订阅的 webhook 与状态式轮询的重复被吸收，不同订阅匹配同一外部事件时各成一行 |
 | `kind` | 闭集 `message`、`approval_decision`、`subscription_completed`、`internal_notice` |
@@ -644,21 +644,21 @@ flowchart TD
 | `delivered_at` | 投递确认时刻：`Accepted` 首次覆盖该行的时刻 |
 | `consumed_at` | 消费时刻 |
 | `abandoned_at`、`abandon_reason` | 不可重试的投递失败后放弃投递的时刻与原因；被放弃的事件不进入常规批与谓词子句 D |
-| `payload` | 合法 JSON，不超过 `S_max`（摄入契约拒绝超限者）；大内容由事件源以附件引用（可取回的 URI 与内容哈希）表达，原样投递 |
+| `payload` | 合法 JSON，不超过 `S_max`（汇入契约拒绝超限者）；大内容由事件源以附件引用（可取回的 URI 与内容哈希）表达，原样投递 |
 
 约束：追加写，只有 `targeted_delivery_id`、`delivered_at`、`consumed_at`、`abandoned_at` 与 `abandon_reason` 可更新；可投递事件索引 `(run_id, inbox_seq) WHERE targeted_delivery_id IS NULL AND abandoned_at IS NULL` 供子句 D、常规选批与「投递滞后」守卫使用；关联键索引 `(run_id, (correlation->>'permission_id'), inbox_seq) WHERE kind='approval_decision'` 与 `(run_id, subscription_id, inbox_seq) WHERE kind='subscription_completed'` 供续接决定判定、`target_ready` 与「订阅创建」的已完成检查使用；`(run_id, dedup_key)` 幂等命中而关联键（`permission_id` 或 `subscription_id`）不同时拒绝写入；`inbox_seq ≤ durable_cursor` 且超过保留期的行才可清理，续接决定除外（见过期行的清理）。取消定向与重投只作用于 `redeliver_from` 之后的事件，而 `redeliver_from ≥ durable_cursor`，定向事件因而不另设清理下界。
 
 ### 唤醒信号（`wake_signal`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `signal_id` | 主键 |
 | `run_id`、`generation` | 所属运行实例与代 |
 | `kind` | 闭集 `llm_completed`、`llm_failed`、`request_completed`、`request_failed`、`timer_fired`、`approval_decided`、`subscription_done` |
 | `ref` | 条件标识：`request_id`、`timer_id`、`permission_id` 或 `subscription_id` |
 | `source` | 信号来源标识，举例为 `llmgateway`、本地代理、`connectorhub`、定时器调度、派生与本模块合成 |
 | `derived_from` | 派生信号的来源 `inbox_seq` |
-| `reason` | 失败原因，只用于 `llm_failed`、`request_failed`：摄入契约写入时取 `WakeSignal.Reason`，出站流上的失败消息不携带原因，写入的信号 `reason` 为空；本模块的合成信号为 `gateway_lost` 或 `connector_lost` |
+| `reason` | 失败原因，只用于 `llm_failed`、`request_failed`：汇入契约写入时取 `WakeSignal.Reason`，出站流上的失败消息不携带原因，写入的信号 `reason` 为空；本模块的合成信号为 `gateway_lost` 或 `connector_lost` |
 | `occurred_at` | 发生时刻，由调用方提供 |
 | `created_at` | 写入时刻，插入事务内取 `now()`；「阻塞已满足未转出」与「悬挂唤醒」中由信号满足的子句以它计时，子句 D 以 `inbox.received_at` 计时 |
 | `consumed_at`、`consumed_by` | 消费时刻与离开等待位置的转移标识，举例为 `blocked:<ref>`、`delivery:<delivery_id>` 与 `wait:<wait_row_id>` |
@@ -668,7 +668,7 @@ flowchart TD
 ### 等待（`wait`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `wait_row_id` | 代理主键 |
 | `run_id` | 所属运行实例 |
 | `wait_id` | 派生等待取来源对象标识（`sub_id`、`timer_id`）；声明等待取 `WaitDeclared.wait_id` |
@@ -690,13 +690,13 @@ flowchart TD
 - `status` 的每次变更以 CAS 完成：`scope=generation` 时 CAS 条件含 `generation=run.generation` 与当前状态，`scope=run` 时只含当前状态。满足判定不存储，在行锁内由信号与收件箱计算；声明等待的任一条件行被满足即视为该声明被满足，消费时同一 `wait_id` 的其余 pending 行 CAS 为 `closed`。
 - `fence_and_bump` 把旧代 pending 行置 `expired`；「显式结束」置 `cancelled`。
 - 代范围的声明等待不跨回合。关闭本代声明等待，即把本代 `scope=generation`、`kind=declared` 的 pending 行 CAS 为 `closed`，并把这些行的 `deadline_timer_id` 所指的 pending 定时器置 `cancelled`；执行点穷举为：「回合结束」（含 `pending_turn_delivery_id` 非空的分支，以及「非 Active 回合进展」对它的应用）、「排空完成」与 `interrupt_turn`。
-- 写入者只有所有者事务，摄入事务不写 `wait`。
+- 写入者只有所有者事务，汇入事务不写 `wait`。
 - 运行实例范围的 pending 行在对应收件箱事件写入后由所有者关闭，关闭点穷举为：运行实例范围定时器的触发事务（`kind=timer` 的行，以及 `declared_kind=timer` 且 `ref` 或 `deadline_timer_id` 等于该 `timer_id` 的声明行）；`wake_check` 的分派在订阅完成事件的 `subscription_status≠active` 时按 `subscription_id` 关闭 `kind=subscription` 的行，并在任一匹配的订阅完成（按 `subscription_id`）或审批决定（按 `permission_id`）到达时关闭 `declared_kind` 为 `wait_for`、`approval` 且 `ref` 相同的声明行；「订阅创建」登记时已有完成事件的订阅。声明行关闭时同一 `wait_id` 的其余 pending 行一并 CAS 为 `closed`。
 
 ### 定时器（`timer`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `timer_id` | 由平台 MCP 服务器每次调用新生成的随机 UUID，全局唯一；不接受 Agent 指定的值。主键 `(run_id, timer_id)`，插入以 `ON CONFLICT DO NOTHING`：同一运行实例的同一 `timer_id` 视为幂等，属于其他运行实例时计数并拒绝该登记 |
 | `run_id`、`scope`、`generation` | CHECK 同 `wait` |
 | `kind` | 闭集 `sleep_until`、`probe`、`declared_deadline`；声明的截止定时器取 `declared_deadline` |
@@ -710,7 +710,7 @@ flowchart TD
 ### 效果记录（`outbox`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `outbox_id` | 主键 |
 | `run_id`、`generation` | 所属运行实例与写入时的代 |
 | `effect` | 闭集见效果记录的执行 |
@@ -728,7 +728,7 @@ flowchart TD
 ### 运行实例事实（`run_fact`）
 
 | 列 | 说明 |
-|---|---|
+| --- | --- |
 | `run_id` | 所属运行实例 |
 | `generation` | 非空；`wake_hint` 取所属代，其余种类为运行实例范围，取 0 |
 | `kind` | 闭集 `live_attach`、`wake_hint`、`end_request`、`resolve_request` |
@@ -737,14 +737,14 @@ flowchart TD
 | `source_seq`、`observed_at` | 来源序号与观察时刻 |
 | `expires_at` | `live_attach` 接入值为真时取写入时刻加 `LiveAttach.TTL`，接入值为假与其他种类为空 |
 
-主键 `(run_id, kind, source, generation)`。只接受 `source_seq`（或 `observed_at`）更大的值；`end_request` 以首次请求为准（ON CONFLICT DO NOTHING）；`resolve_request` 的 `source_seq` 取登记时刻，由「兜底」「放弃」处理后删除，状态已不是 `degraded` 时由 `wake_check` 的分派删除并计数。实时接入的有效值为接入值为真且 `expires_at > now()` 的通道是否存在；终端与文件通道另单独判定，用于「接入唤醒」与进行中的快照或销毁挂起尝试的中止（「取消挂起」「就绪应答」「升级解冻完成」），`ui_session` 通道不参与这些判定。到期的接入事实由「实时接入到期」守卫经内部摄入路径在 `run` 行锁内改写为未接入（`observed_at` 取原 `expires_at`，`expires_at=∅`，`source_seq` 不变），改写以 `source_seq` 等于候选读出时的值且 `expires_at < now()` 为条件，未命中（候选读出之后 `humanchannel` 已续写）时放弃；命中时同一事务写 `wake_check`（`ref=fact:live_attach:<channel>:<source_seq>:expired`）并通知所有者；`humanchannel` 之后以更大的 `source_seq` 续写时照常覆盖。
+主键 `(run_id, kind, source, generation)`。只接受 `source_seq`（或 `observed_at`）更大的值；`end_request` 以首次请求为准（ON CONFLICT DO NOTHING）；`resolve_request` 的 `source_seq` 取登记时刻，由「兜底」「放弃」处理后删除，状态已不是 `degraded` 时由 `wake_check` 的分派删除并计数。实时接入的有效值为接入值为真且 `expires_at > now()` 的通道是否存在；终端与文件通道另单独判定，用于「接入唤醒」与进行中的快照或销毁挂起尝试的中止（「取消挂起」「就绪应答」「升级解冻完成」），`ui_session` 通道不参与这些判定。到期的接入事实由「实时接入到期」守卫经内部汇入路径在 `run` 行锁内改写为未接入（`observed_at` 取原 `expires_at`，`expires_at=∅`，`source_seq` 不变），改写以 `source_seq` 等于候选读出时的值且 `expires_at < now()` 为条件，未命中（候选读出之后 `humanchannel` 已续写）时放弃；命中时同一事务写 `wake_check`（`ref=fact:live_attach:<channel>:<source_seq>:expired`）并通知所有者；`humanchannel` 之后以更大的 `source_seq` 续写时照常覆盖。
 
 ### 在途请求（`source_request`）与事件源实例租约（`source_lease`）
 
 `source_request` 的列为 `run_id`、`generation`、`request_id`、`source`（闭集 `llmgateway`、`connectorhub`、`local_proxy`）、`instance`、`kind`（闭集 `llm`、`request`）、`status`（闭集 `in_flight`、`done`）与 `registered_at`，主键 `(run_id, generation, request_id, source)`，索引 `(instance) WHERE status='in_flight'` 供「事件源实例失联」守卫使用。
 
-- 登记：`llmgateway` 在向上游转发前经 `SetRunFact{inflight_request}` 登记来源为 `llmgateway` 的行，`connectorhub` 的同步请求以同样方式登记（`kind=request`），主键冲突时按摄入契约的幂等规则处理（`done` 行不改，`in_flight` 行的 `instance` 改写为最近一次登记的实例）；本地代理的请求由所有者处理 `llm.request.started` 时登记为来源 `local_proxy` 的行，门控不成立、L0 与 `draining` 中同样登记。
-- 关闭：任一非终态中，所有者处理出站流上的完成或失败消息，或摄入事务处理 `AppendWakeSignal`（含信号幂等命中），都在同一事务把该 `request_id` 的全部来源行置 `done`，与是否命中 `blocked_on` 无关。来源为 `local_proxy` 的行另在「Agent 进程退出」「进入降级」「本代沙箱作废」与 `fence_and_bump` 中按代整体置 `done`；「显式结束」「放弃」把本运行实例全部 `in_flight` 行置 `done`。
+- 登记：`llmgateway` 在向上游转发前经 `SetRunFact{inflight_request}` 登记来源为 `llmgateway` 的行，`connectorhub` 的同步请求以同样方式登记（`kind=request`），主键冲突时按汇入契约的幂等规则处理（`done` 行不改，`in_flight` 行的 `instance` 改写为最近一次登记的实例）；本地代理的请求由所有者处理 `llm.request.started` 时登记为来源 `local_proxy` 的行，门控不成立、L0 与 `draining` 中同样登记。
+- 关闭：任一非终态中，所有者处理出站流上的完成或失败消息，或汇入事务处理 `AppendWakeSignal`（含信号幂等命中），都在同一事务把该 `request_id` 的全部来源行置 `done`，与是否命中 `blocked_on` 无关。来源为 `local_proxy` 的行另在「Agent 进程退出」「进入降级」「本代沙箱作废」与 `fence_and_bump` 中按代整体置 `done`；「显式结束」「放弃」把本运行实例全部 `in_flight` 行置 `done`。
 - I9 预检以本代 `in_flight` 行数为 0 判定无在途请求。
 - 旧代行、终态运行实例的行与已 `done` 超过保留期的行由清理任务删除；不加行锁的登记在竞态下可能遗留旧代或终态的 `in_flight` 行，它们不参与任何判定。
 
@@ -754,24 +754,24 @@ flowchart TD
 
 ### 转移表
 
-转移表穷举运行实例的状态转移，是状态图的完整约束。「起点」中 `a.b` 表示状态 `a` 的子状态 `b`，`a.*` 表示任一子状态，`a(m)` 表示 `resume_mode` 或 `delivery_kind` 为 `m`；「写」列中 `x=v` 为写入，`x=∅` 为清空。「执行者」的取值：所有者；所有者（接管），指通过 Hello 公共校验的接收副本在同一事务接管所有权后执行；任一，指摄入事务。全部所有者事务在行锁内先校验所有权，表中不重复。表中调用的过程 `enter_active`、`maybe_suspend`、`frozen_review`、`must_wake`、`promote_blocked`、`target_ready`、`cancel_delivery`、`interrupt_turn` 与 `fence_and_bump` 定义在本章对应小节，均在调用它的事务内执行；「同事务入队」指转入 `wake_queued` 的所有者事务在同一事务内执行「入队」。「挂起尝试字段」指 `suspend_mode`、`suspend_phase`、`suspend_origin`、`freeze_cap` 与 `transition_deadline`；`suspend_id` 在挂起落地后保留，由 `enter_active`、「本代沙箱作废」、`fence_and_bump` 与「显式结束」清除。
+转移表穷举运行实例的状态转移，是状态图的完整约束。「起点」中 `a.b` 表示状态 `a` 的子状态 `b`，`a.*` 表示任一子状态，`a(m)` 表示 `resume_mode` 或 `delivery_kind` 为 `m`；「写」列中 `x=v` 为写入，`x=∅` 为清空。「执行者」的取值：所有者；所有者（接管），指通过 Hello 公共校验的接收副本在同一事务接管所有权后执行；任一，指汇入事务。全部所有者事务在行锁内先校验所有权，表中不重复。表中调用的过程 `enter_active`、`maybe_suspend`、`frozen_review`、`must_wake`、`promote_blocked`、`target_ready`、`cancel_delivery`、`interrupt_turn` 与 `fence_and_bump` 定义在本章对应小节，均在调用它的事务内执行；「同事务入队」指转入 `wake_queued` 的所有者事务在同一事务内执行「入队」。「挂起尝试字段」指 `suspend_mode`、`suspend_phase`、`suspend_origin`、`freeze_cap` 与 `transition_deadline`；`suspend_id` 在挂起落地后保留，由 `enter_active`、「本代沙箱作废」、`fence_and_bump` 与「显式结束」清除。
 
-**创建与预配**
+#### 创建与预配
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 创建 | — | `RunService.Create` | `(project_id, idempotency_key)` 未用；已用且参数哈希相同时返回原 `run_id`，不同时返回冲突错误 | 插入 `run`：`generation=1`、`cursor_accepted=cursor_consumed=durable_cursor=idle_cursor=head_seq=0`、`turn_phase=idle`、`tenant_id`、`project_id`、`agent_kind`、`cooperation_level`、`create_hash`、`resume_id=新`、`resume_mode=cold_start`、`transition_deadline=now()+T_provision`、所有者字段 | `provision(ref=resume_id)` | `provisioning` | 受理 `Create` 的副本，成为首个所有者 |
 | 预配完成 | `provisioning` | 本代 `Hello` | Hello 公共校验通过（令牌、代、租约持有者） | `sandbox_id` 取自 `Hello`（`provision` 完成事务已写入而不等时按 `sandbox_id` 的不一致规则覆盖，并销毁效果返回的沙箱）；`lease_id`、`lease_generation`（为空时取自 `Hello`，`provision` 完成事务核对）、`ws_durability`（取自 `GetLease`）、`token_expires_at`（取自 `Hello` 的令牌）、`stream_epoch+1`、`stream_seen_at=now()`、`agent_state`、`in_msg_seq`；不写 `session_id`；`enter_active(path=provision)` | 按进入规则可能 `deliver`；令牌已过期或临近到期时 `rotate_token` | `active.*` | 所有者（接管） |
 | 预配失败或超时 | `provisioning` | `transition_deadline` 到期（「过渡态截止」守卫）；`provision` 效果报告失败或租约前置未满足 | — | 按「恢复失败或超时」的规则处理，`provisioning` 视同重建类尝试：租约前置的等待与连接宽限不计数；明确失败与截止时效果仍未完成计入 `resume_attempts`，明确失败的新尝试先 `fence_and_bump` 并换 `resume_id`（状态保持 `provisioning`）；`resume_attempts` 达到 `N_resume` 时执行「进入降级」 | 同「恢复失败或超时」 | `provisioning`，或经「进入降级」到 `degraded` | 所有者 |
 
-**Active 内部**
+#### Active 内部
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 回合开始 | `active.{in_turn, boundary, idle, delivering}` | `turn_started{turn_id, session_id, delivery_id}` | 代匹配 | `current_turn_id=turn_id`；`turn_started.delivery_id` 等于 `pending_turn_delivery_id` 时 `pending_turn_delivery_id=∅`（Agent 自行开始的回合不带投递标识，不清除）；`session_id` 非空时更新；`turn_phase=in_turn`；`start_failures=0`、`fallback_attempts=0`；从回合边界进入时（Agent 自行开始的回合）`grace_deadline=∅`、`review_at=∅`；起点为 `delivering` 时子状态保持，`Accepted` 后按「投递接受」路由 | — | `in_turn` 或不变 | 所有者 |
 | 进入阻塞 | `active.{in_turn, blocked_on, delivering}` | 阻塞进入事件（见阻塞门控与待定向目标） | 代匹配；该条件尚未满足 | 先按阻塞门控处理该事件对既有 `blocked_on` 的影响（门控不再成立时清空，同「阻塞结束或门控失效」）。登记：`llm` 插入 `source_request(source=local_proxy)`；`approval` 写 `permission_id` 并追加待定向目标；`wait_for` 追加待定向目标。门控成立且 `blocked_on` 为空时写 `blocked_on={kind, ref, call_id, since=now(), predicted_ms, mode}`（`mode` 只在 `llm` 时取 `llm.request.started.mode`；`timer` 另插入代范围 `timer` 行）：起点为 `in_turn`、`blocked_on` 时 `substate=blocked_on` 并 `maybe_suspend(trigger=blocked)`，起点为 `delivering` 时子状态保持；门控不成立时只登记 | `maybe_suspend` 选定机制时 `suspend` | `blocked_on`、`in_turn`、不变，或经「发起挂起」到 `suspending` | 所有者 |
 | 进入即满足 | `active.{in_turn, blocked_on, delivering}` | 阻塞进入事件 | 代匹配；该条件已满足：`llm`、`request`、`timer` 存在未消费的本代信号（完成先于进入事件到达）；`approval`、`wait_for` 就绪（收件箱已有对应的决定或订阅完成，含前代到达的事件） | 先按阻塞门控处理该事件对既有 `blocked_on` 的影响。`llm`、`request`、`timer`：消费信号（`consumed_at`、`consumed_by`），不写 `blocked_on`，不调用 `maybe_suspend`。`approval`、`wait_for`：同「进入阻塞」登记待定向目标，不写 `blocked_on`；不在 `delivering` 时按「发起定向投递」投递，在 `delivering` 时由「投递接受」路由 | `approval`、`wait_for` 且不在 `delivering` 时 `deliver` | `in_turn`、`delivering(targeted)` 或不变 | 所有者 |
-| 阻塞满足 | `active.blocked_on`（`kind∈{llm, request, timer}`） | `wake_check`（摄入的信号）、定时器触发事务，或出站流上的完成消息（所有者直接写信号） | 信号 `ref=blocked_on.ref`、kind 可接受、代匹配、未消费 | 消费信号；`blocked_on=∅`；该 `request_id` 的全部来源 `source_request` 行置 `done`（已关闭时为空操作） | — | `in_turn` | 所有者 |
+| 阻塞满足 | `active.blocked_on`（`kind∈{llm, request, timer}`） | `wake_check`（汇入的信号）、定时器触发事务，或出站流上的完成消息（所有者直接写信号） | 信号 `ref=blocked_on.ref`、kind 可接受、代匹配、未消费 | 消费信号；`blocked_on=∅`；该 `request_id` 的全部来源 `source_request` 行置 `done`（已关闭时为空操作） | — | `in_turn` | 所有者 |
 | 发起定向投递 | `active.{in_turn, blocked_on}` | `wake_check`（派生信号）；「进入即满足」「投递接受」「投递不可重试失败」「定向目标失效」与进入规则的路由；`maybe_suspend` 的子句 A 分支 | 存在就绪的待定向目标；不在 `delivering` | 取按登记先后第一个就绪项 t：`delivery_id=新`、`delivery_kind=targeted`、`through_seq` 为该事件的 `inbox_seq`、`delivery_target`（`approval` 为 `permission_decision{id=t.ref}`，`wait_for` 为 `tool_result{call_id=t.call_id}`）、该事件的 `targeted_delivery_id`、`substate=delivering`、`transition_deadline=now()+T_deliver`；`blocked_on` 保留 | `deliver` | `delivering(targeted)` | 所有者 |
 | 阻塞结束或门控失效 | `active.{blocked_on, in_turn, delivering}` | 同回合的进展事件（见阻塞门控与待定向目标；`turn_ended` 见「回合结束」） | 代与回合匹配 | 按阻塞门控结束阻塞或使门控失效：`blocked_on=∅`（不消费信号），起点为 `blocked_on` 时 `substate=in_turn`；所属调用的 `tool_ended` 同时移除其待定向目标，在途定向批的目标属于该调用时 `cancel_delivery`（事件回落为常规投递）并 `substate=in_turn`；常规投递在途时子状态保持；再处理该事件；随后 `promote_blocked` | 视该事件 | 视该事件 | 所有者 |
 | 回合结束 | `active.{in_turn, blocked_on, delivering}` | `turn_ended{turn_id, reason, agent_exited, bg_procs}` | 代与 `current_turn_id` 匹配（`current_turn_id` 为空或为 `accepted:` 占位值时接受）；Agent 驱动器已判定 `result` 与 `idle` 齐备且 `queued_turn_count` 为 0 | `agent_exited=true` 时改按「Agent 进程退出」处理。回合内定向批在途（目标为待定向目标）时 `cancel_delivery`；回合边界续接的定向批在途时不取消。`pending_turn_delivery_id` 非空与为空的分支都先关闭本代声明等待（见等待的约束），`reason=tool_deferred` 时在清空 `permission_id` 之前写 `deferred_permission_id=permission_id`。`pending_turn_delivery_id` 非空时（已接受的投递尚未开始回合，该 `turn_ended` 属于投递在途期间 Agent 自行开始的回合）：`last_turn_id=current_turn_id`、`current_turn_id="accepted:"+pending_turn_delivery_id`、`blocked_on=∅`、`pending_targets=∅`、`running_tools=∅`、`permission_id=∅`、`bg_jobs=bg_procs`，`turn_phase` 保持 `in_turn`，`substate=in_turn`（投递在途时保持 `delivering`），不调用 `maybe_suspend`。否则做边界写入：`turn_phase=boundary`、`last_turn_id=current_turn_id`、`current_turn_id=∅`、`reason=turn_ended.reason`、`blocked_on=∅`、`pending_targets=∅`、`running_tools=∅`、`bg_jobs=bg_procs`、`permission_id=∅`；投递在途时只做边界写入、子状态保持（`Accepted` 后按「投递接受」路由）；其余按进入规则的边界分支选 `delivering`、`boundary` 或 `idle`，无可投递事件时 `maybe_suspend(trigger=boundary)` | `deliver` 或 `suspend` | `delivering`、`in_turn`、`boundary`、`idle`、`suspending` 或不变 | 所有者 |
@@ -793,10 +793,10 @@ flowchart TD
 | 同代重连 | `active.*` | 同代 `Hello`（看守进程重连） | Hello 公共校验 | `stream_epoch+1`、`stream_seen_at`、`agent_state`、`ws_durability`、`token_expires_at`；`agent_state.session_id` 非空时更新 `session_id`；子状态不变；`cursor_accepted`、`cursor_consumed` 按同代重连规则前进；`agent_state.phase=exited` 时执行「Agent 进程退出」；`agent_state.phase=boundary` 而 `turn_phase=in_turn` 时按「回合结束」对账；`agent_state.frozen=true`（Agent 进程树被冻结而状态为 `active`）且 `agent_state.freeze_id` 等于 `aborted_suspend_id` 时不作废，`frozen=true` 的其余情形计数、告警并执行「本代沙箱作废」 | `delivering` 且尚未收到该批结果时把该批的 `deliver` 效果重置为 `pending`（同一 `delivery_id`）；`draining` 时把本代最近一次 `send(Resumed)` 效果重置为 `pending`（看守进程按 `suspend_id` 幂等）；冻结标识等于 `aborted_suspend_id` 时写 `send(Thaw{aborted_suspend_id})`（同 `ref` 已 `done` 的行重置为 `pending`）；`aborted_suspend_id` 非空且 `agent_state` 未报告以它为标识的冻结时，把 `send(CancelSuspend{aborted_suspend_id})` 重置为 `pending`（看守进程从未收到该尝试的 `PrepareSuspend` 时这是唯一的清空途径）；令牌已过期或临近到期时 `rotate_token` | 不变，或经「Agent 进程退出」「回合结束」「本代沙箱作废」离开 | 所有者（接管） |
 | 非 Active 回合进展 | `suspending.*`、`suspended.frozen`、`wake_queued.frozen`、`resuming(thaw)` | 本代已接受出站流上的回合进展事件：`turn_started`、`turn_ended`、`tool_started`、`tool_ended`、`bg_jobs_changed`、`permission_requested`、`wait_started`、`subscription_created`、`timer_requested`、`llm.request.started` | 代匹配 | 按「回合开始」「进入阻塞」「进入即满足」的字段部分（含待定向目标的登记）、「阻塞结束或门控失效」、「回合结束」（`agent_exited=true` 时按「Agent 进程退出」的写入，不计 `start_failures`）、「工具进展」「订阅创建」与「定时请求」更新回合字段并登记行；不做 Active 子状态转移、不投递、不调用 `maybe_suspend`；`suspend_origin=active` 时 `substate` 同步为对应的 active 子状态；冻结态中回合结束或 `blocked_on` 被清空时 `freeze_deadline=∅`（`suspended.frozen` 另写 `review_at=now()`），进入新阻塞时 `freeze_deadline` 取 `blocked_on.since` 加按 `freeze_cap` 的取值规则得到的时长（`llm` 直通取 F_stream，其余取 F_cap(kind)）；`suspending` 中改写 `blocked_on` 时按同一规则重算 `freeze_cap`。随后：`suspended.frozen` 且 `must_wake` 为真时写 `state=wake_queued`、`wake_reason`、`queued_at`、`resume_intent=normal`、`review_at=∅`，同事务入队；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」；其余状态由之后的「升级解冻完成」「就绪应答」「提供者确认」「挂起回退」「提供者挂起失败」与 `enter_active` 按更新后的回合字段路由 | `send(CancelSuspend)` 或无 | 不变或 `wake_queued` | 所有者 |
 
-**挂起**
+#### 挂起
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 发起挂起 | `active.{blocked_on, boundary, idle}`；L2 声明等待下的 `active.in_turn` | `maybe_suspend` 选定 FREEZE、FREEZE_SHRINK、SNAPSHOT 或 DESTROY | 谓词为假（I3）；D_min 已满足（`trigger=drain_done` 时豁免）；`aborted_suspend_id` 为空（回退的尝试解除之前不发起新尝试）；策略选定；I8；`bg_jobs` 为空或策略给出超时终止（`force`）；DESTROY 时 I9 预检通过 | `state=suspending`、`suspend_id=新`、`suspend_mode`、`freeze_variant`（冻结类；FREEZE_SHRINK 只取 `cgroup`）、`suspend_phase=await_ready`、`suspend_origin=active`、`transition_deadline=now()+T_suspend(mode)`、`freeze_cap=d.f_cap`；边界冻结写 `grace_deadline=now()+d.grace`；`review_at=∅`；`policy_state`；`substate`、`turn_phase` 保留 | `suspend`（发 `PrepareSuspend`） | `suspending` | 所有者 |
 | 冻结中升级 | `suspended.frozen` | `frozen_review` 选定 SNAPSHOT 或 DESTROY（由 `review_at`、冻结上限或节点内存压力的复评请求触发） | `must_wake` 为假；实时接入有效值为假；DESTROY 要求 `turn_phase∈{boundary, idle}` 且 I9 预检通过 | `state=suspending`、`suspend_id=新`（升级尝试的标识）、`suspend_mode`、`suspend_origin=frozen`、`suspend_phase=thawing`、`transition_deadline=now()+T_suspend(mode)`、`review_at=∅`；`substate=frozen` 与冻结记录保留。SNAPSHOT 与 DESTROY 都先解冻，快照中不含被冻结的进程树 | `thaw(ref=suspend_id)`，参数为冻结记录的 `freeze_id`、`freeze_variant`（`cgroup` 变体并行恢复 CPU request） | `suspending` | 所有者 |
 | 升级解冻完成 | `suspending`（`thawing`） | `Thawed{suspend_id}` | `Thawed.suspend_id=run.freeze_id` | `must_wake` 为真，或 `suspend_mode=destroy` 且 `turn_phase=in_turn`，或终端或文件通道的接入有效值为真（终端或文件通道接入期间不快照、不销毁；`ui_session` 通道不中止进行中的升级）：`enter_active(path=abort_thawed)`。否则继续挂起：`suspend_phase=await_ready`、`suspend_origin=active`、`substate` 为与回合字段一致的 active 子状态、清空冻结记录、`transition_deadline=now()+T_suspend(mode)` | 中止：`send(Resumed{suspend_id=freeze_id})`；继续挂起：`suspend`（发 `PrepareSuspend{mode}`） | `suspending` 或 `active` | 所有者 |
@@ -809,11 +809,11 @@ flowchart TD
 | 迟到的挂起应答 | `active.*`、`suspending` | `ReadyToSuspend{suspend_id, …}`、`Busy{suspend_id}` 或 `Thawed{suspend_id}`，`suspend_id=run.aborted_suspend_id` | 代匹配 | `Busy`：`aborted_suspend_id=∅`，计数。`ReadyToSuspend` 携带 `frozen_at`（`Freeze{signal}` 已冻结 Agent 进程树）：写 `send(Thaw{suspend_id})`，`aborted_suspend_id` 保留到看守进程上报同一标识的 `Thawed`，期间断流重连的 `Hello` 仍按它解冻而不作废。携带 `exited_at`（销毁模式，Agent 已退出）：`aborted_suspend_id=∅`，写 `agent_state.phase=exited`，`active` 中按「Agent 进程退出」处理，`suspending` 中按「非 Active 回合进展」对「Agent 进程退出」的写入处理。其余（快照或 `Freeze{cgroup}` 的准备已完成）：`aborted_suspend_id=∅`，写 `send(Resumed{suspend_id})`。`active` 或 `suspending` 中收到标识等于 `aborted_suspend_id` 的 `Thawed` 时 `aborted_suspend_id=∅`，不做其他处理 | `send(Thaw)` 或 `send(Resumed)`；经「Agent 进程退出」可能 `deliver` | 不变，或经「Agent 进程退出」离开 | 所有者 |
 | 挂起中重连 | `suspending` | 同代 `Hello`（看守进程重连） | Hello 公共校验 | `stream_epoch+1`、`stream_seen_at`、`agent_state`、`ws_durability`、`token_expires_at`；`agent_state.session_id` 非空时更新 `session_id`；`HelloAck.desired_state` 在解冻尚未完成（`suspend_origin=frozen`）时为 `frozen`，否则为 `running`；回合字段与 `agent_state` 不一致时按「非 Active 回合进展」对账 | `await_ready`：以同一 `suspend_id` 重发 `suspend`；`thawing`：`signal` 变体重执行 `thaw`，`cgroup` 变体把已有的 `send(Thaw)` 效果重置为 `pending`；`provider_pending` 无动作；令牌已过期或临近到期时 `rotate_token` | 不变 | 所有者（接管） |
 
-**Suspended**
+#### Suspended
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
-| 摄入唤醒 | `suspended.*` | 摄入事务（事件、信号、合成信号）；定时器触发事务 | 子句 A、B 或 D 为真；只有子句 E 为真时不转移，见「冻结上限处置」 | 摄入写入集合中的条件 UPDATE：`state=wake_queued`、`wake_reason`、`queued_at`、`resume_intent=normal`、`review_at=∅`，`freeze_deadline` 保留；定时器触发事务为所有者事务，同事务入队 | 摄入事务写 `wake_check` | `wake_queued` | 任一；定时器触发为所有者 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 汇入唤醒 | `suspended.*` | 汇入事务（事件、信号、合成信号）；定时器触发事务 | 子句 A、B 或 D 为真；只有子句 E 为真时不转移，见「冻结上限处置」 | 汇入写入集合中的条件 UPDATE：`state=wake_queued`、`wake_reason`、`queued_at`、`resume_intent=normal`、`review_at=∅`，`freeze_deadline` 保留；定时器触发事务为所有者事务，同事务入队 | 汇入事务写 `wake_check` | `wake_queued` | 任一；定时器触发为所有者 |
 | 冻结上限处置 | `suspended.frozen` | `now ≥ freeze_deadline−safety_margin`：所有者截止调度、`wake_check`、「悬挂唤醒」守卫，以及冻结落地时的检查 | 只有子句 E 为真 | `frozen_review(trigger=f_cap)`：SNAPSHOT 时执行「冻结中升级」；DRAIN 时按 `blocked_on.kind` 处置：`llm`、`approval`、`wait_for` 写 `resume_intent=drain`；`timer` 把该代范围 `timer` 行改为 `scope=run`、`generation=∅`（`fire_at` 不变），插入 `wait(scope=run, kind=timer, ref=timer_id)`，写 `resume_intent=drain`；`request` 写 `resume_intent=normal`，不 DRAIN。DRAIN 的各分支均写 `state=wake_queued`、`wake_reason`（按唤醒原因的派生中冻结上限一行取值）、`queued_at`、`review_at=∅`，`freeze_deadline` 保留，准入以它为截止，同事务入队 | — | `suspending` 或 `wake_queued` | 所有者 |
 | 接入唤醒 | `suspended.{snapshotted, destroyed}` | `wake_check`（终端或文件通道接入）；「提供者确认」落地时接入已有效 | 终端或文件通道的接入有效值为真 | `state=wake_queued`、`wake_reason=live_attach`、`queued_at`、`resume_intent=normal`、`review_at=∅`，同事务入队 | — | `wake_queued` | 所有者 |
 | 预测性恢复 | `suspended.*` | `wake_check`（`wake_hint` 事实） | `suspendpolicy` 批准预测性恢复，且该 `request_id` 未做过预测性恢复 | 同「接入唤醒」，`wake_reason=predictive`；`policy_state` 记该 `request_id` | — | `wake_queued` | 所有者 |
@@ -822,10 +822,10 @@ flowchart TD
 | 销毁态连接 | `suspended.destroyed`、`wake_queued.destroyed`、`degraded` | 通过公共校验的 `Hello` | — | 不转移；只写所有权字段、`stream_epoch+1` 与 `stream_seen_at`，不写 `session_id`、`agent_state`、`token_expires_at`、租约字段与回合字段 | `destroy(ref=g<generation>:<Hello.sandbox_id>)`；不回 `HelloAck`，在该流上同步发送 `Shutdown{graceful=false, reason}` 并关闭流，不经效果记录（与终态下 `Hello` 的处理一致） | 不变 | 所有者（接管） |
 | 冻结态重连 | `suspended.frozen`、`wake_queued.frozen` | 同代 `Hello`（看守进程重连） | Hello 公共校验 | `stream_epoch+1`、`stream_seen_at`、`agent_state`、`ws_durability`、`token_expires_at`；`HelloAck.desired_state=frozen`；`agent_state` 与回合字段不一致时按「非 Active 回合进展」对账 | 令牌已过期或临近到期时 `rotate_token` | 不变 | 所有者（接管） |
 
-**WakeQueued 与 Resuming**
+#### WakeQueued 与 Resuming
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 入队 | `wake_queued` | `wake_check`、所有权接管、「排队悬挂」守卫；转入 `wake_queued` 的所有者事务在同一事务执行 | — | `resume_mode` 为空时取 `suspendpolicy.mechanism(substate, caps, resume_intent)`；新原因按唤醒原因的派生对当前为真的来源取最高优先级（终端或文件通道接入有效值为真时计为 `live_attach` 来源），优先级高于当前 `wake_reason` 时升级，保留 `queued_at`；提交后 `suspendpolicy.admit` 入队，携带 `resume_mode` 与截止（`substate=frozen` 时为 `freeze_deadline−safety_margin`，其余为空）；`admit` 对同一 `run_id` 幂等、不重置老化，机制或截止与已有条目不同时把条目改到新值（「本代沙箱作废」把冻结态或快照态转为销毁态之后为举例） | — | 不变 | 所有者 |
 | 准入放行 | `wake_queued` | 准入放行回调；`wake_queued.frozen` 的冻结截止到期仍未放行（所有者截止放行） | `state=wake_queued`；`resume_mode` 非空，且等于放行回调携带的机制（所有者截止放行不经回调，以当前的 `resume_mode` 为准）；为空或不等时按「入队」计算并重新入队，本次不放行；重建类模式要求 `rebuild_after` 为空或已过；`snapshot_restore` 要求 `now() < snapshot_expires_at−T_snapshot_margin`，否则按「本代沙箱作废」转销毁态 | 重建类模式先 `fence_and_bump`；`state=resuming`、`resume_id=新`、`slot_lease`（截止放行时同样登记）、`transition_deadline=now()+T_resume(mode)`、`slot_expires_at=transition_deadline+T_slot_grace`；`snapshot_restore` 清空 `sandbox_id`，由同代 `Hello` 或 `resume` 完成事务写入 | `resume_mode` 为 `thaw` 或 `snapshot_restore` 时 `resume(ref=resume_id)`，`thaw` 的参数为冻结记录的 `freeze_id`、`freeze_variant`；重建类模式 `provision(ref=resume_id)`，参数为旧代号，租约前置见重建衔接 | `resuming` | 所有者 |
 | 排队中带外恢复 | `wake_queued.snapshotted` | 同代 `Hello`（带外恢复） | Hello 公共校验 | 从准入队列移除；其余同「快照带外恢复」 | `send(Resumed{suspend_id})`；令牌已过期或临近到期时 `rotate_token` | `active.*` | 所有者（接管） |
@@ -837,25 +837,25 @@ flowchart TD
 | 解冻中重连 | `resuming(thaw)` | 同代 `Hello`（重连） | Hello 公共校验 | `stream_epoch+1`、`stream_seen_at`、`agent_state`、`ws_durability`、`token_expires_at`；重发 `Thaw{suspend_id=freeze_id}`：`signal` 变体经 `resume` 重驱动发出，`cgroup` 变体另把已有的 `send(Thaw)` 效果重置为 `pending` | `resume` 重驱动；令牌已过期或临近到期时 `rotate_token` | 不变 | 所有者（接管） |
 | 进入降级 | `active.*`；`resuming`；`provisioning` | 「Agent 进程退出」的 `start_failures` 达到 `N_resume`；「投递可重试失败」的 `delivery_attempts` 达到 `N_deliver_giveup`；「恢复失败或超时」的 `resume_attempts` 达到 `N_resume` | — | `state=degraded`、`substate=∅`、`reason`（`agent_start_failed`、`delivery_failed` 或恢复失败原因）、`degraded_deadline=now()+T_degraded_auto`；释放 `slot_lease`；清空 `resume_id`、`resume_mode`、`resume_intent`、`aborted_suspend_id`、挂起尝试字段、冻结记录、`transition_deadline`、`review_at`、`grace_deadline`、`snapshot_expires_at`；`cancel_delivery`；回合字段 `blocked_on=∅`、`pending_targets=∅`、`running_tools=∅`、`bg_jobs=∅`、`permission_id=∅`、`pending_turn_delivery_id=∅`；本代来源为 `local_proxy` 的 `source_request` 行置 `done`；`turn_phase`、`current_turn_id`、`session_id` 与收件箱游标保留，由「兜底」改写 | `destroy(ref=g<generation>, graceful=false)`（沙箱可能存活或已部分创建）；`workspace_release(ref=g<generation>)`，排在 `destroy` 完成之后；`revoke_egress(ref=g<generation>)` | `degraded` | 所有者 |
 
-**Degraded、Failed、重建意图与结束**
+#### Degraded、Failed、重建意图与结束
 
 | 转移 | 起点 | 触发 | 守卫 | 写 | 效果记录 | 目标 | 执行者 |
-|---|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- | --- |
 | 兜底 | `degraded` | `degraded_deadline` 到期（「复评与截止到期」守卫），或 `resolve_request` 事实（`RunService.Resolve(fallback)`，经 `wake_check`） | `fallback_attempts < N_fallback` | `reason=agent_start_failed` 时 `session_id=∅`（新会话），其余原因保留 `session_id`，以恢复句柄重建；`start_failures=0`、`resume_attempts=0`；`current_turn_id=∅`、`permission_id=∅`、`deferred_permission_id=∅`；插入 `internal_notice{degraded_summary}`（`event_id=dedup_key="degraded:"+generation`，载荷含中断原因、`last_turn_id` 与 `cursor_consumed`，摘要文本由 Agent 驱动器生成），插入成功时 `head_seq` 取新行的 `inbox_seq`，幂等命中时不改；`turn_phase=boundary`（L0 为 `idle`）；`state=wake_queued`、`substate=destroyed`、`resume_intent=fallback`、`resume_mode=cold_start`、`wake_reason=external_event`、`queued_at`、`degraded_deadline=∅`；`fallback_attempts+1`；删除已处理的 `resolve_request` 事实；同事务入队 | — | `wake_queued`，经「准入放行」递增代 | 所有者 |
 | 放弃 | `degraded` | 同「兜底」且 `fallback_attempts ≥ N_fallback`；或 `resolve_request(fail)` 事实 | — | `state=failed`、`reason`；同「显式结束」的清理；删除已处理的 `resolve_request` 事实 | `destroy(ref=g<generation>)`、`workspace_release`（排在 `destroy` 完成之后）与 `revoke_egress(ref=g<generation>)`，与「进入降级」写入的同键记录合并；`release_run(ref=run)` 与 `release_run_lease(ref=run)`，排在同一运行实例全部 `destroy` 与 `workspace_release` 完成之后 | `failed` | 所有者 |
 | 本代沙箱作废 | `active.*`；`suspending` 的 `thawing`、`await_ready`，或冻结类、快照的 `provider_pending`，或销毁的 `provider_pending`（只经「提供者挂起失败」）；`suspended.frozen`；`wake_queued.frozen`；`resuming(thaw)`；`suspended.snapshotted`、`wake_queued.snapshotted`（只在快照保留期临近时）；`resuming(snapshot_restore)`（只经「恢复对象不存在」） | 「沙箱丢失」守卫判定沙箱丢失；`LeaseLost{lease_id, expires_at}`；「挂起截止」的解冻重驱动达到上限；「解冻完成」的租约核对不符；`provider_suspend` 报告沙箱不存在（冻结类与快照）；「恢复对象不存在」；快照保留期临近（`snapshot_expires_at−T_snapshot_margin`）；同代 `Hello` 或 `Activity` 报告 Agent 进程树冻结而状态为 `active`（冻结标识等于 `aborted_suspend_id` 时除外） | 代匹配 | 作废在途的 `suspend`、`thaw`、`provider_suspend`、`resume`、`provision`、`deliver` 与 `send` 效果（置 `abandoned`），释放 `slot_lease`；已知旧租约到期时刻时写 `rebuild_after`（取 `LeaseLost.expires_at`，或「沙箱丢失」守卫、「解冻完成」读取的到期时刻）；`turn_phase=in_turn` 或 L0 处理中时 `interrupt_turn`，否则 `cancel_delivery`；清空 `suspend_id`、`aborted_suspend_id`、挂起尝试字段、冻结记录、`review_at`、`grace_deadline`、`snapshot_expires_at`、`resume_id`、`resume_mode` 与 `bg_jobs`；本代来源为 `local_proxy` 的 `source_request` 行置 `done`。随后按起点选择出口：起点为 `wake_queued.*` 或 `resuming(*)` 时一律写 `state=wake_queued`、`substate=destroyed`、`resume_intent=rebuild`，保留原 `wake_reason` 与 `queued_at`，同事务入队；其余起点在 `must_wake` 为真（存在可投递事件或其他满足的条件）或终端、文件通道的接入有效值为真时写 `state=wake_queued`、`substate=destroyed`、`resume_intent=rebuild`、`wake_reason`（取为真来源中优先级最高者，接入有效时为 `live_attach`）、`queued_at=now()`，同事务入队，否则写 `state=suspended`、`substate=destroyed`，并清空 `resume_intent`、`wake_reason` 与 `queued_at` | `destroy(ref=g<generation>, graceful=false)`，一律写入（`LeaseLost`、流丢失而提供者未确认与快照保留期临近时沙箱可能仍存活）；`revoke_egress(ref=g<generation>)`；本转移写入的 `destroy`、`revoke_egress` 记录与 `fence_and_bump` 的同键写入以 ON CONFLICT 合并 | `wake_queued` 或 `suspended.destroyed` | 所有者 |
 | 显式结束 | 任一非终态 | `end_request` 事实（`RunService.End`，经 `wake_check`） | 已终态时无动作 | `state=ended`、`end_reason`、`ended_at`；`destroy`、`workspace_release`、`release_run`、`release_run_lease`、`revoke_egress` 以外的 pending 效果置 `abandoned`；`blocked_on=∅`、`pending_targets=∅`；释放 `slot_lease` 并从准入队列移除；`timer` 置 `cancelled`；`release_run_lease(ref=run)` 排在同代 `destroy` 完成之后；`wait` 置 `cancelled`；本运行实例全部 `in_flight` 的 `source_request` 行置 `done`；`cancel_delivery`；清空 `suspend_id`、`aborted_suspend_id`、挂起尝试字段、冻结记录、`transition_deadline`、`review_at`、`grace_deadline`、`degraded_deadline`、`rebuild_after`、`token_expires_at`、`snapshot_expires_at`、`resize_deferred_since`、`resume_id`、`resume_mode`、`resume_intent`、`wake_reason`、`queued_at`、`running_tools`、`pending_targets`、`pending_turn_delivery_id` 与 `bg_jobs`；令牌经代查询的终态判定失效 | `destroy(ref=g<generation>)`，参数 `graceful=true`，执行器在目标代沙箱的出站流仍在时先发 `Shutdown{graceful=true}`；在途的 `provision`、`resume` 在调用提供者之前的复核中置 `abandoned`，已调用而在结束之后才返回的，由完成事务的校验失败分支或「沙箱丢失」守卫的反向求差销毁其沙箱，晚于 `destroy(g)` 或 `release_run` 到达提供者的创建被创建墓碑拒绝，运行实例级资源不会在释放之后被重建；`workspace_release`，排在 `destroy` 完成之后；`revoke_egress(ref=g<generation>)`；`release_run(ref=run)`，排在同一运行实例全部 `destroy` 与 `workspace_release` 完成之后 | `ended` | 所有者 |
 
-终态下入站消息不产生转移：`Hello` 不接管所有权，只回 `Shutdown` 并关闭流，其他消息计数丢弃；摄入写入以不可重试错误拒绝，`End` 的登记返回成功；终态行只接受 `owner_*` 的写入（认领与续租）、效果完成事务对 `sandbox_gone_at` 的写入与 `outbox` 写入。
+终态下入站消息不产生转移：`Hello` 不接管所有权，只回 `Shutdown` 并关闭流，其他消息计数丢弃；汇入写入以不可重试错误拒绝，`End` 的登记返回成功；终态行只接受 `owner_*` 的写入（认领与续租）、效果完成事务对 `sandbox_gone_at` 的写入与 `outbox` 写入。
 
 ### 阻塞门控与待定向目标
 
 `blocked_on.kind` 的闭集与各种类的进入、门控与满足如下：
 
 | kind | 进入事件（所有者处理） | 门控 `gate` | `ref` | 满足来源（本代信号） | 满足后 | 冻结上限类别 |
-|---|---|---|---|---|---|---|
-| `llm` | `llm.request.started{request_id, request_hash, mode, predicted_ms}` | `running_tools` 为空且 `pending_targets` 为空 | `request_id` | `llm_completed`、`llm_failed`：`llmgateway` 经摄入契约、本地代理经出站流、本模块合成 | 转 `InTurn` | `llm`；`mode=passthrough` 时取 F_stream |
-| `request` | `wait_started{call_id, kind=request, ref=request_id, predicted_ms}`（平台 MCP 服务器代理的同步连接器操作） | `running_tools ⊆ {call_id}` 且 `pending_targets` 为空 | `request_id` | `request_completed`、`request_failed`：`connectorhub` 经摄入契约、看守进程经出站流、本模块合成 | 转 `InTurn` | `sync` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `llm` | `llm.request.started{request_id, request_hash, mode, predicted_ms}` | `running_tools` 为空且 `pending_targets` 为空 | `request_id` | `llm_completed`、`llm_failed`：`llmgateway` 经汇入契约、本地代理经出站流、本模块合成 | 转 `InTurn` | `llm`；`mode=passthrough` 时取 F_stream |
+| `request` | `wait_started{call_id, kind=request, ref=request_id, predicted_ms}`（平台 MCP 服务器代理的同步连接器操作） | `running_tools ⊆ {call_id}` 且 `pending_targets` 为空 | `request_id` | `request_completed`、`request_failed`：`connectorhub` 经汇入契约、看守进程经出站流、本模块合成 | 转 `InTurn` | `sync` |
 | `timer` | `wait_started{call_id, kind=timer, ref=timer_id, fire_at}`（阻塞型 `sleep_until`） | 同 `request` | `timer_id` | `timer_fired`：代范围定时器触发 | 转 `InTurn` | `wait_for` |
 | `approval` | `permission_requested{id, call_id, blocking=true}` | `running_tools ⊆ {call_id}` 且 `pending_targets` 只含本项 | `permission_id` | `approval_decided`：`AppendInbox` 派生 | 定向投递 `permission_decision{id}`，`Accepted` 后移除该待定向目标并转 `InTurn` | `approval` |
 | `wait_for` | `wait_started{call_id, kind=wait_for, ref=sub_id}` | 同 `approval` | `sub_id` | `subscription_done`：`AppendInbox` 派生 | 定向投递 `tool_result{call_id}`，`Accepted` 后移除该待定向目标并转 `InTurn` | `wait_for` |
@@ -958,7 +958,7 @@ must_wake(run) = A or B or D or i8_lost(run) or ready_target(run)   # 子句 E �
 - 子句 B 只覆盖代范围条件。运行实例范围的条件（订阅、运行实例范围定时器、运行实例范围声明）一律在回合边界由子句 D 承接：订阅完成事件经 `AppendInbox` 进入收件箱，运行实例范围定时器触发写入 `internal_notice{timer_due}`；运行实例范围的声明条件因而不按代匹配，跨代保留。带截止时间的声明条件登记同范围定时器，代范围的截止以 `timer_fired` 经 `deadline_timer_id` 满足子句 B，运行实例范围的截止以 `internal_notice{timer_due}` 满足子句 D，谓词不另设截止子句。
 - 子句 A 的待定向目标分支：每个审批决定与订阅完成事件派生一条信号，子句 A 只认 `live` 信号；`live` 信号的来源事件未被定向投递占用、未被放弃，满足它的待定向目标因而 `target_ready`。登记时已就绪的待定向目标直接定向投递（「进入即满足」）；未就绪的目标只可能被登记之后写入收件箱的事件满足（该事件在当前代派生 `live` 信号），或在匹配事件的在途定向批 `Accepted` 之后就绪（该事件已送达、不再在途；这种就绪只发生在 `Active` 中，由「投递接受」的路由随即再次定向投递）；因此信号判定与收件箱判定（`target_ready`）在挂起态下一致；在非 Active 中登记、登记时已就绪的待定向目标（包括随后被 `promote_blocked` 写回 `blocked_on` 的）由 `must_wake` 的 `ready_target` 承接。同一审批的多条决定、同一订阅的多次完成各自派生信号，新事件派生的信号不被已消费的旧信号吸收，被放弃事件的信号不再使子句 A 为真。门控保证挂起时 `pending_targets` 至多只含 `blocked_on` 本身；挂起期间回合进展事件登记的新目标经「非 Active 回合进展」使 `blocked_on` 清空，`i8_lost` 为真而唤醒。
 - 子句 E 只在 `suspended.frozen` 参与：`freeze_deadline` 只承载回合中、`blocked_on` 非空的冻结的冻结上限，回合边界冻结与 L2 声明等待下的冻结为空；宽限期到期只触发复评，不进入谓词。`wake_queued.frozen` 保留 `freeze_deadline`，由恢复准入的截止放行保证在冻结上限之前解冻。冻结中升级（`suspending`，`suspend_origin=frozen`）期间不以子句 E 中止升级：该升级是冻结上限处置的结果之一，SNAPSHOT 与 DESTROY 都先解冻，解冻之后冻结上限不再适用。
-- `must_wake` 用于挂起过程与挂起态的中止或唤醒判定：「非 Active 回合进展」「升级解冻完成」「就绪应答」「提供者确认」「取消挂起」「本代沙箱作废」、`frozen_review` 与 `wake_check` 的分派。摄入事务只评估子句 A、B、D：摄入不改写回合字段，`i8_lost` 与 `ready_target` 不会因摄入变真。
+- `must_wake` 用于挂起过程与挂起态的中止或唤醒判定：「非 Active 回合进展」「升级解冻完成」「就绪应答」「提供者确认」「取消挂起」「本代沙箱作废」、`frozen_review` 与 `wake_check` 的分派。汇入事务只评估子句 A、B、D：汇入不改写回合字段，`i8_lost` 与 `ready_target` 不会因汇入变真。
 - 实时接入不进入谓词：终端或文件通道接入唤醒快照态或销毁态的运行实例由所有者经 `wake_check` 执行「接入唤醒」；进行中的快照或销毁挂起尝试由「取消挂起」「就绪应答」与「升级解冻完成」各自核对终端与文件通道的接入有效值后中止；`ui_session` 通道只经实时接入有效值约束 `suspendpolicy` 的决策，不唤醒、不中止进行中的挂起尝试。
 - 复杂度：单次评估为本代未消费信号与 pending 等待的索引查找（`wake_signal` 的未消费信号索引、`wait` 的状态索引）加一次收件箱区间存在性查询（`inbox` 的可投递事件索引），派生信号的 `live` 判定另需一次收件箱主键查找；`deferred_permission_id` 非空时另有一次续接决定的关联键索引查找。各项均为 O(log N)，N 为对应表的行数；各索引定义在对应表的约束中。
 
@@ -971,18 +971,18 @@ must_wake(run) = A or B or D or i8_lost(run) or ready_target(run)   # 子句 E �
 
 #### 信号与等待的消费
 
-- 写入不消费：摄入事务只插入信号，不在评估谓词之前、也不在写入事务内消费等待条件（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
+- 写入不消费：汇入事务只插入信号，不在评估谓词之前、也不在写入事务内消费等待条件（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
 - 消费只发生在运行实例实际离开等待位置的转移内，同一事务写 `wake_signal.consumed_at`、`consumed_by`，并清空 `blocked_on` 或把 `wait` CAS 为 `consumed`（同时写 `satisfied_by`）。消费点穷举为：「进入即满足」、「阻塞满足」、「投递接受」的回合内定向分支（消费由该事件派生的信号，存在时）、`enter_active` 的回合中满足分支。
 - `settle_gen_waits(run)` 把本代 pending、已被信号满足的 `probe` 与 `declared` 等待 CAS 为 `consumed` 并写 `satisfied_by`，同一 `wait_id` 的其余 pending 行 CAS 为 `closed`。匹配规则同子句 B，但既不要求信号未消费，也不要求 `live`：派生信号的来源事件已被定向投递占用、已定向送达或已被放弃时，声明的条件同样已经满足。只写等待一侧，一律不写信号的 `consumed_at`：信号留给离开阻塞或待定向位置的转移（「进入即满足」「阻塞满足」、定向投递的「投递接受」、`enter_active` 的回合中满足分支）消费；已无任何引用、写入超过 `R_signal` 的信号由清理任务删除。调用点穷举为：`enter_active`（在阻塞满足的信号消费之后）、`maybe_suspend`（在「阻塞满足」与「发起定向投递」的判定之后）、`active` 状态下 `wake_check` 的分派（同上，`delivering` 中同样调用）、「投递接受」（路由的转移之后）。同一信号既满足 `blocked_on` 或待定向目标、又满足 L2 声明的代范围等待时（声明 `{llm, r}` 而 `blocked_on={llm, r}`，声明 `{approval, p}` 而 p 是待定向目标为举例），不论 `settle_gen_waits` 在离开阻塞位置的转移之前还是之后执行，信号都由该转移消费：`llm`、`request`、`timer` 由「阻塞满足」（常规投递在途期间由「投递接受」路由到它），`approval`、`wait_for` 由定向投递的「投递接受」；声明等待按同一信号结算。运行实例因而不会因信号被等待先行消费而停在 `BlockedOn`，声明等待也不会因信号已被定向投递消费或来源事件已被定向占用而一直保持 pending；`Active` 中被满足的代范围等待在下一次分派、投递确认或挂起判定时被消费，子句 B 不会在 `Active` 中长期为真。
 - 挂起被中止、回退或经其他原因唤醒而回到 `Active` 时（`enter_active` 的全部路径），本代 pending 的 `probe` 定时器与 `probe` 等待置 `cancelled`；「提供者挂起失败」的冻结类分支转 `wake_queued.frozen` 时保留它们。
 - 进入阻塞的事务先查条件是否已满足：`llm`、`request`、`timer` 查本代未消费信号，`approval`、`wait_for` 查收件箱（`target_ready`，跨代有效，受收件箱保留期约束，见定向投递）；命中时执行「进入即满足」，不写 `blocked_on`，不调用挂起决策。
-- 运行实例处于 `Suspending` 时到达的信号保持未消费，由「升级解冻完成」「就绪应答」「提供者确认」的重评估或「取消挂起」接住；处于 `Suspended` 时由同一摄入事务的条件 UPDATE 接住，只有子句 E 为真时由所有者执行「冻结上限处置」；`wake_check` 的分派在行锁内按当前状态评估所需的子句。
+- 运行实例处于 `Suspending` 时到达的信号保持未消费，由「升级解冻完成」「就绪应答」「提供者确认」的重评估或「取消挂起」接住；处于 `Suspended` 时由同一汇入事务的条件 UPDATE 接住，只有子句 E 为真时由所有者执行「冻结上限处置」；`wake_check` 的分派在行锁内按当前状态评估所需的子句。
 - 后到的同条件信号（LLM 网关与本地代理双路径）被非派生信号的唯一约束吸收，或作为另一种类插入后因 `blocked_on` 已清空而无效果。
 
 #### 唤醒原因的派生
 
 | 为真的来源 | `wake_reason` |
-|---|---|
+| --- | --- |
 | 终端或文件通道实时接入（「接入唤醒」；`wake_queued` 中由「入队」升级；「提供者确认」「本代沙箱作废」落地时接入有效） | `live_attach` |
 | 子句 D 中 `kind=message` 的事件，实时接入有效值为真时 | `live_attach` |
 | 子句 D 中 `kind=message` 的事件，实时接入有效值为假时 | `human_reply` |
@@ -995,7 +995,7 @@ must_wake(run) = A or B or D or i8_lost(run) or ready_target(run)   # 子句 E �
 | 子句 E（冻结上限） | 按 `blocked_on.kind`：`llm` 取 `llm_completed`，`approval` 取 `approval`，`request`、`wait_for` 取 `external_event`，`timer` 取 `timer` |
 | 预测性恢复（「预测性恢复」） | `predictive` |
 
-多个来源同时为真时取优先级最高者。摄入事务完成「摄入唤醒」时写派生值；进入 `wake_queued` 后更高优先级的来源到达时，由所有者在「入队」中升级 `wake_reason` 并通知准入队列重排，`queued_at` 不变；`wake_queued` 期间实时接入变为有效、且已有未投递的 `message` 时，同样按本表升级为 `live_attach`。`AdmissionState.Priority` 取 `wake_reason` 的级别。
+多个来源同时为真时取优先级最高者。汇入事务完成「汇入唤醒」时写派生值；进入 `wake_queued` 后更高优先级的来源到达时，由所有者在「入队」中升级 `wake_reason` 并通知准入队列重排，`queued_at` 不变；`wake_queued` 期间实时接入变为有效、且已有未投递的 `message` 时，同样按本表升级为 `live_attach`。`AdmissionState.Priority` 取 `wake_reason` 的级别。
 
 #### 条件 UPDATE
 
@@ -1020,7 +1020,7 @@ SELECT pg_notify($channel, $1::text);
 COMMIT;
 ```
 
-`wake_check` 在插入了收件箱行或唤醒信号、改变了实时接入有效值或恢复提示、登记了结束或裁决请求的摄入事务中写入，与条件 UPDATE 是否命中无关：`Active` 内的投递与阻塞转出、只有子句 E 为真时的「冻结上限处置」、`Suspending` 中的取消、结束与裁决都由所有者经 `wake_check` 执行。「悬挂唤醒」守卫的条件 UPDATE 同属摄入事务，只在命中时写 `wake_check`，由所有者执行「入队」；节点内存压力的复评请求只写 `wake_check`。`ref` 取触发它的 `inbox:<inbox_seq>`、`signal:<signal_id>`、`fact:<kind>:<source>:<source_seq>`（实时接入到期另加 `:expired`）、`dangling:<queued_at>`（「悬挂唤醒」）或 `pressure:<node>:<window>`（节点内存压力，`window` 为压力查询的周期序号）；`$d` 为 `T_dangling_wake`；`$channel` 为 `rc_owner_<owner_id>`，所有者租约已过期时为 `rc_unowned`。条件 UPDATE 不清空 `substate`，物理形态保留到恢复。定时器触发是所有者事务，按同样的子句判定，命中时同事务入队，不写 `wake_check`。
+`wake_check` 在插入了收件箱行或唤醒信号、改变了实时接入有效值或恢复提示、登记了结束或裁决请求的汇入事务中写入，与条件 UPDATE 是否命中无关：`Active` 内的投递与阻塞转出、只有子句 E 为真时的「冻结上限处置」、`Suspending` 中的取消、结束与裁决都由所有者经 `wake_check` 执行。「悬挂唤醒」守卫的条件 UPDATE 同属汇入事务，只在命中时写 `wake_check`，由所有者执行「入队」；节点内存压力的复评请求只写 `wake_check`。`ref` 取触发它的 `inbox:<inbox_seq>`、`signal:<signal_id>`、`fact:<kind>:<source>:<source_seq>`（实时接入到期另加 `:expired`）、`dangling:<queued_at>`（「悬挂唤醒」）或 `pressure:<node>:<window>`（节点内存压力，`window` 为压力查询的周期序号）；`$d` 为 `T_dangling_wake`；`$channel` 为 `rc_owner_<owner_id>`，所有者租约已过期时为 `rc_unowned`。条件 UPDATE 不清空 `substate`，物理形态保留到恢复。定时器触发是所有者事务，按同样的子句判定，命中时同事务入队，不写 `wake_check`。
 
 ### 投递与两级确认
 
@@ -1032,7 +1032,7 @@ COMMIT;
 - 选批：`from = coalesce(redeliver_from, cursor_accepted)`；按 `inbox_seq` 升序取 `(from, head_seq]` 中 `targeted_delivery_id` 为空、`abandoned_at` 为空且不是续接决定的事件，条数不超过 `B_max`、`payload` 累计字节不超过 `S_max`，至少一条；`through_seq` 取批内最后一条的序号，区间内被定向投递占用、已放弃或属于续接决定的事件被跨过、不进批。批内与跨批都不重排，`occurred_at` 不参与排序。复杂度 O(b log N)，b 为批内条数。选批区间 `(from, head_seq]` 内未定向、未放弃且不是续接决定的事件即可投递事件；进入规则的边界分支、子句 D、`wake_check` 的分派与「投递滞后」守卫都以同一下界 `coalesce(redeliver_from, cursor_accepted)` 与同一排除规则判定是否有可投递事件，并另行判定是否存在续接决定。
 - 写：`delivery_id`、`delivery_kind=regular`、`delivery_from=from`、`through_seq`、`delivery_target={next_user_message}`、`substate=delivering`、`transition_deadline=now()+T_deliver`；效果记录 `deliver`。
 - `Deliver` 载荷：`batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`。`subkind` 在 `kind=internal_notice` 时取收件箱 `subkind` 闭集的取值，四类内部通知的载荷结构穷举为：`turn_interrupted` 取 `{generation, interrupted_turn}`（`interrupted_turn` 取去重键中的回合标识）；`timer_due` 取 `{timer_id, fire_at}`；`degraded_summary` 取 `{reason, last_turn_id, cursor_consumed}`；`delivery_abandoned` 取 `{seqs, reason}`。`redelivery=true` 当且仅当 `inbox_seq ≤ cursor_accepted`（重投区间）、该行 `delivered_at` 非空（含取消定向后以常规投递重送的事件），或本批是 `DeliveryFailed` 之后的重投；看守进程对投递意图日志中已记接受的事件同样置 `redelivery=true`。`resume_session_id=run.session_id`，为空表示新会话，看守进程只在需要启动 Agent 进程时使用它。
-- 批的上限 `B_max=100` 条、`S_max=3 MiB`：`S_max` 是本模块自有的单批载荷上限，`agentprotocol` 把出站流的最大消息尺寸配置为不小于 `S_max` 加信封与编码余量；摄入契约要求单个事件的 `payload` 不超过 `S_max`，一批因而至少容纳一条。附件引用随 `payload` 原样投递，Agent 经平台 MCP 服务器附运行实例令牌向存放方取回（见摄入契约的载荷上限），不经本模块与工作区文件接口。
+- 批的上限 `B_max=100` 条、`S_max=3 MiB`：`S_max` 是本模块自有的单批载荷上限，`agentprotocol` 把出站流的最大消息尺寸配置为不小于 `S_max` 加信封与编码余量；汇入契约要求单个事件的 `payload` 不超过 `S_max`，一批因而至少容纳一条。附件引用随 `payload` 原样投递，Agent 经平台 MCP 服务器附运行实例令牌向存放方取回（见汇入契约的载荷上限），不经本模块与工作区文件接口。
 - `Accepted` 之后仍有可投递事件时（游标仍落后，或重投区间未投完），下一回合边界继续投递下一批；`Accepted.fed=false` 时不会开始回合，「投递接受」随即按进入规则的边界分支生成下一批；L0 没有回合边界事件，「投递接受」在同一事务生成下一批。
 
 #### 定向投递
@@ -1148,11 +1148,11 @@ interrupt_turn(run):
 
 #### 调度扫描与触发事务
 
-- 扫描：每个副本每 `T_timer_scan` 执行一次 `SELECT … FROM timer t JOIN run r USING (run_id) WHERE t.status='pending' AND t.fire_at <= now() AND (r.owner_id = self OR r.owner_lease_expires_at < now()) ORDER BY t.fire_at LIMIT n` 选出到期定时器，不加锁；所有者租约已过期的运行实例先以条件 UPDATE 认领，再对每行执行触发事务。定时器的状态变化因而只由所有者写入，不属于摄入事务。
+- 扫描：每个副本每 `T_timer_scan` 执行一次 `SELECT … FROM timer t JOIN run r USING (run_id) WHERE t.status='pending' AND t.fire_at <= now() AND (r.owner_id = self OR r.owner_lease_expires_at < now()) ORDER BY t.fire_at LIMIT n` 选出到期定时器，不加锁；所有者租约已过期的运行实例先以条件 UPDATE 认领，再对每行执行触发事务。定时器的状态变化因而只由所有者写入，不属于汇入事务。
 - 触发事务（所有者事务）：`run` 行锁，然后 `UPDATE timer SET status='fired', fired_at=now() WHERE timer_id=$t AND status='pending'`，不命中则返回；随后按范围处理：
   - 代范围（阻塞型 `sleep_until`、`probe`、声明截止）：`timer.generation ≠ run.generation` 时改置 `expired` 并返回；否则插入 `wake_signal(kind=timer_fired, ref=timer_id, generation)`。
   - 运行实例范围：插入 `inbox(kind=internal_notice, subkind=timer_due, event_id=dedup_key="timer:"+timer_id, payload={timer_id, fire_at})`，插入成功时 `head_seq` 取新行的 `inbox_seq`，幂等命中时不改；同一事务把引用该定时器的运行实例范围等待行 CAS 为 `closed`：`kind=timer` 且 `ref=timer_id` 的行，以及 `declared_kind=timer` 且 `ref` 或 `deadline_timer_id` 等于 `timer_id` 的声明行（同一 `wait_id` 的其余 pending 行一并 `closed`）。
-  - 然后按当前状态处理：`suspended` 且子句 A、B 或 D 为真时按「摄入唤醒」的写入转 `wake_queued`，同事务入队；`suspended.frozen` 且只有子句 E 为真时执行「冻结上限处置」；`active.*` 按 `wake_check` 分派中 `active` 的规则执行「阻塞满足」或「边界投递」；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」；其余状态只写行。
+  - 然后按当前状态处理：`suspended` 且子句 A、B 或 D 为真时按「汇入唤醒」的写入转 `wake_queued`，同事务入队；`suspended.frozen` 且只有子句 E 为真时执行「冻结上限处置」；`active.*` 按 `wake_check` 分派中 `active` 的规则执行「阻塞满足」或「边界投递」；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」；其余状态只写行。
 - 终态运行实例的定时器已在「显式结束」中置 `cancelled`，扫描不再命中。
 - 锁顺序：先 `run` 行、后 `timer` 行，与全部写事务一致。
 
@@ -1161,7 +1161,7 @@ interrupt_turn(run):
 下列时刻存于 `run` 行，不使用 `timer` 表；所有者以内存定时器在到期时执行对应事务，副本崩溃或易主时由对账器按部分索引扫描兜底（「过渡态截止」「悬挂唤醒」「复评与截止到期」守卫），新所有者认领后重建内存定时器。各列只在「有效状态」中调度，残留在其他状态的值不触发动作，「复评与截止到期」守卫按同一状态过滤。
 
 | 列 | 有效状态 | 到期动作 |
-|---|---|---|
+| --- | --- | --- |
 | `transition_deadline` | `provisioning`、`suspending`、`resuming`、`active.{delivering, draining}` | 「过渡态截止」守卫的重驱动：「预配失败或超时」「挂起截止」「恢复失败或超时」、`delivering` 重发、`draining` 重发 `Resumed{drain=true}`（子状态保持，不中断回合、不销毁沙箱） |
 | `freeze_deadline − safety_margin` | `suspended.frozen`、`wake_queued.frozen` | `suspended.frozen`：「冻结上限处置」；`wake_queued.frozen`：仍未放行时执行「准入放行」的截止放行 |
 | `snapshot_expires_at − T_snapshot_margin` | `suspended.snapshotted`、`wake_queued.snapshotted` | 「本代沙箱作废」，转销毁态 |
@@ -1215,7 +1215,7 @@ maybe_suspend(run, trigger):            # 所有者，行锁内
 
 ```text
 frozen_review(run, trigger):            # 所有者，行锁内；state=suspended，substate=frozen
-  if must_wake(run): 按「摄入唤醒」的写入转 wake_queued，同事务入队; return
+  if must_wake(run): 按「汇入唤醒」的写入转 wake_queued，同事务入队; return
   c = evaluate(run)
   r = suspendpolicy.review({..., trigger, 冻结时长, 节点压力, caps, turn_phase, blocked_on.kind, blocked_on.mode, safe_to, grace_deadline,
                             实时接入有效值, policy_state（含 Busy、无应答与提供者失败次数）,
@@ -1229,13 +1229,13 @@ frozen_review(run, trigger):            # 所有者，行锁内；state=suspende
 
 `frozen_review` 的触发穷举为：`review_at`（T_nofreeze、T_snapshot 与宽限期到期点）、冻结上限、节点内存压力的复评请求（`trigger=pressure`）。`review` 的返回约束：实时接入有效值为真时只返回 KEEP，或在冻结上限到达时返回 DRAIN，节点内存压力不构成例外（实时接入期间挂起策略只冻结不销毁，见[概览](../architecture.md#概览)）；冻结上限到达时只返回 SNAPSHOT 或 DRAIN。冻结中升级一律先解冻（「冻结中升级」「升级解冻完成」），快照中不含被冻结的进程树，快照恢复后不需要再解冻；升级尝试在解冻之后回退时回到 `Active`，由 `maybe_suspend` 依 `policy_state` 中的失败次数退避；解冻期间终端或文件通道变为接入时，「升级解冻完成」中止升级。
 
-节点内存压力：每个副本以 `T_pressure` 为周期在事务外经 `sandboxprovider` 查询各沙箱节点的冻结态内存与可分配内存（或订阅其节点压力事件），结果缓存在副本内存中，`maybe_suspend` 与 `frozen_review` 上下文中的节点压力取该缓存中 `placement` 节点的值。某节点压力超过 ρ_soft 时，查询到它的副本按 `(placement->>'node', frozen_since) WHERE substate='frozen'` 只读列出该节点的全部冻结运行实例，连同压力值交给 `suspendpolicy.pick_for_pressure` 选出升级对象（冻结最久且剩余预测等待最长者为举例）；再以内部摄入路径为每个对象在行锁内写 `wake_check(ref=pressure:<node>:<window>)`（参数为压力值）并通知所有者（所有者租约已过期时通知 `rc_unowned`），同一周期内多个副本的请求以该 `ref` 合并。所有者在分派中对仍处于 `suspended.frozen` 的对象执行 `frozen_review(trigger=pressure)`，结果为「冻结保持」或「冻结中升级」。`suspendpolicy` 不读 `run` 表、不调用 `sandboxprovider`，依赖方向不变。
+节点内存压力：每个副本以 `T_pressure` 为周期在事务外经 `sandboxprovider` 查询各沙箱节点的冻结态内存与可分配内存（或订阅其节点压力事件），结果缓存在副本内存中，`maybe_suspend` 与 `frozen_review` 上下文中的节点压力取该缓存中 `placement` 节点的值。某节点压力超过 ρ_soft 时，查询到它的副本按 `(placement->>'node', frozen_since) WHERE substate='frozen'` 只读列出该节点的全部冻结运行实例，连同压力值交给 `suspendpolicy.pick_for_pressure` 选出升级对象（冻结最久且剩余预测等待最长者为举例）；再以内部汇入路径为每个对象在行锁内写 `wake_check(ref=pressure:<node>:<window>)`（参数为压力值）并通知所有者（所有者租约已过期时通知 `rc_unowned`），同一周期内多个副本的请求以该 `ref` 合并。所有者在分派中对仍处于 `suspended.frozen` 的对象执行 `frozen_review(trigger=pressure)`，结果为「冻结保持」或「冻结中升级」。`suspendpolicy` 不读 `run` 表、不调用 `sandboxprovider`，依赖方向不变。
 
 ### 恢复准入与实时接入
 
 - 事实源：`run` 行（`state='wake_queued'`、`wake_reason`、`queued_at`、`resume_mode`、`resume_intent`、`rebuild_after` 与冻结态的 `freeze_deadline`）是准入的唯一事实源；`suspendpolicy` 的内存队列只是缓存，`suspendpolicy.admit(run_id, …)` 对同一 `run_id` 幂等且不重置老化，携带的机制或截止变化时把条目改到新值。
 - 入队：所有者执行「入队」，触发为 `wake_check`、所有权接管、「排队悬挂」守卫，以及转入 `wake_queued` 的所有者事务（「非 Active 回合进展」「就绪应答」「提供者确认」「提供者挂起失败」「冻结上限处置」「接入唤醒」「预测性恢复」「兜底」「本代沙箱作废」与定时器触发事务，均在同一事务内执行）。所有者变更后，新所有者在接管事务之后按 `queued_at` 重建队列条目。
-- 放行：`suspendpolicy` 回调后执行「准入放行」（行锁、`owner_epoch` 校验、`state='wake_queued'`、`resume_mode` 非空且等于回调携带的机制）。`resume_mode` 为空（摄入事务的条件 UPDATE 转入 `wake_queued` 之后、所有者执行「入队」之前为举例），或与回调的机制不等（「本代沙箱作废」把冻结态或快照态转为销毁态并重算 `resume_mode` 之后，旧机制队列的回调先到为举例）时不放行，按「入队」重新 `admit`；`admit` 把条目改到新的机制与截止并保留老化，旧机制的限速、截止与并发额度因而不会放行重建。未放行时保持 `wake_queued`，`queued_at` 参与老化。
+- 放行：`suspendpolicy` 回调后执行「准入放行」（行锁、`owner_epoch` 校验、`state='wake_queued'`、`resume_mode` 非空且等于回调携带的机制）。`resume_mode` 为空（汇入事务的条件 UPDATE 转入 `wake_queued` 之后、所有者执行「入队」之前为举例），或与回调的机制不等（「本代沙箱作废」把冻结态或快照态转为销毁态并重算 `resume_mode` 之后，旧机制队列的回调先到为举例）时不放行，按「入队」重新 `admit`；`admit` 把条目改到新的机制与截止并保留老化，旧机制的限速、截止与并发额度因而不会放行重建。未放行时保持 `wake_queued`，`queued_at` 参与老化。
 - 冻结态的截止放行：`wake_queued.frozen` 保留 `freeze_deadline`，入队时 `admit` 携带截止 `freeze_deadline−safety_margin`，`suspendpolicy` 须在截止之前放行，越过机制限速与优先级；截止到达仍未放行时，所有者直接执行「准入放行」（`thaw`）并登记槽位，计入超限计数。直通模式下已向 Agent 转发部分内容的 LLM 流因此不会在准入队列中冻结超过 F_stream。
 - 机制：`frozen` 取 `thaw`（`resume_intent=rebuild` 时改为重建类）；`snapshotted` 取 `snapshot_restore`（`snapshot_expires_at` 临近时先经「本代沙箱作废」转 `destroyed`）；`destroyed` 取 `warm_claim`（预热池可用）或 `cold_start`。`resume_mode` 由 `suspendpolicy.mechanism` 在入队时确定并落库，`resume` 效果与对账器只读该列。
 - 限速与优先级按[并发模型](../architecture.md#并发模型)中的恢复准入队列；跨副本的全局限速与并发上限（冷启动并发不超过 20 为举例）由 `suspendpolicy` 定义。并发型限额的计数经 `suspendpolicy` 定义的槽位计数接口（`SlotCounter.Count(mechanism)`）取得：本模块实现并注入该接口，按机制统计「`state='resuming'` 且 `resume_mode` 为该机制、`slot_lease` 非空且 `slot_expires_at>now()`」的行数；`suspendpolicy` 因而仍不读 `run` 表，依赖方向不变。该计数是近似上限：不同副本的「准入放行」只锁各自的 `run` 行，同时放行时彼此的计数不可见，超出量不超过同时执行放行的所有者副本数；`suspendpolicy` 定义上限时计入这一余量。
@@ -1298,8 +1298,8 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 效果闭集：
 
 | effect | ref | 写入者 | 执行动作 | 完成 | 失败处理 | `deadline` | 显式结束时 |
-|---|---|---|---|---|---|---|---|
-| `wake_check` | `inbox:<seq>`、`signal:<id>`、`fact:<kind>:<source>:<seq>`（实时接入到期另加 `:expired`）、`dangling:<queued_at>`、`pressure:<node>:<window>`（参数为压力值） | 摄入事务、内部摄入路径（含「悬挂唤醒」的条件 UPDATE 与节点内存压力的复评请求）、`End` 与 `Resolve` 的请求登记 | 行锁内按状态分派（见下） | 分派事务内置 `done` | 重试；无所有者时认领 | `now()+T_dangling_wake` | `abandoned`；`end_request` 自身的 `wake_check` 由分派执行「显式结束」后置 `done` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `wake_check` | `inbox:<seq>`、`signal:<id>`、`fact:<kind>:<source>:<seq>`（实时接入到期另加 `:expired`）、`dangling:<queued_at>`、`pressure:<node>:<window>`（参数为压力值） | 汇入事务、内部汇入路径（含「悬挂唤醒」的条件 UPDATE 与节点内存压力的复评请求）、`End` 与 `Resolve` 的请求登记 | 行锁内按状态分派（见下） | 分派事务内置 `done` | 重试；无所有者时认领 | `now()+T_dangling_wake` | `abandoned`；`end_request` 自身的 `wake_check` 由分派执行「显式结束」后置 `done` |
 | `deliver` | `delivery_id` | 「发起定向投递」「边界投递」「回合结束」「投递接受」（下一批与路由）「投递不可重试失败」「定向目标失效」「退避重发」「Agent 进程退出」「排空完成」、`enter_active` | 持流所有者在本代沙箱的出站流上发送 `Deliver` | 交给该流的发送队列即 `done`；`Accepted`、`DeliveryFailed` 推进状态 | 无流时按 `not_before` 等待；「过渡态截止」守卫在尚未收到结果时以同一 `ref` 重执行 | 写入时的 `run.transition_deadline` | `abandoned` |
 | `suspend` | `suspend_id` | 「发起挂起」「升级解冻完成」 | 发送 `PrepareSuspend` | 发送即 `done`；`ReadyToSuspend`、`Busy` 推进状态 | 同 `deliver`；「挂起截止」 | 写入时的 `run.transition_deadline` | `abandoned` |
 | `thaw` | `suspend_id`（升级尝试）；参数为冻结记录的 `freeze_id`、`freeze_variant` | 「冻结中升级」 | `cgroup`：`sandboxprovider` 解冻并并行请求恢复 CPU request（未缩小时为空操作）；`signal`：发送 `Thaw{freeze_id}`，无本代出站流时按 `not_before` 等待重连，不计 `attempts` | 调用返回或发送即 `done`；完成事务只校验运行实例非终态与代（见 `thaw` 的完成事务）：`cgroup` 记 `resize_deferred_since`，`suspend_id` 仍等于 `ref` 且仍在 `thawing` 时在同一完成事务写 `send(Thaw{freeze_id})`（目标为本代沙箱）；`Thawed` 推进状态 | 只在 `suspend_id` 仍等于 `ref` 时执行：重试至截止；「挂起截止」累计 `N_suspend_redrive` 次仍无 `Thawed` 时执行「本代沙箱作废」；沙箱不存在时执行「本代沙箱作废」 | 写入时的 `run.transition_deadline` | `abandoned` |
@@ -1322,36 +1322,36 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 - 全部非终态：`end_request` 时执行「显式结束」；`resolve_request` 在 `state=degraded` 时执行「兜底」或「放弃」，否则删除该请求并计数；关闭运行实例范围等待行：`kind=subscription` 的行只在订阅完成事件的 `subscription_status≠active` 时按 `subscription_id` 关闭（与「订阅创建」同一规则）；`declared_kind` 为 `wait_for`、`approval` 的声明行在任一匹配的订阅完成（按 `subscription_id`）或审批决定（按 `permission_id`）到达时关闭，同一 `wait_id` 的其余 pending 行一并 `closed`。
 - `active.*`：不在 `delivering` 时，子句 A 为真则先执行「阻塞满足」（`substate=blocked_on`，`blocked_on` 为 `llm`、`request`、`timer`）或「发起定向投递」（待定向目标就绪）；在 `delivering` 时，`blocked_on` 的满足与就绪的待定向目标都由「投递接受」路由，分派不执行「阻塞满足」与「发起定向投递」；随后 `settle_gen_waits`（仍满足 `blocked_on` 或待定向目标的信号只结算等待一侧，留给「投递接受」路由到的转移消费）；`boundary`、`idle` 有可投递事件或续接决定时执行「边界投递」；实时接入有效值变化时执行「实时接入推送」。
 - `suspending`：`await_ready` 且 `must_wake` 为真，或模式为快照、销毁且终端或文件通道接入变为有效时执行「取消挂起」；`thawing` 无动作，`must_wake` 与终端或文件通道接入都由「升级解冻完成」在 `Thawed` 到达时重评估，为真时中止升级；`provider_pending` 无动作，由「提供者确认」的重评估接住；实时接入有效值变化时执行「实时接入推送」。
-- `suspended.frozen`：子句 A、B 或 D 为真时按「摄入唤醒」的写入转 `wake_queued`，同事务入队（摄入事务未命中时的兜底）；只有子句 E 为真时执行「冻结上限处置」；`wake_hint` 时执行「预测性恢复」；节点内存压力的复评请求（`ref` 以 `pressure:` 开头）时以效果参数中的压力值执行 `frozen_review(trigger=pressure)`；实时接入有效值变化时执行「实时接入推送」。
+- `suspended.frozen`：子句 A、B 或 D 为真时按「汇入唤醒」的写入转 `wake_queued`，同事务入队（汇入事务未命中时的兜底）；只有子句 E 为真时执行「冻结上限处置」；`wake_hint` 时执行「预测性恢复」；节点内存压力的复评请求（`ref` 以 `pressure:` 开头）时以效果参数中的压力值执行 `frozen_review(trigger=pressure)`；实时接入有效值变化时执行「实时接入推送」。
 - `suspended.{snapshotted, destroyed}`：子句 A、B 或 D 为真时同上；终端或文件通道接入有效时执行「接入唤醒」；`wake_hint` 时执行「预测性恢复」。
 - `wake_queued`：执行「入队」；`wake_queued.frozen` 在实时接入有效值变化时另执行「实时接入推送」。`resuming(thaw)`：实时接入有效值变化时执行「实时接入推送」。`resuming` 的其余模式与 `provisioning`、`degraded`：除全部非终态的规则外无动作。节点内存压力的复评请求在 `suspended.frozen` 以外的状态无动作。
 
-`wake_check` 在分派事务提交时置 `done`。分派按状态评估所需的子句；`suspended` 与 `wake_queued` 中的唤醒已由摄入事务的条件 UPDATE 完成，分派对它们只做兜底与入队。
+`wake_check` 在分派事务提交时置 `done`。分派按状态评估所需的子句；`suspended` 与 `wake_queued` 中的唤醒已由汇入事务的条件 UPDATE 完成，分派对它们只做兜底与入队。
 
 ### 纠正性对账器
 
-对账器以持久化状态为准（I10），周期 `T_reconcile`。执行范围：每个副本只对本副本拥有的运行实例与所有者租约已过期的运行实例执行所有者类动作，所有者租约已过期的运行实例先以条件 UPDATE 认领再动作；摄入类动作（「悬挂唤醒」的条件 UPDATE、「事件源实例失联」的合成信号、「实时接入到期」的事实失效）由任一副本执行，不认领。守卫依赖的事务外查询（提供者列举与逐个查询、`GetLease`）失败时该周期不判定。每次纠正计数；同一运行实例同一守卫连续 `N_reconcile_alert` 次纠正后仍命中时，按[可观测性](../architecture.md#可观测性)的告警条件上报，不伪造转移。守卫闭集如下：
+对账器以持久化状态为准（I10），周期 `T_reconcile`。执行范围：每个副本只对本副本拥有的运行实例与所有者租约已过期的运行实例执行所有者类动作，所有者租约已过期的运行实例先以条件 UPDATE 认领再动作；汇入类动作（「悬挂唤醒」的条件 UPDATE、「事件源实例失联」的合成信号、「实时接入到期」的事实失效）由任一副本执行，不认领。守卫依赖的事务外查询（提供者列举与逐个查询、`GetLease`）失败时该周期不判定。每次纠正计数；同一运行实例同一守卫连续 `N_reconcile_alert` 次纠正后仍命中时，按[可观测性](../architecture.md#可观测性)的告警条件上报，不伪造转移。守卫闭集如下：
 
 | 守卫 | 触发条件 | 动作 | 阈值来源 | 单轮代价与索引 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 过渡态截止 | `transition_deadline < now()`，且 `state∈{provisioning, suspending, resuming}` 或 `substate∈{delivering, draining}` | `provisioning`：「预配失败或超时」；`suspending`：按 `suspend_phase` 重执行解冻、重发 `PrepareSuspend` 或重执行提供者调用（「挂起截止」）；`resuming`：「恢复失败或超时」（含槽位到期后的 `reacquire_slot`）；`delivering`：尚未收到该批的 `Accepted` 或 `DeliveryFailed` 时以同一 `delivery_id` 重发（收到可重试失败后由「退避重发」以新 `delivery_id` 重发，收到不可重试失败后已离开该批）；`draining`：把本代最近一次 `send(Resumed{drain=true})` 效果重置为 `pending`，子状态保持，不调用 `interrupt_turn`、不写 `destroy`。每次重驱动在同一事务写新的 `transition_deadline`，`resuming` 同时写 `slot_expires_at=transition_deadline+T_slot_grace` | `T_provision`、`T_suspend(mode)`、`T_resume(mode)` 由 `suspendpolicy` 按机制给出；`T_deliver`、`T_drain` 见参数表 | 到期行数；`transition_deadline` 部分索引 |
 | 投递滞后 | `active.{boundary, idle}`，存在可投递事件（未定向、未放弃、不是续接决定且 `inbox_seq > coalesce(redeliver_from, cursor_accepted)`）或续接决定，且其中最早一条的 `received_at < now()−T_deliver_lag` | 「边界投递」 | `T_deliver_lag` | 候选取 `state='active' AND (cursor_accepted<head_seq OR redeliver_from IS NOT NULL)` 的部分索引，再以收件箱的可投递事件索引查询；定向投递不推进 `cursor_accepted`，候选因而包含收件箱尾部只剩已定向送达或已放弃事件的运行实例，它们在下一个常规批或新代之前每轮都被评估一次，代价为候选数乘 O(log N) |
-| 悬挂唤醒 | `state='suspended'` 且谓词为真持续超过 `T_dangling_wake` | 子句 A、B 或 D 为真：任一副本以内部摄入路径在行锁内执行条件 UPDATE，命中时同一事务写 `wake_check(ref=dangling:<queued_at>)` 并通知所有者（所有者租约已过期时通知 `rc_unowned`），所有者经分派执行「入队」；`suspended.frozen` 且只有子句 E 为真：「冻结上限处置」（所有者） | `T_dangling_wake`；`safety_margin` 归 `suspendpolicy` | 候选取并集：`freeze_deadline`（`frozen`）部分索引；`suspended AND (cursor_accepted<head_seq OR redeliver_from IS NOT NULL)` 部分索引（同「投递滞后」，含收件箱尾部只剩已定向或已放弃事件的运行实例）；`ref` 等于 `run.blocked_on.ref`、某个待定向目标的 `ref` 或某个本代 pending 等待的 `ref`、`deadline_timer_id` 的本代未消费 `live` 信号；只对候选评估完整谓词 |
+| 悬挂唤醒 | `state='suspended'` 且谓词为真持续超过 `T_dangling_wake` | 子句 A、B 或 D 为真：任一副本以内部汇入路径在行锁内执行条件 UPDATE，命中时同一事务写 `wake_check(ref=dangling:<queued_at>)` 并通知所有者（所有者租约已过期时通知 `rc_unowned`），所有者经分派执行「入队」；`suspended.frozen` 且只有子句 E 为真：「冻结上限处置」（所有者） | `T_dangling_wake`；`safety_margin` 归 `suspendpolicy` | 候选取并集：`freeze_deadline`（`frozen`）部分索引；`suspended AND (cursor_accepted<head_seq OR redeliver_from IS NOT NULL)` 部分索引（同「投递滞后」，含收件箱尾部只剩已定向或已放弃事件的运行实例）；`ref` 等于 `run.blocked_on.ref`、某个待定向目标的 `ref` 或某个本代 pending 等待的 `ref`、`deadline_timer_id` 的本代未消费 `live` 信号；只对候选评估完整谓词 |
 | 阻塞已满足未转出 | `active` 且不在 `delivering`，满足 `blocked_on` 或某个待定向目标的未消费 `live` 信号存在超过 `T_blocked_stuck` | 「阻塞满足」或「发起定向投递」 | `T_blocked_stuck` | 未消费信号索引 `(run_id, generation, ref) WHERE consumed_at IS NULL`，只取 `ref` 等于 `run.blocked_on.ref` 或待定向目标 `ref`、且 `live` 的行 |
 | 排队悬挂 | `state='wake_queued'` 且所有者租约已过期（任一副本认领后执行），或所有者核对本副本准入队列无该条目（所有者执行） | 「入队」，保留原 `queued_at` | — | `(state, queued_at)` 部分索引 |
-| 事件源实例失联 | 运行实例非终态；`source_request.source ∈ {llmgateway, connectorhub}`、`status='in_flight'`、`generation=run.generation`，所属实例没有 `source_lease` 行或 `expires_at < now()−T_source_grace` | 内部摄入路径写入 `wake_signal(kind=llm_failed|request_failed, ref=request_id, source=runcontroller, reason=gateway_lost|connector_lost)`，同一事务把该 `request_id` 的全部来源行置 `done`，按摄入写入集合执行条件 UPDATE；幂等依据 `(run_id, generation, kind, ref)` 唯一 | `T_source_grace`；实例 TTL 归事件源模块 | 过期实例数乘其在途请求数；`source_request (instance) WHERE status='in_flight'`，反连接 `source_lease` |
+| 事件源实例失联 | 运行实例非终态；`source_request.source ∈ {llmgateway, connectorhub}`、`status='in_flight'`、`generation=run.generation`，所属实例没有 `source_lease` 行或 `expires_at < now()−T_source_grace` | 内部汇入路径写入 `wake_signal(kind=llm_failed|request_failed, ref=request_id, source=runcontroller, reason=gateway_lost|connector_lost)`，同一事务把该 `request_id` 的全部来源行置 `done`，按汇入写入集合执行条件 UPDATE；幂等依据 `(run_id, generation, kind, ref)` 唯一 | `T_source_grace`；实例 TTL 归事件源模块 | 过期实例数乘其在途请求数；`source_request (instance) WHERE status='in_flight'`，反连接 `source_lease` |
 | 复评与截止到期 | 下列列已过而所有者未处理，且运行实例处于该列的有效状态：`review_at`（`active`、`suspended.frozen`）、`degraded_deadline`（`degraded`）、`next_delivery_at`（`active.delivering`）、`token_expires_at−T_token_refresh`（本应有存活沙箱且 `stream_seen_at ≥ now()−T_stream_loss`）、`rebuild_after`（`wake_queued`）、`freeze_deadline−safety_margin`（`wake_queued.frozen`，截止放行）、`snapshot_expires_at−T_snapshot_margin`（`suspended.snapshotted`、`wake_queued.snapshotted`） | 所有者侧截止时间表中对应的到期动作 | 各列 | 各列部分索引，再按状态过滤 |
 | 沙箱丢失 | 候选为本应有存活沙箱的运行实例：`active`；`suspending` 的 `thawing`、`await_ready`，或冻结类的 `provider_pending`；`suspended.frozen`；`wake_queued.frozen`；`resuming(thaw)`。判定成立的条件穷举为：`stream_seen_at < now()−T_stream_loss` 且（沙箱提供者按 `sandbox_id` 逐个查询确认不存在，或 `workspace` 报告租约已过期）；冻结态只要提供者逐个确认不存在；`sandbox_gone_at` 已记录；已记 `rebuild_after` 且已过。反向求差：列举到的沙箱所属运行实例已终态，或其代小于 `run.generation`（在途预配在显式结束、进入降级或代递增之后才落地，执行器在提供者返回之后、完成事务之前崩溃为举例） | 以事务外查询的结果写 `sandbox_gone_at`（只在逐个确认之后）或 `rebuild_after`，再执行「本代沙箱作废」；反向求差命中的沙箱由所有者（终态行同样认领）写 `destroy(ref=g<该沙箱的代>:<sandbox_id>, graceful=false)`；列举到的沙箱等于 `run.sandbox_id` 而 `run.placement` 为空时，以列举结果中的放置位置补写 `placement` | `T_stream_loss`、`T_stream_beat` | 提供者按批列举本控制面的沙箱（结果含所属 `run_id`、代与放置位置，或订阅其删除事件），与候选集求差得到疑似丢失者，反向求差得到待回收者；疑似者再按 `sandbox_id` 逐个查询确认，列举的最终一致或缓存滞后不直接写 `sandbox_gone_at` |
 | 代范围等待过期 | `wait`、`timer` 的 `scope='generation'`、`generation < run.generation`、`status='pending'` | 置 `expired` | — | 正常由 `fence_and_bump` 批量完成，本守卫只兜底 |
 | 效果记录滞留 | `outbox.status='pending'` 且 `deadline < now()` | 同一事务把 `deadline` 顺延一个截止时长（取自 `transition_deadline` 的效果为对应过渡态的 `T_deliver`、`T_suspend(mode)`、`T_resume(mode)` 或 `T_provision`，其余为效果闭集中的参数）：依赖未完成或按 `not_before` 等待重连的行只顺延，不累加 `attempts`；`deadline` 取自 `transition_deadline` 的效果（`deliver`、`suspend`、`thaw`、`provider_suspend`、`resume`、`provision`）在运行实例仍处于对应过渡态时同样只顺延，重驱动只由「过渡态截止」守卫执行，`provider_suspend` 的 `attempts` 因而每个截止周期只累加一次；其余行按 `(effect, ref)` 幂等重执行，`attempts+1` | 各效果的 `deadline` | `(status, not_before)` 部分索引 |
-| 实时接入到期 | `run_fact.kind='live_attach'`、接入值为真且 `expires_at < now()` | 内部摄入路径在 `run` 行锁内以 `source_seq` 等于候选读出时的值且 `expires_at < now()` 为条件，把该行改写为未接入（`observed_at` 取原 `expires_at`，`expires_at=∅`，`source_seq` 不变），未命中（候选读出之后 `humanchannel` 已续写）时放弃；命中时同一事务写 `wake_check` 并通知所有者；所有者的分派按接入有效值的变化执行「实时接入推送」，此后的复评不再受实时接入约束 | `LiveAttach.TTL` 由 `humanchannel` 给出 | 到期行数；`run_fact (expires_at) WHERE expires_at IS NOT NULL` |
+| 实时接入到期 | `run_fact.kind='live_attach'`、接入值为真且 `expires_at < now()` | 内部汇入路径在 `run` 行锁内以 `source_seq` 等于候选读出时的值且 `expires_at < now()` 为条件，把该行改写为未接入（`observed_at` 取原 `expires_at`，`expires_at=∅`，`source_seq` 不变），未命中（候选读出之后 `humanchannel` 已续写）时放弃；命中时同一事务写 `wake_check` 并通知所有者；所有者的分派按接入有效值的变化执行「实时接入推送」，此后的复评不再受实时接入约束 | `LiveAttach.TTL` 由 `humanchannel` 给出 | 到期行数；`run_fact (expires_at) WHERE expires_at IS NOT NULL` |
 
 快照态、销毁态、快照与销毁模式的 `provider_pending`、`resuming(snapshot_restore)` 与 `provisioning` 不纳入「沙箱丢失」守卫：快照与销毁模式的 `provider_pending` 由 `provider_suspend` 的失败处理处置；快照态由快照保留期（「复评与截止到期」守卫、「本代沙箱作废」）与恢复路径（「恢复失败或超时」「恢复对象不存在」）处置，`provisioning` 与 `resuming(snapshot_restore)` 由「预配失败或超时」「恢复失败或超时」处置。终态运行实例上的活动订阅不由本模块对账：`connectorhub` 依代查询的终态结果或 `AppendInbox` 的终态拒绝取消订阅。
 
 参数如下，表中默认值为设计取值：
 
 | 参数 | 默认值 | 归属与依据 |
-|---|---|---|
+| --- | --- | --- |
 | `T_reconcile` | 10 s | 本模块；对账周期 |
 | `T_owner_lease` | 15 s，续租周期 5 s | 本模块 |
 | `T_stream_beat`、`T_stream_loss` | 5 s、30 s | 本模块；`T_stream_loss` 覆盖看守进程的重连退避 |
@@ -1374,7 +1374,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | `N_deliver_retry`、`N_deliver_giveup`、`T_deliver_backoff` 与退避上限 | 8、40、1 s、60 s | 本模块；`N_deliver_retry` 为告警点，`N_deliver_giveup`（约 35 min）为转 `degraded` 的放弃点 |
 | `T_connect_grace` | 60 s | 本模块；效果已完成而完成消息未到时的连接宽限，覆盖 `T_stream_loss` 与看守进程的重连退避 |
 | `T_snapshot_keep`、`T_snapshot_margin`、`T_hold_margin` | 按提供者、`T_resume(snapshot_restore)+T_stream_loss`、10 min | `T_snapshot_keep` 为快照保留期限，取 `sandboxprovider` 随快照确认报告的值，未报告时由 `suspendpolicy` 给出；`T_snapshot_margin` 保证快照恢复在保留期内完成；`T_hold_margin` 为 `HoldLease` 超出快照保留期的余量，归本模块 |
-| `B_max`、`S_max` | 100 条、3 MiB | 本模块；`agentprotocol` 把出站流的最大消息尺寸配置为不小于 `S_max` 加信封与编码余量；`S_max` 同时是摄入契约的单事件 `Payload` 上限 |
+| `B_max`、`S_max` | 100 条、3 MiB | 本模块；`agentprotocol` 把出站流的最大消息尺寸配置为不小于 `S_max` 加信封与编码余量；`S_max` 同时是汇入契约的单事件 `Payload` 上限 |
 | `T_token_refresh` | 令牌有效期的 1/3 | 有效期由 `secrets` 给出 |
 | `T_gen_cache` | 1 s | 本模块规定的上限；只适用于 `llmgateway` 的 LLM 请求 |
 | `safety_margin`、D_min、G_turn_grace、F_cap、F_stream、T_nofreeze、T_snapshot、Q_quiet、ρ_soft、`T_resize_migrate` | 由 `suspendpolicy` 定义 | `suspendpolicy` |
@@ -1384,7 +1384,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 失败的处置由状态对账、幂等重驱动、至少一次投递与代围栏组合表达；重试计数与退避时刻（`delivery_attempts`、`next_delivery_at`、`resume_attempts`、`start_failures`、`fallback_attempts`、`degraded_deadline`）属于 `run` 行，不另设失败记录表。下表列出已明确处置路径的失败，各行是举例；判定任一失败处置是否完备的标准是它能否由状态对账、幂等重驱动、至少一次投递与代围栏组合表达。
 
 | 失败 | 处置 |
-|---|---|
+| --- | --- |
 | 过渡态超时 | 「过渡态截止」守卫以同一标识重驱动，沙箱提供者与看守进程对同一标识返回首次结果 |
 | 重复投递 | 收件箱与唤醒信号的唯一约束、投递意图日志去重、`redelivery` 标记 |
 | 代过期 | 围栏拒绝计数，`Fenced` 与 `HelloAck.fenced`；令牌经代查询失效 |
@@ -1409,23 +1409,23 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 
 ## 并发与事务边界
 
-### 单写者与摄入
+### 单写者与汇入
 
-写事务分为摄入事务与所有者事务；所有权获取事务与清理任务的删除不属于摄入事务与所有者事务，分别见所有权的获取与续租、过期行的清理。
+写事务分为汇入事务与所有者事务；所有权获取事务与清理任务的删除不属于汇入事务与所有者事务，分别见所有权的获取与续租、过期行的清理。
 
-**摄入事务**由接收请求的任一副本执行，不校验 `owner_epoch`。成员穷举为：`AppendInbox`、`AppendWakeSignal`、`SetRunFact`、`RenewSourceLease`、`RunService.End` 与 `RunService.Resolve` 的请求登记，以及本模块的内部摄入路径（「事件源实例失联」守卫的合成信号、「实时接入到期」守卫的事实失效、「悬挂唤醒」守卫的条件 UPDATE、节点内存压力的复评请求）。`RenewSourceLease` 只更新 `source_lease`，`SetRunFact{inflight_request}` 只写 `source_request` 与 `source_lease`，`RenewSourceLease` 与 `SetRunFact{inflight_request}` 都不加行锁、不写 `wake_check`：它们不改变状态与谓词，代与终态的核对读取 `run` 行而不加锁，竞态遗留的旧代或终态行不参与任何判定（I9 预检与「事件源实例失联」守卫只看本代、非终态），由清理任务删除。其余成员在 `run` 行锁内执行。摄入写入集合穷举为：
+**汇入事务**由接收请求的任一副本执行，不校验 `owner_epoch`。成员穷举为：`AppendInbox`、`AppendWakeSignal`、`SetRunFact`、`RenewSourceLease`、`RunService.End` 与 `RunService.Resolve` 的请求登记，以及本模块的内部汇入路径（「事件源实例失联」守卫的合成信号、「实时接入到期」守卫的事实失效、「悬挂唤醒」守卫的条件 UPDATE、节点内存压力的复评请求）。`RenewSourceLease` 只更新 `source_lease`，`SetRunFact{inflight_request}` 只写 `source_request` 与 `source_lease`，`RenewSourceLease` 与 `SetRunFact{inflight_request}` 都不加行锁、不写 `wake_check`：它们不改变状态与谓词，代与终态的核对读取 `run` 行而不加锁，竞态遗留的旧代或终态行不参与任何判定（I9 预检与「事件源实例失联」守卫只看本代、非终态），由清理任务删除。其余成员在 `run` 行锁内执行。汇入写入集合穷举为：
 
 1. 插入 `inbox` 行，`inbox_seq` 在行锁之后由序列分配，`run.head_seq` 取新行的 `inbox_seq`；`(run_id, dedup_key)` 幂等命中、未插入新行时不改 `head_seq`。
 2. 插入 `wake_signal` 行，含审批决定与订阅完成的派生信号。
 3. 写运行实例事实行（`run_fact` 的实时接入、恢复提示、结束请求、裁决请求，以及 `source_request`），以及 `source_lease`；信号幂等命中时同样把对应 `source_request` 行置 `done`。
 4. 唯一的状态转移：`UPDATE run SET state='wake_queued', wake_reason=$r, queued_at=now(), resume_intent='normal', review_at=NULL WHERE run_id=$1 AND generation=$g AND state='suspended'`，只在谓词子句 A、B 或 D 为真时执行；`freeze_deadline` 不清空，冻结态在准入队列中仍受冻结上限约束。只有子句 E 为真时不转移，由所有者经 `wake_check` 执行「冻结上限处置」。
-5. 写 `outbox(effect='wake_check')`：插入了收件箱行或唤醒信号、改变了实时接入有效值或恢复提示、登记了结束或裁决请求的摄入事务各写一条；「悬挂唤醒」守卫的条件 UPDATE 命中时写一条（`ref=dangling:<queued_at>`）；节点内存压力的复评请求为每个选中的运行实例写一条（`ref=pressure:<node>:<window>`）；幂等命中、终态拒绝、只登记或关闭在途请求的写入不写。
+5. 写 `outbox(effect='wake_check')`：插入了收件箱行或唤醒信号、改变了实时接入有效值或恢复提示、登记了结束或裁决请求的汇入事务各写一条；「悬挂唤醒」守卫的条件 UPDATE 命中时写一条（`ref=dangling:<queued_at>`）；节点内存压力的复评请求为每个选中的运行实例写一条（`ref=pressure:<node>:<window>`）；幂等命中、终态拒绝、只登记或关闭在途请求的写入不写。
 
-摄入事务不写 `wait`、`timer` 行，也不写 `run` 行的其他列（`wake_reason` 的升级、`substate`、`blocked_on` 为举例）。
+汇入事务不写 `wait`、`timer` 行，也不写 `run` 行的其他列（`wake_reason` 的升级、`substate`、`blocked_on` 为举例）。
 
-**所有者事务**是摄入事务、所有权获取事务（「创建」的插入、通过 Hello 公共校验的接管、所有者租约过期后的认领，见所有权的获取与续租）与清理任务的删除之外的写事务，含定时器触发。开头在行锁内要求 `run.owner_id=self AND run.owner_epoch=held AND run.owner_lease_expires_at>now()`，不满足则回滚、丢弃本副本该运行实例的内存状态并关闭其出站流。
+**所有者事务**是汇入事务、所有权获取事务（「创建」的插入、通过 Hello 公共校验的接管、所有者租约过期后的认领，见所有权的获取与续租）与清理任务的删除之外的写事务，含定时器触发。开头在行锁内要求 `run.owner_id=self AND run.owner_epoch=held AND run.owner_lease_expires_at>now()`，不满足则回滚、丢弃本副本该运行实例的内存状态并关闭其出站流。
 
-**所有者得知待处理的运行实例**：摄入事务写 `wake_check` 效果记录，同一事务执行 `pg_notify('rc_owner_'||owner_id, run_id)`（所有者租约已过期时通知公共频道 `rc_unowned`），通知在提交时送达；通知丢失由效果执行器轮询 `outbox` 与对账器兜底。`wake_check` 只由摄入事务写入；所有者自己转入 `wake_queued` 的事务在同一事务执行「入队」，不写 `wake_check`。
+**所有者得知待处理的运行实例**：汇入事务写 `wake_check` 效果记录，同一事务执行 `pg_notify('rc_owner_'||owner_id, run_id)`（所有者租约已过期时通知公共频道 `rc_unowned`），通知在提交时送达；通知丢失由效果执行器轮询 `outbox` 与对账器兜底。`wake_check` 只由汇入事务写入；所有者自己转入 `wake_queued` 的事务在同一事务执行「入队」，不写 `wake_check`。
 
 **所有权的获取与续租**：
 
@@ -1461,9 +1461,9 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 必须在同一数据库事务内完成的写事务穷举如下：
 
 | 写事务 | 同一事务内的写入 | 幂等依据 | 不变量 |
-|---|---|---|---|
-| 摄入写入 | `inbox` 或 `wake_signal` 行（含派生信号）、运行实例事实行、`head_seq`（取新行的 `inbox_seq`）、条件 UPDATE、`wake_check` 效果记录与通知 | `(run_id, dedup_key)`；非派生信号 `(run_id, generation, kind, ref)`，派生信号 `(run_id, derived_from)`；事实主键与 `source_seq`；在途请求主键（`done` 行不改，`in_flight` 行改写为最近登记的实例） | I5 |
-| 内部摄入 | 合成失败信号与在途行关闭、条件 UPDATE；到期接入事实的改写与 `wake_check`；「悬挂唤醒」的条件 UPDATE 与命中时的 `wake_check` 及通知；节点内存压力复评请求的 `wake_check` 及通知；`end_request`、`resolve_request` 事实与 `wake_check` | `(run_id, generation, kind, ref)`；条件 UPDATE 的 `state='suspended'` 条件；`wake_check` 的 `(run_id, effect, ref)`；`end_request` 以首次请求为准 | I5、I10 |
+| --- | --- | --- | --- |
+| 汇入写入 | `inbox` 或 `wake_signal` 行（含派生信号）、运行实例事实行、`head_seq`（取新行的 `inbox_seq`）、条件 UPDATE、`wake_check` 效果记录与通知 | `(run_id, dedup_key)`；非派生信号 `(run_id, generation, kind, ref)`，派生信号 `(run_id, derived_from)`；事实主键与 `source_seq`；在途请求主键（`done` 行不改，`in_flight` 行改写为最近登记的实例） | I5 |
+| 内部汇入 | 合成失败信号与在途行关闭、条件 UPDATE；到期接入事实的改写与 `wake_check`；「悬挂唤醒」的条件 UPDATE 与命中时的 `wake_check` 及通知；节点内存压力复评请求的 `wake_check` 及通知；`end_request`、`resolve_request` 事实与 `wake_check` | `(run_id, generation, kind, ref)`；条件 UPDATE 的 `state='suspended'` 条件；`wake_check` 的 `(run_id, effect, ref)`；`end_request` 以首次请求为准 | I5、I10 |
 | 定时器触发 | `timer` 状态 CAS；`timer_fired` 信号，或 `timer_due` 通知、`head_seq` 与运行实例范围等待行的关闭；转 `wake_queued` 与入队 | `timer.status='pending'` 的 CAS；`dedup_key="timer:"+timer_id` | I5 |
 | 协议消息处理 | 转移、字段、`in_msg_seq` 与效果记录，含非 Active 状态下的回合进展 | `(generation, msg_seq)` 与 `in_msg_seq`；`delivery_id`、`suspend_id`、`freeze_id` | I7、I10 |
 | `Hello` 的校验与接管 | 校验、所有权接管、`stream_epoch`、令牌到期时刻、租约字段、进入规则与 `rotate_token`；拒绝路径不写 `run` 行 | `owner_epoch` 条件；令牌中的代 | I7 |
@@ -1483,28 +1483,28 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 任一竞态的处置由 `run` 行锁串行化、带代的 CAS、幂等标识与「写入不消费、离开等待位置才消费」组合给出，这是判定新竞态处置是否完备的标准。下表是举例：
 
 | 竞态 | 交错序列 | 事务边界 | 处置 | 不变量 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 事件先于订阅登记 | webhook 先落连接器事件日志 → Agent 调用 `subscribe_event` → `connectorhub` 登记事务回溯匹配命中 → `AppendInbox` 写入完成事件 → 看守进程的 `subscription_created` 晚于完成事件到达 | 回溯匹配在 `connectorhub` 自身事务；`AppendInbox` 与「订阅创建」各自持 `run` 行锁 | 完成事件进入收件箱，回合边界由子句 D 投递；「订阅创建」发现已有 `subscription_status≠active` 的完成事件，等待行直接 `closed`；回合中的 `wait_for` 由派生信号承接，`wait_started` 经「进入即满足」直接定向投递 | I2、I5 |
 | 事件在 Suspending 期间到达 | 「发起挂起」提交（`await_ready`）→ `AppendInbox` 提交（条件 UPDATE 不命中，写 `wake_check`）→ 所有者执行「取消挂起」→ 看守进程回 `Busy{cancelled}`（「挂起回退」回到 `Active` 并投递），或已越过不可撤销点回 `ReadyToSuspend`（「就绪应答」重评估为真：`cgroup` 冻结、快照与销毁中止回 `Active`，`signal` 冻结转 `wake_queued`）；`provider_pending` 期间到达时由「提供者确认」重评估为真转 `wake_queued` | 每步一个行锁事务；事件与信号不被消费 | 不丢唤醒；挂起至多完成后立即排队恢复 | I3、I5 |
 | 事件在 Resuming 期间到达 | 「准入放行」提交 → `AppendInbox`（状态 `resuming`，只写行与 `wake_check`）→ `Thawed` 或 `Hello` | 各自行锁 | `wake_check` 的分派无动作；`enter_active` 按进入规则读取全部已到事件：回合边界进入 `Delivering`，回合中的审批与 `wait_for` 定向投递，其余回合中事件留到回合边界 | I4、I5 |
-| webhook 与状态式轮询重复 | 两条路径各自 `AppendInbox` 同一完成事件 | 两个摄入事务串行于行锁 | `(run_id, dedup_key)` 冲突，返回已分配序号，不插入新行、不写 `wake_check` | I4 |
+| webhook 与状态式轮询重复 | 两条路径各自 `AppendInbox` 同一完成事件 | 两个汇入事务串行于行锁 | `(run_id, dedup_key)` 冲突，返回已分配序号，不插入新行、不写 `wake_check` | I4 |
 | 旧代重连 | 重建的「准入放行」提交（代 g+1）→ 旧沙箱的看守进程以代 g 重连 | `Hello` 处理事务 | 回 `HelloAck.fenced{g+1}`，看守进程停止副作用并终止 Agent；校验在接管之前完成，被围栏的 `Hello` 回滚、不改变 `owner_epoch`，新代在原所有者上的出站流不受影响；已建立流上的旧代非 `Hello` 消息回 `Fenced`（每流每代一次）并关流；旧代令牌经代查询失效 | I7、I10 |
 | 已投递未确认时崩溃 | 看守进程日志记 `accepted` → 发 `Accepted` 之前沙箱丢失 → 「本代沙箱作废」→「准入放行」→ 新代 `Hello{cursor_consumed, pending_intents}` | 「重建完成」在一个事务内完成游标对账与选批 | `cursor_accepted` 按 `pending_intents` 前进；`redeliver_from` 按跨代重投求得；重投批带 `redelivery`，看守进程按日志去重；同代出站流断开时看守进程重放未确认的 `Accepted` | I4、I7 |
 | `Accepted` 与 `Consumed` 都丢失 | `sync` 语义下回合边界的常规批 d（`(c, t]`）→ 看守进程日志记接受与消费，Agent 开始处理 d → `Accepted`、`turn_started`、`Consumed` 送达之前沙箱丢失 →「本代沙箱作废」（`turn_phase=boundary`，只执行 `cancel_delivery`）→ 重建 → 新代 `Hello{pending_intents 含 d 的接受, cursor_consumed=t}` | 「重建完成」一个事务 | 先按 `pending_intents` 中常规投递的最大已接受序号把 `cursor_accepted` 前进到 t，再以 `Hello.cursor_consumed` 前进 `cursor_consumed`，上界取前进后的 `cursor_accepted`，`cursor_consumed` 不被截在 c；`redeliver_from=t`，d 不重投；`cursor_accepted` 与 `cursor_consumed` 都因 `Hello` 前进，进入规则插入 `internal_notice{turn_interrupted}`（回合标识 `consumed:t`），作为常规批送达，新代 Agent 进程以恢复句柄续接被截断的回合，运行实例不会停在等待下一条外部输入的 `Boundary`；L0 同样补写该通知，「看门狗空闲」随之可以成立，此后的 Agent 退出不被误计为启动失败 | I4、I7 |
 | 控制面重启于 `provisioning` | 「创建」提交后副本崩溃，`provision` 未执行或执行中 | — | 所有者租约过期后认领；「效果记录滞留」或「过渡态截止」守卫以同一 `resume_id` 重执行，沙箱提供者、`workspace` 与 `secrets` 按键幂等 | I10 |
 | 控制面重启于 `suspending`（`ReadyToSuspend` 之前） | 「发起挂起」提交，`PrepareSuspend` 未发出或已发出 | — | 「过渡态截止」守卫以同一 `suspend_id` 重发 `PrepareSuspend`，看守进程对同一 `suspend_id` 返回首次结果 | I10 |
 | 控制面重启于 `suspending`（`ReadyToSuspend` 之后） | 「就绪应答」提交（恢复句柄已落库、`provider_suspend` 为 pending）→ 崩溃 | — | 新所有者以同一 `suspend_id` 重执行提供者调用，已完成则返回同一结果，「提供者确认」落地 | I9、I10 |
-| 控制面重启于 `wake_queued` | 「摄入唤醒」提交 → 持有准入队列的副本崩溃 | — | 「排队悬挂」守卫认领后按原 `queued_at` 重新入队；`admit` 对同一 `run_id` 幂等 | I5、I10 |
+| 控制面重启于 `wake_queued` | 「汇入唤醒」提交 → 持有准入队列的副本崩溃 | — | 「排队悬挂」守卫认领后按原 `queued_at` 重新入队；`admit` 对同一 `run_id` 幂等 | I5、I10 |
 | 控制面重启于 `resuming` | 「准入放行」提交 → 崩溃 | — | 「过渡态截止」或「效果记录滞留」守卫以同一 `resume_id` 重执行，不递增代；`slot_expires_at` 比截止晚 `T_slot_grace`，认领与重驱动在此之前完成时槽位一直计入并发，之后才完成时先经 `suspendpolicy.reacquire_slot` 重新取得槽位，取不到不发效果、按 `not_before` 等待，不绕过准入延长旧槽位 | I7、I10 |
 | 控制面重启于 `delivering` | 「边界投递」提交 → 崩溃 | — | 「过渡态截止」守卫以同一 `delivery_id` 重发，看守进程按日志与 `delivery_id` 返回首次结果 | I4、I10 |
 | 控制面重启于 `draining` | 「解冻完成」（`resume_intent=drain`）提交，`Resumed{drain=true}` 已入发送队列 → 所有者副本崩溃 | — | 看守进程重连，新所有者在 `Hello` 中把最近一次 `send(Resumed)` 重置为 `pending` 重发，看守进程按 `suspend_id` 幂等；仍未转为回合边界时每到 `T_drain` 截止由「过渡态截止」守卫再次重发 `Resumed{drain=true}`，`Draining` 保持到 `turn_ended`，不中断回合、不销毁沙箱 | I9、I10 |
 | 控制面重启于 `suspending(thawing)` | 「冻结中升级」（DESTROY）提交，`thaw` 效果执行中 → 崩溃 | — | 新所有者经「效果记录滞留」或「过渡态截止」守卫以同一 `suspend_id` 重执行 `thaw`（解冻对象为冻结记录的 `freeze_id`），累计 `N_suspend_redrive` 次仍无 `Thawed` 时按沙箱丢失执行「本代沙箱作废」 | I10 |
 | 看门狗误判 | L0 空闲证据成立 →「看门狗空闲」登记 `probe` 并冻结 → Agent 实际在等待内部计时 | 冻结与 `probe` 登记在同一事务 | `probe` 触发 → 子句 B → `wake_queued` → 解冻，`enter_active` 消费该探测等待 → `Activity` 显示忙则保持 `Active`，仍空闲则以加倍间隔再次冻结；`flap_counter` 与 `policy_state` 记录失准。L0 只经看门狗挂起，挂起总附带探测定时器；挂起中止或经其他原因唤醒时未触发的探测定时器被取消 | I8 |
-| 恢复风暴 | 节点故障使大量沙箱同时丢失，或大量定时同时到期 | 每个运行实例的「本代沙箱作废」或「摄入唤醒」各自一个事务 | 全部进入 `wake_queued`，按机制限速、按唤醒原因优先级与老化放行；重建也经恢复准入；排队不计恢复失败；预热池按比例保留 | I10 |
+| 恢复风暴 | 节点故障使大量沙箱同时丢失，或大量定时同时到期 | 每个运行实例的「本代沙箱作废」或「汇入唤醒」各自一个事务 | 全部进入 `wake_queued`，按机制限速、按唤醒原因优先级与老化放行；重建也经恢复准入；排队不计恢复失败；预热池按比例保留 | I10 |
 | `Hello` 先于首条消息 | 「创建」→ 第 1 代 `Hello` → 首条 `AppendInbox` | 各自行锁 | 「预配完成」的进入规则落在 `Idle`（`turn_phase=idle`），不进入没有回合的 `InTurn`；首条消息经 `wake_check` 由「边界投递」送达 | I4 |
 | 回合边界冻结被定时器唤醒 | 回合边界冻结 → 运行实例范围的 `sleep_until` 到期 | 定时器触发事务 | 写 `internal_notice{timer_due}`，子句 D 为真，转 `wake_queued`；恢复后进入 `Delivering` 投递该通知 | I5、I8 |
 | 完成信号先于 `llm.request.started` | LLM 网关的 `AppendWakeSignal(llm_completed)` 先提交（`in_turn`，信号未消费）→ 所有者处理 `llm.request.started` | 两个行锁事务 | 「进入即满足」：消费信号、留在 `InTurn`、不写 `blocked_on`、不调用挂起决策；本地代理的同一完成被唯一约束吸收；「阻塞已满足未转出」守卫兜底 | I3、I5 |
-| `AppendInbox` 与冻结中升级并发 | 回合边界冻结 → `frozen_review` 选定 DESTROY | 行锁串行 | 摄入先提交：条件 UPDATE 转 `wake_queued`，`frozen_review` 发现状态已变，不升级；升级先提交（`thawing`）：摄入只写行与 `wake_check`，`Thawed` 到达时「升级解冻完成」重评估为真，中止升级回到 `Active` 并投递 | I5、I9 |
+| `AppendInbox` 与冻结中升级并发 | 回合边界冻结 → `frozen_review` 选定 DESTROY | 行锁串行 | 汇入先提交：条件 UPDATE 转 `wake_queued`，`frozen_review` 发现状态已变，不升级；升级先提交（`thawing`）：汇入只写行与 `wake_check`，`Thawed` 到达时「升级解冻完成」重评估为真，中止升级回到 `Active` 并投递 | I5、I9 |
 | 审批决定与挂起并发 | `BlockedOn{approval}` →「发起挂起」（冻结）→ 决定到达 | 各自行锁 | 决定派生 `approval_decided`；`await_ready` 时经「取消挂起」或「就绪应答」中止后由 `enter_active` 定向投递；`provider_pending` 时「提供者确认」转 `wake_queued`，解冻后由 `enter_active` 定向投递 | I5 |
 | 审批决定在 Suspending 或 Resuming 期间到达 | 同「事件在 Suspending 期间到达」「事件在 Resuming 期间到达」 | — | 信号未消费，`enter_active` 的回合中满足分支定向投递 | I5 |
 | 审批决定与 DRAIN 并发 | 冻结上限 →「冻结上限处置」（`drain`）→ 决定在解冻之前或 `Draining` 中到达 | 各自行锁 | 解冻之前到达：`enter_active` 先判满足分支，定向投递而不进入 `Draining`；`Draining` 中到达：`blocked_on` 与待定向目标已清空，事件保持未定向，在回合边界作为常规投递送达（hook 已以「批准后以消息通知」拒绝） | I4、I5 |
@@ -1518,8 +1518,8 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | 提供者冻结结果不确定后迟到生效 | 「就绪应答」（`freeze_cgroup`）→ `provider_suspend(s)` 的执行者领取后停顿 → 重驱动累计达到 `N_provider` →「提供者挂起失败」按已冻结转 `wake_queued.frozen` →「准入放行」解冻（`freeze_id=s`）→ 停顿的执行者的冻结请求到达提供者 | 各自行锁；提供者调用在事务外 | 「提供者挂起失败」同一事务把该 `provider_suspend` 置 `abandoned`，重驱动不再发出；提供者对已解冻的 `freeze_id=s` 不再执行冻结，FREEZE_SHRINK 随后的缩小请求同样携带 `freeze_id=s` 而不生效，CPU request 不会停在缩小值；进程树仍被冻结时，看守进程的 `Activity` 报告 `frozen=true`，所有者按 `active` 中的冻结规则执行「本代沙箱作废」并经准入重建，运行实例不会永久停在 `InTurn` | I7、I10 |
 | 待就绪回退后看守进程完成冻结 | 「发起挂起」（`freeze_signal`，`suspend_id=s`）→ `PrepareSuspend` 重发 `N_suspend_redrive` 次仍无应答 →「挂起截止」回退到 `active`，写 `aborted_suspend_id=s` 与 `send(CancelSuspend{s})` → 看守进程完成 `Freeze{signal}` 并回 `ReadyToSuspend{s}` | 各自行锁 | `CancelSuspend` 先被处理时看守进程回 `Busy{s, cancelled}`，「迟到的挂起应答」只清空 `aborted_suspend_id`；已越过不可撤销点时「迟到的挂起应答」写 `send(Thaw{s})`，看守进程解冻 Agent 进程树并上报 `Thawed{s}`，`aborted_suspend_id` 随之清空；`Thaw` 送达之前断流时，重连的 `Hello` 报告 `frozen=true` 且冻结标识为 s，所有者把 `send(Thaw{s})` 重置为 `pending` 重发，不执行「本代沙箱作废」，健康沙箱不被重建；`aborted_suspend_id` 解除之前「发起挂起」不发起新尝试，第二次回退不会覆盖 s，迟到的 `ReadyToSuspend{s}` 总能按「迟到的挂起应答」处理 | I10 |
 | 冻结上限唤醒、排空与回合边界 | 「冻结上限处置」（`drain`）→「解冻完成」→ `Draining` → `turn_ended` | 各自行锁 | `Draining` 不约束回合时长，截止到期只重发 `Resumed{drain=true}`；「排空完成」写 `grace_deadline=now()`，`maybe_suspend(drain_done)` 豁免 D_min，`suspendpolicy` 在 I9 成立时返回 DESTROY | I8、I9 |
-| 冻结沙箱被驱逐后先被信号唤醒 | 驱逐 → 信号「摄入唤醒」→「准入放行」（`thaw`）→ 解冻返回沙箱不存在 | 各自行锁 | 「恢复对象不存在」：转重建意图、不计失败、保留 `queued_at`，再经「准入放行」执行 `fence_and_bump` | I7、I10 |
-| `signal` 变体解冻时无出站流 | `suspended.frozen`（`signal`）→ 看守进程重连中或沙箱被驱逐 → 信号「摄入唤醒」→「准入放行」（`thaw`）→ `resume` 效果因无本代出站流按 `not_before` 等待 → 截止到期 | 各自行锁；提供者查询在事务外 | 「恢复失败或超时」不计 `resume_attempts`，按 `sandbox_id` 查询提供者：沙箱存在且自效果写入起未超过 `T_resume(thaw)+T_connect_grace` 时延长截止与槽位，看守进程重连后由「解冻中重连」重驱动发出 `Thaw`；沙箱不存在或超过宽限时执行「恢复对象不存在」转重建意图；不因看守进程重连消耗恢复失败次数，也不无上限等待 | I10 |
+| 冻结沙箱被驱逐后先被信号唤醒 | 驱逐 → 信号「汇入唤醒」→「准入放行」（`thaw`）→ 解冻返回沙箱不存在 | 各自行锁 | 「恢复对象不存在」：转重建意图、不计失败、保留 `queued_at`，再经「准入放行」执行 `fence_and_bump` | I7、I10 |
+| `signal` 变体解冻时无出站流 | `suspended.frozen`（`signal`）→ 看守进程重连中或沙箱被驱逐 → 信号「汇入唤醒」→「准入放行」（`thaw`）→ `resume` 效果因无本代出站流按 `not_before` 等待 → 截止到期 | 各自行锁；提供者查询在事务外 | 「恢复失败或超时」不计 `resume_attempts`，按 `sandbox_id` 查询提供者：沙箱存在且自效果写入起未超过 `T_resume(thaw)+T_connect_grace` 时延长截止与槽位，看守进程重连后由「解冻中重连」重驱动发出 `Thaw`；沙箱不存在或超过宽限时执行「恢复对象不存在」转重建意图；不因看守进程重连消耗恢复失败次数，也不无上限等待 | I10 |
 | Suspending 期间沙箱消失 | 「发起挂起」→ Pod 消失 | 「沙箱丢失」守卫的事务 | 「本代沙箱作废」作废挂起效果，按 `turn_phase` 写回合被中断通知；有可投递事件、其他满足的条件或终端、文件通道接入时转重建意图，否则 `suspended.destroyed` | I10 |
 | 对账器重驱动 Resuming 与重建 | 「过渡态截止」守卫的重驱动与「恢复失败或超时」的新尝试 | 行锁串行 | 重驱动以同一 `resume_id`、不递增代；只有提供者报告明确失败的新尝试调用 `fence_and_bump` | I7、I10 |
 | `Accepted` 与代递增并发 | 旧代 `Accepted` 与「准入放行」 | 行锁串行 | 代递增先提交时按代不等围栏拒绝；`Accepted` 先提交时状态已是 `wake_queued`（进入它的各条路径都已 `cancel_delivery`），`wake_queued.destroyed` 按本代作废围栏丢弃，其余子状态因 `substate≠delivering` 计数丢弃，都不推进游标。旧代已落盘的接受记录由新代 `Hello.pending_intents` 推进 `cursor_accepted`，再按跨代重投规则重投 | I4、I7 |
@@ -1543,8 +1543,8 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | Agent 以恢复句柄启动反复失败 | 重建后 `Deliver` → 看守进程以 `--resume` 启动失败 → `Accepted` → `turn_ended{agent_exited=true}`，循环 | 各自行锁 | 「Agent 进程退出」累加 `start_failures`，达到 `N_resume` 经「进入降级」转 `degraded`，由「兜底」以新会话恢复 | I10 |
 | 快照期间令牌过期 | 「提供者确认」落地为快照 → 等待超过令牌有效期 →「准入放行」快照恢复 → 同代 `Hello` 携带过期令牌 | `Hello` 处理事务 | 签名、代与租约校验通过，接受连接并在同一事务写 `rotate_token`；看守进程收到 `TokenRotate` 之前不访问 `llmgateway`、`connectorhub` | I7 |
 | 快照落地后立即唤醒 | 「提供者确认」（快照，写 `workspace_hold(s)`）→ 事件随即到达，转 `wake_queued` →「准入放行」（`snapshot_restore`）时 `HoldLease` 尚未执行 | 各自行锁 | `resume(snapshot_restore)` 依赖 `workspace_hold(s)` 离开 `pending`，按 `not_before` 退避、不计 `attempts`；`HoldLease` 以 `lease_id` 与代为 CAS 条件先执行，恢复出的沙箱随后以首次续约绑定持有者；快照态已被带外恢复或作废时 `workspace_hold` 在领取或调用前的复核中置 `abandoned`；复核之后才被带外恢复时，`HoldLease` 以持有者为空或等于快照时的沙箱为 CAS 条件，已绑定持有者的其他沙箱不受影响，迟到的 `HoldLease` 不会清空活跃沙箱的租约持有者；`resume(snapshot_restore)` 在调用前复核运行实例仍在 `resuming(snapshot_restore)` 且 `sandbox_id` 为空，「快照恢复完成」已先提交时不再发出快照恢复 | I7、I10 |
-| 冻结态接入终端 | `suspended.frozen` → 用户打开终端 | 摄入事务与所有者事务 | 冻结态不唤醒，`humanchannel` 对沙箱存活的冻结态直接转发终端请求；快照态与销毁态由「接入唤醒」唤醒后转发；快照或销毁模式的挂起尝试由「取消挂起」取消，看守进程已越过不可撤销点而回 `ReadyToSuspend` 时由「就绪应答」中止；冻结中升级正在解冻时由「升级解冻完成」中止，不再发 `PrepareSuspend{snapshot|destroy}`；已进入 `provider_pending` 的在「提供者确认」落地时转 `wake_queued` | I5 |
-| 冻结上限临近与无关事件并发 | 回合中冻结，`freeze_deadline−safety_margin` 已到而「冻结上限处置」尚未执行 → 无关的人类消息经 `AppendInbox` 写入 | 摄入事务 | 回合中子句 D 为假、只有子句 E 为真，摄入事务不转移，只写 `wake_check`；所有者执行「冻结上限处置」（快照或 DRAIN），不以普通恢复绕过冻结上限的处置 | I5 |
+| 冻结态接入终端 | `suspended.frozen` → 用户打开终端 | 汇入事务与所有者事务 | 冻结态不唤醒，`humanchannel` 对沙箱存活的冻结态直接转发终端请求；快照态与销毁态由「接入唤醒」唤醒后转发；快照或销毁模式的挂起尝试由「取消挂起」取消，看守进程已越过不可撤销点而回 `ReadyToSuspend` 时由「就绪应答」中止；冻结中升级正在解冻时由「升级解冻完成」中止，不再发 `PrepareSuspend{snapshot|destroy}`；已进入 `provider_pending` 的在「提供者确认」落地时转 `wake_queued` | I5 |
+| 冻结上限临近与无关事件并发 | 回合中冻结，`freeze_deadline−safety_margin` 已到而「冻结上限处置」尚未执行 → 无关的人类消息经 `AppendInbox` 写入 | 汇入事务 | 回合中子句 D 为假、只有子句 E 为真，汇入事务不转移，只写 `wake_check`；所有者执行「冻结上限处置」（快照或 DRAIN），不以普通恢复绕过冻结上限的处置 | I5 |
 | 同一回合并行的阻塞型审批 | `tool_started{c1}`、`tool_started{c2}` → `permission_requested{p1, c1}`、`permission_requested{p2, c2}` → 决定 p2 先到 → 决定 p1 | 各自行锁 | 两项都记入待定向目标，门控不成立，不写 `blocked_on`、不挂起；p2 的派生信号经 `wake_check` 触发「发起定向投递」，`Accepted` 后移除该项；p1 同理；只剩一项且其调用是唯一运行中的工具时提升为 `blocked_on`，可以冻结；`tool_started` 晚于 hook 发出时，后到的登记只使门控失效，不清除先登记的目标 | I4、I5 |
 | 投递在途期间 Agent 自行开始的回合 | 回合边界的常规批或 defer 续接定向批在途 → `turn_started{T_a}` → `Accepted` → `turn_ended{T_a}` | 各自行锁 | 「回合开始」改写回合字段、子状态保持 `delivering`；「投递接受」记 `pending_turn_delivery_id`；`T_a` 的 `turn_ended` 经「回合结束」保持 `in_turn` 并写占位 `current_turn_id`，不进入回合边界、不挂起；看守进程在 `T_a` 结束后才喂入已接受的输入，其 `turn_started{delivery_id}` 经「回合开始」清除标记；`T_a` 在 `Accepted` 之后才开始时其 `turn_started` 不带该标识、不清除；`T_a` 的进展事件不取消 defer 续接的定向批；`T_a` 以 `turn_ended{reason=tool_deferred}` 结束时，「回合结束」在清空 `permission_id` 之前把它转存为 `deferred_permission_id`，已接受批的回合结束后，其决定作为续接决定在回合边界以续接定向批送达，不进入常规批 | I4、I8 |
 | 投递不可重试失败 | 常规批 d（序号 11 至 15）→ `DeliveryFailed{seqs=[13], retryable=false}` | 行锁 | 「投递不可重试失败」放弃 13，插入 `delivery_abandoned` 通知，重新选批时跳过 13；游标随之后的批越过 13；运行实例不停留在 `Delivering` | I4、I10 |
@@ -1560,24 +1560,24 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | 定向投递的消费与已接受未喂入的常规批 | 回合边界常规批 d1（`(c, t]`）在途时 Agent 自行开始回合 →「投递接受」记 d1 为已接受、尚未喂入 → 该回合的阻塞型审批以回合内定向批 d2 送达（序号 u > t），Agent 处理该决定 → 沙箱丢失 | 各自行锁 | 看守进程只为常规批发 `Consumed`，d2 的消费只写投递意图日志，`cursor_consumed` 与 `durable_cursor` 仍不超过 c；重建以 `redeliver_from=c` 重投 d1，d1 的事件不会因定向投递的消费被越过或先被清理 | I4 |
 | 首批全部是已消费事件 | 新代进入的重投区间以日志已记消费的事件开头（取消定向的回合内事件为举例），首批受 `B_max`、`S_max` 截断后只含这些事件 | 各自行锁 | `Accepted{fed=false}`：`redeliver_from` 前移到该批的 `through_seq`，同一事务按进入规则的边界分支生成下一批，直到出现需要喂入的事件（`fed=true`）或重投区间投完 | I4 |
 | 同代内对同一订阅再次 `wait_for` | `BlockedOn{wait_for, s1}`（`lifetime: once`）→ 完成事件 e1 派生信号 g1 → 定向投递 e1，`Accepted` 消费 g1 → 同一回合内 Agent 再次 `wait_for(s1)` | 各自行锁 | e1 已送达、不再在途，`target_ready` 为真，「进入即满足」以 `redelivery=true` 再次定向送达 e1，不进入 `BlockedOn`；同一回合中并行等待 s1 的其他调用（门控不成立，不写 `blocked_on`）在 e1 的 `Accepted` 之后由「投递接受」的路由同样送达；once 订阅不会再有完成事件，运行实例不会冻结在等不到信号的 `BlockedOn` | I4、I5 |
-| 同一审批的多条决定 | `BlockedOn{approval, p}` → 冻结 → 审批人的决定 e1 写入并派生 g1 →「准入放行」之前另一审批人的决定 e2 写入并派生 g2 | 摄入事务；各自行锁 | g2 以 `(run_id, derived_from)` 唯一，不被 g1 吸收；子句 A 由 g1 为真，条件 UPDATE 转 `wake_queued`；恢复后 `enter_active` 按 `target_ready` 取 `inbox_seq` 最小的 e1 定向投递，「投递接受」只消费 `derived_from` 为 e1 的 g1；p 移除后 g2 不对应任何待定向目标或等待，不影响谓词，e2 作为未定向事件在回合边界以常规批送达 | I4、I5 |
+| 同一审批的多条决定 | `BlockedOn{approval, p}` → 冻结 → 审批人的决定 e1 写入并派生 g1 →「准入放行」之前另一审批人的决定 e2 写入并派生 g2 | 汇入事务；各自行锁 | g2 以 `(run_id, derived_from)` 唯一，不被 g1 吸收；子句 A 由 g1 为真，条件 UPDATE 转 `wake_queued`；恢复后 `enter_active` 按 `target_ready` 取 `inbox_seq` 最小的 e1 定向投递，「投递接受」只消费 `derived_from` 为 e1 的 g1；p 移除后 g2 不对应任何待定向目标或等待，不影响谓词，e2 作为未定向事件在回合边界以常规批送达 | I4、I5 |
 | `Active` 中经定向投递满足声明的审批或 `wait_for` | L2 `active.in_turn` → `permission_requested{p, blocking=true}`（`BlockedOn{approval, p}`）→ `WaitDeclared{scope=generation, [{approval, p}]}` → 决定 e1 写入并派生 g1 → `wake_check` 的分派执行「发起定向投递」，随后 `settle_gen_waits` → `Accepted` | 各自行锁 | `settle_gen_waits` 不要求 `live`：e1 已被定向占用，g1 照常匹配声明行；g1 仍满足待定向目标 p，只写等待一侧，声明行置 `consumed`；「投递接受」消费 g1、移除 p 并回到 `InTurn`，路由之后的 `settle_gen_waits` 无事可做；此后的 `maybe_suspend` 中 I8 不再因该声明成立，运行实例不会在执行被批准的工具时冻结而没有唤醒来源。阻塞型 `wait_for(s1)` 与声明 `{wait_for, s1}` 同理 | I5、I8 |
 | 新代未启动 Agent 即在回合边界销毁 | L1 回合边界销毁落地（`run.session_id=S1`）→ 界面经沙箱读取工作区文件，「接入唤醒」→ 重建第 g+1 代，新代 `Hello` 不写 `session_id`，无可投递事件而进入 `Boundary`，Agent 进程未启动 → 读取结束，接入失效 →「发起挂起」（DESTROY，I9 预检通过）→ `ReadyToSuspend{exited_at, session_id=∅}` | 各自行锁 | 看守进程本代未启动 Agent 进程、也没有收到过 `Deliver`，回报空的 `session_id`；「就绪应答」只在 `session_id` 非空时写入，`run.session_id` 保持 S1；下一条消息触发的重建以 `resume_session_id=S1` 续接原会话，会话历史不丢失 | I9 |
 
 ## 扩展点
 
-### 新增事件源接入摄入契约
+### 新增事件源接入汇入契约
 
-新增事件源满足下列条件时不修改本模块：写入前派生稳定的 `event_id` 与内容派生的 `dedup_key`；`Payload` 不超过 `S_max`，大内容自行存放并以附件引用表达，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口；收件箱事件的 `kind` 落在 `InboxEvent.Kind` 闭集内；唤醒信号的 `kind` 落在 `WakeSignal.Kind` 闭集内，且携带运行实例当前代；运行实例事实按摄入契约的幂等键写入；承担摄入契约的调用方义务；不读取本模块的表、不假定写入顺序。`kind` 超出接口闭集时属于修改本模块：增加取值须同时扩展接口闭集与表闭集（`InboxEvent.Kind` 与 `inbox.kind`，`WakeSignal.Kind` 与 `wake_signal.kind`）；收件箱事件增加种类另须扩展 `agentprotocol` 的投递目标与看守进程的 Agent 驱动器；新的唤醒信号种类按「新增等待条件类型」处理。
+新增事件源满足下列条件时不修改本模块：写入前派生稳定的 `event_id` 与内容派生的 `dedup_key`；`Payload` 不超过 `S_max`，大内容自行存放并以附件引用表达，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口；收件箱事件的 `kind` 落在 `InboxEvent.Kind` 闭集内；唤醒信号的 `kind` 落在 `WakeSignal.Kind` 闭集内，且携带运行实例当前代；运行实例事实按汇入契约的幂等键写入；承担汇入契约的调用方义务；不读取本模块的表、不假定写入顺序。`kind` 超出接口闭集时属于修改本模块：增加取值须同时扩展接口闭集与表闭集（`InboxEvent.Kind` 与 `inbox.kind`，`WakeSignal.Kind` 与 `wake_signal.kind`）；收件箱事件增加种类另须扩展 `agentprotocol` 的投递目标与看守进程的 Agent 驱动器；新的唤醒信号种类按「新增等待条件类型」处理。
 
 ### 新增等待条件类型
 
-新增等待条件类型须扩展 `blocked_on.kind` 或 `wait.kind` 闭集，并给出 `accepts` 映射、满足来源、门控、冻结上限类别、截止时间与对账器可观察的满足来源。条件由外部系统产生时，由对应事件源模块经摄入契约写入完成事件或唤醒信号；条件由 Agent 声明时经 `WaitDeclared` 追加。须同步修改的位置穷举为：新的唤醒信号种类同时扩展 `wake_signal.kind` 闭集与 `WakeSignal.Kind`；唤醒原因的派生表给出新信号种类的 `wake_reason` 映射，新增 `blocked_on.kind` 时同时给出子句 E 的映射；新增 `wake_reason` 取值时同步修改[并发模型](../architecture.md#并发模型)中的恢复准入优先级与 `wake_reason` 闭集；新增代范围的 `wait.kind` 时同步扩展子句 B 与 `i8_lost` 中的 kind 集合。投递路径、游标与确认语义不变。
+新增等待条件类型须扩展 `blocked_on.kind` 或 `wait.kind` 闭集，并给出 `accepts` 映射、满足来源、门控、冻结上限类别、截止时间与对账器可观察的满足来源。条件由外部系统产生时，由对应事件源模块经汇入契约写入完成事件或唤醒信号；条件由 Agent 声明时经 `WaitDeclared` 追加。须同步修改的位置穷举为：新的唤醒信号种类同时扩展 `wake_signal.kind` 闭集与 `WakeSignal.Kind`；唤醒原因的派生表给出新信号种类的 `wake_reason` 映射，新增 `blocked_on.kind` 时同时给出子句 E 的映射；新增 `wake_reason` 取值时同步修改[并发模型](../architecture.md#并发模型)中的恢复准入优先级与 `wake_reason` 闭集；新增代范围的 `wait.kind` 时同步扩展子句 B 与 `i8_lost` 中的 kind 集合。投递路径、游标与确认语义不变。
 
 ## 实现状态
 
 | 能力 | 状态 | 代码 |
-|---|---|---|
+| --- | --- | --- |
 | 状态机 | 未实现 | — |
 | 收件箱与投递 | 未实现 | — |
 | 唤醒谓词与挂起决策调用点 | 未实现 | — |

@@ -13,7 +13,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 **协作层级。** 协作层级是闭合集合：
 
 | 层级 | 含义 | 托管环境可用的信号 | 允许的挂起机制 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | L0 纯观测 | Agent 不配合托管环境 | 本地代理、LLM 网关与连接器的在途请求；沙箱活动度，举例为 PSI（[REF-linux-psi](../references.md)）、进程态、限流计数 | 冻结，且必须附带探测定时器；显式结束时销毁 |
 | L1 驱动器中介（Claude Code） | Agent 驱动器以无头协议驱动 Agent | L0 的全部信号，加上 Agent 驱动器暴露的信号，举例为回合开始与结束、`idle` 与 `requires_action` 状态（[REF-claude-agent-sdk-typescript](../references.md)）、工具开始与结束、权限询问、平台 MCP 工具调用（[REF-mcp](../references.md)）、hooks（[REF-claude-code-hooks](../references.md)） | 回合中冻结，有快照能力时可快照；回合边界销毁重建 |
 | L2 协作式 | 平台原生 Agent 显式声明等待并保证状态已落盘 | 显式 `WaitDeclared` | 任意声明的等待点：回合中冻结或快照，回合边界可销毁重建 |
@@ -27,8 +27,8 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 顶层模块、职责与运行位置的穷举清单：
 
 | 模块 | 职责 | 运行位置 |
-|---|---|---|
-| `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待与定时器的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与围栏；事件源的摄入契约；纠正性对账器 | 控制面 |
+| --- | --- | --- |
+| `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待与定时器的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与围栏；事件源的汇入契约；纠正性对账器 | 控制面 |
 | `suspendpolicy` | 挂起决策函数；冻结中复评与升级梯（冻结时长达到上限后依次切换到快照或 `DRAIN` 的顺序）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程 |
 | `agentprotocol` | 看守进程与控制面之间的协议：信封、消息、出站流与入站端点、重放与去重、协议版本 | 共享库，链接进控制面服务与看守进程 |
 | `warden` | 看守进程：进程监督、Agent 驱动器、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、工作区租约续约、投递意图日志、本地代理、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1 |
@@ -81,7 +81,7 @@ graph TD
 方向约束：
 
 - 基础层 `agentprotocol`、`suspendpolicy`、`secrets`、`workspace` 不依赖 `runcontroller`、`sandboxprovider`、`warden` 与事件源模块。`agentprotocol` 是控制面与看守进程共用的协议库；`suspendpolicy` 是库，链接进 `runcontroller` 进程。
-- 事件源模块 `llmgateway`、`connectorhub`、`humanchannel` 只通过 `runcontroller` 的摄入契约写入收件箱事件、唤醒信号、运行实例事实（在途请求、实时接入状态为举例）与事件源实例租约；`runcontroller` 不反向调用事件源模块，新增一个事件源不改动 `runcontroller`。
+- 事件源模块 `llmgateway`、`connectorhub`、`humanchannel` 只通过 `runcontroller` 的汇入契约写入收件箱事件、唤醒信号、运行实例事实（在途请求、实时接入状态为举例）与事件源实例租约；`runcontroller` 不反向调用事件源模块，新增一个事件源不改动 `runcontroller`。
 - `humanchannel` 通过 `secrets` 的令牌校验函数校验附件取回请求携带的运行实例令牌，这是它与 `connectorhub` 对 `secrets` 的直接依赖，不引入对 `runcontroller` 表的读取。
 - `connectorhub` 通过 `sandboxprovider` 的出口策略接口推送每个运行实例的出口策略，`sandboxprovider` 在预配与认领沙箱时按代落地，并把推送的更新同步到尚未撤销的代；这是事件源模块对 `sandboxprovider` 的唯一依赖。
 - `sandboxprovider` 依赖 `workspace`（预配与认领时绑定工作区）与 `agentprotocol`（恢复触发所用的入站端点 `/readyz` 与 `/wake`）。
@@ -299,7 +299,7 @@ sequenceDiagram
         R->>P: 缩小 CPU request
     end
     G-->>W: 上游响应流（本地代理持有上游连接，缓存模式下缓冲）
-    G->>R: 唤醒信号 llm_completed（摄入契约）
+    G->>R: 唤醒信号 llm_completed（汇入契约）
     W->>R: llm.request.completed（出站流）
     R->>R: 写事务内条件 UPDATE，Suspended 转 WakeQueued
     R->>R: 恢复准入放行，WakeQueued 转 Resuming
@@ -317,11 +317,11 @@ sequenceDiagram
 冻结路径各转移的前置条件与持久化点（同一转移中由 `runcontroller` 写入 PostgreSQL 的持久化点在同一事务内写入；其他方的落盘单独标注）：
 
 | 转移 | 前置条件 | 持久化点 |
-|---|---|---|
+| --- | --- | --- |
 | InTurn 转 BlockedOn | 本地代理 `llm.request.started` 的 `generation` 与运行实例当前代一致；Agent 驱动器报告无运行中的工具；不存在已满足该条件的未消费唤醒信号 | `blocked_on{kind, ref, since, mode}`（`mode` 取 `llm.request.started.mode`），作用域为本代；LLM 网关侧的在途请求表 `llm_request`（`llmgateway` 自身事务） |
 | Active 转 Suspending | 运行实例行锁内唤醒谓词为假；无后台作业；预测等待的保守值不低于 T_nofreeze；Freeze 在沙箱提供者能力集内；距上次恢复不少于 D_min | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`freeze_cap`（`suspendpolicy` 决策返回的冻结上限时长） |
 | Suspending 转 Suspended | 看守进程的 `ReadyToSuspend` 已到达；`Freeze{cgroup}` 路径另要求其处理事务已写入调用沙箱提供者的效果记录、且沙箱提供者的冻结确认已到达；`Freeze{signal}` 路径以 `ReadyToSuspend` 为冻结确认；行锁内重评估唤醒谓词为假，为真则转 WakeQueued | `substate`、`frozen_since`（`Freeze{cgroup}` 路径取节点冻结代理的冻结确认时刻，`Freeze{signal}` 路径取看守进程在 `ReadyToSuspend` 中携带的 `frozen_at`）、`freeze_deadline`（`blocked_on.since` 加 `freeze_cap`：直通模式为 F_stream，缓存模式为 F_cap(llm)） |
-| Suspended 转 WakeQueued | 唤醒信号 `llm_completed` 或 `llm_failed`（由本地代理的 `llm.request.completed`、`llm.request.failed` 与 LLM 网关的摄入写入产生）命中 `blocked_on.ref`；LLM 网关实例失联时的合成信号见故障与降级；冻结截止时间减安全余量已到时不经该条件 UPDATE，由运行实例所有者按冻结中复评处置（快照或 `DRAIN`） | `wake_signal` 行；同一写事务内的条件 UPDATE 写入 `wake_reason` 与 `queued_at`；网关侧的回放存储与 `llm_request` 状态（`llmgateway` 自身事务） |
+| Suspended 转 WakeQueued | 唤醒信号 `llm_completed` 或 `llm_failed`（由本地代理的 `llm.request.completed`、`llm.request.failed` 与 LLM 网关的汇入写入产生）命中 `blocked_on.ref`；LLM 网关实例失联时的合成信号见故障与降级；冻结截止时间减安全余量已到时不经该条件 UPDATE，由运行实例所有者按冻结中复评处置（快照或 `DRAIN`） | `wake_signal` 行；同一写事务内的条件 UPDATE 写入 `wake_reason` 与 `queued_at`；网关侧的回放存储与 `llm_request` 状态（`llmgateway` 自身事务） |
 | WakeQueued 转 Resuming | 恢复准入按机制限速与优先级放行 | `resume_id`、`slot_lease`（`resume_mode` 已在入队时落库，放行时只读） |
 | Resuming 转 InTurn | 沙箱提供者解冻完成且看守进程上报 `Thawed{suspend_id}`；`workspace` 报告的租约持有者仍为该沙箱 | `state`，`last_resumed_at` 作为 D_min 的计时起点 |
 
@@ -342,7 +342,7 @@ sequenceDiagram
     W->>C: 登记订阅（携带运行实例令牌）
     C->>C: 同一事务写 subscription 行并对连接器事件日志回溯匹配
     C->>X: 按 verify 核对外部对象当前状态
-    C->>R: 匹配或已终态时写入完成事件（摄入契约）
+    C->>R: 匹配或已终态时写入完成事件（汇入契约）
     W->>R: AgentEvent subscription_created{sub_id, since_cursor}
     W-->>A: 返回 sub_id
     A->>W: result（queued_turn_count 为 0）与 session_state_changed idle
@@ -370,7 +370,7 @@ sequenceDiagram
     C->>C: 先写连接器事件日志（delivery_id 唯一）
     C-->>X: 200
     C->>C: 订阅匹配，内容派生 dedup_key 去重
-    C->>R: 写入订阅完成事件（摄入契约）
+    C->>R: 写入订阅完成事件（汇入契约）
     R->>R: 同一事务 head_seq 取新行的 inbox_seq 并条件 UPDATE，Suspended 转 WakeQueued
     R->>R: 恢复准入放行，围栏旧代，转 Resuming
     R->>P: 旧代销毁确认之后预配或认领新代沙箱
@@ -393,8 +393,8 @@ sequenceDiagram
 销毁重建路径各步骤的前置条件与持久化点（同一步骤中由 `runcontroller` 写入 PostgreSQL 的持久化点在同一事务内写入；`connectorhub` 与看守进程侧的落盘单独标注）：
 
 | 步骤 | 前置条件 | 持久化点 |
-|---|---|---|
-| 订阅登记 | 平台 MCP 服务器调用 `connectorhub` 时携带的运行实例令牌 `generation` 与当前代一致 | `subscription` 行（过滤、关联键、`completes_on`、`lifetime`、`since_cursor`、`timeout_at`）与同一事务内对连接器事件日志的回溯匹配（`connectorhub` 自身事务）；匹配命中或 `verify` 核对到已终态时经摄入契约写入的完成事件 |
+| --- | --- | --- |
+| 订阅登记 | 平台 MCP 服务器调用 `connectorhub` 时携带的运行实例令牌 `generation` 与当前代一致 | `subscription` 行（过滤、关联键、`completes_on`、`lifetime`、`since_cursor`、`timeout_at`）与同一事务内对连接器事件日志的回溯匹配（`connectorhub` 自身事务）；匹配命中或 `verify` 核对到已终态时经汇入契约写入的完成事件 |
 | InTurn 转 Boundary | `idle` 与 `result` 都已到齐且 `result.queued_turn_count` 为 0；`generation` 与 `turn_id` 匹配 | `turn_phase`、`last_turn_id`、`reason` |
 | Active 转 Suspending（宽限期内冻结） | 行锁内唤醒谓词为假；预测等待的保守值不低于 T_nofreeze 且不超过 G_turn_grace；Freeze 在沙箱提供者能力集内；距上次恢复不少于 D_min；无后台作业（或策略给出超时终止 `force`） | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`grace_deadline` |
 | Active 转 Suspending（销毁） | 预测等待的保守值超过 G_turn_grace；行锁内唤醒谓词为假；Destroy 在沙箱提供者能力集内；距上次恢复不少于 D_min；I9 前置检查通过，检查项穷举为协作层级不是 L0、`idle` 已到（回合边界）、无后台作业、本代无在途请求（本地代理、LLM 网关与连接器登记的在途行）、活动度静默不短于 Q_quiet、进程树中除 Agent 主进程外无其他进程 | `state`、`suspend_id`、`suspend_mode`、`transition_deadline` |
@@ -447,16 +447,16 @@ flowchart LR
     sys -->|"webhook 先落盘后应答"| evlog
     sys -->|"状态式轮询"| hub
     evlog --> hub
-    hub -->|"订阅完成事件 摄入契约"| inbox
+    hub -->|"订阅完成事件 汇入契约"| inbox
     humans --> hc
-    hc -->|"消息与审批决定 摄入契约"| inbox
+    hc -->|"消息与审批决定 汇入契约"| inbox
     inbox --> rc
     rc -->|"Deliver 出站流"| driver
     driver -->|"accepted 与 consumed"| intent
     driver -->|"原生输入"| agent
     proxy -->|"llm.request.completed 出站流"| wake
     mcp -->|"request.completed 出站流"| wake
-    gw -->|"完成或失败 摄入契约"| wake
+    gw -->|"完成或失败 汇入契约"| wake
     hub -->|"同步调用完成"| wake
     timer -->|"代范围定时器触发"| wake
     timer -->|"运行实例范围定时器到期通知"| inbox
@@ -478,10 +478,10 @@ flowchart LR
 跨边界的数据形态与权威存储按数据项列出，表为穷举；控制面存储为 PostgreSQL，沙箱侧存储为工作区。
 
 | 数据 | 跨越的边界 | 形态 | 权威存储 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 外部事件 | 外部系统到 `connectorhub` | 原始 webhook 负载与 `delivery_id`；状态式轮询只产生完成事件 | 连接器事件日志，`delivery_id` 唯一，保留期不短于最长订阅超时 |
-| 订阅完成事件 | `connectorhub` 到 `runcontroller`（摄入契约） | `event_id` 由 `(sub_id, 终态)` 派生，内容派生 `dedup_key`；原始 webhook 以附件引用（可取回的 URI 与内容哈希）放入载荷，载荷不超过 S_max，大内容由 `connectorhub` 自行存放，Agent 经平台 MCP 服务器附运行实例令牌取回 | `inbox` 表，主键 `(run_id, inbox_seq)`，`(run_id, dedup_key)` 唯一 |
-| 人类消息与审批决定 | `humanchannel` 到 `runcontroller`（摄入契约） | 收件箱事件，`kind` 为消息或审批决定；实时接入状态作为运行实例事实写入 | `inbox` 表与运行实例事实表（`run_fact`） |
+| 订阅完成事件 | `connectorhub` 到 `runcontroller`（汇入契约） | `event_id` 由 `(sub_id, 终态)` 派生，内容派生 `dedup_key`；原始 webhook 以附件引用（可取回的 URI 与内容哈希）放入载荷，载荷不超过 S_max，大内容由 `connectorhub` 自行存放，Agent 经平台 MCP 服务器附运行实例令牌取回 | `inbox` 表，主键 `(run_id, inbox_seq)`，`(run_id, dedup_key)` 唯一 |
+| 人类消息与审批决定 | `humanchannel` 到 `runcontroller`（汇入契约） | 收件箱事件，`kind` 为消息或审批决定；实时接入状态作为运行实例事实写入 | `inbox` 表与运行实例事实表（`run_fact`） |
 | 投递批次 | `runcontroller` 到看守进程（出站流 `Deliver`） | 信封 `{run_id, generation, msg_seq, ack_msg_seq}` 加 `batch[{inbox_seq, event_id, dedup_key, kind, payload, occurred_at, redelivery}]`、`through_seq`、`target`、`resume_session_id` | 投递进度为 `run.cursor_accepted` 与 `run.cursor_consumed`；沙箱侧去重为工作区内的投递意图日志 `.platform/deliveries.jsonl` |
 | Agent 输入 | 看守进程的 Agent 驱动器到 Agent 进程 | 按 `target` 翻译为 Agent 原生输入：下一条用户消息、工具结果或权限决定 | Agent 自身的会话记录，位于工作区内的 `CLAUDE_CONFIG_DIR` |
 | 唤醒信号 | 看守进程的本地代理与平台 MCP 服务器（出站流）、`llmgateway`、`connectorhub`、定时器到 `runcontroller` | 引用阻塞条件或代范围等待条件的 `kind` 与 `ref`，带 `generation`，不进入收件箱 | `wake_signal` 表，在运行实例行锁内消费 |
@@ -502,7 +502,7 @@ flowchart LR
 **协议层错误**由 `agentprotocol` 定义，在看守进程与 `runcontroller` 之间的出站流上传递。带有重试语义的协议层错误穷举如下：
 
 | 消息 | 发出方 | 含义 | 重试语义 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `Shutdown{graceful=false}` | `runcontroller` | 本代沙箱已被判定作废（`Degraded` 或销毁态）或运行实例已终态，代尚未递增因而不用 `Fenced`；本代作废围栏、销毁态连接与终态下的应答 | 不可重试，与 `Fenced` 和可重试关闭相区分。控制面对该消息不产生转移、不推进游标与 `in_msg_seq`、计入围栏拒绝，发出后关闭流，销毁态连接下另销毁该沙箱；看守进程的处置以 `agentprotocol` 对 `Shutdown` 的定义为准（[ADR-generation-fencing](../adr/adr-generation-fencing.md)） |
 | `Fenced{current_generation}` 与 `HelloAck.fenced{current_generation}` | `runcontroller` | 发送方所在沙箱的代已过期 | 不可重试。收到的看守进程停止投递与副作用，对 Agent 进程树执行强制终止；控制面对该代的消息、令牌、工作区写入、游标推进与出口请求一律拒绝（[ADR-generation-fencing](../adr/adr-generation-fencing.md)） |
 | 区别于 `Fenced` 与可重试关闭的不可重试认证失败关闭状态 | `runcontroller` | `Hello` 的令牌签名或 `run_id` 无效，或令牌中的代与信封 `generation` 不符 | 不可重试。不回 `HelloAck`、不携带当前代；看守进程停止重连并上报 |
@@ -554,7 +554,7 @@ graph LR
 PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑部署架构。必须在同一数据库事务内原子完成的操作穷举如下，每一项都对应一条架构不变量：
 
 | 原子操作 | 内容 | 对应不变量 |
-|---|---|---|
+| --- | --- | --- |
 | 事件或唤醒信号写入加唤醒谓词重评估 | 写入收件箱或 `wake_signal` 的事务内对 `run` 行执行条件 UPDATE，`Suspended` 且谓词中冻结截止时间以外的条件为真则转 `WakeQueued`；只有冻结截止时间已到时由运行实例所有者处置 | I5 |
 | 挂起决策 | 在 `run` 行锁内评估唤醒谓词，为真则不写入 `Suspending` | I3 |
 | 进入 `Suspended` 的重评估 | 处理 `ReadyToSuspend` 的事务在销毁模式下先落库恢复句柄；除 `Freeze{signal}` 外写调用沙箱提供者的效果记录；沙箱提供者确认后（`Freeze{signal}` 路径为 `ReadyToSuspend`）在行锁内重评估谓词，假则 `Suspended`，真则 `WakeQueued` | I5、I9 |
@@ -572,7 +572,7 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 
 ### 并发模型
 
-**每运行实例单写者。** 任一时刻只有一个 `runcontroller` 副本是某个运行实例状态机的写者，由 `run` 行中的运行实例所有者租约与 `owner_epoch` 决定；`HelloAck` 把 `owner_epoch` 告知看守进程，持有旧 `owner_epoch` 的副本发出的转移被拒绝，出站流终止在所有者副本。摄入契约的写事务与 `runcontroller` 同类的内部写入是唯一例外，内部写入穷举为：合成失败信号；实时接入到期的事实失效；「悬挂唤醒」守卫的条件 UPDATE，命中时同一事务写入通知所有者的效果记录，所有者租约已过期时通知无主运行实例的公共频道 `rc_unowned`；节点内存压力的复评请求，只写入通知所有者的效果记录；显式结束与运维裁决请求的登记。这些写事务任一副本可执行，只写入收件箱、唤醒信号、运行实例事实（含在途请求）与事件源实例租约，推进 `head_seq`；只登记在途请求或续租事件源实例的写入不改变状态与唤醒谓词，不加 `run` 行锁，其余在 `run` 行锁内执行，在同一事务写入通知所有者的效果记录，并执行唯一一条状态转移 `Suspended` 转 `WakeQueued`（条件 UPDATE，在唤醒谓词中冻结截止时间以外的条件为真时执行）；其余转移只由所有者执行，所有者经效果记录得知需要处理的运行实例，定时器的触发同样由所有者执行。全部状态转移在 `run` 行锁内执行。
+**每运行实例单写者。** 任一时刻只有一个 `runcontroller` 副本是某个运行实例状态机的写者，由 `run` 行中的运行实例所有者租约与 `owner_epoch` 决定；`HelloAck` 把 `owner_epoch` 告知看守进程，持有旧 `owner_epoch` 的副本发出的转移被拒绝，出站流终止在所有者副本。汇入契约的写事务与 `runcontroller` 同类的内部写入是唯一例外，内部写入穷举为：合成失败信号；实时接入到期的事实失效；「悬挂唤醒」守卫的条件 UPDATE，命中时同一事务写入通知所有者的效果记录，所有者租约已过期时通知无主运行实例的公共频道 `rc_unowned`；节点内存压力的复评请求，只写入通知所有者的效果记录；显式结束与运维裁决请求的登记。这些写事务任一副本可执行，只写入收件箱、唤醒信号、运行实例事实（含在途请求）与事件源实例租约，推进 `head_seq`；只登记在途请求或续租事件源实例的写入不改变状态与唤醒谓词，不加 `run` 行锁，其余在 `run` 行锁内执行，在同一事务写入通知所有者的效果记录，并执行唯一一条状态转移 `Suspended` 转 `WakeQueued`（条件 UPDATE，在唤醒谓词中冻结截止时间以外的条件为真时执行）；其余转移只由所有者执行，所有者经效果记录得知需要处理的运行实例，定时器的触发同样由所有者执行。全部状态转移在 `run` 行锁内执行。
 
 **每运行实例工作区单写者。** 工作区租约归 `workspace`；看守进程周期续约，续约失败即冻结或杀死 Agent 进程树并上报 `LeaseLost{lease_id, expires_at}`；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除（删除确认携带被删除沙箱所属的代，且该代等于工作区租约所属的代）后接管工作区（[ADR-generation-fencing](../adr/adr-generation-fencing.md)、[ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)）。
 
@@ -589,10 +589,10 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 下表列出设计已明确处置路径的故障，各行是举例而不是穷举；判定任一故障处置是否完备的标准是，它能否由状态对账、幂等重驱动、至少一次投递与代围栏组合表达，而不引入运行实例状态之外的持久化状态（重试计数与退避时刻属于运行实例状态）。
 
 | 故障 | 行为 |
-|---|---|
+| --- | --- |
 | 看守进程崩溃 | 看守进程是沙箱 PID 1，其崩溃即沙箱崩溃；`runcontroller` 在出站流丢失且 Pod 消失或工作区租约过期后进入重建路径，回合中丢失时写入"回合被中断"事件，经恢复准入放行时递增代（[ADR-warden-is-pid1](../adr/adr-warden-is-pid1.md)） |
 | `runcontroller` 副本崩溃 | 另一副本按运行实例所有者租约与 `owner_epoch` 接管；处于过渡态的运行实例由对账器按截止时间幂等重驱动，`WakeQueued` 的运行实例由新所有者按原排队时刻重建准入队列；看守进程的出站流重连后以 `Hello` 与 `HelloAck` 对账 |
-| LLM 网关实例失联 | `llmgateway` 经摄入契约登记在途请求并按实例续租，续租过期后 `runcontroller` 对该实例的全部在途请求合成 `llm_failed` 唤醒信号（`reason=gateway_lost`）；已完成并持久化到回放存储的响应由本地代理按 `request_id` 取回 |
+| LLM 网关实例失联 | `llmgateway` 经汇入契约登记在途请求并按实例续租，续租过期后 `runcontroller` 对该实例的全部在途请求合成 `llm_failed` 唤醒信号（`reason=gateway_lost`）；已完成并持久化到回放存储的响应由本地代理按 `request_id` 取回 |
 | webhook 丢失或乱序 | 状态式轮询按订阅遍历外部对象当前状态并合成完成事件；订阅登记时按 `verify` 核对外部对象状态；事件按 `occurred_at` 排序；`lifetime: once` 的订阅完成后，同对象的迟到事件由 `connectorhub` 丢弃并审计 |
 | 冻结中的 Pod 被驱逐 | 状态机把"`Suspended{frozen}` 且沙箱已死"转入重建路径；`preStop` 先解冻再终止；`safe-to-evict=false` 标注（[REF-cluster-autoscaler-faq](../references.md)）只约束集群自动扩缩器，不阻止内存压力驱逐 |
 | 原地放大进入 `Deferred` | 解冻与放大并行，不等待放大；`Deferred` 超过阈值且处于回合边界则销毁重建以迁移，回合中则以低权重继续运行 |
@@ -614,7 +614,7 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 下表穷举属于设计的时延与利用率目标。
 
 | 目标 | 数值 | 前提 |
-|---|---|---|
+| --- | --- | --- |
 | 解冻：恢复决策（准入放行）完成到 Agent 可接收 | p95 < 100 ms | 冻结机制 |
 | 解冻：事件到达到 Agent 可接收 | p95 < 200 ms | 冻结机制 |
 | 快照恢复：同节点本地快照且无在途请求 | p95 < 2 s | 快照机制 |
@@ -640,7 +640,7 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 表中的不变量为穷举集合。
 
 | 编号 | 不变量 | 违反的表现 |
-|---|---|---|
+| --- | --- | --- |
 | I1 | Agent 每一次可能阻塞的对外交互经过本地代理、LLM 网关、连接器、Agent 驱动器之一 | 沙箱直连外部的阻塞调用 |
 | I2 | 订阅登记时对已到达的连接器事件日志回溯匹配，并核对外部对象当前状态；正确性不依赖事件与登记的先后 | 事件先于订阅到达而丢失 |
 | I3 | 挂起决策在运行实例行锁内评估唤醒谓词，为真则不挂起 | 事件已在收件箱中仍然挂起 |
@@ -657,7 +657,7 @@ I1 与 I6 的决策依据为 [ADR-host-owns-all-wake-sources](../adr/adr-host-ow
 ## 实现状态
 
 | 模块 | 状态 |
-|---|---|
+| --- | --- |
 | [runcontroller](modules/design-runcontroller.md) | 未实现 |
 | [suspendpolicy](modules/design-suspendpolicy.md) | 未实现 |
 | [agentprotocol](modules/design-agentprotocol.md) | 未实现 |
