@@ -29,7 +29,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 | 模块 | 职责 | 运行位置 |
 | --- | --- | --- |
 | `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待与定时器的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与围栏；事件源的汇入契约；纠正性对账器 | 控制面 |
-| `suspendpolicy` | 挂起决策函数；冻结中复评与升级梯（冻结时长达到上限后依次切换到快照或 `DRAIN` 的顺序）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程 |
+| `suspendpolicy` | 挂起决策函数；冻结中复评与升级梯（冻结时长达到上限后依次切换到快照或 `DRAIN` 的顺序）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程（[ADR-suspendpolicy-as-library](../adr/adr-suspendpolicy-as-library.md)） |
 | `agentprotocol` | 看守进程与控制面之间的协议：信封、消息、出站流与入站端点、重放与去重、协议版本 | 共享库，链接进控制面服务与看守进程 |
 | `warden` | 看守进程：进程监督、Agent 驱动器、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、工作区租约续约、投递意图日志、本地代理、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1 |
 | `sandboxprovider` | 沙箱提供者的能力自描述接口；沙箱预配、挂起、恢复与按代销毁，整代销毁之后拒绝该代及更早代的沙箱创建；冻结、解冻与缩小 CPU request 以 `freeze_id` 标识，已解冻的 `freeze_id` 不再接受冻结与缩小；运行实例结束或失败后按运行实例释放运行实例级资源，释放之后拒绝该运行实例的一切创建；按节点查询冻结态内存与可分配内存；预热池；出口策略在预配与认领沙箱时按代落地，按代撤销，撤销之后拒绝该代的落地与更新。子模块 k8s 负责 Sandbox CR、节点冻结代理、原地缩放、平台出口代理配置与 NetworkPolicy 落地、入站路由；子模块 substrate 负责 actor 模板、Suspend 与 Resume、路由器唤醒、EgressPolicy 与凭据提供者（credential provider）对接 | 控制面与节点，节点冻结代理为 DaemonSet |
@@ -320,9 +320,9 @@ sequenceDiagram
 | --- | --- | --- |
 | InTurn 转 BlockedOn | 本地代理 `llm.request.started` 的 `generation` 与运行实例当前代一致；Agent 驱动器报告无运行中的工具；不存在已满足该条件的未消费唤醒信号 | `blocked_on{kind, ref, since, mode}`（`mode` 取 `llm.request.started.mode`），作用域为本代；LLM 网关侧的在途请求表 `llm_request`（`llmgateway` 自身事务） |
 | Active 转 Suspending | 运行实例行锁内唤醒谓词为假；无后台作业；预测等待的保守值不低于 T_nofreeze；Freeze 在沙箱提供者能力集内；距上次恢复不少于 D_min | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`freeze_cap`（`suspendpolicy` 决策返回的冻结上限时长） |
-| Suspending 转 Suspended | 看守进程的 `ReadyToSuspend` 已到达；`Freeze{cgroup}` 路径另要求其处理事务已写入调用沙箱提供者的效果记录且沙箱提供者的冻结确认已到达；`Freeze{signal}` 路径以 `ReadyToSuspend` 为冻结确认；行锁内重评估唤醒谓词为假，为真则转 WakeQueued | `substate`、`frozen_since`（`Freeze{cgroup}` 路径取节点冻结代理的冻结确认时刻，`Freeze{signal}` 路径取看守进程在 `ReadyToSuspend` 中携带的 `frozen_at`）、`freeze_deadline`（`blocked_on.since` 加 `freeze_cap`：直通模式为 F_stream，缓存模式为 F_cap(llm)） |
+| Suspending 转 Suspended | 看守进程的 `ReadyToSuspend` 已到达；`Freeze{cgroup}` 路径另要求其处理事务已写入调用沙箱提供者的效果记录（[ADR-effect-record-after-commit](../adr/adr-effect-record-after-commit.md)）且沙箱提供者的冻结确认已到达；`Freeze{signal}` 路径以 `ReadyToSuspend` 为冻结确认；行锁内重评估唤醒谓词为假，为真则转 WakeQueued | `substate`、`frozen_since`（`Freeze{cgroup}` 路径取节点冻结代理的冻结确认时刻，`Freeze{signal}` 路径取看守进程在 `ReadyToSuspend` 中携带的 `frozen_at`）、`freeze_deadline`（`blocked_on.since` 加 `freeze_cap`：直通模式为 F_stream，缓存模式为 F_cap(llm)） |
 | Suspended 转 WakeQueued | 唤醒信号 `llm_completed` 或 `llm_failed`（由本地代理的 `llm.request.completed`、`llm.request.failed` 与 LLM 网关的汇入写入产生）命中 `blocked_on.ref`；LLM 网关实例失联时的合成信号见故障与降级；冻结截止时间减安全余量已到时不经该条件 UPDATE，由运行实例所有者按冻结中复评处置（快照或 `DRAIN`） | `wake_signal` 行；同一写事务内的条件 UPDATE 写入 `wake_reason` 与 `queued_at`；网关侧的回放存储与 `llm_request` 状态（`llmgateway` 自身事务） |
-| WakeQueued 转 Resuming | 恢复准入按机制限速与优先级放行 | `resume_id`、`slot_lease`（`resume_mode` 已在入队时落库，放行时只读） |
+| WakeQueued 转 Resuming | 恢复准入按机制限速与优先级放行（[ADR-single-recovery-admission](../adr/adr-single-recovery-admission.md)） | `resume_id`、`slot_lease`（`resume_mode` 已在入队时落库，放行时只读） |
 | Resuming 转 InTurn | 沙箱提供者解冻完成且看守进程上报 `Thawed{suspend_id}`；`workspace` 报告的租约持有者仍为该沙箱 | `state`，`last_resumed_at` 作为 D_min 的计时起点 |
 
 冻结期间看守进程自身不被冻结：被冻结的是 Agent 子 cgroup 中的进程树，看守进程继续应答探针、续约工作区租约、维持出站流并持有本地代理的上游连接。本地代理在请求开始时一次性选定模式：直通模式（`passthrough`）下该请求期间的冻结不超过 F_stream，且一旦已向 Agent 转发响应内容就不再延长；缓存模式（`hold`）下冻结不超过 F_cap(llm)，本地代理缓冲全部内容事件、只转发保活事件（[REF-anthropic-streaming](../references.md)），响应在解冻后一次性交付，客户端因看门狗中止并重发（[REF-claude-code-network-config](../references.md)）时按 `(run_id, generation, request_hash)` 命中单次回放缓存。LLM 网关与本地代理的完成信号命中同一阻塞条件，后到的信号在条件 UPDATE 中无效果。预测等待超过 T_snapshot 且沙箱提供者具备 Snapshot 能力时决策为快照，Freeze 与解冻换成 Snapshot 与快照恢复，本地代理在恢复后按 `request_id` 向 LLM 网关取回已完成响应。回合中冻结时长达到 F_cap 时的升级梯与全部参数值由 [suspendpolicy](modules/design-suspendpolicy.md) 定义。`Freeze{signal}` 与 `Freeze{cgroup}` 都以 `Thaw{suspend_id}` 触发看守进程上报 `Thawed`：`Freeze{signal}` 能力下冻结与解冻由看守进程对 Agent 进程树执行，看守进程收到 `Thaw` 后自行解冻；`Freeze{cgroup}` 能力下 `Thaw` 由控制面在沙箱提供者的解冻调用返回之后发送，看守进程观察到 Agent 子 cgroup 未冻结后上报（进程树从未冻结时立即上报）。冻结与解冻以冻结标识 `freeze_id` 区分，已执行过解冻的冻结标识不再接受冻结，迟到的冻结请求因而不会在解冻之后生效。决策依据见 [ADR-two-tier-llm-proxy](../adr/adr-two-tier-llm-proxy.md) 与 [ADR-freeze-via-node-agent](../adr/adr-freeze-via-node-agent.md)。
@@ -398,7 +398,7 @@ sequenceDiagram
 | InTurn 转 Boundary | `idle` 与 `result` 都已到齐且 `result.queued_turn_count` 为 0；`generation` 与 `turn_id` 匹配 | `turn_phase`、`last_turn_id`、`reason` |
 | Active 转 Suspending（宽限期内冻结） | 行锁内唤醒谓词为假；预测等待的保守值不低于 T_nofreeze 且不超过 G_turn_grace；Freeze 在沙箱提供者能力集内；距上次恢复不少于 D_min；无后台作业（或策略给出超时终止 `force`） | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`grace_deadline` |
 | Active 转 Suspending（销毁） | 预测等待的保守值超过 G_turn_grace；行锁内唤醒谓词为假；Destroy 在沙箱提供者能力集内；距上次恢复不少于 D_min；I9 前置检查通过，检查项穷举为：协作层级不是 L0；`idle` 已到（回合边界）；无后台作业；本代无在途请求（本地代理、LLM 网关与连接器登记的在途行）；活动度静默不短于 Q_quiet；进程树中除 Agent 主进程外无其他进程 | `state`、`suspend_id`、`suspend_mode`、`transition_deadline` |
-| Suspended{frozen} 转 Suspending（宽限期到期升级为销毁） | 冻结中复评选定 DESTROY；行锁内唤醒谓词为假；不处于实时接入；回合边界且 I9 前置检查通过（检查项同 Active 转 Suspending（销毁）） | `state`、`suspend_id`、`suspend_mode`、`suspend_origin=frozen`、`suspend_phase=thawing`、`transition_deadline` 与解冻的效果记录；`Thawed` 到达后行锁内重评估唤醒谓词并核对回合位置与终端、文件通道的接入，谓词为假，解冻期间回合未开始，且终端与文件通道的接入都无效时才发 `PrepareSuspend{destroy}`；谓词为真，解冻期间回合已开始（例如 Agent 自行开始回合），或终端或文件通道接入有效时回到 Active，不发 `PrepareSuspend` |
+| Suspended{frozen} 转 Suspending（宽限期到期升级为销毁） | 冻结中复评选定 DESTROY；行锁内唤醒谓词为假；不处于实时接入；回合边界且 I9 前置检查通过（检查项同 Active 转 Suspending（销毁）） | `state`、`suspend_id`、`suspend_mode`、`suspend_origin=frozen`、`suspend_phase=thawing`、`transition_deadline` 与解冻的效果记录；`Thawed` 到达后行锁内重评估唤醒谓词并核对回合位置（[ADR-turn-position-persisted](../adr/adr-turn-position-persisted.md)）与终端、文件通道的接入，谓词为假，解冻期间回合未开始，且终端与文件通道的接入都无效时才发 `PrepareSuspend{destroy}`；谓词为真，解冻期间回合已开始（例如 Agent 自行开始回合），或终端或文件通道接入有效时回到 Active，不发 `PrepareSuspend` |
 | PrepareSuspend 到 ReadyToSuspend（看守进程侧） | Agent 驱动器关闭 stdin 后 Agent 正常退出并取得退出码；会话记录 JSONL 末尾已含本回合记录；共享文件系统上的工作区 fsync 完成；无其他进程、无工作区写文件描述符，否则回 `Busy` | `ReadyToSuspend{suspend_id, mode, exited_at, session_id, procs_remaining, ws_write_fds}` 中的恢复句柄（`session_id`）非空时落入 `run` 行，为空时保留已落库的恢复句柄（例如本代未启动 Agent 进程的沙箱），同一事务写入调用沙箱提供者销毁的效果记录；看守进程侧无数据库写入 |
 | Suspending 转 Suspended | 恢复句柄（`session_id`）已落库；沙箱提供者确认销毁，`durableDir` 退化配置下为同步挂起已返回（上传完成）；行锁内重评估唤醒谓词为假 | `substate` |
 | webhook 接收 | 签名校验通过；`delivery_id` 未出现过 | 连接器事件日志行（`connectorhub` 自身事务），写入后才应答 200 |
@@ -493,7 +493,7 @@ flowchart LR
 
 事件与唤醒信号的写入事务各自重评估唤醒谓词（I5）。LLM 流量不走占位符注入，凭据换取与在途跟踪在 LLM 网关完成；外部系统流量的占位符替换与默认拒绝见安全边界。决策依据见 [ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md) 与 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)。
 
-## 横切设计
+## 跨切面设计
 
 ### 错误模型
 
@@ -564,21 +564,23 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 | 订阅登记加回溯匹配 | 登记订阅与对连接器事件日志的回溯匹配在同一事务 | I2 |
 | 状态转移加持久化点 | 运行实例状态机的每次转移与该转移的持久化字段（例如 `suspend_id`、`resume_id`、`delivery_id` 与恢复句柄 `session_id`）在同一事务 | I10 |
 
+跨进程副作用不在数据库事务内直接执行：状态转移与效果记录在同一事务写入，提交后按幂等键执行（[ADR-effect-record-after-commit](../adr/adr-effect-record-after-commit.md)）。
+
 工作区不在任何数据库事务内。工作区内唯一影响投递语义的状态是投递意图日志，其写入时机与重投判定见模块间调用关系（[ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)）。Agent 的会话记录与 `CLAUDE_CONFIG_DIR` 同样位于工作区内，但它们是 Agent 自身的状态，`runcontroller` 不读取其内容，只在 I9 安全点要求其持久化完成。各代沙箱以逐字一致的路径挂载工作区并以该路径为 Agent 的 cwd；Agent 状态目录、投递意图日志与已初始化标记都在工作区内，不放 rootfs。
 
-投递语义是至少一次（[ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)）加跨代幂等（[ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)、[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。幂等依据按层次穷举如下：收件箱以 `(run_id, dedup_key)` 唯一；协议消息以 `(generation, msg_seq)` 去重；连接器事件日志以 `delivery_id` 唯一，订阅完成事件的 `event_id` 由 `(sub_id, 终态)` 派生，内容派生的 `dedup_key` 唯一索引兜底 webhook 与状态式轮询的重复；内部事件「回合被中断」以 `(generation, 回合标识)` 去重，回合标识的取值（含已接受未开始的回合与 L0）见 [runcontroller](modules/design-runcontroller.md)；投递意图日志随工作区跨代有效。
+投递语义是至少一次（[ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)）加跨代幂等（[ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)、[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。幂等依据按层次穷举如下：收件箱以 `(run_id, dedup_key)` 唯一；协议消息以 `(generation, msg_seq)` 去重；连接器事件日志以 `delivery_id` 唯一，订阅完成事件的 `event_id` 由 `(sub_id, 终态)` 派生，内容派生的 `dedup_key` 唯一索引兜底 webhook 与状态式轮询的重复；内部事件「回合被中断」以 `(generation, 回合标识)` 去重，回合标识的取值（含已接受未开始的回合与 L0）见 [runcontroller](modules/design-runcontroller.md)；投递意图日志随工作区跨代有效。收件箱事件跨代保留；唤醒信号按代失效，代范围的等待与定时器按代作废，运行实例范围的等待与定时器跨代保留（[ADR-generation-scoped-waits](../adr/adr-generation-scoped-waits.md)）。
 
-`runcontroller` 的纠正性对账器以持久化状态为准，不以事件历史为准（I10）。出站流重连时 `Hello` 与 `HelloAck` 以状态对账补偿事件丢失。周期对账器的守卫规则穷举为：过渡态超过截止时间则以同一标识幂等重驱动；`Active` 处于回合边界且有事件超过阈值未投递则投递；`Suspended` 且唤醒谓词为真超过阈值则唤醒；回合中阻塞条件已被满足却未转出则转出；`WakeQueued` 不在准入队列中则以原排队时刻重新入队；事件源实例（含 LLM 网关实例）续租过期则为其在途请求合成失败信号；实时接入事实超过有效期未续写则视为断开并通知所有者；复评、退避与降级兜底等截止时间已过而未处理则执行对应的到期动作；本应存活的沙箱丢失则进入重建路径，提供者列举到属于已终态运行实例或更小代的沙箱时将其销毁；代范围的等待随代过期作废，运行实例范围的等待保留；效果记录滞留超过截止时间则按其标识幂等重执行。各守卫的条件、阈值与代价见 [runcontroller](modules/design-runcontroller.md)。
+`runcontroller` 的纠正性对账器以持久化状态为准，不以事件历史为准（I10；[ADR-state-based-reconciliation](../adr/adr-state-based-reconciliation.md)）。出站流重连时 `Hello` 与 `HelloAck` 以状态对账补偿事件丢失。周期对账器的守卫规则穷举为：过渡态超过截止时间则以同一标识幂等重驱动；`Active` 处于回合边界且有事件超过阈值未投递则投递；`Suspended` 且唤醒谓词为真超过阈值则唤醒；回合中阻塞条件已被满足却未转出则转出；`WakeQueued` 不在准入队列中则以原排队时刻重新入队；事件源实例（含 LLM 网关实例）续租过期则为其在途请求合成失败信号；实时接入事实超过有效期未续写则视为断开并通知所有者；复评、退避与降级兜底等截止时间已过而未处理则执行对应的到期动作；本应存活的沙箱丢失则进入重建路径，提供者列举到属于已终态运行实例或更小代的沙箱时将其销毁；代范围的等待随代过期作废，运行实例范围的等待保留；效果记录滞留超过截止时间则按其标识幂等重执行。各守卫的条件、阈值与代价见 [runcontroller](modules/design-runcontroller.md)。
 
 ### 并发模型
 
-**每运行实例单写者。** 任一时刻只有一个 `runcontroller` 副本是某个运行实例状态机的写者，由 `run` 行中的运行实例所有者租约与 `owner_epoch` 决定；`HelloAck` 把 `owner_epoch` 告知看守进程，持有旧 `owner_epoch` 的副本发出的转移被拒绝，出站流在所有者副本上终止。汇入契约的写事务与 `runcontroller` 同类的内部写入是唯一例外，内部写入穷举为：合成失败信号；实时接入到期的事实失效；「悬挂唤醒」守卫的条件 UPDATE，命中时同一事务写入通知所有者的效果记录，所有者租约已过期时通知无主运行实例的公共频道 `rc_unowned`；节点内存压力的复评请求，只写入通知所有者的效果记录；显式结束与运维裁决请求的登记。这些写事务任一副本可执行，只写入收件箱、唤醒信号、运行实例事实（含在途请求）与事件源实例租约，推进 `head_seq`；只登记在途请求或续租事件源实例的写入不改变状态与唤醒谓词，不加 `run` 行锁，其余在 `run` 行锁内执行，在同一事务写入通知所有者的效果记录，并执行唯一一条状态转移 `Suspended` 转 `WakeQueued`（条件 UPDATE，在唤醒谓词中冻结截止时间以外的条件为真时执行）；其余转移只由所有者执行，所有者经效果记录得知需要处理的运行实例，定时器的触发同样由所有者执行。全部状态转移在 `run` 行锁内执行。
+**每运行实例单写者。** 任一时刻只有一个 `runcontroller` 副本是某个运行实例状态机的写者，由 `run` 行中的运行实例所有者租约与 `owner_epoch` 决定；`HelloAck` 把 `owner_epoch` 告知看守进程，持有旧 `owner_epoch` 的副本发出的转移被拒绝，出站流在所有者副本上终止。汇入契约的写事务与 `runcontroller` 同类的内部写入是唯一例外，内部写入穷举为：合成失败信号；实时接入到期的事实失效；「悬挂唤醒」守卫的条件 UPDATE，命中时同一事务写入通知所有者的效果记录，所有者租约已过期时通知无主运行实例的公共频道 `rc_unowned`；节点内存压力的复评请求，只写入通知所有者的效果记录；显式结束与运维裁决请求的登记。这些写事务任一副本可执行，只写入收件箱、唤醒信号、运行实例事实（含在途请求）与事件源实例租约，推进 `head_seq`；只登记在途请求或续租事件源实例的写入不改变状态与唤醒谓词，不加 `run` 行锁，其余在 `run` 行锁内执行，在同一事务写入通知所有者的效果记录，并执行唯一一条状态转移 `Suspended` 转 `WakeQueued`（条件 UPDATE，在唤醒谓词中冻结截止时间以外的条件为真时执行）；其余转移只由所有者执行，所有者经效果记录得知需要处理的运行实例，定时器的触发同样由所有者执行。全部状态转移在 `run` 行锁内执行（[ADR-single-writer-per-run](../adr/adr-single-writer-per-run.md)）。
 
 **每运行实例工作区单写者。** 工作区租约归 `workspace`；看守进程周期续约，续约失败即冻结或杀死 Agent 进程树并上报 `LeaseLost{lease_id, expires_at}`；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除（删除确认携带被删除沙箱所属的代，且该代等于工作区租约所属的代）后接管工作区（[ADR-generation-fencing](../adr/adr-generation-fencing.md)、[ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)）。
 
 **沙箱提供者操作按代围栏、串行且幂等。** 对同一运行实例的 `Suspend`、`Resume`、`Destroy` 不并发；每个过渡态携带 `suspend_id` 或 `resume_id` 与截止时间，对账器以同一标识重驱动时沙箱提供者返回与首次相同的结果。整代销毁与单个销毁（参数为 `(generation, sandbox_id)`）都携带代，只作用于该代的沙箱实例，不作用于更新的代；新代沙箱不会被迟到执行的旧代销毁删除，依据是按代的销毁语义，而不是调用的到达顺序。整代销毁之后，沙箱提供者拒绝该代及更早代的沙箱创建，按运行实例释放之后拒绝该运行实例的一切创建，迟到到达的预配不会在删除确认或资源释放之后再创建沙箱或运行实例级资源。预配与恢复在调用沙箱提供者之前于运行实例行锁内复核运行实例未终态，代与尝试标识未变，完成事务的校验失败（调用期间显式结束、降级或代递增已提交）且提供者结果含 `sandbox_id` 时，同一事务写入销毁该沙箱的效果记录；执行者在提供者返回之后、完成事务之前崩溃时遗留的沙箱，由对账器按提供者列举结果回收（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 
-**恢复准入队列。** `WakeQueued` 的放行由恢复准入控制：按机制（解冻、快照恢复、预热池认领、冷启动重建）独立限速；按唤醒原因排定优先级，次序为实时接入、异步人类回复、审批、LLM 完成、外部事件、定时、预测性恢复，同级 FIFO，对排队时长超过老化阈值的请求提升优先级；预热池容量按比例保留给实时接入与异步人类回复；低优先级的准入速率不超过 LLM 网关当前可用并发；节点冻结代理按节点 CPU 余量分批解冻。并发型限额（例如冷启动并发）按占用恢复槽位的运行实例计数，是近似上限：不同副本同时放行时彼此的计数不可见，超出量不超过同时执行放行的所有者副本数。各机制的限速值、并发上限、老化阈值与保留比例由 [suspendpolicy](modules/design-suspendpolicy.md) 定义。
+**恢复准入队列。** `WakeQueued` 的放行由恢复准入控制：按机制（解冻、快照恢复、预热池认领、冷启动重建）独立限速；按唤醒原因排定优先级，次序为实时接入、异步人类回复、审批、LLM 完成、外部事件、定时、预测性恢复，同级 FIFO，对排队时长超过老化阈值的请求提升优先级；预热池容量按比例保留给实时接入与异步人类回复；低优先级的准入速率不超过 LLM 网关当前可用并发；节点冻结代理按节点 CPU 余量分批解冻。并发型限额（例如冷启动并发）按占用恢复槽位的运行实例计数，是近似上限：不同副本同时放行时彼此的计数不可见，超出量不超过同时执行放行的所有者副本数。各机制的限速值、并发上限、老化阈值与保留比例由 [suspendpolicy](modules/design-suspendpolicy.md) 定义（[ADR-single-recovery-admission](../adr/adr-single-recovery-admission.md)）。
 
 **看守进程内部并发。** 看守进程在冻结期间继续运行的职责与本地代理按请求选定模式的规则见模块间调用关系。Agent 驱动器登记的后台作业与子代理未结束时运行实例视为活动，`suspendpolicy` 不对其挂起。
 
@@ -652,7 +654,7 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 | I9 | 以挂起为目的的沙箱销毁仅在同时满足以下条件后执行：Agent 进程正常退出；无在途请求；无其他进程；工作区已持久化（共享文件系统为 fsync 完成，`durableDir` 为同步快照上传完成）；恢复句柄已落库。不以挂起为目的的销毁（显式结束、进入 `Degraded`、放弃、本代沙箱作废、`fence_and_bump` 对旧代的销毁、销毁态连接、`sandbox_id` 核对不符与完成事务校验失败的单个销毁、「沙箱丢失」守卫的反向求差）不受此约束，其会话分别由恢复句柄、回合被中断通知与兜底摘要承接 | `--resume` 丢失最后一回合 |
 | I10 | 运行实例的所有过渡态有截止时间且可幂等重驱动；出站流断连后以状态对账而非事件历史恢复一致 | 控制面重启后运行实例卡在过渡态 |
 
-I1 与 I6 的决策依据为 [ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md)；I2、I3、I5 与 I8 为 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)；I4 为 [ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)；I7 为 [ADR-generation-fencing](../adr/adr-generation-fencing.md)；I9 为 [ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)，其中工作区持久化确认按沙箱提供者区分的依据为 [ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)。
+I1 与 I6 的决策依据为 [ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md)；I2、I3、I5 与 I8 为 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)；I4 为 [ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)；I7 为 [ADR-generation-fencing](../adr/adr-generation-fencing.md)，持久化事实的代范围划分为 [ADR-generation-scoped-waits](../adr/adr-generation-scoped-waits.md)；I9 为 [ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)，其中工作区持久化确认按沙箱提供者区分的依据为 [ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)；I10 为 [ADR-state-based-reconciliation](../adr/adr-state-based-reconciliation.md)。
 
 ## 实现状态
 

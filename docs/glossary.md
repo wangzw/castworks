@@ -14,7 +14,10 @@
 | 订阅 | Subscription | 运行实例对某外部系统事件的持久登记，含过滤条件、关联键、完成条件与生命周期 |
 | 回合 | Turn | Agent 从收到一条输入到停下等待下一条输入之间的工作段 |
 | 回合边界 | turn boundary | 回合结束、Agent 等待下一条输入的时刻；L1 与 L2 以挂起为目的销毁沙箱的唯一时点（L0 不以挂起为目的销毁） |
+| 回合位置 | turn position | 运行实例在回合中的位置，由 `run` 行的回合字段表达，跨挂起保留 |
 | 代 | generation | 运行实例每次预配沙箱时递增的单调计数 |
+| 代范围 | generation scope | 随代递增作废的等待与定时器范围；代范围条件只对登记它的一代有效 |
+| 运行实例范围 | run scope | 跨代保留的等待与定时器范围；运行实例范围的等待与定时器不携带代 |
 | 围栏 | fencing | 以代为依据拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求 |
 | 挂起 | suspend | 释放沙箱计算资源的统称，涵盖冻结、快照与销毁重建 |
 | 冻结 | freeze | 停止 Agent 进程树的 CPU 调度并保留内存；反向操作为解冻 |
@@ -22,8 +25,11 @@
 | 销毁重建 | destroy and recreate | 删除沙箱、保留工作区；恢复时新建沙箱并由 Agent 自身的会话恢复机制续接 |
 | 沙箱提供者 | SandboxProvider | 以能力集合自描述的沙箱生命周期实现，包括 k8s 提供者与 Substrate 提供者 |
 | 节点冻结代理 | node freeze agent | k8s 提供者中的特权 DaemonSet，对 Agent 子 cgroup（[REF-linux-cgroup-v2](references.md)）执行冻结与解冻 |
-| 看守进程 | warden | 沙箱内的守护进程（PID 1）：驱动 Agent、执行冻结、采集活动度、提供本地代理与平台 MCP 服务器、维持与控制面的连接 |
-| Agent 驱动器 | Agent Driver | 看守进程中把某种 Agent 的原生信号翻译为协议事件、把投递翻译为该 Agent 原生输入的组件 |
+| 看守进程 | warden | 沙箱内的守护进程（PID 1）：驱动 Agent、执行 `Freeze{signal}` 降级路径的冻结与解冻（默认的 `Freeze{cgroup}` 由节点冻结代理执行）、采集活动度、提供本地代理与平台 MCP 服务器、维持与控制面的连接 |
+| Agent 驱动器 | Agent Driver | 看守进程中把某种 Agent 的原生信号翻译为协议事件、把投递翻译为该 Agent 原生输入的组件，即进程驱动器 |
+| Agent 驱动器接口 | Agent Driver interface | 两种循环共用的唯一翻译层，规定协议事件、投递、挂起与恢复语义，进程驱动器与控制面循环驱动器各自实现 |
+| 进程驱动器 | process driver | 沙箱内的 Agent 驱动器实现，以无头协议（stream-json）驱动完整第三方 Agent（Claude Code），在同一代沙箱内保持 Agent 进程跨回合存活，并以恢复句柄续接会话 |
+| 控制面循环驱动器 | control-plane loop driver | 控制面内的 Agent 驱动器实现，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 接口使用沙箱，不假定沙箱内存在 Agent 进程 |
 | 本地代理 | local proxy | 看守进程内不被冻结的 HTTP 代理，Agent 进程的全部出站 HTTP 流量经它中继：LLM 请求转发到 LLM 网关，外部系统请求以 CONNECT 或 HTTP 前置转发到出口代理 |
 | LLM 网关 | LLM gateway | 控制面中代理 LLM 调用的服务：凭据换取、围栏校验、在途跟踪、回放存储、限流计费 |
 | 连接器 | Connector | 按外部系统定义接入一个外部系统的组件：出口策略、操作、事件源、订阅匹配 |
@@ -37,6 +43,7 @@
 | 出口策略 | egress policy | 连接器为每个运行实例生成的允许出口主机集合与请求头凭据占位符替换规则，由沙箱提供者落地；未列入的主机默认拒绝 |
 | 出口代理 | egress proxy | 落地出口策略的托管侧代理，接收本地代理中继的 Agent 流量，在发往允许主机时把凭据占位符替换为真实凭据；k8s 路径为 connectorhub 的平台出口代理，Substrate 路径为 Substrate 出口网关（[REF-substrate](references.md)） |
 | 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, expires_at} 记录；看守进程以首次续约绑定持有者并周期续约，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除后接管工作区 |
+| 运行实例所有者租约 | run owner lease | `run` 行上的 `owner_id`、`owner_epoch` 与 `owner_lease_expires_at`，决定该运行实例状态机的写者 |
 | 运行实例令牌 | Run token | 短期 JWT {run_id, generation, exp}，只由看守进程持有并按控制面的 TokenRotate 轮换；LLM 网关与连接器以它换取真实凭据并校验其中的代，k8s 路径的平台出口代理以它逐请求校验代；令牌在签名、过期时间与 run_id 校验通过，令牌中的代等于运行实例当前代，运行实例未进入终态，本代沙箱未被判定作废时有效 |
 | 出站流 | outbound stream | 看守进程运行时始终维持的一条主动外连控制面的 gRPC 双向流，承载全部协议消息与投递；重连后发送方重放未确认消息，Hello 与 HelloAck 做状态对账 |
 | 汇入契约 | ingestion contract | runcontroller 向事件源模块提供的唯一写入接口，用于写入收件箱事件、唤醒信号、运行实例事实与事件源实例租约；runcontroller 不反向调用事件源模块 |
