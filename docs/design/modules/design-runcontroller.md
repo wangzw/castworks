@@ -1,5 +1,9 @@
 # runcontroller
 
+`runcontroller` 坐在控制面，是运行实例状态机的唯一写者。它拥有 `run` 行及其状态转移、收件箱与唤醒信号的持久化、唤醒谓词、投递游标、代与失效判定的控制面一侧、定时器、效果记录与纠正性对账；它不拥有 Agent 进程、沙箱的创建与销毁、挂起决策的参数与沙箱侧的安全点检查，这些分别归看守进程、`sandboxprovider` 与 `suspendpolicy`。心智模型：沙箱一代代出现和消失，运行实例不会；本模块维护的正是这个跨代存续的状态机，每一代沙箱只是它当前借用的执行载体（[ADR-run-outlives-sandbox](../../adr/adr-run-outlives-sandbox.md)）。
+
+文档较长，不宜顺序通读。第一次阅读按以下顺序：职责、[状态一览](#状态一览)、状态与回合字段的闭集、走查、转移表、唤醒谓词、投递与两级确认、挂起决策与冻结中复评、恢复准入与实时接入；外部接口契约、依赖、UML 图与字段表作为参考，在核对具体效果或字段时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文的处置规则判断每个交错序列的结果，再与表中结论核对。
+
 ## 职责
 
 `runcontroller` 是控制面中运行实例状态机的写者。除汇入事务的条件 UPDATE（`suspended` 转 `wake_queued`）外，运行实例的状态转移由持有该运行实例所有者租约的副本在 `run` 行锁内执行；汇入事务可由任一副本执行，其写入范围与所有权规则见并发与事务边界（[ADR-single-writer-per-run](../../adr/adr-single-writer-per-run.md)）。职责穷举如下，每条先写本模块执行的动作，再写产生的结果或边界；具体算法、表结构与转移细节见后续章节。
@@ -521,6 +525,22 @@ flowchart TD
 - `state=active` 且 `substate=delivering`：`delivery_kind=targeted` ⇒ 目标为 `pending_targets` 中的一项（回合内定向投递），或为 `deferred_permission_id` 的决定（回合边界续接，发出时 `turn_phase=boundary`，在途期间可因 Agent 自行开始的回合变为 `in_turn`）；`delivery_kind=regular` 的批在 `turn_phase∈{boundary, idle}` 时发出，在途期间 `turn_phase` 可因 Agent 自行开始的回合或该回合进入的阻塞变为 `in_turn`，`Accepted` 后按「投递接受」路由。
 - 非 active 状态：回合字段（`turn_phase`、`blocked_on`、`pending_targets`、`running_tools`、`current_turn_id`）记录挂起位置，由「非 Active 回合进展」「Agent 进程退出」与「本代沙箱作废」改写。
 
+### 状态一览
+
+状态与回合字段的闭集回答存在哪些取值；下表回答每个 `state` 取值在运行中意味着什么，`substate` 的差异并入对应行。
+
+| 状态 | 一句话含义 | 沙箱在做什么 | 直觉画面 |
+| --- | --- | --- | --- |
+| `provisioning` | 运行实例已创建，第一代沙箱尚未接入 | 正在预配，或已创建、等待看守进程的首个 `Hello` | 办公室正在搭起来，人还没到 |
+| `active` | 运行实例可以推进回合或投递事件 | 存活；`in_turn` 时 Agent 在运行，其余子状态空闲或阻塞 | 灯亮着，可能有人在打字，也可能在等电话 |
+| `suspending` | 已选定挂起机制，正在执行该机制 | 正在冻结、快照，或退出并销毁 | 正在把房间封存或退租，收尾动作尚未完成 |
+| `suspended` | 沙箱已按 `frozen`、`snapshotted` 或 `destroyed` 落位 | 冻结保留内存、快照已上传，或已删除只剩工作区 | 房间被暂停、拍成照片，或已退租，家具还在仓库 |
+| `wake_queued` | 唤醒条件已成立，等待恢复准入放行 | 保持上一状态，尚未开始恢复 | 叫醒服务已登记，正在恢复队列里排队 |
+| `resuming` | 准入已放行，正在恢复沙箱并等待重新接入 | 解冻、快照恢复、从预热池认领或冷启动 | 房间正在重新通电或重建，Agent 还没接上话 |
+| `degraded` | 恢复或投递连续失败达到上限，等待兜底或放弃 | 本代沙箱已销毁或正在销毁 | 事故后先清场，等待用恢复句柄或新会话重开 |
+| `ended` | 显式结束，终态 | 销毁中或已销毁，运行实例级资源待释放 | 任务关闭归档 |
+| `failed` | 放弃，终态 | 销毁中或已销毁，运行实例级资源待释放 | 任务判定无法继续，归档并标注失败 |
+
 ### 运行实例行（`run`）
 
 #### 身份、租户与创建
@@ -756,6 +776,39 @@ flowchart TD
 `source_lease` 的列为 `module`、`instance` 与 `expires_at`，主键 `(module, instance)`。`SetRunFact{inflight_request}` 在同一事务以 `InitialTTL` 写入本次调用所带实例的行（只延长），在途行已存在时同样为本次实例续租，此后事件源按实例周期调用 `RenewSourceLease`；`SetRunFact{inflight_request}` 与 `RenewSourceLease` 都不加行锁、不写 `wake_check`。失联判定按 `source_request.instance`（最近一次登记该在途请求的实例）关联租约，依赖实例标识对每次进程启动唯一：进程重启后以新标识登记与续租，旧标识的租约不再延长，重启前登记的在途请求随之由「事件源实例失联」守卫判为失联。
 
 ## 核心算法与流程
+
+### 走查
+
+两条走查把主要路径落到具体值上；`run` 行只列与本条相关的字段。
+
+**回合中等待 LLM。** 初始 `generation=5`、`sandbox_id=sb-5`、`state=active`、`substate=in_turn`、`turn_phase=in_turn`、`current_turn_id=turn-7`、`blocked_on=∅`、`cursor_accepted=10`、`cursor_consumed=10`、`head_seq=10`。
+
+| 步骤 | 事件或调用 | `run` 行关键字段 |
+| --- | --- | --- |
+| 1 | 本地代理收到 `llm.request.started{request_id=r-1, mode=hold}`，登记在途请求 | `blocked_on={kind=llm, ref=r-1, call_id=c-3, since=t1, mode=hold}`、`substate=blocked_on` |
+| 2 | `maybe_suspend` 选定 `FREEZE{cgroup}`，发出 `PrepareSuspend` | `state=suspending`、`suspend_id=s-1`、`suspend_mode=freeze`、`suspend_phase=await_ready`、`transition_deadline=t1+T_suspend(freeze)` |
+| 3 | 看守进程回 `ReadyToSuspend{suspend_id=s-1}` | `suspend_phase=provider_pending` |
+| 4 | 节点冻结代理确认冻结 | `state=suspended`、`substate=frozen`、`freeze_id=s-1`、`frozen_since=t2`、`freeze_deadline=t1+F_cap(llm)` |
+| 5 | LLM 网关写入 `llm_completed` 信号，同一事务条件 UPDATE | `state=wake_queued`、`wake_reason=llm_completed`、`queued_at=t3`、`substate` 仍为 `frozen` |
+| 6 | 恢复准入放行 | `state=resuming`、`resume_id=rs-1`、`resume_mode=thaw`、`slot_lease=sl-1` |
+| 7 | 提供者解冻完成，看守进程上报 `Thawed`，`enter_active` 消费信号并清空 `blocked_on` | `state=active`、`substate=in_turn`、`turn_phase=in_turn`、`last_resumed_at=t4`、冻结记录清空 |
+
+走查结束时 `generation` 仍为 5，`cursor_accepted` 与 `cursor_consumed` 仍为 10：冻结与解冻不改变代，也不推进投递游标。
+
+**回合边界等待外部事件。** 初始 `generation=5`、`sandbox_id=sb-5`、`state=active`、`substate=in_turn`、`turn_phase=in_turn`、`current_turn_id=turn-8`、`session_id=ses-1`、`cursor_accepted=10`、`cursor_consumed=10`、`head_seq=10`。
+
+| 步骤 | 事件或调用 | `run` 行关键字段 |
+| --- | --- | --- |
+| 1 | MCP 工具 `subscribe_event` 在 `connectorhub` 登记订阅 `sub-9`；`subscription_created` 到达 | 插入 `wait(scope=run, kind=subscription, ref=sub-9)`；`run` 行不变 |
+| 2 | `turn_ended{turn_id=turn-8}` 与 `state_changed{idle}`；无可投递事件，`maybe_suspend(trigger=boundary)` | `turn_phase=boundary`、`current_turn_id=∅`、`last_turn_id=turn-8`、`blocked_on=∅` |
+| 3 | 预测等待超过 `G_turn_grace`，选定 `DESTROY`，I9 预检通过；发出 `PrepareSuspend{destroy}` | `state=suspending`、`suspend_id=s-2`、`suspend_mode=destroy`、`suspend_phase=await_ready` |
+| 4 | `ReadyToSuspend{suspend_id=s-2, session_id=ses-1}`；提供者确认销毁 | `session_id=ses-1` 在销毁前已落库；`state=suspended`、`substate=destroyed`；`generation` 仍为 5 |
+| 5 | webhook 到达，`connectorhub` 匹配订阅并写入完成事件 `inbox_seq=11` | `head_seq=11`；同一事务条件 UPDATE 写 `state=wake_queued`、`wake_reason=external_event`、`queued_at=t3`、`substate=destroyed` |
+| 6 | 恢复准入放行，`fence_and_bump` | `generation=6`、`sandbox_id=∅`、`state=resuming`、`resume_id=rs-2`、`resume_mode=cold_start` |
+| 7 | 新代 `Hello{generation=6, sandbox_id=sb-6, cursor_accepted=10, cursor_consumed=10, pending_intents=[]}`；`enter_active(path=rebuild)` 按回合字段路由到 `Delivering` | `sandbox_id=sb-6`、`stream_epoch` 加一、`session_id` 保持 `ses-1`、`turn_phase=boundary`、`delivery_id=d-4`、`through_seq=11` |
+| 8 | `Accepted{delivery_id=d-4, through_seq=11, fed=true}`；随后 `Consumed{through_seq=11}` | `cursor_accepted=11`、`cursor_consumed=11`、`state=active`、`substate=in_turn`、`turn_phase=in_turn` |
+
+走查结束时 `generation=6`、`sandbox_id=sb-6`、`cursor_accepted=11`、`cursor_consumed=11`、`session_id=ses-1`：代在重建时递增，投递游标在一次新投递中前进，恢复句柄跨代保留。
 
 ### 转移表
 

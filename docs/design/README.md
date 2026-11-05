@@ -4,7 +4,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent（托管的
 
 ## 索引
 
-- [架构](architecture.md)：系统级结构、跨切面设计与架构不变量
+- [架构](architecture.md)：核心概念与设计主线、系统级结构、跨切面设计与架构不变量
 - [术语表](../glossary.md)：项目级术语，所有文档类型共用
 - [引用](../references.md)：文档引用的公开外部来源
 

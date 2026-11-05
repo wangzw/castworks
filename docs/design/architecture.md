@@ -2,6 +2,62 @@
 
 ## 概览
 
+### 核心概念
+
+castworks 把一次 Agent 任务表示为运行实例。运行实例是持久主体，沙箱只是它某一代的执行载体（[ADR-run-outlives-sandbox](../adr/adr-run-outlives-sandbox.md)）。下表列出阅读后续章节所需的概念，以及它们之间的关系与存续范围；术语的定义见[术语表](../glossary.md)，链接指向该文件，按术语名查找。
+
+| 概念 | 关系 | 生命周期与存续范围 |
+| --- | --- | --- |
+| [运行实例](../glossary.md) | 拥有工作区、收件箱、等待、投递游标、回合位置与代 | 从创建到显式结束或放弃；跨越沙箱的多次创建与销毁 |
+| [沙箱](../glossary.md) | 承载看守进程与 Agent 进程，由代标识 | 一代一个；随挂起、销毁与重建出现和消失 |
+| [工作区](../glossary.md) | 挂载进每一代沙箱，承载 Agent 会话状态与投递意图日志 | 与运行实例同寿命，跨代保留 |
+| [代](../glossary.md) | 每次预配沙箱递增，标识沙箱所属的载体代次 | 只增不减；旧代在代递增后立即失效 |
+| [收件箱](../glossary.md) | 运行实例的可投递事件队列，由投递送入沙箱 | 跨代保留，按消费下界清理 |
+| [唤醒信号](../glossary.md) | 不进入收件箱，满足阻塞条件与代范围的等待条件 | 按代失效；运行实例范围的等待跨代保留 |
+| [等待](../glossary.md) | 由收件箱、唤醒信号与等待行推导，不依赖沙箱上报 | 按代范围或运行实例范围存续，在行锁内评估 |
+| [回合位置](../glossary.md) | 记录回合停在何处，决定恢复后进入哪个子状态 | 跨挂起保留，由控制面持久化 |
+
+```mermaid
+flowchart TB
+    run["运行实例"]
+    workspace["工作区"]
+    inbox["收件箱"]
+    wait["等待"]
+    gen["代"]
+    sandbox["沙箱"]
+    warden["看守进程"]
+    agent["Agent 进程"]
+    signal["唤醒信号"]
+
+    run -->|"拥有，跨代保留"| workspace
+    run -->|"拥有，跨代保留"| inbox
+    run -->|"拥有，按范围存续"| wait
+    run -->|"每次预配递增"| gen
+    gen -->|"标识某一代载体"| sandbox
+    sandbox -->|"承载"| warden
+    warden -->|"驱动"| agent
+    workspace -->|"挂载进每一代"| sandbox
+    inbox -->|"投递"| warden
+    signal -->|"满足"| wait
+    wait -->|"唤醒"| sandbox
+```
+
+概念图的核心约束是运行实例与沙箱的分离：运行实例拥有的状态在沙箱消失后仍然可读，控制面据此评估唤醒谓词、选择投递批并判定恢复位置；沙箱只承载当前代的运行时状态，其存在与健康从沙箱提供者读取。等待在持久化收件箱与唤醒信号上推导（[ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)）；工作区的持久化方式按沙箱提供者选择（[ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)）；代对旧代消息与副作用的拒绝见失效判定（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
+
+### 设计主线
+
+设计要解决的问题与对应的机制如下；每行的展开位置给出继续阅读的章节。
+
+| 问题 | 机制 | 展开位置 |
+| --- | --- | --- |
+| 等待与唤醒 | 唤醒源全部由托管侧组件持有；等待由持久化收件箱、唤醒信号与等待行推导，唤醒谓词在运行实例行锁内求值 | [模块间调用关系](#模块间调用关系)、[runcontroller](modules/design-runcontroller.md) 的「唤醒谓词」 |
+| 挂起 | 挂起机制按沙箱提供者能力分层；以挂起为目的的销毁只在安全点执行；机制与时长由 `suspendpolicy` 决策 | [顶层模块](#顶层模块) 的挂起机制与回合边界销毁段、[suspendpolicy](modules/design-suspendpolicy.md) |
+| 投递 | 至少一次投递，收件箱以 `inbox_seq` 全序，`Accepted` 与 `Consumed` 分级确认，重建后从消费位置重投并由投递意图日志跨代去重 | [模块间调用关系](#模块间调用关系)、[runcontroller](modules/design-runcontroller.md) 的「投递与两级确认」 |
+| 一致性 | 每运行实例单写者；状态转移与持久化点同事务；跨进程副作用经效果记录在提交后执行；纠正性对账以持久化状态为准 | [跨切面设计](#跨切面设计) 的「数据一致性与事务边界」与「并发模型」 |
+| 失效判定 | 代单调递增；旧代沙箱的消息、令牌、工作区写入、游标推进与出口请求一律拒绝 | [跨切面设计](#跨切面设计) 的「认证与授权边界」、[架构不变量](#架构不变量) I7 |
+
+### 顶层模块
+
 castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进程运行在挂载持久化工作区的沙箱内，托管的 Agent 为 Claude Code，Agent 驱动器抽象可扩展到其他第三方 Agent；Agent 的 LLM 调用与外部系统流量全部经托管侧代理；托管环境在 Agent 等待 LLM、外部系统或人类时挂起沙箱以释放计算资源，并在依赖解除后恢复运行实例，以同时达到计算资源利用率与响应延迟的目标。外部系统以 GitHub 为参考实例，CRM 与 ERP 类业务系统通过 HTTP 加轮询型外部系统定义接入。
 
 沙箱内完整第三方 Agent 与控制面外置循环并存，共用同一套 Agent 驱动器接口：沙箱内的进程驱动器以无头协议驱动 Claude Code（[REF-claude-code-headless](../references.md)），不暴露交互式 TUI；控制面循环驱动器在控制面运行原生 Agent 循环，通过看守进程的 `ToolExec` 接口使用沙箱。进程驱动器与控制面循环驱动器向 `runcontroller` 发出同一套事件；控制面循环驱动器只定义接口，其实现状态见 [warden](modules/warden/design-warden.md) 模块文档（[ADR-dual-agent-loop-location](../adr/adr-dual-agent-loop-location.md)）。
