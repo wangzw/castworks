@@ -60,11 +60,11 @@
 | --- |
 | [工作区持久化按沙箱提供者选择](adr-workspace-persistence-per-provider.md) |
 
-## 围栏
+## 失效判定
 
 | 决策 |
 | --- |
-| [以代围栏沙箱消息与副作用](adr-generation-fencing.md) |
+| [按代拒绝旧沙箱的消息与副作用](adr-generation-fencing.md) |
 
 ## 租户
 

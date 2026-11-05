@@ -12,7 +12,7 @@
 - **唤醒谓词**：在 `run` 行锁内评估子句 A、B、D、E，返回为真的子句集合；在汇入事务中执行唯一一条 `Suspended` 转 `WakeQueued` 的条件 UPDATE；在每次挂起决策、进入 `Suspended` 之前与对账时重新评估（I5）。
 - **挂起决策与冻结中复评**：在可挂起子状态向 `suspendpolicy` 提供上下文（回合位置、阻塞条件、活动度、实时接入、能力集合、`policy_state` 等），持久化 `decide` 与 `review` 的结果，并写 `suspend`、`thaw`、`provider_suspend` 效果记录，驱动沙箱提供者冻结、解冻、快照与销毁；在谓词为真、唤醒集合为空或 I9 不成立时不发起挂起。
 - **投递与两级确认**：在回合边界与回合内选取常规批或定向批，写 `delivery_id` 与 `deliver` 效果记录；处理 `Accepted` 推进 `cursor_accepted` 与 `delivered_at`，处理 `Consumed` 推进 `cursor_consumed`，处理 `DeliveryFailed` 执行退避重发、放弃或目标失效回退；新代 `Hello` 时按 `pending_intents` 与 `cursor_consumed` 对账并跨代重投（I4）。
-- **代与围栏**：在重建类准入放行与明确失败后的新预配中递增代；拒绝旧代的消息、令牌、游标推进、工作区写入与出口请求；作废旧代的等待、定时器与在途请求；写 `destroy` 与 `revoke_egress` 效果记录；向令牌校验方提供当前代、终态与本代作废状态（I7）。
+- **代与失效判定**：在重建类准入放行与明确失败后的新预配中递增代；拒绝旧代的消息、令牌、游标推进、工作区写入与出口请求；作废旧代的等待、定时器与在途请求；写 `destroy` 与 `revoke_egress` 效果记录；向令牌校验方提供当前代、终态与本代作废状态（I7）。
 - **汇入契约**：向事件源提供 `AppendInbox`、`AppendWakeSignal`、`SetRunFact` 与 `RenewSourceLease`；校验种类闭集、幂等键、关联键、载荷上限与事件源实例标识；以汇入事务写入收件箱、唤醒信号、事实行与租约，派生审批决定与订阅完成的唤醒信号，并返回不可重试与暂时性错误分类。
 - **定时器与截止时间**：登记 `sleep_until`、`probe` 与 `declared_deadline` 定时器；按 `fire_at` 扫描到期行并在所有者事务中触发，代范围定时器写 `timer_fired` 信号，运行实例范围定时器写 `timer_due` 通知；以内存定时器与对账器调度 `transition_deadline`、`review_at`、`freeze_deadline`、`degraded_deadline`、`next_delivery_at`、`rebuild_after` 等所有者侧截止时间。
 - **恢复准入与重建衔接**：在 `wake_queued` 入队时确定 `resume_mode` 并调用 `admit`；在放行事务中写 `resuming`、`resume_id` 与 `slot_lease`，经效果记录驱动预配、快照恢复、解冻或预热池认领；经效果记录建立、保持与释放工作区租约，签发与轮换运行实例令牌；在恢复失败、超时或对象不存在时重驱动、转重建意图或进入降级；处理 `wake_hint` 事实并按 `suspendpolicy` 的批准触发预测性恢复。
@@ -20,7 +20,7 @@
 - **事件源实例失联处置**：按 `source_request.instance` 关联 `source_lease`，在续租过期时为该实例的全部在途请求合成 `llm_failed` 或 `request_failed` 唤醒信号，并在同一事务关闭在途行。
 - **纠正性对账**：按 `T_reconcile` 扫描守卫闭集——过渡态截止、投递滞后、悬挂唤醒、阻塞已满足未转出、排队悬挂、事件源实例失联、复评与截止到期、沙箱丢失、代范围等待过期、效果记录滞留、实时接入到期——以同一标识幂等重驱动或纠正，计数并在连续命中时告警（I10）。
 - **控制面服务接口**：实现 `Create`、`End`、`Get`、`AdmissionState` 与 `Resolve`；`Create` 以 `(project_id, idempotency_key)` 幂等并成为首个所有者，`End` 与 `Resolve` 登记请求事实后由所有者执行，`Get` 返回状态与准入字段，`AdmissionState` 按 `run` 行计算队列位置与预计恢复时刻。
-- **对看守进程的协议处理**：处理 `Hello`、`AgentEvent`、LLM 与请求完成/失败、`WaitDeclared`、`Activity`、`Accepted`/`Consumed`/`DeliveryFailed`、`ReadyToSuspend`/`Busy`/`Thawed`、`LeaseLost` 等入站消息，按消息类型执行状态机效果并写效果记录；在 `Hello` 中校验令牌、代与工作区租约，接管所有权或围栏拒绝。
+- **对看守进程的协议处理**：处理 `Hello`、`AgentEvent`、LLM 与请求完成/失败、`WaitDeclared`、`Activity`、`Accepted`/`Consumed`/`DeliveryFailed`、`ReadyToSuspend`/`Busy`/`Thawed`、`LeaseLost` 等入站消息，按消息类型执行状态机效果并写效果记录；在 `Hello` 中校验令牌、代与工作区租约，接管所有权或拒绝旧代。
 
 ### 非职责
 
@@ -105,7 +105,7 @@ type SourceLease struct {
 - **幂等**：`AppendInbox` 以 `(run_id, dedup_key)` 幂等，命中时返回已分配的序号，已有行的关联键（`permission_id` 或 `subscription_id`）与本次不同时以冲突错误拒绝并计数；`AppendWakeSignal` 写入非派生信号，以 `(run_id, generation, kind, ref)` 幂等，`AppendInbox` 同一事务派生的信号以 `(run_id, derived_from)` 幂等；`SetRunFact` 的实时接入按 `(run_id, kind, channel)`、恢复提示按 `(run_id, generation, request_id)` 幂等，只接受更大的 `SourceSeq`，接入值为真的实时接入以写入时刻加 `LiveAttach.TTL` 为有效期；在途请求按 `(run_id, generation, request_id, source)` 以插入登记，不比较 `SourceSeq`：主键冲突且已有行为 `done` 时不改，已 `done` 的行不会被重复登记改回 `in_flight`；已有行仍为 `in_flight` 且本次实例不同时，把 `instance` 改写为本次实例（同一请求被改发到另一实例，失联判定随之转到该实例），并在同一事务为本次实例续租；`SetRunFact{inflight_request}` 在同一事务以 `InitialTTL` 登记该事件源实例的租约；`RenewSourceLease` 只延长租约。
 - **载荷上限**：`InboxEvent.Payload` 不超过 `S_max`（与投递批的字节上限相同，单个事件因而总能装入一批）。超过上限的内容由事件源自行存放，`Payload` 内只放附件引用（可取回的 URI 与内容哈希）；Agent 经平台 MCP 服务器取回附件：平台 MCP 服务器附运行实例令牌向存放方请求引用中的 URI，存放方按令牌有效的条件校验后返回内容，Agent 进程因而不需要直连存放方（I6）。存放附件的事件源承担提供这一取回接口的义务；本模块不解析、不取回附件。
 - **事件源实例标识**：`InFlightRequest.Instance` 与 `SourceLease.Instance` 对事件源进程的每次启动唯一（例如 Pod 名加启动时生成的随机串），进程重启后不沿用旧标识登记在途请求或续租；「事件源实例失联」守卫依赖这一唯一性判定重启前登记的在途请求失联。
-- **错误语义**：错误按类别穷举。不可重试错误：运行实例已终态；代不匹配；冲突（`dedup_key` 命中而关联键不同）；运行实例不存在；参数非法（`Kind` 越出闭集、写入只由本模块写入的种类、必填字段缺失、`Payload` 不是合法 JSON 或超过 `S_max`）。暂时性错误：数据库不可用、超时、锁等待超时、所有者通知失败。调用方收到不可重试错误时丢弃该写入并计入围栏拒绝或审计（终态拒绝时 `connectorhub` 的订阅处置见调用方义务），收到暂时性错误时按幂等键退避重试。
+- **错误语义**：错误按类别穷举。不可重试错误：运行实例已终态；代不匹配；冲突（`dedup_key` 命中而关联键不同）；运行实例不存在；参数非法（`Kind` 越出闭集、写入只由本模块写入的种类、必填字段缺失、`Payload` 不是合法 JSON 或超过 `S_max`）。暂时性错误：数据库不可用、超时、锁等待超时、所有者通知失败。调用方收到不可重试错误时丢弃该写入并计入旧代拒绝计数或审计（终态拒绝时 `connectorhub` 的订阅处置见调用方义务），收到暂时性错误时按幂等键退避重试。
 - **调用方义务**：对汇入契约的调用为至少一次。已在事件源自身事务中提交、尚未写入汇入契约的事实（例如已认领的连接器事件、已完成的在途请求），事件源必须能从自身持久化状态重驱动对应写入，直到成功或收到不可重试错误；`AppendInbox` 因运行实例已终态被拒时，`connectorhub` 把对应订阅置为 `cancelled`。
 - **读取边界**：作为汇入契约调用方的事件源模块不读取 `run`、`inbox`、`wake_signal`、`wait`、`timer`、`outbox`、`run_fact`、`source_request` 与 `source_lease` 表；事件源模块自有的表（例如 `subscription`、`llm_request` 与连接器事件日志）由所属模块在自身事务内写入。
 - **写入路径**：本模块写入自有表的路径穷举为：汇入契约；协议接口，看守进程的消息由所有者事务处理；所有者自身的调度，即定时器触发、截止时间与对账器；所有权的获取与续租，即 `Hello` 接管、效果执行器、定时器扫描与对账器以条件 UPDATE 对过期所有者租约的认领，以及所有者以 `owner_id=self AND owner_epoch=held` 为条件对 `owner_lease_expires_at` 与 `stream_seen_at` 的批量刷新（单条 UPDATE，逐行取得 `run` 行锁，只写这两列）；内部汇入路径，即事件源实例失联的合成信号、实时接入到期的事实失效、「悬挂唤醒」守卫的条件 UPDATE、节点内存压力的复评请求与 `End`、`Resolve` 的请求登记；`RunService.Create` 的插入，受理副本成为首个所有者；效果记录的领取与完成事务，由所有者或认领者执行；清理任务对过期行的删除。全部写入在 `run` 行锁事务内执行，例外穷举为：不改变状态与谓词的 `RenewSourceLease` 与 `SetRunFact{inflight_request}` 都不加行锁；清理任务的执行者、锁与删除条件见过期行的清理。
@@ -152,8 +152,8 @@ type CurrentGeneration struct {
 | 方向 | 消息 | 处理 |
 | --- | --- | --- |
 | 入站 | `Hello` | 见 Hello 的处理 |
-| 入站 | `AgentEvent` | `active` 中：`turn_started`（「回合开始」）、`turn_ended`（「回合结束」「Agent 进程退出」，`draining` 中为「排空完成」）、`state_changed`（只更新 `agent_state`）、`tool_started`、`tool_ended`、`bg_jobs_changed`（「工具进展」）、`permission_requested`（「进入阻塞」或只记录，`draining` 中为「排空中回合进展」）、`subscription_created`（「订阅创建」）、`timer_requested`（「定时请求」）、`wait_started`（「进入阻塞」或「进入即满足」，`draining` 中为「排空中回合进展」）；「非 Active 回合进展」所列起点中回合进展事件按该转移；本代作废的状态按本代作废围栏处理；其余非终态（例如快照态）计数丢弃 |
-| 入站 | `llm.request.started`、`llm.first_token` | `active` 中按「进入阻塞」或「进入即满足」，门控不成立或 L0 时只登记在途请求，`draining` 中按「排空中回合进展」只登记在途请求；「非 Active 回合进展」所列起点中按该转移；本代作废的状态按本代作废围栏处理；其余非终态计数丢弃；`llm.first_token` 只用于预测性恢复提示与预测重估 |
+| 入站 | `AgentEvent` | `active` 中：`turn_started`（「回合开始」）、`turn_ended`（「回合结束」「Agent 进程退出」，`draining` 中为「排空完成」）、`state_changed`（只更新 `agent_state`）、`tool_started`、`tool_ended`、`bg_jobs_changed`（「工具进展」）、`permission_requested`（「进入阻塞」或只记录，`draining` 中为「排空中回合进展」）、`subscription_created`（「订阅创建」）、`timer_requested`（「定时请求」）、`wait_started`（「进入阻塞」或「进入即满足」，`draining` 中为「排空中回合进展」）；「非 Active 回合进展」所列起点中回合进展事件按该转移；本代作废的状态按本代作废的拒绝规则处理；其余非终态（例如快照态）计数丢弃 |
+| 入站 | `llm.request.started`、`llm.first_token` | `active` 中按「进入阻塞」或「进入即满足」，门控不成立或 L0 时只登记在途请求，`draining` 中按「排空中回合进展」只登记在途请求；「非 Active 回合进展」所列起点中按该转移；本代作废的状态按本代作废的拒绝规则处理；其余非终态计数丢弃；`llm.first_token` 只用于预测性恢复提示与预测重估 |
 | 入站 | `llm.request.completed`、`llm.request.failed`、`request.completed`、`request.failed` | 本代未作废的非终态中：所有者事务写唤醒信号（来源为本地代理或看守进程），同一事务把该 `request_id` 的全部来源 `source_request` 行置 `done`；`active.blocked_on` 时同一事务执行「阻塞满足」；`suspended` 时同一事务按汇入写入集合的条件判定转 `wake_queued` 并入队；`suspending(await_ready)` 且 `must_wake` 为真时执行「取消挂起」 |
 | 入站 | `WaitDeclared` | 「等待声明」 |
 | 入站 | `Activity` | 所有者内存保留最近摘要与累计时长（接管后从零累计）；看守进程按固定周期发送；L0 空闲证据成立时执行「看门狗空闲」；`active` 中报告 `frozen=true` 时：冻结标识等于 `aborted_suspend_id` 则不处置（由「迟到的挂起应答」与重连解除），否则计数、告警并执行「本代沙箱作废」 |
@@ -167,28 +167,28 @@ type CurrentGeneration struct {
 | 出站 | `Thaw{suspend_id}` | 取值为冻结记录的 `freeze_id`；由 `thaw` 效果（「冻结中升级」）与 `resume` 效果（「准入放行」的解冻）发出：`signal` 变体由效果直接发送，`cgroup` 变体由效果的完成事务在提供者解冻调用返回之后写 `send(Thaw)`；「解冻中重连」与 `suspending(thawing)` 中的重连时重发；`aborted_suspend_id` 所指的冻结由「迟到的挂起应答」与 `active.*` 中的同代 `Hello` 以 `send(Thaw{aborted_suspend_id})` 解除，看守进程随后的 `Thawed` 只清空 `aborted_suspend_id` |
 | 出站 | `Resumed{suspend_id, suspended_for_ms, wall_clock_now, drain}` | `send` 效果：「解冻完成」（`suspend_id=freeze_id`）、「快照恢复完成」「快照带外恢复」「排队中带外恢复」、「升级解冻完成」与「就绪应答」的中止分支、「提供者挂起失败」的快照与销毁中止、「迟到的挂起应答」的快照与 `Freeze{cgroup}` 分支；载荷在写入效果记录时确定 |
 | 出站 | `LiveState{attached, as_of}` | `send` 效果（「实时接入推送」）；`ref=live:<as_of>`，看守进程只接受更新的 `as_of`；被接受的 `Hello` 由 `HelloAck` 携带同样的值 |
-| 出站 | `Shutdown{graceful, reason, deadline}` | `destroy` 效果执行器在目标沙箱的出站流上先行发出（「显式结束」「放弃」「进入降级」「本代沙箱作废」与 `fence_and_bump`）；「销毁态连接」与终态下的 `Hello` 在应答中同步发出，本代作废围栏在关闭流之前同步发出，不经效果记录；`deadline` 取发出时刻加 `T_shutdown_grace` |
+| 出站 | `Shutdown{graceful, reason, deadline}` | `destroy` 效果执行器在目标沙箱的出站流上先行发出（「显式结束」「放弃」「进入降级」「本代沙箱作废」与 `fence_and_bump`）；「销毁态连接」与终态下的 `Hello` 在应答中同步发出，本代作废的拒绝判定在关闭流之前同步发出，不经效果记录；`deadline` 取发出时刻加 `T_shutdown_grace` |
 | 出站 | `Fenced{current_generation}` | 已建立的出站流上收到非 `Hello` 的旧代消息时应答，每条流每个旧代一次，随后关闭该流 |
 | 出站 | `TokenRotate{token}` | `rotate_token` 效果 |
 
-- **围栏**：信封 `generation` 不等于当前代的入站消息不产生转移、不推进游标、不更新事实，计入围栏拒绝计数（I7）。入站消息只在本代已接受的出站流（`stream_epoch` 为当前值）上处理；同一副本上 `stream_epoch` 较小的流在新流建立后关闭，其上的消息不再处理。
-- **本代作废围栏**：本代作废（`state=degraded`，或 `state∈{suspended, wake_queued}` 且 `substate=destroyed`，与 `Generations.Current` 的 `Fenced` 判定相同）时，同代出站流上的非 `Hello` 消息不产生转移、不推进游标与 `in_msg_seq`、不写信号与事实，计入围栏拒绝计数，回 `Shutdown{graceful=false}` 后关闭该流；`Hello` 按「销毁态连接」处理。
+- **失效判定**：信封 `generation` 不等于当前代的入站消息不产生转移、不推进游标、不更新事实，计入旧代拒绝计数（I7）。入站消息只在本代已接受的出站流（`stream_epoch` 为当前值）上处理；同一副本上 `stream_epoch` 较小的流在新流建立后关闭，其上的消息不再处理。
+- **本代作废的拒绝判定**：本代作废（`state=degraded`，或 `state∈{suspended, wake_queued}` 且 `substate=destroyed`，与 `Generations.Current` 的 `Fenced` 判定相同）时，同代出站流上的非 `Hello` 消息不产生转移、不推进游标与 `in_msg_seq`、不写信号与事实，计入旧代拒绝计数，回 `Shutdown{graceful=false}` 后关闭该流；`Hello` 按「销毁态连接」处理。
 - **可重试拒绝**：消息处理依赖的事务外调用（令牌校验函数、`workspace.GetLease`）失败时，该消息不处理、不推进 `ack_msg_seq`，控制面以可重试状态关闭出站流；看守进程不终止 Agent 进程树，退避重连后重放未确认消息。
 - **幂等标识**：`Deliver` 以 `delivery_id`；`PrepareSuspend`、`CancelSuspend` 与 `Resumed` 以 `suspend_id`；`Thaw` 与 `Thawed` 以冻结记录的 `freeze_id`；`Accepted` 依靠 `delivery_id` 与带代的单调 CAS，`Consumed` 依靠带代的单调 CAS；`resume_id` 只用于 `sandboxprovider`、`workspace` 的调用与效果记录。
 - **消息序号**：协议消息的处理事务提交后才推进 `ack_msg_seq`；本代最后已处理的入站序号持久化在 `run.in_msg_seq`，`HelloAck.last_received_msg_seq` 取自它。
 
 ### Hello 的处理
 
-**公共校验**：事务外先以 `secrets` 的校验函数验证 `resume_token` 的签名与 `run_id`（过期单独标记，不在此拒绝），并调用 `workspace.GetLease(run_id)`；任一调用失败（不可达、超时）不是校验失败，按可重试拒绝应答，不开事务、不接管、不围栏、关闭流。调用成功后，事务内持 `run` 行锁、在改变所有权之前依次校验：
+**公共校验**：事务外先以 `secrets` 的校验函数验证 `resume_token` 的签名与 `run_id`（过期单独标记，不在此拒绝），并调用 `workspace.GetLease(run_id)`；任一调用失败（不可达、超时）不是校验失败，按可重试拒绝应答，不开事务、不接管、不作失效判定、关闭流。调用成功后，事务内持 `run` 行锁、在改变所有权之前依次校验：
 
-1. 签名与 `run_id` 有效，且令牌中的代等于信封 `generation`；否则以 `agentprotocol` 定义的不可重试认证失败状态关闭流，不回 `HelloAck`、不携带当前代，计入围栏拒绝计数，看守进程收到后停止重连并上报。
+1. 签名与 `run_id` 有效，且令牌中的代等于信封 `generation`；否则以 `agentprotocol` 定义的不可重试认证失败状态关闭流，不回 `HelloAck`、不携带当前代，计入旧代拒绝计数，看守进程收到后停止重连并上报。
 2. `generation` 不等于 `run.generation` 时回 `HelloAck.fenced{current_generation}`，计数，关闭流。
 3. 运行实例已终态时回 `Shutdown{graceful=false}` 并关闭流。
-4. 租约与沙箱：`lease.generation=run.generation`、`lease.lease_id=Hello.workspace_lease_id`、`lease.holder=Hello.sandbox_id`、`lease.expires_at > now()`；`run.lease_generation=run.generation` 时另要求 `lease.lease_id=run.lease_id`；`run.sandbox_id` 非空且状态属于同一沙箱实例延续的集合（`active`、`suspending`、`suspended.frozen`、`wake_queued.frozen`、`resuming(thaw)`）时另要求 `run.sandbox_id=Hello.sandbox_id`。任一不满足时回 `HelloAck.fenced{current_generation}`，同代不同沙箱同样拒绝；`lease.holder` 为空（迟到的 `HoldLease` 在快照之后清空了持有者）时回可重试拒绝而不围栏，看守进程的下一次 `RenewLease` 重新绑定持有者后重连。快照态、`resuming(snapshot_restore)` 与新代状态下 `sandbox_id` 取自 `Hello`：快照恢复的实例可能换标识，租约持有者已由其首次续约绑定；`HoldLease` 在快照恢复调用之前完成（见效果间的先后依赖），并以持有者为空或等于快照时的沙箱为 CAS 条件；带外恢复的实例沿用原标识时，该绑定可能被迟到的 `HoldLease` 清空，其下一次续约重新绑定持有者，期间的 `Hello` 以可重试拒绝应答，清空本身不构成围栏。
+4. 租约与沙箱：`lease.generation=run.generation`、`lease.lease_id=Hello.workspace_lease_id`、`lease.holder=Hello.sandbox_id`、`lease.expires_at > now()`；`run.lease_generation=run.generation` 时另要求 `lease.lease_id=run.lease_id`；`run.sandbox_id` 非空且状态属于同一沙箱实例延续的集合（`active`、`suspending`、`suspended.frozen`、`wake_queued.frozen`、`resuming(thaw)`）时另要求 `run.sandbox_id=Hello.sandbox_id`。任一不满足时回 `HelloAck.fenced{current_generation}`，同代不同沙箱同样拒绝；`lease.holder` 为空（迟到的 `HoldLease` 在快照之后清空了持有者）时回可重试拒绝而不作失效判定，看守进程的下一次 `RenewLease` 重新绑定持有者后重连。快照态、`resuming(snapshot_restore)` 与新代状态下 `sandbox_id` 取自 `Hello`：快照恢复的实例可能换标识，租约持有者已由其首次续约绑定；`HoldLease` 在快照恢复调用之前完成（见效果间的先后依赖），并以持有者为空或等于快照时的沙箱为 CAS 条件；带外恢复的实例沿用原标识时，该绑定可能被迟到的 `HoldLease` 清空，其下一次续约重新绑定持有者，期间的 `Hello` 以可重试拒绝应答，清空本身不构成失效判定。
 5. 令牌已过期或临近到期：签名与租约校验都通过时仍接受，同一事务写 `rotate_token`（`ref=t<generation>:<token_expires_at>`，同 `ref` 已 `done` 的行重置为 `pending`；「销毁态连接」不写）。看守进程收到 `TokenRotate` 之前不向 `llmgateway` 与 `connectorhub` 发请求；`llmgateway`、`connectorhub` 照常拒绝过期令牌。
 6. 校验通过后接管所有权（`owner_epoch+1`、`owner_id=self`、续租），写 `stream_epoch+1` 与 `stream_seen_at`。「销毁态连接」只写这些字段；其余状态另写 `agent_state`、`token_expires_at`（取该令牌的到期时刻）、`ws_durability`（取 `lease.durability`），`lease_id`、`lease_generation` 为空或属旧代时取自租约。`session_id` 只由使运行实例保持或进入沙箱存活状态的同代 `Hello`（「同代重连」「挂起中重连」「冻结态重连」「解冻中重连」「快照恢复完成」「快照带外恢复」「排队中带外恢复」）在 `agent_state.session_id` 非空时更新，新代 `Hello`（「预配完成」「重建完成」）与「销毁态连接」不写。回 `HelloAck{accepted, desired_state, last_received_msg_seq=in_msg_seq, cursor_accepted, owner_epoch, live_attached, live_as_of}`。
 
-任一校验的拒绝路径回滚事务，不写 `run` 行、不改变所有权，接收副本只应答。各类拒绝计入围栏拒绝计数，`Hello` 的认证属于围栏入口。
+任一校验的拒绝路径回滚事务，不写 `run` 行、不改变所有权，接收副本只应答。各类拒绝计入旧代拒绝计数，`Hello` 的认证属于代校验入口。
 
 **按状态的效果**：
 
@@ -228,7 +228,7 @@ type CurrentGeneration struct {
 **被依赖方与调用方承担的约束**：除依赖清单所列接口的语义外，本模块的正确性依赖下列由其他模块承担的约束，按模块穷举如下。
 
 - 看守进程：首次 `RenewLease` 成功之后才发 `Hello`，在 `expires_at` 减时钟余量之前停止写入；`Hello.agent_state` 如实反映回合位置；`Hello.cursor_accepted` 只计常规投递的已接受前缀；每个 `tool_started` 都有配对的 `tool_ended`，被 hook 拒绝或超时的调用同样发出；`permission_requested`、`wait_started` 携带 `call_id`；本地代理为每次上游请求（含客户端重发）生成在同一运行实例、同一代内唯一的 `request_id`，不从 `request_hash` 派生；以单次回放缓存应答重发时不发 `llm.request.started`，仍发时必须用新的 `request_id` 并随后发出同一 `request_id` 的完成或失败。本地代理随转发给 `llmgateway` 的请求携带与 `llm.request.started` 相同的 `request_id`，平台 MCP 服务器随同步连接器操作携带与 `wait_started.ref` 相同的 `request_id`；`wait_started{kind=wait_for}` 的 `ref` 只取 `lifetime: once` 的订阅；`timer_requested` 只以 `scope=run` 发出；已接受的常规投递与回合边界续接只在 Agent 回合之间喂入（L1、L2），回合进行中 `Accepted` 的输入等该回合 `turn_ended` 之后才喂入；`Accepted.fed` 如实报告本批按投递意图日志去重之后是否仍有事件喂给 Agent；常规批与回合边界续接批在 `fed=true` 时随后发出带该 `delivery_id` 的 `turn_started`（L0 为 `Consumed`）或报告 Agent 进程退出，`fed=false` 时不为本批启动 Agent、不发 `turn_started`；以恢复句柄启动 Agent 失败时先发该投递的 `Accepted`，再报 `turn_ended{agent_exited=true}`；L0 在事件交给 Agent 后写消费记录并发 `Consumed`；接受记录同步写入工作区之后才回 `Accepted`，消费记录同步写入工作区之后才发 `Consumed`，写入失败时都不发；`Consumed` 只针对 `target=next_user_message` 的常规投递发出，`through_seq` 取已开始处理的常规批的 `through_seq`，定向投递（含回合边界续接）的消费只写入投递意图日志、不发 `Consumed`；`Hello.cursor_consumed` 只计常规投递的已消费前缀；`Activity` 按固定周期发送，携带 Agent 进程树的冻结状态（`cgroup` 与 `signal` 两种变体都计入）与冻结标识；`PrepareSuspend.force` 只终止 Agent 主进程之外的进程；`ReadyToSuspend` 销毁模式的 `session_id` 取本代 Agent 进程使用的恢复句柄，本代未启动 Agent 进程时取最近一次收到的 `resume_session_id`，没有收到过时为空；`Resumed.drain` 按 `suspend_id` 幂等处理，收到 `Resumed{drain=true}` 时，已在等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 都按 DRAIN 规则立即返回，之后发起的阻塞型 `sleep_until` 照常发出 `wait_started{kind=timer}`；收到 `Thaw{freeze_id}` 后上报 `Thawed`，按 `freeze_id` 幂等：`signal` 变体在自行解冻进程树之后，`cgroup` 变体在读取 Agent 子 cgroup 观察到未冻结之后（进程树从未冻结时立即）；取消定向后以常规投递重送的事件按投递意图日志去重；`LiveState` 与 `HelloAck` 的实时接入状态按 `as_of` 取最新；令牌已过期而重连时，收到 `TokenRotate` 之前不访问 `llmgateway` 与 `connectorhub`；收到可重试拒绝时不终止 Agent 进程树，收到不可重试认证失败关闭时停止重连并上报；目标等待点已在沙箱内失效时以 `DeliveryFailed{reason=target_gone}` 应答；`CancelSuspend` 以 `Busy{cancelled}` 或 `ReadyToSuspend` 确认，对从未收到过 `PrepareSuspend` 的 `suspend_id` 同样回 `Busy{cancelled}`；租约续约失败时上报 `LeaseLost{lease_id, expires_at}`。
-- `connectorhub`：`subscription_completed` 的 `dedup_key` 以订阅标识与外部事件标识共同派生；订阅超时以 CAS 置 `expired` 并经 `AppendInbox` 写入 `subscription_completed(subscription_status=expired)`；汇入因终态被拒或代查询返回终态时取消订阅；同步请求经 `SetRunFact{inflight_request}` 登记并按实例续租，实例标识对每次进程启动唯一；平台出口代理对 k8s 路径的每个出口请求按附带的运行实例令牌经 `Generations.Current` 校验，不使用缓存，不通过时拒绝并计入围栏拒绝；`InFlight.RequestID` 与 `WakeSignal.Ref` 取平台 MCP 服务器随请求携带的 `request_id`；超过 `S_max` 的原始负载自行存放，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口。
+- `connectorhub`：`subscription_completed` 的 `dedup_key` 以订阅标识与外部事件标识共同派生；订阅超时以 CAS 置 `expired` 并经 `AppendInbox` 写入 `subscription_completed(subscription_status=expired)`；汇入因终态被拒或代查询返回终态时取消订阅；同步请求经 `SetRunFact{inflight_request}` 登记并按实例续租，实例标识对每次进程启动唯一；平台出口代理对 k8s 路径的每个出口请求按附带的运行实例令牌经 `Generations.Current` 校验，不使用缓存，不通过时拒绝并计入旧代拒绝计数；`InFlight.RequestID` 与 `WakeSignal.Ref` 取平台 MCP 服务器随请求携带的 `request_id`；超过 `S_max` 的原始负载自行存放，并为平台 MCP 服务器提供附运行实例令牌的附件取回接口。
 - `llmgateway`：转发上游前经 `SetRunFact{inflight_request}` 登记在途请求并按实例续租，实例标识对每次进程启动唯一；`InFlight.RequestID` 与 `WakeSignal.Ref` 取本地代理随请求携带的 `request_id`；完成与失败经 `AppendWakeSignal`；拒绝过期令牌与代查询报告作废的令牌。
 - `humanchannel`：实时接入按通道经 `SetRunFact` 写入，接入期间按小于 `LiveAttach.TTL` 的周期以更大的 `SourceSeq` 续写，进程重启后以更大的 `SourceSeq` 重报全部有效接入；人类事件填 `Actor`；审批决定的 `dedup_key` 每个决定唯一；终端请求与经沙箱的文件访问按恢复准入与实时接入所列条件转发或等待；超过 `S_max` 的内容自行存放，并提供与 `connectorhub` 相同的附件取回接口。
 - `suspendpolicy`：`review` 在实时接入有效值为真时只返回 KEEP，或在冻结上限到达时返回 DRAIN；冻结上限到达时只返回 SNAPSHOT 或 DRAIN；`decide` 对已过冻结上限的阻塞不返回冻结，FREEZE_SHRINK 只与 `cgroup` 变体组合；`admit` 在冻结态携带的截止之前放行；`admit` 对同一 `run_id` 幂等、不重置老化，携带的机制或截止与已有条目不同时把条目改到新的机制与截止；放行回调携带该条目的机制；`Activity` 累计不足 Q_quiet 时空闲证据不成立。
@@ -1077,7 +1077,7 @@ cancel_delivery(run):
 on_accepted(a):                          # 所有者，行锁内
   if a.generation != run.generation or run.state in (ended, failed): 计数并返回
   if 本代作废（state=degraded，或 state ∈ {suspended, wake_queued} 且 substate=destroyed）:
-      按本代作废围栏计数、回 Shutdown 并关流，返回
+      按本代作废的拒绝规则计数、回 Shutdown 并关流，返回
   if run.substate != delivering or a.delivery_id != run.delivery_id: 计数并返回（迟到或重复）
   if run.delivery_kind = regular:
       require a.through_seq <= run.through_seq                  # 上界
@@ -1096,7 +1096,7 @@ on_accepted(a):                          # 所有者，行锁内
 
 on_consumed(c):                          # 所有者，行锁内
   if c.generation != run.generation or run.state in (ended, failed): 计数并返回
-  if 本代作废: 按本代作废围栏计数、回 Shutdown 并关流，返回
+  if 本代作废: 按本代作废的拒绝规则计数、回 Shutdown 并关流，返回
   t = min(c.through_seq, run.cursor_accepted)；c.through_seq 超过 cursor_accepted 时计数
   if run.cooperation_level = L0: start_failures=0；fallback_attempts=0   # 事件已交给 Agent，进程已启动
   if t <= run.cursor_consumed: return                                   # 幂等
@@ -1271,7 +1271,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 
 - `fence_and_bump` 不写 `resume_id`、不写 `provision` 效果，由调用方写入，每次尝试只有一个 `resume_id`。它不要求旧租约已到期：接管前置由 `provision` 效果调用 `workspace.TakeoverLease` 强制（见下方执行顺序；[ADR-generation-fencing](../../adr/adr-generation-fencing.md)），「准入放行」只以 `rebuild_after` 避免空占槽位。`deferred_permission_id` 跨代保留，决定到达后以定向投递续接。
 - 全部重建都经 `wake_queued` 与恢复准入：销毁态唤醒、沙箱丢失、`LeaseLost`、快照保留期临近与降级兜底。重建因此受准入限速，每次重建，以及明确失败后的新预配尝试，各递增一次代（同一 `resume_id` 的重驱动不递增）；`fence_and_bump` 只在「准入放行」（重建类）与「恢复失败或超时」「预配失败或超时」的新尝试（提供者报告明确失败）中调用；对账器重驱动 `resuming`、`provisioning` 时以同一 `resume_id` 重执行，不递增代。
-- `provision` 效果的执行顺序（与旧代 `destroy` 之间按代围栏，见[并发模型](../architecture.md#并发模型)）：
+- `provision` 效果的执行顺序（与旧代 `destroy` 之间按代校验，见[并发模型](../architecture.md#并发模型)）：
   1. 租约前置（第 1 代无此步）：先调用 `workspace.GetLease(run_id)`。运行实例尚无租约，或 `lease.generation` 等于本代（同一尝试的重驱动）时直接进入第 2 步；否则取租约所属代的整代 `destroy(ref=g<lease.generation>)`，等待它完成或 `GetLease` 报告旧租约到期，先到者即进入第 2 步：`destroy` 先完成时以其 `result` 中携带该代的删除确认为 `proof`（整代销毁的创建墓碑使该代在删除确认之后不再出现沙箱实例，迟到的同代预配、认领与快照恢复被提供者拒绝），旧租约先到期时不带 `proof`。等待期间按 `not_before` 退避，不计 `attempts`，「恢复失败或超时」对这段等待不计 `resume_attempts`，只延长截止（`transition_deadline` 与随之重写的 `slot_expires_at`）。中间代从未取得租约时（例如某代预配一直等待更早代销毁，最终降级兜底），`lease.generation` 仍指向最后持有租约的代，`proof` 证明的是该代沙箱已删除。旧代的销毁可能晚于新代预配执行，例如旧租约先到期而不等待销毁完成、退避中的单个销毁 `g<k>:<sandbox_id>`、更早代尚未完成的整代销毁，以及所有权转移后原执行者仍在途的同一 `destroy` 调用。新代沙箱不被删除，依据的是按代的销毁语义：整代销毁与单个销毁都携带代，提供者只作用于该代的沙箱实例，不作用于更新的代（k8s 提供者以每运行实例一个 Sandbox CR 的 `operatingMode` 实现销毁与重建时，新旧代沙箱共用同一 CR，提供者在 Pod 上标注代并按 Pod UID 带前置条件删除），不依据效果之间的先后。
   2. 租约：第 1 代调用 `workspace.CreateLease(run_id, generation, resume_id)`；重建调用 `workspace.TakeoverLease(run_id, generation, resume_id, proof)`。返回 `not_before` 时按「恢复失败或超时」的租约等待处理：不计 `resume_attempts`，延长截止，按 `not_before` 重排。
   3. `secrets.IssueRunToken(run_id, generation)`。
@@ -1386,13 +1386,13 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 
 ## 错误与失败语义
 
-失败的处置由状态对账、幂等重驱动、至少一次投递与代围栏组合表达；重试计数与退避时刻（`delivery_attempts`、`next_delivery_at`、`resume_attempts`、`start_failures`、`fallback_attempts`、`degraded_deadline`）属于 `run` 行，不另设失败记录表。下表列出已明确处置路径的失败，各行是举例；判定任一失败处置是否完备的标准是它能否由状态对账、幂等重驱动、至少一次投递与代围栏组合表达。
+失败的处置由状态对账、幂等重驱动、至少一次投递与失效判定组合表达；重试计数与退避时刻（`delivery_attempts`、`next_delivery_at`、`resume_attempts`、`start_failures`、`fallback_attempts`、`degraded_deadline`）属于 `run` 行，不另设失败记录表。下表列出已明确处置路径的失败，各行是举例；判定任一失败处置是否完备的标准是它能否由状态对账、幂等重驱动、至少一次投递与失效判定组合表达。
 
 | 失败 | 处置 |
 | --- | --- |
 | 过渡态超时 | 「过渡态截止」守卫以同一标识重驱动，沙箱提供者与看守进程对同一标识返回首次结果 |
 | 重复投递 | 收件箱与唤醒信号的唯一约束、投递意图日志去重、`redelivery` 标记 |
-| 代过期 | 围栏拒绝计数，`Fenced` 与 `HelloAck.fenced`；令牌经代查询失效 |
+| 代过期 | 旧代拒绝计数，`Fenced` 与 `HelloAck.fenced`；令牌经代查询失效 |
 | 对账器纠正失败 | 同一守卫连续 `N_reconcile_alert` 次纠正后告警，运行实例停留原状态 |
 | `runcontroller` 副本崩溃 | 所有者租约过期后由其他副本认领，`owner_epoch` 加一；按「过渡态截止」「排队悬挂」「复评与截止到期」守卫重建内存状态；看守进程重连以 `Hello` 对账 |
 | 看守进程回 `Busy` | 「挂起回退」，按 `retry_after` 复评；反复 `Busy` 后由 `suspendpolicy` 给出超时终止 |
@@ -1493,7 +1493,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | 事件在 Suspending 期间到达 | 「发起挂起」提交（`await_ready`）→ `AppendInbox` 提交（条件 UPDATE 不命中，写 `wake_check`）→ 所有者执行「取消挂起」→ 看守进程回 `Busy{cancelled}`（「挂起回退」回到 `Active` 并投递），或已越过不可撤销点回 `ReadyToSuspend`（「就绪应答」重评估为真：`cgroup` 冻结、快照与销毁中止回 `Active`，`signal` 冻结转 `wake_queued`）；`provider_pending` 期间到达时由「提供者确认」重评估为真转 `wake_queued` | 每步一个行锁事务；事件与信号不被消费 | 不丢唤醒；挂起至多完成后立即排队恢复 | I3、I5 |
 | 事件在 Resuming 期间到达 | 「准入放行」提交 → `AppendInbox`（状态 `resuming`，只写行与 `wake_check`）→ `Thawed` 或 `Hello` | 各自行锁 | `wake_check` 的分派无动作；`enter_active` 按进入规则读取全部已到事件：回合边界进入 `Delivering`，回合中的审批与 `wait_for` 定向投递，其余回合中事件留到回合边界 | I4、I5 |
 | webhook 与状态式轮询重复 | 两条路径各自 `AppendInbox` 同一完成事件 | 两个汇入事务串行于行锁 | `(run_id, dedup_key)` 冲突，返回已分配序号，不插入新行、不写 `wake_check` | I4 |
-| 旧代重连 | 重建的「准入放行」提交（代 g+1）→ 旧沙箱的看守进程以代 g 重连 | `Hello` 处理事务 | 回 `HelloAck.fenced{g+1}`，看守进程停止副作用并终止 Agent；校验在接管之前完成，被围栏的 `Hello` 回滚、不改变 `owner_epoch`，新代在原所有者上的出站流不受影响；已建立流上的旧代非 `Hello` 消息回 `Fenced`（每流每代一次）并关流；旧代令牌经代查询失效 | I7、I10 |
+| 旧代重连 | 重建的「准入放行」提交（代 g+1）→ 旧沙箱的看守进程以代 g 重连 | `Hello` 处理事务 | 回 `HelloAck.fenced{g+1}`，看守进程停止副作用并终止 Agent；校验在接管之前完成，被拒绝的 `Hello` 回滚、不改变 `owner_epoch`，新代在原所有者上的出站流不受影响；已建立流上的旧代非 `Hello` 消息回 `Fenced`（每流每代一次）并关流；旧代令牌经代查询失效 | I7、I10 |
 | 已投递未确认时崩溃 | 看守进程日志记 `accepted` → 发 `Accepted` 之前沙箱丢失 → 「本代沙箱作废」→「准入放行」→ 新代 `Hello{cursor_consumed, pending_intents}` | 「重建完成」在一个事务内完成游标对账与选批 | `cursor_accepted` 按 `pending_intents` 前进；`redeliver_from` 按跨代重投求得；重投批带 `redelivery`，看守进程按日志去重；同代出站流断开时看守进程重放未确认的 `Accepted` | I4、I7 |
 | `Accepted` 与 `Consumed` 都丢失 | `sync` 语义下回合边界的常规批 d（`(c, t]`）→ 看守进程日志记接受与消费，Agent 开始处理 d → `Accepted`、`turn_started`、`Consumed` 送达之前沙箱丢失 →「本代沙箱作废」（`turn_phase=boundary`，只执行 `cancel_delivery`）→ 重建 → 新代 `Hello{pending_intents 含 d 的接受, cursor_consumed=t}` | 「重建完成」一个事务 | 先按 `pending_intents` 中常规投递的最大已接受序号把 `cursor_accepted` 前进到 t，再以 `Hello.cursor_consumed` 前进 `cursor_consumed`，上界取前进后的 `cursor_accepted`，`cursor_consumed` 不被截在 c；`redeliver_from=t`，d 不重投；`cursor_accepted` 与 `cursor_consumed` 都因 `Hello` 前进，进入规则插入 `internal_notice{turn_interrupted}`（回合标识 `consumed:t`），作为常规批送达，新代 Agent 进程以恢复句柄续接被截断的回合，运行实例不会停在等待下一条外部输入的 `Boundary`；L0 同样补写该通知，「看门狗空闲」随之可以成立，此后的 Agent 退出不被误计为启动失败 | I4、I7 |
 | 控制面重启于 `provisioning` | 「创建」提交后副本崩溃，`provision` 未执行或执行中 | — | 所有者租约过期后认领；「效果记录滞留」或「过渡态截止」守卫以同一 `resume_id` 重执行，沙箱提供者、`workspace` 与 `secrets` 按键幂等 | I10 |
@@ -1527,8 +1527,8 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | `signal` 变体解冻时无出站流 | `suspended.frozen`（`signal`）→ 看守进程重连中或沙箱被驱逐 → 信号「汇入唤醒」→「准入放行」（`thaw`）→ `resume` 效果因无本代出站流按 `not_before` 等待 → 截止到期 | 各自行锁；提供者查询在事务外 | 「恢复失败或超时」不计 `resume_attempts`，按 `sandbox_id` 查询提供者：沙箱存在且自效果写入起未超过 `T_resume(thaw)+T_connect_grace` 时延长截止与槽位，看守进程重连后由「解冻中重连」重驱动发出 `Thaw`；沙箱不存在或超过宽限时执行「恢复对象不存在」转重建意图；不因看守进程重连消耗恢复失败次数，也不无上限等待 | I10 |
 | Suspending 期间沙箱消失 | 「发起挂起」→ Pod 消失 | 「沙箱丢失」守卫的事务 | 「本代沙箱作废」作废挂起效果，按 `turn_phase` 写回合被中断通知；有可投递事件、其他满足的条件或终端、文件通道接入时转重建意图，否则 `suspended.destroyed` | I10 |
 | 对账器重驱动 Resuming 与重建 | 「过渡态截止」守卫的重驱动与「恢复失败或超时」的新尝试 | 行锁串行 | 重驱动以同一 `resume_id`、不递增代；只有提供者报告明确失败的新尝试调用 `fence_and_bump` | I7、I10 |
-| `Accepted` 与代递增并发 | 旧代 `Accepted` 与「准入放行」 | 行锁串行 | 代递增先提交时按代不等围栏拒绝；`Accepted` 先提交时状态已是 `wake_queued`（进入它的各条路径都已 `cancel_delivery`），`wake_queued.destroyed` 按本代作废围栏丢弃，其余子状态因 `substate≠delivering` 计数丢弃，都不推进游标。旧代已落盘的接受记录由新代 `Hello.pending_intents` 推进 `cursor_accepted`，再按跨代重投规则重投 | I4、I7 |
-| `LeaseLost` 与投递确认并发 | `LeaseLost` 与 `Accepted`、`Consumed` | 行锁串行 | `Accepted` 带代与 `delivery_id`，`Consumed` 只带代；「本代沙箱作废」之后同代迟到的 `Accepted` 与 `Consumed` 按本代作废围栏丢弃（不推进游标，回 `Shutdown` 后关流），代递增后按代不等围栏；重投按跨代重投 | I4、I7、I10 |
+| `Accepted` 与代递增并发 | 旧代 `Accepted` 与「准入放行」 | 行锁串行 | 代递增先提交时按代不等拒绝；`Accepted` 先提交时状态已是 `wake_queued`（进入它的各条路径都已 `cancel_delivery`），`wake_queued.destroyed` 按本代作废的拒绝规则丢弃，其余子状态因 `substate≠delivering` 计数丢弃，都不推进游标。旧代已落盘的接受记录由新代 `Hello.pending_intents` 推进 `cursor_accepted`，再按跨代重投规则重投 | I4、I7 |
+| `LeaseLost` 与投递确认并发 | `LeaseLost` 与 `Accepted`、`Consumed` | 行锁串行 | `Accepted` 带代与 `delivery_id`，`Consumed` 只带代；「本代沙箱作废」之后同代迟到的 `Accepted` 与 `Consumed` 按本代作废的拒绝规则丢弃（不推进游标，回 `Shutdown` 后关流），代递增后按代不等拒绝；重投按跨代重投 | I4、I7、I10 |
 | 对账器重驱动与在线转移并发 | 「过渡态截止」守卫与在线完成 | 行锁串行 | 在线转移先提交：重驱动在领取时发现标识不再是当前值，置 `abandoned` | I10 |
 | Agent 进程退出与 `Accepted`、`Consumed` 交错 | `Accepted` → Agent 退出（`turn_started` 之前或之后） | 各自行锁 | 退出在 `turn_started` 之前：去重键取 `accepted:<delivery_id>`，已接受未消费的事件随回合被中断通知以 `redelivery` 重投；退出在 `Consumed` 之后：去重键取 `turn_id`，只重投通知与之后的事件 | I4 |
 | 所有者易主与出站流 | 看守进程重连到另一副本；或所有者副本与数据库分区，租约过期后被认领 | `Hello` 处理事务：校验通过后接管 | 旧所有者的事务因 `owner_epoch` 失败、关闭旧流；与数据库分区的旧所有者以本地单调时钟判定续租超时后关闭出站流，看守进程重连到其他副本；`ack_msg_seq` 只在处理事务提交后推进；新所有者以 `in_msg_seq` 去重；未通过校验的 `Hello` 不接管 | I10 |
@@ -1555,7 +1555,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | 投递不可重试失败 | 常规批 d（序号 11 至 15）→ `DeliveryFailed{seqs=[13], retryable=false}` | 行锁 | 「投递不可重试失败」放弃 13，插入 `delivery_abandoned` 通知，重新选批时跳过 13；游标随之后的批越过 13；运行实例不停留在 `Delivering` | I4、I10 |
 | 投递持续可重试失败 | 工作区存储长时间不可用 → `DeliveryFailed{retryable=true}` 反复到达 | 各自行锁 | 「投递可重试失败」「退避重发」按退避以新 `delivery_id` 重新选批，达到 `N_deliver_retry` 时告警；存储恢复后下一次重发成功；达到 `N_deliver_giveup` 时经「进入降级」转 `degraded`，释放沙箱，「兜底」以恢复句柄重建 | I10 |
 | 快照保留期到期 | 「提供者确认」快照落地 → 等待超过 `snapshot_expires_at−T_snapshot_margin` | 所有者截止调度，「复评与截止到期」守卫兜底 | 「本代沙箱作废」：回合中写回合被中断通知，写 `destroy(g)`；起点为 `wake_queued.snapshotted` 时留在 `wake_queued` 并转重建意图，起点为 `suspended.snapshotted` 时有可投递事件或终端、文件通道接入则转重建意图，否则 `suspended.destroyed`；之后的唤醒以恢复句柄重建，不经快照恢复，`HoldLease` 的期限晚于该时刻 | I7、I10 |
-| 依赖调用失败时的 `Hello` 与 `Thawed` | `workspace` 短暂不可用 → 看守进程重连或上报 `Thawed` → `GetLease` 调用失败 | 处理事务之外 | 可重试拒绝：不接管、不围栏、关闭流，不推进 `ack_msg_seq`；看守进程不终止 Agent 进程树，退避重连后重放 | I7、I10 |
+| 依赖调用失败时的 `Hello` 与 `Thawed` | `workspace` 短暂不可用 → 看守进程重连或上报 `Thawed` → `GetLease` 调用失败 | 处理事务之外 | 可重试拒绝：不接管、不作失效判定、关闭流，不推进 `ack_msg_seq`；看守进程不终止 Agent 进程树，退避重连后重放 | I7、I10 |
 | L0 处理中丢失沙箱 | L0 `idle` → `Deliver` → `Accepted` → `Consumed` → Agent 处理中 → 节点故障 →「沙箱丢失」守卫 | 行锁 | `cursor_accepted > idle_cursor` 判定处理中：`interrupt_turn` 写回合被中断通知、`redeliver_from=cursor_consumed`，子句 D 为真，转重建意图；新代从对账之后的 `cursor_consumed` 起重投，已交给 Agent 的事件按投递意图日志跳过，回合被中断通知告知 Agent 处理被中断 | I4、I5 |
 | 回合中断与已 `Accepted` 的定向事件 | `BlockedOn{wait_for, s1}` → 订阅完成定向送达并 `Accepted` → 沙箱丢失（例如 `durableDir` 下工作区回退到上次快照）→ 新代 Agent 续接被中断回合并重新调用 `wait_for(s1)` | 各自行锁 | `interrupt_turn` 与新代进入把 `redeliver_from` 之后的定向事件改回未定向，随重投批以 `redelivery=true` 送达，看守进程按日志去重；重新等待经「进入即满足」依收件箱再次定向送达，不进入 `BlockedOn` | I4、I5 |
 | 重投区间超过一批 | `on_suspend` 下上次同步挂起之后又接受并消费了超过 `B_max` 条 → 沙箱丢失并重建 → 新代 `Hello{cursor_consumed=c}`（回退到同步挂起时的位置）→ 首批 `(c, t1]` 的 `Accepted{fed=true}` → 窗口内 Agent 进程退出，或回合中冻结、快照后恢复 | 各自行锁 | 「重建完成」把 `cursor_consumed` 对齐到 c、`redeliver_from=c`；「投递接受」把 `redeliver_from` 前移到 t1，`(t1, cursor_accepted]` 内的事件仍可投递；Agent 进程退出时 `interrupt_turn` 取 `redeliver_from=cursor_consumed`（首批尚未 `Consumed` 时为 c），从该位置重投；回合中挂起与恢复不改 `redeliver_from`，回合边界上进入规则、子句 D 与「投递滞后」守卫以 `coalesce(redeliver_from, cursor_accepted)` 为下界续投下一批，越过 `cursor_accepted` 时清空 | I4、I5 |
@@ -1586,7 +1586,7 @@ fence_and_bump(run):                    # 不自带事务；由已持锁的所�
 | 状态机 | 未实现 | — |
 | 收件箱与投递 | 未实现 | — |
 | 唤醒谓词与挂起决策调用点 | 未实现 | — |
-| 代与围栏 | 未实现 | — |
+| 代与失效判定 | 未实现 | — |
 | 定时器调度 | 未实现 | — |
 | 纠正性对账器 | 未实现 | — |
 | 恢复准入调用点 | 未实现 | — |
