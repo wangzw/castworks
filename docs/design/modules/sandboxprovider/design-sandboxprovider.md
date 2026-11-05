@@ -208,7 +208,7 @@ type EgressPolicyDocument struct {
 
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本模块依赖基础层的 `workspace` 与 `agentprotocol`，以及各提供者层的控制器、代理与存储；`runcontroller` 与 `connectorhub` 依赖本模块；本模块不依赖 `runcontroller`、`suspendpolicy` 与 `connectorhub`。
 
-- `workspace`：在预配与认领时绑定工作区，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`，把绑定交给沙箱；`lease_id` 取自 `ProvisionRequest.LeaseID`，由 `runcontroller` 建立租约后随请求传入，不来自绑定；工作区持久化按提供者选择，k8s 子模块以共享文件系统为默认、块存储为退化配置，substrate 子模块优先外部 CSI 卷、`durableDir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。本模块不持有租约，续约与接管由 `workspace` 与看守进程完成；`on_suspend` 语义下，销毁路径在同步挂起返回之后调用 `workspace.Confirm(Mode=suspend_upload)`，确认成功才视为工作区已持久化。
+- `workspace`：在预配与认领时绑定工作区，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`，把绑定交给沙箱；`lease_id` 取自 `ProvisionRequest.LeaseID`，由 `runcontroller` 建立租约后随请求传入，不来自绑定；工作区持久化按提供者选择，k8s 子模块以共享文件系统为默认、块存储为退化配置，substrate 子模块优先外部 CSI 卷、`durableDir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。本模块不持有租约，续约与接管由 `workspace` 与看守进程完成；`on_suspend` 语义下，销毁路径在同步挂起返回之后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功才视为工作区已持久化；确认以 `(run_id, generation, lease_id)` 幂等。
 - `agentprotocol`：恢复触发使用 `/readyz` 与 `/wake` 入站端点；`/readyz` 是就绪探针，`/wake` 返回表示看守进程的出站流已重建。入站端点不承载事件内容，投递只在出站流上进行。
 - k8s 提供者层：agent-sandbox 控制器管理 Sandbox、SandboxClaim 与 SandboxWarmPool；节点冻结代理是特权 DaemonSet，按节点定位 Pod 与容器 cgroup，在容器 cgroup 下维护子 cgroup `agent`，写 `agent/cgroup.freeze` 执行冻结与解冻（[REF-linux-cgroup-v2](../../../references.md)）；原地缩放依赖 Kubernetes In-Place Pod Resize（[REF-k8s-in-place-pod-resize](../../../references.md)），需要 `pods/resize` 子资源的 patch 权限；k8s 入站路由 wake-router 只服务 `/terminal` 与界面文件访问，事件驱动的恢复由控制面直调提供者。
 - substrate 提供者层：Substrate 控制面执行 actor 的 Suspend 与 Resume；路由器以 `ate-target-actor` 头调用 `/wake`，恢复 actor 并停泊请求直到 `/readyz` 就绪；出口网关落地 EgressPolicy 并实现占位符替换；对象存储承载快照与 `durableDir` 数据。控制面调用路由器的身份是 SPIFFE 身份，且必须在路由器的入站白名单内（[REF-spiffe](../../../references.md)）。
@@ -543,7 +543,7 @@ flowchart LR
 3. **按运行实例释放**：`ReleaseRun(run_id)` 删除运行实例级资源，k8s 子模块删除 Sandbox CR、Service 与 PVC，substrate 子模块释放 actor 相关资源；释放幂等，释放之前写入释放墓碑，释放之后拒绝该运行实例的一切创建，含沙箱、运行实例级资源与出口策略。
 4. **正确性不依赖到达顺序**：整代销毁与单个销毁都携带代，只作用于该代的沙箱实例，不作用于更新的代；新代沙箱不会被迟到执行的旧代销毁删除。整代销毁之后的迟到预配被创建墓碑拒绝；释放之后的迟到预配被释放墓碑拒绝；出口策略撤销之后的迟到落地与更新被撤销墓碑拒绝。
 5. **幂等**：同一 `(run_id, generation)` 的整代销毁返回首次确认；同一 `(generation, sandbox_id)` 的单个销毁重复执行返回成功；同一 `run_id` 的释放重复执行返回成功；同一 `freeze_id` 的解冻、同一 `suspend_id` 的快照撤销重复执行不产生第二次副作用。提供者按到达顺序串行执行同一运行实例的调用，重复调用返回首次结果。
-6. **创建墓碑与工作区租约**：删除确认携带的代等于工作区租约所属的代时，可作为 `workspace` 接管租约的 `proof`；创建墓碑保证删除确认之后该代不再出现沙箱实例，因而该证明成立。
+6. **创建墓碑与工作区租约**：整代销毁的删除确认携带的代等于工作区租约所属的代时，可作为 `workspace` 接管租约的 `proof`；创建墓碑保证删除确认之后该代不再出现沙箱实例，因而该证明成立。`DestroySandbox` 的单个沙箱删除确认不写创建墓碑，不证明该代不再出现沙箱实例，因而不构成 `proof`。
 
 ### 预热池容量与分片
 

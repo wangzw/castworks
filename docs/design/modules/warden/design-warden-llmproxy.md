@@ -67,10 +67,10 @@
 
 | 请求 | 携带 | 响应与处置 |
 | --- | --- | --- |
-| `POST /v1/messages` | `x-castworks-run-token`、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头 | 终态条目直接返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；上游流为 SSE |
+| `POST /v1/messages` | `x-castworks-run-token`、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头 | 终态条目直接返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；`request_id` 跨代复用返回 `422`；上游流为 SSE |
 | `GET /v1/requests/{request_id}` | 同一运行实例令牌 | `200` 返回终态条目；`202` 仍在途；`403` 归属不符；`404` 条目缺失或已过保留期；`409` 由另一实例持有 |
 
-`202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。
+`202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。`422` 只表示 `request_id` 与运行实例内已有行冲突，本地代理重新生成 `request_id`、保持同一 `request_hash` 与模式后重发，不执行取回；`request_hash` 与唯一索引使重发仍命中同一逻辑请求。
 
 **对出口代理。** 外部系统请求保持方法、路径、请求头与请求体不变，本地代理附加运行实例身份并转发；`Authorization` 等头中的凭据占位符原样保留，由出口代理在发往允许主机时替换。CONNECT 隧道建立后，本地代理只转发字节流，不解析隧道内的 TLS。k8s 路径的出口代理对每个请求按运行实例令牌校验代、终态与作废状态；Substrate 路径按以运行实例与代为键的出口策略放行（[REF-substrate](../../../references.md)）。出口代理的校验与撤销归 `connectorhub` 与 `sandboxprovider`，本地代理不缓存放行结果。
 
@@ -283,7 +283,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | `passthrough`，尚未转发内容 | 状态转 `aborted`，继续读入本地回放缓存；重发命中同一逻辑请求，按原模式重新直刷 |
 | `passthrough`，已转发内容 | Claude Code 保留截断结果且不重发；本地代理结束请求，释放本地缓冲，上游由网关继续到终态 |
 | 重发命中本地回放缓存 | 挂接同一条目，不发起第二次上游请求，不重复上报 `started` |
-| 重发未命中本地缓存 | 以同一 `request_hash`、同一 `request_id` 再次 `POST`；网关按唯一索引返回终态条目、`202` 或 `409`，都不新建上游调用 |
+| 重发未命中本地缓存 | 以同一 `request_hash`、同一 `request_id` 再次 `POST`；网关按唯一索引返回终态条目、`202`、`409`，或 `422`（`request_id` 冲突，重新生成后重发），都不新建上游调用 |
 | 网关返回 `409` | 不由本地代理重发上游，退避后 `GET /v1/requests/{request_id}` 取回 |
 
 单次回放的保证是同一 `(run_id, generation, request_hash)` 至多产生一次上游调用，不限制同一响应被交付的次数；本地回放条目在请求关闭前可被多次重发命中，交付内容一致。
@@ -320,6 +320,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | 上游返回错误或流中断 | 网关提交失败回放条目并写 `llm_failed`；本地代理上报 `llm.request.failed`；已到达的内容按模式交付或丢弃 |
 | 网关返回 `202` | 不新建上游调用；挂接已有本地上游流，或退避后取回 |
 | 网关返回 `409` | 不重发上游；退避后取回条目 |
+| 网关返回 `422` | `request_id` 与运行实例内已有行冲突；重新生成 `request_id`，保持 `request_hash` 与模式后重发，不取回 |
 | 客户端在未收到内容时中止 | 状态转 `aborted`，上游继续；重发按 `request_hash` 命中同一逻辑请求 |
 | 客户端在 `passthrough` 已收到内容后中止 | 不重发；本地代理结束请求，上游由网关继续到终态 |
 | 冻结到达 `F_stream` 或 `F_cap(llm)` | 由 `runcontroller` 解冻或升级；本地代理不改变模式，继续按原模式处理后续事件 |

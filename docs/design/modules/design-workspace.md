@@ -136,7 +136,7 @@ type LeaseState struct {
 ```
 
 - `CreateLease` 只用于第 1 代，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约时，请求的代必须大于租约的代，否则返回不可重试的代错误；已有未到期且未释放的租约、或运行实例已有墓碑时拒绝。
-- `TakeoverLease` 用于重建，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约且请求的代不大于 `lease.generation` 时返回不可重试的代错误。运行实例尚无租约时直接建立；旧租约已到期时不需要 `proof`；旧租约未到期时只在 `proof` 是沙箱提供者的删除确认、其 `run_id` 等于 `run_id`、且其携带的代等于 `lease.generation` 时接管；`proof.sandbox_id` 只用于审计与错误归因，不参与接管判定；其余情形返回旧租约的到期时刻作为 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
+- `TakeoverLease` 用于重建，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约且请求的代不大于 `lease.generation` 时返回不可重试的代错误。运行实例尚无租约时直接建立；旧租约已到期时不需要 `proof`；旧租约未到期时只在 `proof` 是沙箱提供者整代销毁的删除确认、其 `run_id` 等于 `run_id`、且其携带的代等于 `lease.generation` 时接管；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`，`proof.sandbox_id` 只用于审计与错误归因，不参与接管判定；其余情形返回旧租约的到期时刻作为 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
 - `RenewLease` 由看守进程周期调用，CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。调用以 `lease_id` 与代认证，不经 `secrets` 校验，也不以运行实例令牌未过期为前提。
 - `HoldLease` 用于快照期间：以 `lease_id`、代匹配、`released=false` 且持有者为空或等于 `holder` 为 CAS 条件，把到期时刻设为 `until` 并清空持有者；快照恢复的沙箱以首次续约重新绑定。持有者已是其他沙箱时为空操作。
 - `ReleaseLease` 只在同代沙箱的删除确认之后调用，以 `lease.generation=generation` 为 CAS 条件；租约已被更大的代接管时为空操作。释放把租约标记为已释放并清空持有者，`expires_at` 不变，此后 `RenewLease` 以 CAS 失败返回；释放本身不构成接管条件。
@@ -157,6 +157,7 @@ type ConfirmRequest struct {
     RunID      RunID
     Generation int
     LeaseID    string
+    SuspendID  string      // Mode=suspend_upload 时由销毁路径携带，用于审计与重试关联
     Mode       ConfirmMode // fsync | suspend_upload
 }
 
@@ -169,7 +170,7 @@ type ConfirmResult struct {
 - `Mode=fsync` 用于 `sync` 语义：由看守进程在 `ReadyToSuspend` 之前调用，确认当前代的工作区写入已关闭并完成 fsync，返回确认时刻。共享文件系统、块存储与外部 CSI 卷在销毁前使用该模式。
 - `Mode=suspend_upload` 用于 `on_suspend` 语义：由销毁路径在沙箱提供者的同步挂起返回之后调用，核对 `durableDir` 的上传完成标记并返回确认时刻；上传失败返回暂时性错误。
 - `Mode` 与绑定的 `durability` 不符时返回不可重试错误；调用方必须以租约返回的 `durability` 选择模式，不自行推断。
-- 确认以 `(run_id, generation, lease_id)` 幂等；重复确认返回同一结果，不重复上传。
+- 确认以 `(run_id, generation, lease_id)` 幂等；重复确认返回同一结果，不重复上传。`SuspendID` 只用于审计与重试关联，不是幂等键的一部分。
 - 确认失败不产生「工作区已持久化」的结论：`fsync` 失败时看守进程不得发出 `ReadyToSuspend`；`suspend_upload` 失败时销毁路径不得把沙箱判定为已销毁，`runcontroller` 不进入 `Suspended`。
 
 ### 文件 API

@@ -1,6 +1,6 @@
 # 控制面循环驱动器
 
-控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一：接口被沙箱内的[进程驱动器](../../../glossary.md)与本模块共用，规定两种 Agent 循环向 `runcontroller` 发出的事件、`Deliver` 到原生输入的翻译、挂起与恢复语义，以及 `ToolExec` 的使用方式。本模块的实现运行在控制面，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 使用沙箱，不假定沙箱内存在 Agent 进程。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对后者只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
+控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一：接口被沙箱内的[进程驱动器](../../../glossary.md)与本模块共用，规定两种 Agent 循环向 `runcontroller` 发出的事件、`Deliver` 到原生输入的翻译、挂起与恢复语义，以及 `ToolExec` 的使用方式。本模块的实现运行在控制面，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 使用沙箱，不假定沙箱内存在 Agent 进程。第一版只定义该接口；接口的实现形式定为链接进 `runcontroller` 进程的库：它不持有运行实例令牌，不建立第二条协议会话，`ToolExec` 帧经该运行实例已有的出站流承载。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对后者只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
 文档较长，第一次阅读按以下顺序：职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
 
@@ -12,8 +12,8 @@
 - **规定事件集合与顺序**：要求两种驱动器发出同一套 `AgentEvent`，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序；结果是收件箱、游标与唤醒谓词不依赖循环位置。
 - **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致。
 - **规定挂起与恢复语义**：定义回合边界、恢复点、以挂起为目的的退出、恢复句柄与快照恢复后的衔接；结果是两种循环的挂起决策与恢复准入使用同一套规则。
-- **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、鉴权依据、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
-- **实现控制面循环驱动器**：在控制面运行原生 Agent 循环，经 `ToolExec` 调用沙箱，按接口发出事件、接收 `Deliver`、执行挂起准备与恢复；结果是平台原生 Agent 不需要打包进沙箱镜像。
+- **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、帧关联、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
+- **实现控制面循环驱动器**：作为库链接进 `runcontroller`，运行原生 Agent 循环，经出站流上的 `ToolExec` 帧调用沙箱，按接口发出事件、接收 `Deliver`、执行挂起准备与恢复；结果是平台原生 Agent 不需要打包进沙箱镜像，也不需要独立的沙箱凭据与协议会话。
 - **持久化循环状态**：在恢复点保存回合位置、待决工具调用、已交付输入与恢复句柄；结果是不依赖 Agent 原生会话持久化也能跨代续接。
 - **维护两类驱动器的契约一致性**：以同一套事件、目标闭集与契约测试约束两种实现；结果是新增一种驱动器不修改 `runcontroller`、`suspendpolicy` 或协议消息。
 
@@ -25,7 +25,7 @@
 - 运行实例状态机、收件箱、唤醒谓词、投递游标、代与失效判定归 `runcontroller`；本模块只发出同一套事件并按 `Deliver` 喂入。
 - 挂起决策、冻结上限、DRAIN 与冻结中复评归 `suspendpolicy`；本模块只执行挂起准备并报告恢复点。
 - 沙箱预配、冻结、快照、销毁与工作区租约归 `sandboxprovider` 与 `workspace`；本模块不管理沙箱生命周期。
-- `ToolExec` 的沙箱侧实现、运行实例令牌鉴权、路径边界与进程执行归看守进程；本模块只按契约调用。
+- `ToolExec` 的沙箱侧实现、出站流鉴权、路径边界与进程执行归看守进程；本模块只按契约调用。
 - Claude Code 的启动命令、hooks、托管设置与 stream-json 翻译归 [Claude Code 驱动器](design-warden-driver-claude-code.md)；本模块只定义它必须实现的接口。
 - 审批决定的内容与人类身份归 `humanchannel`；本模块只接收决定并解除循环中的等待。
 - 控制面循环的模型调用在控制面执行，其上游选择与凭据由实现该循环的模块决定；看守进程不代理控制面的模型调用。
@@ -42,7 +42,7 @@
 
 ## 外部接口契约
 
-本模块的接口对两种驱动器实现稳定：进程驱动器与控制面循环驱动器逐项实现同一接口，`runcontroller` 不感知循环位置。事件字段受 `agentprotocol` 的协议版本约束；`ToolExec` 操作对控制面循环稳定；挂起与恢复语义对 `runcontroller` 与 `suspendpolicy` 稳定。新增操作、事件种类或目标种类都改变跨模块契约，须同时修改 `agentprotocol`、`runcontroller` 与两种驱动器。
+本模块的接口对两种驱动器实现稳定：进程驱动器与控制面循环驱动器逐项实现同一接口，`runcontroller` 不感知循环位置。事件字段受 `agentprotocol` 的协议版本约束；`ToolExec` 帧对控制面循环稳定；挂起与恢复语义对 `runcontroller` 与 `suspendpolicy` 稳定。新增操作、事件种类或目标种类都改变跨模块契约，须同时修改 `agentprotocol`、`runcontroller` 与两种驱动器。控制面循环驱动器在宿主进程内使用 `runcontroller` 注入的事件入口与 `ToolExecClient`；它不持有运行实例令牌，不发起 `Hello`，也不参与出站流的序号与重放。
 
 ### Agent 驱动器接口
 
@@ -158,15 +158,15 @@ type DriverState struct {
 | 流式输出 | 按输出偏移续传一次执行或后台作业的输出；断线后从上次偏移继续 |
 | 后台作业 | 列出、查询与终止后台作业；未结束的作业计入活动 |
 
-每次调用附运行实例令牌并按代校验；`Shutdown` 与 `Fenced` 到达后停止新调用并终止在途执行。控制面循环不得假定沙箱内存在 Agent 进程、会话文件或 hook；它只把沙箱当作工具执行器。
+每次调用经宿主写入本代出站流并按代校验；`Shutdown` 与 `Fenced` 到达后停止新调用并终止在途执行。控制面循环不得假定沙箱内存在 Agent 进程、会话文件或 hook；它只把沙箱当作工具执行器。
 
 ### `ToolExec` 的传输与鉴权
 
-`ToolExec` 是看守进程在沙箱内监听的 gRPC 服务，服务名为 `castworks.warden.v1.ToolExec`，控制面循环驱动器经沙箱地址直接调用；该路径不经过只服务 `/terminal` 与界面文件访问的入站路由。方法为 `Exec`、`ReadFile`、`WriteFile`、`Stream`、`ListJobs`、`GetJob` 与 `TerminateJob`；`Exec` 与 `Stream` 以服务端流返回标准输出与标准错误。
+`ToolExec` 是看守进程在出站流上处理的一组帧，不是沙箱地址上的独立 gRPC 服务。控制面循环驱动器在宿主进程内调用 `ToolExecClient`，由 `runcontroller` 把请求帧写入该运行实例已有的出站流；看守进程在同一流上以响应帧与数据帧应答。请求、数据与应答以 `(run_id, generation, exec_id)` 关联，`msg_seq`、`ack_msg_seq`、重放与去重沿用出站流，不建立第二个序号域。帧集合为 `Exec`、`ReadFile`、`WriteFile`、`Stream`、`ListJobs`、`GetJob`、`TerminateJob` 与 `Cancel`；`Exec` 与 `Stream` 的输出以带偏移的数据帧分片返回。
 
-鉴权在 gRPC metadata 中携带 `authorization: Bearer <运行实例令牌>` 与 `x-castworks-generation`。看守进程校验令牌签名、代与当前代一致、运行实例未终态；令牌无效或过期返回 `UNAUTHENTICATED`，代不匹配或运行实例已终态返回 `PERMISSION_DENIED`，路径越界与未知执行标识返回 `NOT_FOUND`，偏移无效返回 `INVALID_ARGUMENT`，输出超出上限返回 `RESOURCE_EXHAUSTED`，`Shutdown` 与 `Fenced` 之后的调用返回 `ABORTED`。
+鉴权由出站流承担：流由看守进程主动建立并以运行实例令牌通过 `Hello` 认证，只有当前代的流接受 `ToolExec` 帧。控制面循环驱动器不持有令牌，也不得直接连接沙箱；宿主只在该运行实例由本进程拥有、帧的代等于当前代且运行实例未终态时写入请求帧。错误以响应帧返回：令牌或代问题在流层已按 `Fenced`、可重试关闭或认证失败处置；路径越界与未知执行标识返回未找到，偏移无效返回参数非法，输出超出上限返回资源耗尽，`Shutdown` 与 `Fenced` 之后的请求返回已中止。
 
-每次调用携带截止时间；截止到期只结束本次流，已启动的执行不被终止，调用方以 `GetJob` 查询结果。`ToolExec` 不承载 `AgentEvent`：控制面循环驱动器以 `agentprotocol` 的会话向 `runcontroller` 发送 `AgentEvent` 并接收 `Deliver`，该会话与看守进程的出站流相互独立，事件都进入 `runcontroller` 的同一套进入规则。
+每次调用携带截止时间；截止到期只结束本次流，已启动的执行不被终止，调用方以 `GetJob` 查询结果。`ToolExec` 帧不承载 `AgentEvent`：控制面循环驱动器经宿主提供的事件入口把 `AgentEvent` 交给 `runcontroller` 的同一套进入规则，并从中接收 `Deliver`、挂起准备与恢复通知；它不发送 `Hello`，也不与看守进程争用 `msg_seq`。
 
 ### 稳定性承诺
 
@@ -178,14 +178,14 @@ type DriverState struct {
 
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `ToolExec` 的调用是运行时接口调用，不是代码依赖。
 
-- `agentprotocol`：`AgentEvent`、`Deliver`、`PrepareSuspend`、`Resumed`、`Shutdown` 等消息的字段与发送；本模块只声明接口级操作与触发点。
-- 看守进程的 `ToolExec`：exec、文件读写、流式输出与后台作业的运行时契约；沙箱侧实现与鉴权归看守进程。
+- `agentprotocol`：`AgentEvent`、`Deliver`、`PrepareSuspend`、`Resumed`、`Shutdown` 与 `ToolExec` 帧的字段与发送；本模块只声明接口级操作与触发点。
+- 看守进程的 `ToolExec`：exec、文件读写、流式输出与后台作业的运行时契约；沙箱侧实现归看守进程，帧在已认证的出站流上传输。
 - `runcontroller`：状态机效果、投递选择、游标推进与恢复准入；本模块不复制其规则。
 - `suspendpolicy`：挂起决策、冻结上限与恢复点相关的策略参数；本模块只执行挂起准备。
 - 循环状态的持久化：位置由实现选定，约束是跨代可读、在恢复点同步写入，并与工作区或控制面持久化同寿命；恢复句柄经 `Deliver.resume_session_id` 与 `SuspendReady.SessionID` 传递。
 - 控制面循环的模型调用：在控制面执行，上游与凭据由实现该循环的模块决定；不经过看守进程的本地代理。
 
-方向约束：本模块只依赖 `agentprotocol`，因此可独立于控制面模块演进；新增一种驱动器实现不改变本模块的接口，只增加一个实现面。
+方向约束：本模块只依赖 `agentprotocol`；`ToolExec` 客户端与事件入口由宿主 `runcontroller` 注入，不构成对 `runcontroller` 包的代码依赖，也不引入新的模块依赖边。新增一种驱动器实现不改变本模块的接口，只增加一个实现面。把控制面循环驱动器部署为独立进程需要另行定义受限的驱动器身份与会话，第一版不做。
 
 ## UML 图
 
@@ -239,21 +239,24 @@ sequenceDiagram
     D->>D: 加载循环状态，进入回合
     D->>R: AgentEvent turn_started
     D->>R: AgentEvent tool_started{call_id}
-    D->>W: ToolExec exec，附运行实例令牌与代
+    D->>R: ToolExecClient.Exec{exec_id}
+    R->>W: ToolExecRequest 帧（既有出站流）
     W->>S: 在运行实例 uid 下执行
     S-->>W: 标准输出、标准错误与退出码
-    W-->>D: 流式输出，按偏移续传
+    W-->>R: ToolExecData 帧，按偏移分片
+    R-->>D: 按偏移续传
     D->>R: AgentEvent tool_ended{call_id}
     D->>R: AgentEvent turn_ended
     R->>D: PrepareForSuspend{suspend_id, mode}
-    D->>W: 查询在途执行并拒绝新调用
+    D->>R: ListJobs 与 TerminateJob
+    R->>W: ToolExec 帧
     D->>D: 同步写入循环状态
     D-->>R: SuspendReady{suspend_id}
     R->>W: PrepareSuspend{要求沙箱侧静默}
     W-->>R: ReadyToSuspend
 ```
 
-图固定控制面循环与沙箱之间的边界：循环在控制面运行，沙箱只执行工具；`ToolExec` 调用带运行实例令牌与代，输出按偏移续传；挂起准备由驱动器先停循环并持久化循环状态，看守进程再确认沙箱侧静默。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
+图固定控制面循环与沙箱之间的边界：循环在控制面运行并链接进 `runcontroller`，沙箱只执行工具；`ToolExec` 帧经看守进程已认证的出站流往返，输出按偏移续传；驱动器不持有令牌，也不建立第二条会话。挂起准备由驱动器先停循环并持久化循环状态，看守进程再确认沙箱侧静默。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
 
 ## 核心数据结构
 
@@ -316,7 +319,7 @@ sequenceDiagram
 | 1 | `Feed` 收到投递，按 `consumed_deliveries` 去重后 `3` 未消费 | 追加输入；`turn_position=in_turn`；`fed=true` | 无 |
 | 2 | 发出 `turn_started{turn_id=turn-11, delivery_id=d-7}` | `turn_id=turn-11` | 无 |
 | 3 | 循环决定调用工具；发出 `tool_started{call_id=call-1}` | `running_tools={call-1}` | 建立 `call-1`，状态 `已发出` |
-| 4 | 调用 `ToolExec exec`，附运行实例令牌与代 | 无变化 | `exec_id=x-1`，状态 `运行中` |
+| 4 | 经宿主转发 `ToolExec exec` 帧，代与当前代一致 | 无变化 | `exec_id=x-1`，状态 `运行中` |
 | 5 | 沙箱执行并返回标准输出、标准错误与退出码 | 无变化 | `output_offset` 随流式输出前进；状态 `已完成` |
 | 6 | 发出 `tool_ended{call_id=call-1}`，把结果加入循环状态 | `running_tools` 清空 | 保存结果 |
 | 7 | 循环完成模型调用，进入恢复点；发出 `turn_ended` | `turn_position=boundary`；同步写入循环状态 | 无在途记录 |
@@ -358,7 +361,7 @@ sequenceDiagram
 
 `ToolExec` 的调用按以下规则：
 
-1. 每次调用附运行实例令牌与代；令牌无效、代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。
+1. 每次调用经宿主写入本代出站流；流已关闭、代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。
 2. `exec` 返回 `exec_id`；驱动器以 `call_id` 与 `exec_id` 建立工具执行记录，`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
 3. 流式输出按 `output_offset` 续传；断线后先查询执行状态，再从上次偏移继续，不从零重放。
 4. 后台作业由 `exec` 启动；驱动器列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使运行实例保持活动，回合边界不构成 I9 安全点。
@@ -416,7 +419,7 @@ sequenceDiagram
 
 ### 新增 `ToolExec` 操作
 
-新增操作须同时修改看守进程主文档、本模块的调用规则与 `agentprotocol` 的对应消息；操作须保持运行实例令牌与代鉴权、路径边界与错误分类。
+新增操作须同时修改看守进程主文档、本模块的调用规则与 `agentprotocol` 的对应消息；操作须保持出站流鉴权与代校验、路径边界与错误分类。
 
 ### 新增事件种类
 

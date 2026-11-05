@@ -239,6 +239,8 @@ stateDiagram-v2
 | `llm.first_token` | `request_id` | 收到首个响应事件；用于预测性恢复提示与等待时长重估，不单独满足阻塞条件。 |
 | `llm.request.completed`、`llm.request.failed` | `request_id`；失败另带 `reason` | LLM 请求完成或失败；满足同一 `request_id` 的阻塞条件。 |
 | `request.completed`、`request.failed` | `request_id`；失败另带 `reason` | 经[平台 MCP 服务器](../../glossary.md)发起的同步连接器操作完成或失败；与同一 `request_id` 的等待条件匹配。 |
+| `ToolExecResponse` | `exec_id`、`status`、`exit_code`、`result`、`error` | 工具执行请求的终态应答；`status` 取 `completed`、`failed`、`cancelled`，`error` 只在失败时非空。按 `(run_id, generation, exec_id)` 匹配请求。 |
+| `ToolExecData` | `exec_id`、`stream: stdout\|stderr`、`offset`、`data`、`eof` | 工具执行输出分片；`offset` 从该流起点计，接收方按偏移续传，重复或乱序分片被丢弃。`eof` 表示该流结束。 |
 
 - `session_epoch` 由看守进程按进程启动生成，用于识别同一代内看守进程的重启，不参与失效判定；失效判定只以 `generation` 为依据。
 - `agent_state.phase` 的取值为 `starting`、`in_turn`、`blocked`、`boundary`、`exited`；`blocked_on` 与 `turn_id` 描述回合位置；新代 `Hello` 的 `session_id` 只用于核对，不改写控制面的恢复句柄。
@@ -259,8 +261,12 @@ stateDiagram-v2
 | `Shutdown` | `graceful`、`reason`、`deadline` | 本代作废或运行实例已终态时关闭流；`graceful` 决定关闭 stdin 让 Agent 正常退出，还是强制终止；`deadline` 取发出时刻加 `T_shutdown_grace`。 |
 | `Fenced` | `current_generation` | 已建立的流上收到旧代非 `Hello` 消息时应答，每条流每个旧代一次，随后关闭该流。看守进程停止投递与副作用，强制终止 Agent 进程树。 |
 | `TokenRotate` | `token` | 轮换运行实例令牌。看守进程收到后用于 LLM 网关与连接器请求；令牌已过期而重连时，收到它之前不发起这类请求。 |
+| `ToolExecRequest` | `exec_id`、`op: exec\|read_file\|write_file\|stream\|list_jobs\|get_job\|terminate_job`、`args`、`deadline` | 工具执行请求。由链接进 `runcontroller` 的控制面循环驱动器发起，经本运行实例的出站流转发；`exec_id` 在同一代内唯一，`args` 与截止时间按操作定义。 |
+| `ToolExecCancel` | `exec_id` | 取消一次工具执行或输出流；看守进程按 `exec_id` 幂等，已结束的执行返回已完成。 |
 
 `HelloAck` 的 `last_received_msg_seq` 是控制面已处理的看守进程消息序号，与 `Hello` 的 `last_received_msg_seq` 方向相反；两者都只用于裁剪重放缓冲与启动对账，不替代投递游标。
+
+`ToolExec` 帧由 `runcontroller` 在进程内从控制面循环驱动器接收后写入该运行实例的出站流，并以同一 `(run_id, generation, exec_id)` 把响应与数据帧交回驱动器。控制面循环驱动器不持有运行实例令牌、不发送 `Hello`，也不建立第二条协议会话；帧的认证由出站流承担，代与终态由 `runcontroller` 在写入前复核。`ToolExec` 帧不进入投递、唤醒谓词或运行实例状态机。
 
 ### 入站端点契约
 

@@ -133,7 +133,7 @@ type CurrentGeneration struct {
 }
 ```
 
-- `Get` 用于终端与文件接入的转发判定与等待；`RunView` 提供 `state`、`substate`、`suspend_mode`、`generation` 等字段，不提供项目归属。项目归属由通道绑定判定。
+- `Get` 用于终端与文件接入的转发判定与等待；`RunView` 提供 `state`、`substate`、`suspend_mode`、`generation`、`project_id` 等字段。本模块的通道归属仍由通道绑定判定，`project_id` 只用于核对令牌与运行实例的归属。
 - `Current` 用于附件取回时判定令牌中的代、运行实例是否终态与本代沙箱是否作废。
 - `RunService` 与 `Generations` 对平台界面、运维接口与事件源模块稳定；本模块不假定其实现读取哪张表。
 

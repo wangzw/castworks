@@ -10,7 +10,7 @@
 
 - **CONNECT 终止与 HTTP 前置终止**：在单一监听端口上接受本地代理的 CONNECT 与绝对形式 HTTP 请求，解析目标主机与请求形态，把请求交给鉴权与替换阶段；无法解析目标主机的请求立即拒绝，不建立上游连接。
 - **按运行实例白名单鉴权**：从代理认证头取运行实例令牌，经 `secrets` 校验签名、过期时间与 `run_id`，逐请求经 `runcontroller` 的 `Generations.Current` 校验代、终态与本代作废状态，并检查目标主机属于该运行实例出口策略的 `AllowedHosts`；任一条件不通过即拒绝，不向上游发送任何字节。
-- **凭据占位符替换**：对命中的注入规则，只在请求已存在的头中把占位符替换为真实凭据；缺少该头时不注入，请求体、请求行与其他头保持不变；代理自身的认证头在转发前移除。
+- **凭据占位符替换**：对命中的注入规则，只在请求已存在的头中把占位符替换为真实凭据；缺少该头时不注入，请求体、请求行与其他头保持不变；代理自身的认证头在转发前移除。真实凭据由 `secrets.ExchangeCredential` 以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取，按 `(run_id, generation, system, auth_method, scopes)` 缓存在进程内直到 `ExpiresAt`；策略缺 `project_id`、凭据对象或作用域不足时该规则不生效，请求按未授权拒绝并审计。
 - **规则档位选择**：按目标主机、请求形态与出口策略，把请求归入 `https`、`tls_passthrough`、`http` 档位；`https` 档终止客户端 TLS，`http` 档解析明文请求，两者都检查请求头；`tls_passthrough` 档保留端到端 TLS 并按目标主机放行。
 - **上游 TLS 发起**：对 `https` 档，以目标主机名作为 SNI 发起向上游的 TLS 并校验证书；对 `http` 档以明文转发；对 `tls_passthrough` 档原样转发 TLS 记录，不改写 SNI。
 - **在途请求事件上报**：在请求头阶段与响应头阶段各上报一次在途信号，携带运行实例、代、请求标识、目标主机与方法；该信号不进入收件箱、不形成持久化请求记录。
@@ -54,7 +54,7 @@
 
 出口策略由 `connectorhub` 生成，字段与语义以主文档的「对沙箱提供者的出口策略推送」为准（[design-connectorhub](design-connectorhub.md)）。k8s 路径上，策略内容经 `sandboxprovider` 的 k8s 子模块落地为本进程的配置副本；本进程不直接接受业务模块推送，只按字段语义消费。
 
-本子模块消费的字段为 `RunID`、`Revision`、`AllowedHosts`、`Inject` 与 `Git`。稳定承诺：修订号按运行实例单调递增；同一修订重复落地幂等；更低或相同修订不覆盖当前快照；`AllowedHosts` 之外的主机默认拒绝；`Inject` 的每条规则只在请求已有对应头时生效。
+本子模块消费的字段为 `RunID`、`ProjectID`、`Revision`、`AllowedHosts`、`Inject` 与 `Git`；`Inject` 的每条规则携带 `Host`、`Header`、`Placeholder`、`System`、`AuthMethod` 与 `Scopes`，用于向 `secrets` 换取凭据。稳定承诺：修订号按运行实例单调递增；同一修订重复落地幂等；更低或相同修订不覆盖当前快照；`AllowedHosts` 之外的主机默认拒绝；`Inject` 的每条规则只在请求已有对应头时生效。
 
 ### 对 `runcontroller` 的代查询
 
@@ -80,7 +80,7 @@ type CurrentGeneration struct {
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本子模块依赖 `runcontroller`、`secrets`、`sandboxprovider` 的 k8s 子模块与 Envoy 数据面（[REF-envoy](../../../references.md)）；本地代理是运行时 HTTP 调用方，不是代码依赖，不出现在模块依赖图中。
 
 - `runcontroller`：代查询接口 `Generations.Current`，逐请求调用，不使用缓存。本子模块不读 `run` 表，不参与状态转移；`runcontroller` 不反向调用本子模块。
-- `secrets`：运行实例令牌的签名、过期时间与 `run_id` 校验，以及占位符对应凭据的取得。真实凭据只在本进程内存中出现，不写入策略副本、审计记录或请求头事件。
+- `secrets`：运行实例令牌的签名、过期时间与 `run_id` 校验，以及占位符对应凭据的取得。凭据换取以策略中的 `project_id` 为项目范围、以 `(run_id, generation)` 定位运行实例与代、以 `system` 与 `auth_method` 选择凭据对象、以 `scopes` 约束授权；代理不使用缓存之外的代。真实凭据只在本进程内存中出现，不写入策略副本、审计记录或请求头事件。
 - `sandboxprovider` 的 k8s 子模块：平台出口代理配置与 NetworkPolicy 的落地，出口策略副本的保存与按运行实例推送。k8s 路径的 `RevokeEgressPolicy` 为空操作，本子模块不依赖撤销墓碑；NetworkPolicy 默认拒绝沙箱出口，只放行控制面地址、LLM 网关与平台出口代理。
 - `connectorhub` 主文档：出口策略的内容来源，包括 `AllowedHosts` 的并集、`Inject` 规则与 `GitRule`。本子模块与连接器同属 `connectorhub`，不构成跨模块依赖。
 - Envoy：数据面。CONNECT 终止、TLS 终止与发起、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 由 Envoy 提供；本子模块实现 `ext_authz` 与 `ext_proc` 的策略逻辑。
@@ -187,10 +187,10 @@ stateDiagram-v2
 | 结构 | 字段 | 约束与含义 |
 | --- | --- | --- |
 | `EgressRule` | `Host`、`Mode`、`Inject` | `Host` 必须属于 `AllowedHosts`；`Inject` 来自出口策略的 `Inject` 规则；`Mode` 是本次请求按档位选择规则确定的档位，不属于快照字段 |
-| `PolicySnapshot` | `Revision`、`AllowedHosts`、`Rules`、`Git` | 不可变；`Revision` 单调递增；`Rules` 按 `Host` 索引；`Git` 保存 `ProxyHost` |
+| `PolicySnapshot` | `ProjectID`、`Revision`、`AllowedHosts`、`Rules`、`Git` | 不可变；`ProjectID` 用于凭据换取的项范围；`Revision` 单调递增；`Rules` 按 `Host` 索引；`Git` 保存 `ProxyHost` 与凭据引用 |
 | `AuthDecision` | `RunID`、`Generation`、`Revision`、`Mode`、`Allowed`、`Reason` | 一次请求的鉴权结果；`Revision` 写入动态元数据，供 `ext_proc` 选择同一快照 |
 | `RequestEvent` | `RunID`、`Generation`、`RequestID`、`Host`、`Method`、`Phase`、`OccurredAt` | `Phase` 闭集为 `request_headers`、`response_headers`；不持久化 |
-| `InjectRule` | `Host`、`Header`、`Placeholder` | 与出口策略同名字段一致；`Header` 大小写不敏感匹配；只在请求已有该头时替换 |
+| `InjectRule` | `Host`、`Header`、`Placeholder`、`System`、`AuthMethod`、`Scopes` | 与出口策略同名字段一致；`Header` 大小写不敏感匹配；只在请求已有该头时替换；后三项用于向 `secrets` 换取凭据 |
 
 `PolicySnapshot` 是出口策略在代理内的派生视图，不改变 `EgressPolicy` 的字段。`EgressRule` 的 `Mode` 由请求形态与注入规则推导，不是出口策略的新字段。`AuthDecision.Revision` 把鉴权与替换绑定到同一快照：`ext_authz` 选定修订，`ext_proc` 只按该修订的注入规则替换，避免鉴权与替换之间策略更新造成混用。
 
@@ -233,9 +233,9 @@ stateDiagram-v2
 1. 只处理 `https` 与 `http` 档；`tls_passthrough` 档不进入该流程。
 2. 遍历该主机在选定修订中的注入规则。头名按大小写不敏感匹配请求头。git 的 Basic 或 Bearer 头按同一规则处理：头已存在时替换占位符，头不存在时不注入。
 3. 请求没有该头时跳过该规则，不新增头，不把占位符写入新头。
-4. 请求有该头且值包含占位符时，把占位符替换为从 `secrets` 取得的真实凭据，替换该头中出现的全部占位符。
+4. 请求有该头且值包含占位符时，按注入规则的 `system`、`auth_method` 与 `scopes` 从 `secrets` 取得真实凭据，把占位符替换为该凭据，替换该头中出现的全部占位符；同一凭据在 `ExpiresAt` 之前复用于同一运行实例、同一代与同一凭据对象。
 5. 请求有该头但值不含占位符时保持不变。
-6. `https` 与 `http` 档中，请求头出现形如 `{{...}}` 的占位符，但没有匹配的注入规则时，返回 `403` 并审计；不把未解析的占位符发往上游。
+6. `https` 与 `http` 档中，请求头出现形如 `{{...}}` 的占位符，但没有匹配的注入规则时，返回 `403` 并审计；不把未解析的占位符发往上游。匹配规则但凭据换取失败（无凭据对象、作用域不足或密钥库不可用）时同样返回 `403` 或 `503`，不发送未替换的占位符。
 7. 规则匹配但凭据不可取得时返回 `503`，不转发请求，审计记录包含运行实例、代、主机与头名。
 8. 替换完成后移除 `Proxy-Authorization`；请求行、请求体与其他头保持不变。
 
@@ -253,7 +253,7 @@ k8s 路径与 Substrate 路径的语义一致：默认拒绝未列入的主机�
 
 ### 策略落地与原子替换
 
-1. 接收一个运行实例的策略修订，校验 `Revision`、`AllowedHosts`、`Inject` 与 `Git`：主机非空、注入规则的 `Host` 属于 `AllowedHosts`、`Header` 是合法头名、`Placeholder` 非空。
+1. 接收一个运行实例的策略修订，校验 `ProjectID`、`Revision`、`AllowedHosts`、`Inject` 与 `Git`：`ProjectID` 非空、主机非空、注入规则的 `Host` 属于 `AllowedHosts`、`Header` 是合法头名、`Placeholder` 非空、`System` 与 `AuthMethod` 非空、`Scopes` 非空。
 2. 读取当前快照的修订。新修订不大于当前修订时丢弃并计数，不改变当前快照。
 3. 构建新的 `PolicySnapshot`，按主机建立索引，保存各主机的注入规则与 `Git` 规则；规则档位在请求到达时按请求形态选择，不在落地时固定。
 4. 原子替换该运行实例的快照指针。替换之前开始的请求继续使用旧快照；替换之后开始的请求使用新快照。不存在部分字段来自新修订、部分来自旧修订的请求。
@@ -330,7 +330,7 @@ k8s 路径的放行不依赖按代策略副本，也不依赖撤销墓碑。每�
 ## 扩展点
 
 - **新增外部系统**：只在外部系统定义中增加 `upstreams` 与 `inject`，出口策略随之生成并落地；代理不需要修改代码。新增主机走同一套白名单与规则档位选择。
-- **新增注入头**：在定义的 `access.inject` 中增加 `{host, header, placeholder}`；代理按同一替换规则处理，不新增代码。
+- **新增注入头**：在定义的 `access.inject` 中增加 `{host, header, placeholder}`，由 `connectorhub` 解析为带 `system`、`auth_method` 与 `scopes` 的规则；代理按同一替换与凭据换取规则处理，不新增代码。
 - **新增允许主机**：只改变 `AllowedHosts`；未列入的主机仍默认拒绝。
 - **新增规则档位**：规则档位是闭集，新增取值需要数据面支持并改变本子模块的档位选择与 Envoy 配置，不是兼容变更。
 - **新增凭据类型**：由 `secrets` 扩展凭据取得与占位符映射；代理只按占位符替换，不感知凭据类型。

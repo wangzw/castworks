@@ -9,7 +9,7 @@ castworks 把一次 Agent 任务表示为[运行实例](../glossary.md)。运行
 | 概念 | 关系 | 生命周期与存续范围 |
 | --- | --- | --- |
 | 运行实例 | 拥有工作区、收件箱、等待、投递游标、回合位置与代 | 从创建到显式结束或放弃；跨越沙箱的多次创建与销毁 |
-| 沙箱 | 承载看守进程与 Agent 进程，由代标识 | 一代一个；随挂起、销毁与重建出现和消失 |
+| 沙箱 | 承载看守进程与 Agent 进程，由代标识 | 同一代可有一个或多个沙箱实例，快照恢复可更换实例并以 `sandbox_id` 区分；随挂起、销毁与重建出现和消失 |
 | 工作区 | 挂载进每一代沙箱，承载 Agent 会话状态与投递意图日志 | 与运行实例同寿命，跨代保留 |
 | 代 | 每次预配沙箱递增，标识沙箱所属的载体代次 | 只增不减；旧代在代递增后立即失效 |
 | 收件箱 | 运行实例的可投递事件队列，由投递送入沙箱 | 跨代保留，按消费下界清理 |
@@ -60,7 +60,7 @@ flowchart TB
 
 castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进程运行在挂载持久化工作区的沙箱内，托管的 Agent 为 Claude Code，Agent 驱动器抽象可扩展到其他第三方 Agent；Agent 的 LLM 调用与外部系统流量全部经托管侧代理；托管环境在 Agent 等待 LLM、外部系统或人类时挂起沙箱以释放计算资源，并在依赖解除后恢复运行实例，以同时达到计算资源利用率与响应延迟的目标。外部系统以 GitHub 为参考实例，CRM 与 ERP 类业务系统通过 HTTP 加轮询型外部系统定义接入。
 
-沙箱内完整第三方 Agent 与控制面外置循环并存，共用同一套 Agent 驱动器接口：沙箱内的进程驱动器以无头协议驱动 Claude Code（[REF-claude-code-headless](../references.md)），不暴露交互式 TUI；控制面循环驱动器在控制面运行原生 Agent 循环，通过看守进程的 `ToolExec` 接口使用沙箱。进程驱动器与控制面循环驱动器向 `runcontroller` 发出同一套事件；控制面循环驱动器只定义接口，其实现状态见 [warden](modules/warden/design-warden.md) 模块文档（[ADR-dual-agent-loop-location](../adr/adr-dual-agent-loop-location.md)）。
+沙箱内完整第三方 Agent 与控制面外置循环并存，共用同一套 Agent 驱动器接口：沙箱内的进程驱动器以无头协议驱动 Claude Code（[REF-claude-code-headless](../references.md)），不暴露交互式 TUI；控制面循环驱动器在控制面运行原生 Agent 循环，通过看守进程的 `ToolExec` 接口使用沙箱；其接口的实现形式定为链接进 `runcontroller` 的库，`ToolExec` 帧经该运行实例已有的出站流往返，不持有运行实例令牌，也不建立第二条协议会话。进程驱动器与控制面循环驱动器向 `runcontroller` 发出同一套事件；第一版只定义控制面循环驱动器的接口，实现状态见 [warden](modules/warden/design-warden.md) 模块文档（[ADR-dual-agent-loop-location](../adr/adr-dual-agent-loop-location.md)）。
 
 **统一等待原语。** 对托管环境而言，Agent 的每一次等待都归约为运行实例在持久化收件箱与唤醒信号上等待唤醒谓词成立。收件箱每个运行实例一个，按 `inbox_seq` 全序，`(run_id, dedup_key)` 唯一，只存放可投递事件；唤醒信号不进入收件箱，用于满足阻塞条件与代范围的等待条件（探测定时器、显式声明）；审批决定与订阅完成写入收件箱时，同一事务派生对应的唤醒信号。等待是控制面从持久化事实推导的对象，不是沙箱发来的消息：回合中为当前阻塞条件（代范围），回合边界上为活动订阅、人类消息与定时器的并集（运行实例范围）；L2 协作式 Agent 的 `WaitDeclared` 只向推导结果追加显式条件。唤醒谓词在运行实例行锁内评估（[ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)）。
 
@@ -229,7 +229,7 @@ graph TD
 
 - 控制面模块 `runcontroller`、`llmgateway`、`connectorhub`、`humanchannel`、`secrets`、`workspace`、`sandboxprovider` 之间只经外部接口契约交互；`suspendpolicy` 链接进 `runcontroller` 进程，`agentprotocol` 链接进控制面服务与看守进程，都不单独成进程；其余模块到进程的映射由部署配置决定。
 - 沙箱是一个进程树：看守进程是沙箱容器的 PID 1，Agent 进程是看守进程以管道驱动的子进程；看守进程崩溃即沙箱崩溃，运行实例走重建与「回合被中断」路径（[ADR-warden-is-pid1](../adr/adr-warden-is-pid1.md)）。Agent 进程能到达的网络端点受 I6 约束，见架构不变量。
-- 看守进程与 `runcontroller` 之间只有出站流与入站端点；控制面循环驱动器经沙箱地址调用看守进程的 `ToolExec` gRPC 服务，该调用附运行实例令牌并按代校验，不经过只服务 `/terminal` 与界面文件访问的入站路由。看守进程对 `llmgateway` 与 `connectorhub` 的调用是附运行实例令牌的运行时 HTTP 调用，不承载协议消息。消息、重放、状态对账与恢复触发方式见模块间调用关系。控制面按 `generation` 判定并拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求，出口路径的失效判定方式见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
+- 看守进程与 `runcontroller` 之间只有出站流与入站端点；控制面循环驱动器作为库链接进 `runcontroller`，其 `ToolExec` 帧经该运行实例的出站流往返，由 `runcontroller` 在写入前按所有权、代与终态校验，不经过沙箱地址或入站路由。看守进程对 `llmgateway` 与 `connectorhub` 的调用是附运行实例令牌的运行时 HTTP 调用，不承载协议消息。消息、重放、状态对账与恢复触发方式见模块间调用关系。控制面按 `generation` 判定并拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求，出口路径的失效判定方式见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - LLM 路径：Agent 进程 → 本地代理 → LLM 网关 → Anthropic API。本地代理与 LLM 网关之间是 HTTP 调用，Anthropic API 只由 LLM 网关访问，凭据换取与代校验见认证与授权边界（[ADR-two-tier-llm-proxy](../adr/adr-two-tier-llm-proxy.md)）。
 - 外部系统路径：Agent 进程 → 本地代理（CONNECT 或 HTTP 前置，附运行实例身份）→ 出口代理 → 允许主机。本地代理不做 MITM，出口策略的内容与落地见安全边界。平台出口代理属 `connectorhub`，是 k8s 路径的出口网关，`sandboxprovider` 的 k8s 子模块向其推送每运行实例出口策略并落地 NetworkPolicy；Substrate 路径的出口代理是 Substrate 出口网关。平台操作、状态式轮询与 webhook 接收由 `connectorhub` 在控制面完成。
 - 提供者层：agent-sandbox 控制器、节点冻结代理、k8s 入站路由（wake-router）、Substrate 控制面、Substrate 路由器与 Substrate 出口网关都是控制面之外的进程，`sandboxprovider` 通过它们的 API 预配、挂起、恢复与销毁沙箱。
@@ -327,7 +327,7 @@ Kubernetes 集群内的划分：
 
 ## 模块间调用关系
 
-全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容；同一端口提供 `ToolExec` gRPC 服务，供控制面循环驱动器使用。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
+全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容；`ToolExec` 帧随出站流往返，由 `runcontroller` 从进程内控制面循环驱动器转发，不占用入站端点。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
 
 回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如经连接器的同步外部调用、实时接入中的审批）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。
 
@@ -602,7 +602,7 @@ graph LR
 - **出口路径的失效判定**：k8s 路径上本地代理附加的运行实例身份为运行实例令牌，平台出口代理对每个请求经 `runcontroller` 的代查询接口校验令牌中的代、运行实例是否已终态与本代沙箱是否已被判定作废，不使用缓存的代，不通过的请求被拒绝并计入旧代拒绝计数。Substrate 路径的出口策略以（运行实例，代）为键，在为该代预配或认领沙箱时落地；本代沙箱作废、回合边界销毁的确认（提供者确认）、进入 `Degraded`、放弃、显式结束与代递增的事务同时写入撤销对应代（代递增时为递增前的代）出口策略的效果记录，撤销即墓碑，已撤销的代拒绝此后的落地与更新；撤销在其执行截止之前完成时，残余窗口不超过该截止，截止前未能生效时（例如 Substrate 控制面不可达），窗口延续到撤销生效或该代沙箱删除完成（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - **控制面与沙箱提供者**：`sandboxprovider` 的 k8s 子模块以其 k8s RBAC 身份操作 Sandbox CR 与 Pod，其中原地缩放需要 `pods/resize` 子资源的 patch 权限；`sandboxprovider` 的 Substrate 子模块经路由器调用 `/wake` 的身份是 SPIFFE 身份（[REF-spiffe](../references.md)），且必须在路由器的入站白名单内。
 - **控制面与看守进程的出站认证**：看守进程主动外连 `runcontroller` 建立出站流，`Hello` 携带绑定代的运行实例令牌（协议字段 `resume_token`）与 `workspace_lease_id`；`runcontroller` 以 `HelloAck.accepted` 或 `HelloAck.fenced` 应答；令牌签名或 `run_id` 无效，或令牌中的代与信封 `generation` 不符时，以不可重试认证失败状态关闭流；依赖调用失败时以可重试状态关闭流；运行实例已终态时回 `Shutdown`。
-- **入站端点的调用方**：Substrate 提供者下入站调用方必须持有 SPIFFE 身份且在白名单内；k8s 提供者下 `/readyz` 由 kubelet 探针调用，恢复不经入站端点，`/terminal` 与界面文件访问经 k8s 入站路由；控制面循环驱动器经沙箱地址调用 `ToolExec`，以运行实例令牌鉴权，不经过入站路由。`/terminal` 的实时接入只在 `humanchannel` 完成用户身份校验后建立。
+- **入站端点的调用方**：Substrate 提供者下入站调用方必须持有 SPIFFE 身份且在白名单内；k8s 提供者下 `/readyz` 由 kubelet 探针调用，恢复不经入站端点，`/terminal` 与界面文件访问经 k8s 入站路由；控制面循环驱动器的 `ToolExec` 帧经出站流，不经过入站路由。`/terminal` 的实时接入只在 `humanchannel` 完成用户身份校验后建立。
 - **人类通道的用户身份与项目归属**：`humanchannel` 在控制面校验人类用户的身份，并把消息、审批决定与实时接入归属到该用户有权访问的项目下的运行实例；写入收件箱的人类事件携带用户身份。
 - **凭据作用域**：凭据对象按项目作用域授权到外部系统；外部系统定义的 `token_minting` 规定签发凭据的 `ttl` 与 `scopes`；每次凭据使用在审计记录中关联 `run_id`、`generation`、外部系统与操作。
 
@@ -683,7 +683,7 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 | 冷启动重建 | p95 < 60 s | 块存储 |
 | `idle_while_scheduled_ratio` | < 10% | 全部机制 |
 
-预热池容量按 `N = λL + z_ε·√(λL) + B` 计算，其中 λ 为峰值认领率，L 为补充前置时间，ε 为允许的缺池概率，B 为需吸收的最大相关唤醒突发；池按镜像、规格与节点池或可用区分片，分片的容量各自计算。
+预热池容量按 `N = λL + z_{1−ε}·√(λL) + B` 计算，其中 λ 为峰值认领率，L 为补充前置时间，ε 为允许的缺池概率，`z_{1−ε}` 为标准正态分布的 `1−ε` 分位数，B 为需吸收的最大相关唤醒突发；池按镜像、规格与节点池或可用区分片，分片的容量各自计算。
 
 ### 安全边界
 

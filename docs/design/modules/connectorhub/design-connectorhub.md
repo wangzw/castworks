@@ -18,7 +18,7 @@
 - **订阅完成事件投递**：把订阅完成事件经[汇入契约](../../../glossary.md)写入收件箱，`event_id` 由订阅与终态派生，`dedup_key` 由订阅与外部事件标识派生，原始负载以附件引用表达，载荷不超过 `S_max`。
 - **去重**：以内容派生的 `dedup_key` 与收件箱唯一索引兜底 webhook 与轮询的重复，以 `delivery_id` 唯一兜底 webhook 重发，以 `once` 订阅的状态 CAS 兜底并发完成，以认领记录与完成事件投递记录的唯一键兜底 `until_cancelled` 的重复。
 - **预关联锚与未认领区**：平台操作返回时按 `anchors` 登记 `run_id`、关联键值与 TTL；匹配到锚的事件先写入运行实例的未认领区，订阅登记时并入回溯匹配。
-- **订阅对账扫描**：按配置的扫描周期重新匹配未被认领的留存事件、重投 `pending` 的完成事件投递记录，并取消运行实例已终态的活动订阅；以认领记录、投递记录的唯一键与订阅状态 CAS 幂等。
+- **订阅对账扫描**：按配置的扫描周期重新匹配未被认领的留存事件、重投 `pending` 的完成事件投递记录，取消运行实例已终态的活动订阅，并把 `timeout_at` 已到期且仍为 `active` 的订阅置为 `expired` 并写入超时完成事件；以认领记录、投递记录的唯一键与订阅状态 CAS 幂等。
 - **订阅生命周期**：维护 `active`、`completed`、`expired`、`cancelled`；`lifetime: once` 完成后丢弃同对象的迟到事件并审计；超时以 CAS 置 `expired` 并经汇入契约写入超时完成事件；运行实例终态，或 `active` 订阅的完成事件投递被终态拒绝时取消订阅。
 - **同步操作**：接收[平台 MCP 服务器](../../../glossary.md)（[REF-mcp](../../../references.md)）转发的同步外部系统操作，校验运行实例令牌中的代，以 `(run_id, generation, request_id)` 持久化操作记录并经 `SetRunFact{inflight_request}` 登记在途事实，同一 `request_id` 只首次执行外部调用，其余返回已存结果或拒绝，执行结果返回 Agent；完成或失败经 `AppendWakeSignal` 写入同一 `request_id` 的唤醒信号。
 - **出口策略生成与推送**：为每个运行实例生成允许主机与占位符替换规则，推送给沙箱提供者；未列入的主机默认拒绝；git 路径按 `reverse_proxy_rewrite` 生成重写规则。
@@ -513,10 +513,11 @@ sequenceDiagram
 | 字段 | 类型 | 约束 | 含义 |
 | --- | --- | --- | --- |
 | `run_id` | uuid | 主键 | 出口策略所属运行实例 |
+| `project_id` | uuid | 非空 | 运行实例所属项目；出口代理以它向 `secrets` 换取凭据 |
 | `revision` | int64 | 每次推送递增 | 推送修订号；最新成功推送生效 |
 | `allowed_hosts` | string[] | 各定义 `upstreams` 的并集 | 允许出口的主机；未列入默认拒绝 |
-| `inject` | InjectRule[] | 每条 `{host, header, placeholder}` | 请求头占位符替换规则 |
-| `git` | GitRule | `{mode, proxy_host}` | git 反向代理重写规则 |
+| `inject` | InjectRule[] | 每条 `{host, header, placeholder, system, auth_method, scopes}` | 请求头占位符替换规则；后三项是出口代理换取凭据所需的凭据对象定位与作用域 |
+| `git` | GitRule | `{mode, proxy_host, system, auth_method, scopes}` | git 反向代理重写规则及其凭据引用 |
 | `updated_at` | time | 非空 | 最近一次成功推送时刻 |
 
 ### 同步操作
@@ -529,8 +530,10 @@ sequenceDiagram
 | `system` | string | 属于已装载定义 | 外部系统 |
 | `operation` | string | 属于定义的 `operations` 且 `mode=sync` | 操作名 |
 | `status` | string | 闭集 `in_flight`、`completed`、`failed` | 操作状态 |
+| `failure_reason` | string | 可空；闭集 `registration_failed`、`instance_lost`、`external_error` | 失败分类；决定能否自动恢复执行 |
 | `result` | json | 可空 | 完成时的结果或失败原因；重复请求直接返回该记录 |
 | `source_instance` | string | 对每次进程启动唯一 | 事件源实例标识；用于租约与失联判定 |
+| `lease_expires_at` | time | `in_flight` 时非空 | 实例租约到期时刻；过期后行可被判定为 `instance_lost` |
 | `started_at` | time | 非空 | 开始时刻 |
 | `finished_at` | time | 可空 | 完成或失败时刻 |
 
@@ -609,14 +612,14 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 
 轮询复杂度与活动订阅数成正比。同一 `once` 订阅的 webhook 完成与轮询完成由状态 CAS 裁决，只有一个成功；失败的一方不写完成事件与投递记录。
 
-订阅对账扫描按配置的扫描周期纠正以下差异：未被任何认领记录认领、仍在活动订阅匹配窗口内的留存事件按关联键重新匹配并认领；`pending` 的完成事件投递记录按 `event_id` 与 `dedup_key` 重投；活动订阅经 `Generations.Current` 检查，运行实例终态或不存在时置 `cancelled`，覆盖没有完成事件也不参与状态式轮询的 `until_cancelled` 订阅。各纠正分别以认领记录的 `(sub_id, delivery_id)`、投递记录的 `(sub_id, dedup_key)` 与订阅状态 CAS 幂等；每次纠正计数，差异数计入 `subscription_reconcile_diff` 指标。该扫描不读取 `runcontroller` 的表，只调用其代查询接口。
+订阅对账扫描按配置的扫描周期纠正以下差异：未被任何认领记录认领、仍在活动订阅匹配窗口内的留存事件按关联键重新匹配并认领；`pending` 的完成事件投递记录按 `event_id` 与 `dedup_key` 重投；活动订阅经 `Generations.Current` 检查，运行实例终态或不存在时置 `cancelled`，覆盖没有完成事件也不参与状态式轮询的 `until_cancelled` 订阅；`timeout_at` 已到期且仍为 `active` 的订阅按「订阅取消与超时」的规则 CAS 置 `expired` 并写入超时完成事件。各纠正分别以认领记录的 `(sub_id, delivery_id)`、投递记录的 `(sub_id, dedup_key)` 与订阅状态 CAS 幂等；每次纠正计数，差异数计入 `subscription_reconcile_diff` 指标。该扫描不读取 `runcontroller` 的表，只调用其代查询接口。
 
 ### 完成事件构造与投递
 
 完成事件以 `AppendInbox` 写入，`Kind=subscription_completed`。字段构造规则如下。
 
 - `终态`：`verify` 合成取核对到的终态；webhook 事件取事件中的结论字段；`until_cancelled` 的事件没有结论字段时取事件类型；超时为 `expired`。
-- `EventID`：`lifetime: once`（含 `verify` 合成）、`lifetime: until_cancelled` 的每次匹配与超时都使用 `(sub_id, 终态)`，超时为 `(sub_id, expired)`。`until_cancelled` 的多次完成由 `dedup_key` 区分，`event_id` 只标识终态。
+- `EventID`：`lifetime: once`（含 `verify` 合成）、`lifetime: until_cancelled` 的每次匹配与超时都使用 `(sub_id, 终态)`，超时为 `(sub_id, expired)`。`until_cancelled` 的多次完成由 `dedup_key` 区分，`event_id` 只标识终态；等待方按收件箱序号游标取尚未通知的完成，游标由 `runcontroller` 在该订阅的等待行上维护，不依赖 `event_id` 唯一。
 - `DedupKey`：webhook 触发与 `until_cancelled` 的每次匹配使用 `H(sub_id, 外部事件标识)`，外部事件标识由 `dedup_spec` 的字段值派生；`once` 的 `verify` 合成为 `H(sub_id, verify, 终态)`；超时为 `H(sub_id, expired)`。内容相同的 webhook 即使 `delivery_id` 不同也得到同一 `dedup_key`。
 - `SubscriptionStatus`：`once` 为 `completed`；`until_cancelled` 为 `active`；超时为 `expired`；取消不写事件。
 - `Correlation`：订阅的关联键与终态。
@@ -648,25 +651,32 @@ webhook 事件到达时，若关联键命中未过期的锚，事件写入该运
 
 1. 平台 MCP 服务器把运行实例令牌、`system`、`operation`、参数与 `request_id` 转发给 `connectorhub`。
 2. `connectorhub` 校验令牌的签名、代、终态与作废状态；操作必须属于定义的 `operations` 且 `mode=sync`；参数由连接器实现校验。
-3. 以 `(run_id, generation, request_id)` 插入同步操作行，`status=in_flight`。插入冲突时读取已有行：`completed` 直接返回已存结果，`failed` 返回同一失败，`in_flight` 返回重复请求错误；这些情况都不发起外部调用。
-4. 首次执行时，在外部调用之前以 `SetRunFact{inflight_request}` 登记在途事实，携带 `Generation`、`RequestID`、`Instance` 与 `InitialTTL`。长操作期间以 `RenewSourceLease` 续租。
+3. 以 `(run_id, generation, request_id)` 插入同步操作行，`status=in_flight`，`lease_expires_at` 取登记时刻加 `InitialTTL`。插入冲突时读取已有行并按状态处置：
+   - `completed`：直接返回已存结果。
+   - `failed` 且 `failure_reason=registration_failed`：该行尚未发起外部调用，以 CAS 置回 `in_flight` 并重置 `lease_expires_at`，从第 4 步继续。
+   - `failed` 且 `failure_reason=instance_lost`：只读操作以 CAS 置回 `in_flight` 并重新执行；有外部副作用的操作返回该失败，不自动重执行，由 Agent 决定是否以新的 `request_id` 重试。
+   - `failed` 的其他原因：返回同一失败。
+   - `in_flight` 且 `lease_expires_at > now()`：返回重复请求错误。
+   - `in_flight` 且 `lease_expires_at ≤ now()`：以 CAS 置为 `failed`、`failure_reason=instance_lost`，再按上一条处置。该行可能已发起外部调用，故有外部副作用的操作不自动重执行。
+4. 首次执行或从 `registration_failed` 恢复时，在外部调用之前以 `SetRunFact{inflight_request}` 登记在途事实，携带 `Generation`、`RequestID`、`Instance` 与 `InitialTTL`。登记失败（暂时性错误）时以 CAS 把该行置为 `failed`、`failure_reason=registration_failed`，返回 `503`；不换取凭据、不发起外部调用、不写唤醒信号。长操作期间以 `RenewSourceLease` 续租并以同一周期刷新 `lease_expires_at`。
 5. 从 `secrets` 换取真实凭据，执行外部调用。有外部副作用的操作不自动重试；只读操作可重试。
-6. 成功时把结果写入操作记录并返回平台 MCP 服务器，经 `AppendWakeSignal` 写入 `request_completed`，`Ref=request_id`。失败时写入 `failed` 与失败原因，返回工具错误，并写入 `request_failed`。
+6. 成功时把结果写入操作记录并返回平台 MCP 服务器，经 `AppendWakeSignal` 写入 `request_completed`，`Ref=request_id`。失败时写入 `failed`、`failure_reason=external_error` 与失败原因，返回工具错误，并写入 `request_failed`。
 7. 完成信号只在请求登记时的代上写入。`Generations.Current` 显示当前代已变化时，不写旧代信号；旧代沙箱此时已被替换，结果不再交付旧代，新代由 Agent 重新发起或读取外部状态。
 
-`request_id` 由平台 MCP 服务器对每次请求生成，在同一运行实例、同一代内唯一。`(run_id, generation, request_id)` 上的操作记录是执行幂等键：只有首次插入的操作行发起外部调用，同一 `request_id` 的后续请求返回已存结果或失败，不重复调用外部系统；`SetRunFact` 吸收同一在途事实的重复登记。
+`request_id` 由平台 MCP 服务器对每次请求生成，在同一运行实例、同一代内唯一。`(run_id, generation, request_id)` 上的操作记录是执行幂等键：只有首次插入或从 `registration_failed` 恢复的操作行发起外部调用，同一 `request_id` 的后续请求返回已存结果或失败，不重复调用外部系统；`SetRunFact` 吸收同一在途事实的重复登记。`failure_reason` 的闭集为 `registration_failed`、`instance_lost` 与 `external_error`，恢复规则只对前两者中的无副作用情形生效。
 
 ### 出口策略生成与推送
 
 出口策略的输入是运行实例可用的外部系统定义集合。可用集合由该运行实例的项目作用域凭据授权决定，本模块不扩大授权范围。对每个定义，取其 `access.upstreams`、`access.inject` 与 `access.git`：
 
 - `AllowedHosts` 是所有定义 `upstreams` 的并集。未列入的主机默认拒绝；本地代理对未放行目标立即拒绝而不是黑洞。
-- `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder}`；只替换已有请求头，缺头不注入。
-- `Git` 存在 `reverse_proxy_rewrite` 时，git 客户端的目标主机重写为平台 git 代理，git 的 Basic 或 Bearer 头由出口路径注入。
+- `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder, system, auth_method, scopes}`；后三项取该定义 `auth.methods` 中与占位符对应的凭据对象，作用域取 `token_minting.scopes`；只替换已有请求头，缺头不注入。
+- `Git` 存在 `reverse_proxy_rewrite` 时，git 客户端的目标主机重写为平台 git 代理，git 的 Basic 或 Bearer 头由出口路径注入；`system`、`auth_method` 与 `scopes` 同样随规则携带。
+- `project_id` 取运行实例所属项目（`RunView.project_id`），出口代理以 `(project_id, run_id, generation)`、`system`、`auth_method` 与 `scopes` 向 `secrets` 换取凭据；凭据只在出口代理内存中持有到 `ExpiresAt`，不写入出口策略、配置或日志。缺失 `project_id`、凭据对象或作用域不足时，该条注入规则不生效并按默认拒绝处置，出口请求被拒绝并计入审计。
 
 出口策略以运行实例为键生成，`Revision` 递增，经 `PutEgressPolicy` 推送给沙箱提供者。沙箱提供者在预配与认领沙箱时按代落地，并把更新同步到尚未撤销的代；按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动。推送失败时保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试；默认拒绝使未列入的主机不会因推送失败而放行。
 
-Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符。k8s 路径落地为平台出口代理配置与 NetworkPolicy，代理逐请求校验运行实例令牌中的代。
+Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符；`project_id` 与每条规则的 `system`、`auth_method`、`scopes` 一并写入策略文档，由 Substrate 出口网关的凭据提供者按同一组标识取得真实凭据。k8s 路径落地为平台出口代理配置与 NetworkPolicy，代理逐请求校验运行实例令牌中的代，并以策略中的同一组字段向 `secrets` 换取凭据。
 
 ### 平台出口代理（k8s 路径）
 
@@ -719,6 +729,8 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 | 出口策略撤销 | 运行实例终态、本代作废、提供者确认（销毁落地）、进入降级、放弃、显式结束或代递增（`fence_and_bump`） | `runcontroller` 写 `revoke_egress` 效果；沙箱提供者按代撤销，已撤销的代拒绝落地与更新 | 该代出口请求被拒绝 |
 | 出口策略推送失败 | 沙箱提供者不可达或拒绝 | 保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试 | 已推送的修订继续生效，未列入主机仍拒绝 |
 | 同步操作失败 | 外部系统返回错误或超时 | 有外部副作用的操作不自动重试；结果作为工具错误返回 Agent；写入 `request_failed` | Agent 决定是否重试 |
+| 同步操作在途登记失败 | `SetRunFact` 返回暂时性错误 | 行置 `failed`、`failure_reason=registration_failed`，返回 `503`；同一 `request_id` 重试可恢复，不发起外部调用 | 调用方退避重试 |
+| 同步操作实例租约过期 | 行仍为 `in_flight` 且 `lease_expires_at` 到期 | 行置 `failed`、`failure_reason=instance_lost`；只读操作可自动重执行，有外部副作用的操作返回失败 | 有副作用的操作由 Agent 决定是否以新 `request_id` 重试 |
 | 同步操作完成时已换代 | `Generations.Current` 的当前代与请求的代不同 | 不写旧代唤醒信号，结果不交付旧代 | 新代由 Agent 重新发起或读取外部状态 |
 | 附件过期 | 取回时超过 `expires_at` | 返回 410 | Agent 收到附件不可取回 |
 | 附件哈希不符 | 取回内容与 `content_hash` 不匹配 | 调用方拒绝内容并记录审计 | 取回失败 |

@@ -115,7 +115,7 @@ type ReviewResult struct {
 }
 ```
 
-- **`decide`**：由 `runcontroller` 在 `run` 行锁内于可挂起子状态调用，调用前已判定唤醒谓词、`D_min` 与 `aborted_suspend_id`。`FCap` 的取值规则为：`blocked_on.kind=llm` 且 `blocked_on.mode=passthrough` 时取 `F_stream`；`blocked_on` 非空的其他情形取 `F_cap(blocked_on.kind)`；`blocked_on` 为空时为空。`Grace` 为回合边界宽限期：首次边界决策取 `G_turn_grace(channel)`，`runcontroller` 据此写 `grace_deadline=now()+grace`；`grace_deadline` 已存在时，决策按它的剩余值判断宽限期，`Grace` 返回该剩余值。`FREEZE_SHRINK` 只与 `cgroup` 变体组合。
+- **`decide`**：由 `runcontroller` 在 `run` 行锁内于可挂起子状态调用，调用前已判定唤醒谓词与 `D_min`；`decide` 返回后由 `runcontroller` 再判定 `aborted_suspend_id`。`FCap` 的取值规则为：`blocked_on.kind=llm` 且 `blocked_on.mode=passthrough` 时取 `F_stream`；`blocked_on` 非空的其他情形取 `F_cap(blocked_on.kind)`；`blocked_on` 为空时为空。`Grace` 为回合边界宽限期：首次边界决策取 `G_turn_grace(channel)`，`runcontroller` 据此写 `grace_deadline=now()+grace`；`grace_deadline` 已存在时，决策按它的剩余值判断宽限期，`Grace` 返回该剩余值。`FREEZE_SHRINK` 只与 `cgroup` 变体组合。
 - **`review`**：由 `runcontroller` 在 `suspended.frozen` 中对复评触发调用。输入含触发来源、冻结时长、节点压力、能力集合、`turn_phase`、`blocked_on.kind`、`blocked_on.mode`、`safe_to`、`grace_deadline`、实时接入有效值、`policy_state` 与 `f_cap_reached`。实时接入有效值为真时只返回 `KEEP`，或在冻结上限到达时返回 `DRAIN`；冻结上限到达时只返回 `SNAPSHOT` 或 `DRAIN`；`DESTROY` 只在宽限期已过、未到冻结上限且实时接入无效时返回。
 - **`mechanism`**：在入队时确定 `resume_mode` 并落库；`resume` 效果与对账器只读该列，放行回调携带的机制与它不等时重新入队。
 - **`admit`**：对同一 `run_id` 幂等，不重置老化；携带的机制或截止与已有条目不同时把条目改到新值。截止为冻结态入队时的 `freeze_deadline−safety_margin`，其余为空。
@@ -376,6 +376,7 @@ freezeCapExpired(ctx, now) =
 
 - `D_lo` 是用于冻结、快照与销毁门槛的保守值，置信度不足 0.7 时取 p25；快照门槛同样使用 `D_lo`，只有保守估计也超过 `T_snapshot` 才付出快照写入，避免为不确定的长尾提前快照。`D_hi` 只用于估计函数之间的诊断与参数校准，不参与机制选择。已过冻结上限的阻塞（`now ≥ blocked_on.since + F_cap`）不再返回冻结，回合中改由快照或 `NONE` 处置。
 - `freezeDecision` 填 `Variant`：能力集合含 `Freeze{cgroup}` 时取 `cgroup`，否则取 `signal`；`FREEZE_SHRINK` 只在 `cgroup` 下返回。`FCap` 按 `blocked_on` 计算，`signal` 变体取 `min(F_cap(kind), F_signal)`。`Grace` 在回合边界取剩余宽限期（`grace_deadline` 为空时取 `G_turn_grace(channel)`），回合中为空。`NextReviewAt` 取 `T_nofreeze` 点、`T_snapshot` 点、宽限期截止与 `freeze_deadline−safety_margin` 中最早的。
+- `RunMemCPU ≥ 0.8 × NodeMemCPU` 时关闭冻结与缩容的组合：`freezeDecision` 不返回 `FREEZE_SHRINK`，冻结上限取 `min(F_cap(kind), F_signal)`，不发起长冻结；节点压力与回合边界处置按升级梯选择快照或销毁。
 - `snapshotDecision` 与 `destroyDecision` 不设 `FCap`；`destroyDecision` 的 `Grace` 为 0，`runcontroller` 只为边界冻结写 `grace_deadline`。`destroyDecision` 只在回合边界、非实时接入与 `safe_to.destroy` 同时成立时返回，原地放大迁移另要求 `resize_deferred_since + T_resize_migrate` 已过，节点压力超过 `ρ_hard` 时不受宽限期约束。`NONE` 的 `NextReviewAt` 取预测等待跨过 `T_nofreeze` 的时刻与下一次预测刷新时刻中较早者；预测不足但持续等待时不会立即重试形成循环。
 - `ProbeInterval` 只在 `trigger=watchdog` 时非空，取值随 `policy_state.ProbeBackoff` 指数增长；L0 的挂起必须附带探测定时器（I8）。
 - `Force` 只在后台作业超过策略上限时置真；`runcontroller` 据此在 `PrepareSuspend` 中要求看守进程终止 Agent 主进程之外的进程。
@@ -432,7 +433,7 @@ freezeCapExpired(ctx, now) =
 | 预测性恢复置信度阈值 | 0.7 | 来源置信度低于此值时 `approve_predictive` 不批准 |
 | 退避上限（`Busy`） | 60 s | `busy_retry` 返回值随 `BusyCount` 指数增长的上限 |
 | 退避上限（无应答与提供者失败） | 10 min | `failure_backoff` 返回值随 `NoResponseCount` 或 `ProviderFailures` 指数增长的上限 |
-| `safety_margin` | 10 s，由本模块定义 | 冻结态入队截止取 `freeze_deadline−safety_margin`；取值覆盖过渡态截止与重连时延上界 |
+| `safety_margin` | `T_resume(thaw) + 10 s`（默认 40 s），由本模块定义 | 冻结态入队截止取 `freeze_deadline−safety_margin`；取值覆盖解冻的过渡态截止与重连时延上界，保证强制放行后仍能在冻结上限之前完成解冻 |
 
 ### 挂起机制闭集与能力选择
 

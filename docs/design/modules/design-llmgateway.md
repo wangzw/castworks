@@ -63,7 +63,7 @@ GET  /v1/requests/{request_id}
 - 同一 `(run_id, generation, request_hash)` 已有终态行时，`POST` 直接返回该回放条目，不再请求上游；已有 `in_flight` 行且由同一网关实例持有时返回 `202`，由另一存活网关实例持有时返回 `409`，租约已到期的行先按回收规则删除再登记，都不新建上游调用。
 - `GET /v1/requests/{request_id}` 携带同一运行实例令牌。网关按 `(run_id, request_id)` 定位行，校验令牌有效且运行实例未终态，并要求令牌的 `run_id` 等于行的 `run_id`；行的 `generation` 只作记录，取回不要求与令牌的代相同，因而销毁重建后的新代本地代理仍可取回旧代已完成的响应。行处于终态时返回 `200` 与原始响应内容；仍在途且由同一网关实例持有时返回 `202`，由另一存活网关实例持有时返回 `409`；持有实例的租约已到期时按回收规则删除该行并返回 `404`；条目缺失或已过保留期时返回 `404`；行属于其他运行实例时返回 `403`。
 - 认证失败、代不匹配、终态与作废、参数非法与限流以 HTTP 客户端错误返回；上游 `401` 与 `403` 以 `502` 返回；`secrets`、`runcontroller`、回放存储不可用以 `503` 返回。错误体字段不是稳定契约，调用方按状态码处置。
-- 稳定承诺覆盖请求头名称、响应头 `x-castworks-request-id`、`mode` 闭集、`GET` 的取回语义与 `200`、`202`、`403`、`404`、`409`、`502`、`503` 的区分；上游模型清单与事件类型的变化不改变本地代理的调用方式。
+- 稳定承诺覆盖请求头名称、响应头 `x-castworks-request-id`、`mode` 闭集、`GET` 的取回语义与 `200`、`202`、`403`、`404`、`409`、`422`、`502`、`503` 的区分；上游模型清单与事件类型的变化不改变本地代理的调用方式。
 
 ### 对 runcontroller 的汇入调用
 
@@ -284,7 +284,7 @@ flowchart TD
 
 1. 按运行实例限流。超限返回 `429`，不换取凭据、不登记、不产生上游调用。
 2. 以运行实例令牌调用 `ExchangeLLMCredential`。换取失败按 `secrets` 的错误分类返回 `401`、`403` 或 `503`，不登记。凭据在 `ExpiresAt` 之前可复用于同一运行实例的后续请求；换取与复用都记审计。
-3. 插入 `llm_request` 行，`status=in_flight`，`gateway_instance` 取当前实例标识，`lease_expires_at` 取登记时刻加 `InitialTTL`。唯一索引 `(run_id, generation, request_hash)` 冲突时按已有行处置：已有行为 `completed`、`replayed` 或 `failed` 且 `reason≠registration_failed` 时直接返回回放条目；已有行为 `failed` 且 `reason=registration_failed` 时以 CAS 置回 `in_flight` 并重新执行登记；已有行为 `in_flight` 且 `gateway_instance` 为当前实例时返回 `202` 与规范 `request_id`；属于另一存活网关实例时返回 `409`；`lease_expires_at < now()` 时先按回收规则删除该行再登记。唯一索引 `(run_id, request_id)` 冲突时返回 `409`，由本地代理重新生成标识。上述情形都不新建上游调用。
+3. 插入 `llm_request` 行，`status=in_flight`，`gateway_instance` 取当前实例标识，`lease_expires_at` 取登记时刻加 `InitialTTL`。唯一索引 `(run_id, generation, request_hash)` 冲突时按已有行处置：已有行为 `completed`、`replayed` 或 `failed` 且 `reason≠registration_failed` 时直接返回回放条目；已有行为 `failed` 且 `reason=registration_failed` 时以 CAS 置回 `in_flight` 并重新执行登记；已有行为 `in_flight` 且 `gateway_instance` 为当前实例时返回 `202` 与规范 `request_id`；属于另一存活网关实例时返回 `409`；`lease_expires_at < now()` 时先按回收规则删除该行再登记。唯一索引 `(run_id, request_id)` 冲突时返回 `422`，由本地代理重新生成标识后重发；该状态与 `409`（同一逻辑请求由另一存活网关实例持有）语义不同，本地代理不得对 `422` 执行取回或退避。上述情形都不新建上游调用。
 4. 调用 `SetRunFact{inflight_request}`。`InFlightRequest` 的 `Kind` 为 `llm`，`Instance` 取当前网关实例标识，`InitialTTL` 取本次租约有效期。`runcontroller` 在同一事务写入 `source_request` 与 `source_lease`。调用失败时以 CAS 把刚插入的 `in_flight` 行置为 `failed`、写入 `reason=registration_failed` 与失败回放条目，返回 `503`，不转发上游，不写唤醒信号；已并发拿到 `202` 的调用方取回该失败条目，不会看到行被删除。回放存储不可用时行保持 `in_flight`，由回收规则删除。
 5. 开始向上游转发，并周期调用 `RenewSourceLease`。续租周期小于 `InitialTTL` 减去时钟余量；每次续租成功后刷新本实例全部在途行的 `lease_expires_at`，`lease_expires_at` 与 `source_lease.expires_at` 按同一 `InitialTTL` 与续租周期推进。`Instance` 对每次进程启动唯一，进程重启后不使用旧标识续租。
 
@@ -346,7 +346,7 @@ flowchart TD
 | 代不匹配、运行实例已终态或本代已作废 | 客户端错误 | `403` | 无上游调用；计入旧代拒绝计数 | 不重试 |
 | `request_id`、`request_hash` 或 `mode` 缺失或越界 | 客户端错误 | `400` | 无上游调用 | 不重试 |
 | 同一 `request_hash` 在另一存活网关实例上处于 `in_flight` | 客户端错误 | `409` | 不新建上游调用；持有实例的租约已到期时先按回收规则删除再登记 | 不重试 |
-| `request_id` 已在运行实例的另一代登记 | 客户端错误 | `409` | 无上游调用；由本地代理重新生成 `request_id` 后重发 | 不重试 |
+| `request_id` 已在运行实例内登记（跨代复用） | 客户端错误 | `422` | 无上游调用；由本地代理重新生成 `request_id` 后重发，不得按 `409` 取回 | 不重试 |
 | 限流 | 客户端错误 | `429` | 无凭据换取、无上游调用 | 不重试 |
 | `secrets` 或 `runcontroller` 不可达 | 网关依赖错误 | `503` | 无上游调用；不写回放条目 | 可重试 |
 | `SetRunFact{inflight_request}` 失败 | 网关依赖错误或部署错误 | `503` | 行置 `failed`、`reason=registration_failed` 并写失败条目；不写唤醒信号 | 暂时性错误可重试 |

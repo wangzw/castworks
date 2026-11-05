@@ -14,8 +14,8 @@ k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现
 - **冻结与解冻的提供者侧执行**：按 `freeze_id` 执行 `Freeze{cgroup}` 与 `Thaw`，返回冻结确认时刻；同一 `freeze_id` 的迟到冻结与迟到缩小被冻结墓碑拒绝；`Freeze{signal}` 由看守进程执行，本子模块只声明能力。
 - **原地缩放**：以 `pods/resize` 子资源缩小与放大 CPU request；沙箱 Pod 从创建起为 Burstable（request 小于 limit），容器的 `resizePolicy` 为 `NotRequired`，原始 CPU request 保存在 Pod 注解中；缩小在冻结之后执行，放大与解冻并行；放大进入 `Deferred` 时经 `ResizeStatus` 暴露实际状态（[REF-k8s-in-place-pod-resize](../../../references.md)）。
 - **预热池**：维护 SandboxWarmPool 与 SandboxClaim；预热 Pod 在创建时挂载共享文件系统的项目根，认领后看守进程只切换到运行实例子目录；认领的 Pod 不回收复用；池空时认领返回池空，恢复退化为冷启动。
-- **网络强制层与出口配置**：落地 NetworkPolicy，默认拒绝出口，只放行控制面地址、LLM 网关与平台出口代理；入站放行 kubelet 探针、wake-router 与控制面命名空间对看守进程 `ToolExec` 端口的调用；向平台出口代理下发按运行实例的出口策略配置，逐请求代校验由平台出口代理完成。
-- **入站路由**：wake-router 只服务 `/terminal` 与界面文件访问，按沙箱单飞，受全局停泊上限约束，以 200 ms 周期探测看守进程的 `/readyz`，未就绪或超过停泊预算时返回 503 与 `Retry-After`；事件投递与控制面循环驱动器的 `ToolExec` 调用不经该路由，后者按沙箱地址直接到达看守进程端口，以运行实例令牌鉴权。
+- **网络强制层与出口配置**：落地 NetworkPolicy，默认拒绝出口，只放行控制面地址、LLM 网关与平台出口代理；入站放行 kubelet 探针与 wake-router；向平台出口代理下发按运行实例的出口策略配置，逐请求代校验由平台出口代理完成。
+- **入站路由**：wake-router 只服务 `/terminal` 与界面文件访问，按沙箱单飞，受全局停泊上限约束，以 200 ms 周期探测看守进程的 `/readyz`，未就绪或超过停泊预算时返回 503 与 `Retry-After`；事件投递与 `ToolExec` 帧都不经该路由；`ToolExec` 帧随看守进程的出站流往返，不新增沙箱入站端点。
 - **恢复触发**：冻结态由 `Thaw` 解冻，以 `Thawed` 为完成观察；销毁态把 Sandbox CR 的 `spec.operatingMode` 改回 `Running` 重建 Pod，或从预热池认领，以看守进程重连并发送新代 `Hello` 为完成观察；事件驱动的恢复由控制面直调提供者。
 - **串行化与幂等**：同一运行实例的冻结、解冻、销毁与预配按到达顺序串行；以 `freeze_id`、`(run_id, generation, attempt_id)`、`(run_id, generation)` 与 `(generation, sandbox_id)` 幂等；重复调用返回首次结果。
 

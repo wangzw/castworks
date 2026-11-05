@@ -12,7 +12,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - **预配与认领**：创建 actor 或从预热 worker 认领；调用 `workspace` 绑定工作区并按 `(run_id, generation)` 落地出口策略副本；创建墓碑或释放墓碑之后拒绝该代或该运行实例的创建。
 - **Suspend 与快照**：按 `suspend_id` 执行 MEMORY 保真度的内存快照，释放 actor 的计算资源并返回快照标识与保留期限；按 `suspend_id` 撤销尚未确认的快照尝试，撤销即墓碑。
 - **Resume 与路由器唤醒**：按 `resume_id` 在同一代内恢复快照；经 Substrate 路由器以 `ate-target-actor` 头调用 `/wake`，路由器恢复 actor 并停泊请求直到 `/readyz` 就绪；`/wake` 返回表示看守进程的出站流已重建；调用方持有 SPIFFE 身份且在路由器的入站白名单内。
-- **EgressPolicy 落地与撤销**：保存 `connectorhub` 推送的每运行实例出口策略；在预配与认领时按 `(run_id, generation)` 落地为 EgressPolicy，以 MITM 与 `replaceHeaders` 替换请求头凭据占位符，默认拒绝未列入的主机；按代撤销并写撤销墓碑。
+- **EgressPolicy 落地与撤销**：保存 `connectorhub` 推送的每运行实例出口策略；在预配与认领时按 `(run_id, generation)` 落地为 EgressPolicy，以 MITM 与 `replaceHeaders` 替换请求头凭据占位符，默认拒绝未列入的主机；策略文档中的 `project_id` 与每条规则的 `system`、`auth_method`、`scopes` 原样透传，供出口网关的凭据提供者换取真实凭据；按代撤销并写撤销墓碑。
 - **外部 CSI 卷与 durableDir**：为每个 actor 挂载一卷外部 CSI 卷，写穿持久、崩溃不丢、沙箱外可经同一导出访问、内容不进快照；外部 CSI 不可用时在绑定时退到 `durableDir`，退化配置下回合边界的销毁使用同步挂起。
 - **预热 worker**：维护按镜像、规格与节点池或可用区分片的预热 worker 容量；认领时返回可用的 actor；容量按主文档的公式分片计算。
 - **恢复完成后的交接**：`/wake` 只在出站流重建完成之后返回；看守进程随后校时、断开 Agent 进程的旧 TCP 连接，并由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。本子模块只负责把 actor 恢复到可就绪状态，不执行这些看守进程动作。
@@ -51,7 +51,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 | `Claim` | 从预热 worker 认领 actor；绑定工作区；落地本代 EgressPolicy；返回 `sandbox_id` 与放置位置 |
 | `Snapshot` | 按 `suspend_id` 执行 MEMORY 快照；返回 `SnapshotReceipt{snapshot_id, snapshot_expires_at}` |
 | `RevokeSnapshot` | 按 `suspend_id` 撤销尚未确认的快照尝试并写快照撤销墓碑；重复撤销返回成功 |
-| `RestoreSnapshot` | 在同一代内恢复快照；经路由器调用 `/wake` 并等待 `/readyz` 就绪；返回 `SandboxHandle`；快照不存在或已过期为确定性错误 |
+| `RestoreSnapshot` | 在同一代内恢复快照；先检查创建墓碑与释放墓碑，已销毁或已释放的运行实例以确定性错误拒绝；经路由器调用 `/wake` 并等待 `/readyz` 就绪；返回 `SandboxHandle`；快照不存在或已过期为确定性错误 |
 | `Destroy` | 挂起或删除该代 actor，保留运行实例级资源；写创建墓碑；返回携带代的确认 |
 | `DestroySandbox` | 只删除调用携带的 `(generation, sandbox_id)` 对应的 actor，不删除更新的代；目标不存在时幂等成功 |
 | `ReleaseRun` | 释放 actor 相关资源；写释放墓碑；此后拒绝该运行实例的一切创建 |
@@ -73,7 +73,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 | 路由器 `ResumeActor` | 以 `ate-target-actor` 头定位 actor，调用方需具备 `can_resume`；路由器恢复 actor 并停泊请求直到 `wakeupProbe` 就绪 |
 | `wakeupProbe` | 在 actor 模板中声明为看守进程的 `/readyz:80`；就绪之前路由器不释放停泊请求 |
 | `parked-request-budget` | 路由器停泊请求的预算；默认 5 s，部署时按快照恢复与冷启动的时延调大 |
-| EgressPolicy API | 以 `(run_id, generation)` 为键落地允许的主机与 `replaceHeaders` 规则；MITM 由出口网关执行 |
+| EgressPolicy API | 以 `(run_id, generation)` 为键落地允许的主机、`replaceHeaders` 规则与凭据引用（`project_id`、`system`、`auth_method`、`scopes`）；MITM 由出口网关执行 |
 | 凭据提供者协议 | 出口网关在解析占位符时调用 `secrets` 实现的凭据提供者；本子模块不调用该协议 |
 | 外部 CSI 卷 | actor 卷类型 `external`，每 actor 一卷；由 CSI 驱动动态供给 |
 | `durableDir` | 退化卷类型；挂起时上传对象存储，沙箱外无读取接口 |
@@ -87,8 +87,8 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - `workspace`：在预配与认领时调用绑定接口取得卷标识、挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自 `ProvisionRequest`，不来自绑定；Substrate 提供者优先使用 `external_csi`，`durable_dir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。存储模式在绑定时固定，运行中不静默退化；外部 CSI 不可用时预配或恢复按自身规则失败，不在运行中切换到 `durableDir`。
 - `agentprotocol`：恢复完成以看守进程发送 `Hello` 为观察；`/readyz` 是路由器的 `wakeupProbe`，`/wake` 返回表示出站流已重建。入站端点不承载事件内容，投递只在出站流上进行。
 - Substrate 控制面：执行 actor 的创建、认领、Suspend 与 Resume；快照保留期限由 `SnapshotReceipt` 返回。Substrate 控制面不可达时预配、挂起与恢复返回暂时性错误。
-- Substrate 路由器：以 `ate-target-actor` 头调用 `/wake`，恢复 actor 并停泊请求直到 `/readyz` 就绪；调用方持有 SPIFFE 身份并在白名单内。路由器同时承载 `/terminal` 与界面文件访问；事件投递不经该路由，快照恢复经 `/wake` 触发。控制面循环驱动器的 `ToolExec` 调用经 Substrate 提供的工作负载网络地址到达看守进程端口，以运行实例令牌鉴权，与路由器唤醒路径相互独立。
-- Substrate 出口网关：把 EgressPolicy 落地为 MITM 代理，以 `replaceHeaders` 替换请求头中的凭据占位符，默认拒绝未列入的主机；actor 镜像信任出口网关的 CA。出口网关在解析占位符时调用 `secrets` 的凭据提供者，真实凭据不进入 actor。
+- Substrate 路由器：以 `ate-target-actor` 头调用 `/wake`，恢复 actor 并停泊请求直到 `/readyz` 就绪；调用方持有 SPIFFE 身份并在白名单内。路由器同时承载 `/terminal` 与界面文件访问；事件投递与 `ToolExec` 帧都不经该路由，快照恢复经 `/wake` 触发；`ToolExec` 帧随看守进程的出站流往返，与路由器唤醒路径相互独立。
+- Substrate 出口网关：把 EgressPolicy 落地为 MITM 代理，以 `replaceHeaders` 替换请求头中的凭据占位符，默认拒绝未列入的主机；actor 镜像信任出口网关的 CA。出口网关在解析占位符时调用 `secrets` 的凭据提供者，以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取真实凭据；真实凭据不进入 actor。
 - 对象存储：承载快照与 `durableDir` 上传数据；GCS 原生支持，S3 经插件。
 - PostgreSQL：Substrate 控制面的存储。
 - 外部 CSI 驱动：为每 actor 供给一卷外部 CSI 卷；写穿持久、崩溃不丢、沙箱外可经同一导出访问，内容不进快照。
@@ -212,7 +212,7 @@ flowchart LR
 
 走查结束时 `generation` 由 `runcontroller` 决定，提供者不递增代；快照恢复在同一代内进行，`snapshot_id` 与 `suspend_id` 保留到撤销或释放。第 5 步的整代销毁与第 8 步的释放都保留运行实例级记录，创建墓碑与释放墓碑使迟到预配不产生第二次副作用。
 
-`durableDir` 退化配置下的回合边界销毁使用同步挂起，走查的差异只在挂起步骤：看守进程发出 `ReadyToSuspend` 后，提供者执行同步挂起并等待对象存储上传完成；上传完成才返回，销毁路径随后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, suspend_id)`，确认成功后才由 `runcontroller` 进入 `Suspended`。上传失败或确认失败时提供者返回暂时性错误，运行实例不进入 `Suspended`，销毁路径以同一 `suspend_id` 重试；回合中 actor 崩溃时，上次上传之后的写入丢失，`runcontroller` 以「回合被中断」重投事件并接受该回合文件改动丢失。
+`durableDir` 退化配置下的回合边界销毁使用同步挂起，走查的差异只在挂起步骤：看守进程发出 `ReadyToSuspend` 后，提供者执行同步挂起并等待对象存储上传完成；上传完成才返回，销毁路径随后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功后才由 `runcontroller` 进入 `Suspended`。上传失败或确认失败时提供者返回暂时性错误，运行实例不进入 `Suspended`，销毁路径以同一 `suspend_id` 重试；`workspace.Confirm` 以 `(run_id, generation, lease_id)` 幂等。回合中 actor 崩溃时，上次上传之后的写入丢失，`runcontroller` 以「回合被中断」重投事件并接受该回合文件改动丢失。
 
 ### actor 创建与认领
 
@@ -229,11 +229,11 @@ flowchart LR
 2. Substrate 控制面执行 MEMORY 保真度的快照，持久化进程内存与运行状态并释放 actor 的计算资源；提供者持久化 `SnapshotTrace`，返回 `SnapshotReceipt`，其中 `SnapshotExpiresAt` 是快照保留期限。
 3. `runcontroller` 在保留期临近前作废该代，避免恢复落在已过期快照上。快照保留期与工作区租约的覆盖范围一致：工作区以 `HoldLease` 延长到快照保留期加安全余量，快照恢复的 actor 以首次续约重新绑定租约持有者。
 4. 撤销尚未确认的快照尝试按 `suspend_id` 执行，提供者写入快照撤销墓碑；撤销确认之后到达的同一 `suspend_id` 的快照请求不生效。快照恢复不递增代，同一代内由新的 actor 实例承载；快照不替代工作区持久化，外部 CSI 卷的内容不进快照。
-5. `durableDir` 退化配置下，快照仍按 `Snapshot` 执行；回合边界的销毁改用同步挂起：提供者等待对象存储上传完成才返回，销毁路径再以同一 `suspend_id` 调用 `workspace.Confirm(Mode=suspend_upload)`；确认成功后才进入 `Suspended`。上传或确认失败返回暂时性错误，运行实例停在 `Suspending`，不进入 `Suspended`。同步挂起的上传由同一 `suspend_id` 幂等，重复调用不重复上传。
+5. `durableDir` 退化配置下，快照仍按 `Snapshot` 执行；回合边界的销毁改用同步挂起：提供者等待对象存储上传完成才返回，销毁路径再以同一 `suspend_id` 调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id)`；确认成功后才进入 `Suspended`。上传或确认失败返回暂时性错误，运行实例停在 `Suspending`，不进入 `Suspended`。同步挂起的上传由同一 `suspend_id` 幂等，重复调用不重复上传；`workspace.Confirm` 以 `(run_id, generation, lease_id)` 幂等。
 
 ### Resume 与路由器唤醒
 
-1. `runcontroller` 按 `resume_mode` 调用 `RestoreSnapshot`、`Claim` 或 `Provision`。`RestoreSnapshot` 在同一代内恢复快照，不递增代；请求携带 `run_id`、`generation`、`suspend_id` 与 `attempt_id`，`attempt_id` 取 `resume_id`。
+1. `runcontroller` 按 `resume_mode` 调用 `RestoreSnapshot`、`Claim` 或 `Provision`。`RestoreSnapshot` 在同一代内恢复快照，不递增代；请求携带 `run_id`、`generation`、`suspend_id` 与 `attempt_id`，`attempt_id` 取 `resume_id`。调用前检查创建墓碑与释放墓碑；已销毁或已释放时以确定性错误拒绝，不恢复 actor。
 2. 提供者经 Substrate 路由器以 `ate-target-actor` 头调用 `/wake`。路由器按该头定位 actor，调用 `ResumeActor` 恢复 actor；调用方必须持有 SPIFFE 身份且在路由器的入站白名单内，并具备 `can_resume`。
 3. 路由器把请求停泊到 `wakeupProbe` 就绪；`wakeupProbe` 为看守进程的 `/readyz:80`，就绪之前路由器不释放请求。停泊预算由 `parked-request-budget` 配置，默认 5 s，部署时按快照恢复与冷启动的时延调大；预算耗尽时路由器返回失败，不把未就绪的 actor 标记为恢复完成。
 4. `/wake` 返回表示看守进程的出站流已重建。提供者随后返回 `SandboxHandle`；`runcontroller` 以同代 `Hello` 完成 `Resuming` 到 `Active` 的转移。快照不存在或已过期时提供者返回确定性错误，`runcontroller` 转重建意图，不把该错误计入恢复失败次数。
