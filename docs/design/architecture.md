@@ -78,7 +78,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 
 **挂起机制按提供者能力分层。** 挂起机制是闭合集合：不挂起、冻结（可附带原地缩小 CPU request，依赖 Kubernetes In-Place Pod Resize，[REF-k8s-in-place-pod-resize](../references.md)）、快照、销毁重建。沙箱提供者以能力集合 `{Freeze{cgroup | signal}, Snapshot, Destroy, InPlaceResize, WarmPool, EgressInject}` 自描述，挂起策略只在能力允许的机制中选择，`Freeze{signal}` 只允许短冻结（[ADR-capability-tiered-suspension](../adr/adr-capability-tiered-suspension.md)）。系统实现 k8s 提供者与 Substrate 提供者，共用看守进程、协议与控制面（[ADR-dual-sandbox-providers](../adr/adr-dual-sandbox-providers.md)）：k8s 提供者基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../references.md)）与节点冻结代理，覆盖 `Freeze{cgroup | signal}`、`Destroy`、`WarmPool`、`InPlaceResize`，冻结由节点冻结代理对 Agent 子 cgroup（[REF-linux-cgroup-v2](../references.md)）执行，看守进程自身不冻结（[ADR-freeze-via-node-agent](../adr/adr-freeze-via-node-agent.md)）；Substrate 提供者基于 agent-substrate/substrate（[REF-substrate](../references.md)），覆盖 `Snapshot`、`WarmPool`、`Destroy`、`EgressInject`，不具备 `Freeze` 能力。
 
-**回合边界销毁。** 以挂起为目的的销毁只在不变量 I9 规定的安全点执行：L1 与 L2 都只在回合边界，L0 不以挂起为目的销毁。人机交互默认为异步回合制；实时接入期间挂起策略切换为只冻结不销毁；实时接入的各通道中，只有终端或文件通道的接入会中止已开始的快照或销毁尝试，平台界面会话的接入不中止进行中的挂起尝试（[ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)）。
+**回合边界销毁。** 以挂起为目的的销毁只在不变量 I9 规定的安全点执行：L1 与 L2 都只在回合边界，L0 不以挂起为目的销毁。人机交互默认为异步回合制；实时接入期间挂起策略切换为只冻结不销毁；实时接入的各通道中，只有终端或文件通道的接入会中止尚未发出提供者调用的快照或销毁尝试，平台界面会话的接入不中止进行中的挂起尝试（[ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)）。
 
 顶层模块、职责与运行位置的穷举清单：
 
@@ -88,7 +88,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 | `suspendpolicy` | 挂起决策函数；冻结中复评与升级梯（冻结时长达到上限后依次切换到快照或 `DRAIN` 的顺序）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程（[ADR-suspendpolicy-as-library](../adr/adr-suspendpolicy-as-library.md)） |
 | `agentprotocol` | 看守进程与控制面之间的协议：信封、消息、出站流与入站端点、重放与去重、协议版本 | 共享库，链接进控制面服务与看守进程 |
 | `warden` | 看守进程：进程监督、Agent 驱动器、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、工作区租约续约、投递意图日志、本地代理、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1 |
-| `sandboxprovider` | 沙箱提供者的能力自描述接口；沙箱预配、挂起、恢复与按代销毁，整代销毁之后拒绝该代及更早代的沙箱创建；冻结、解冻与缩小 CPU request 以 `freeze_id` 标识，已解冻的 `freeze_id` 不再接受冻结与缩小；运行实例结束或失败后按运行实例释放运行实例级资源，释放之后拒绝该运行实例的一切创建；按节点查询冻结态内存与可分配内存；预热池；出口策略在预配与认领沙箱时按代落地，按代撤销，撤销之后拒绝该代的落地与更新。子模块 k8s 负责 Sandbox CR、节点冻结代理、原地缩放、平台出口代理配置与 NetworkPolicy 落地、入站路由；子模块 substrate 负责 actor 模板、Suspend 与 Resume、路由器唤醒、EgressPolicy 与凭据提供者（credential provider）对接 | 控制面与节点，节点冻结代理为 DaemonSet |
+| `sandboxprovider` | 沙箱提供者的能力自描述接口；沙箱预配、挂起、恢复与按代销毁，整代销毁之后拒绝该代及更早代的沙箱创建；冻结、解冻与缩小 CPU request 以 `freeze_id` 标识，已解冻的 `freeze_id` 不再接受冻结与缩小；运行实例结束或失败后按运行实例释放运行实例级资源，释放之后拒绝该运行实例的一切创建；按节点查询冻结态内存与可分配内存；预热池；出口策略在预配与认领沙箱时按代落地，按代撤销，撤销之后拒绝该代的落地与更新。子模块 k8s 负责 Sandbox CR、节点冻结代理、原地缩放、平台出口代理配置与 NetworkPolicy 落地、入站路由；子模块 substrate 负责 actor 模板、Suspend 与 Resume、路由器唤醒与 EgressPolicy 落地；出口网关的凭据提供者（credential provider）协议由 `secrets` 实现，出口网关调用 | 控制面与节点，节点冻结代理为 DaemonSet |
 | `llmgateway` | 以运行实例令牌换取 LLM 凭据、`generation` 校验、在途请求表与在途请求事实的登记、实例续租、回放存储、限流、计费与审计 | 控制面 |
 | `connectorhub` | 外部系统定义与连接器：出口策略生成、k8s 路径的平台出口代理、同步与异步操作、webhook 落盘与状态式轮询、订阅登记与回溯匹配、预关联锚（平台操作返回时登记的运行实例与关联键值，带 TTL，匹配到的事件先暂存到运行实例的未认领区）、订阅完成事件写入收件箱 | 控制面 |
 | `humanchannel` | 聊天界面、即时通讯与 Issue 评论到收件箱的适配，审批决定，在线与「正在输入」信号，实时接入状态 | 控制面 |
@@ -130,6 +130,7 @@ graph TD
     sandboxprovider --> workspace
     sandboxprovider --> agentprotocol
     warden --> agentprotocol
+    warden --> workspace
 ```
 
 箭头 A → B 表示 A 依赖 B 的外部接口契约：A 调用 B 导出的接口或引用 B 定义的类型，B 不感知 A。图中的边穷举允许的模块间代码依赖，图中没有的依赖不得出现在非测试代码中，测试代码的跨模块引用不受此图约束；依赖图是有向无环图。
@@ -141,7 +142,7 @@ graph TD
 - `humanchannel` 通过 `secrets` 的令牌校验函数校验附件取回请求携带的运行实例令牌，这是它与 `connectorhub` 对 `secrets` 的直接依赖，不引入对 `runcontroller` 表的读取。
 - `connectorhub` 通过 `sandboxprovider` 的出口策略接口推送每个运行实例的出口策略，`sandboxprovider` 在预配与认领沙箱时按代落地，并把推送的更新同步到尚未撤销的代；这是事件源模块对 `sandboxprovider` 的唯一依赖。
 - `sandboxprovider` 依赖 `workspace`（预配与认领时绑定工作区）与 `agentprotocol`（恢复触发所用的入站端点 `/readyz` 与 `/wake`）。
-- 没有模块依赖 `warden`，`warden` 只依赖 `agentprotocol`。本地代理与 LLM 网关之间、本地代理与出口代理之间、平台 MCP 服务器与 `connectorhub` 之间是运行时 HTTP 调用，不是代码依赖，不出现在图中。
+- 没有模块依赖 `warden`。`warden` 依赖 `agentprotocol`，并以链接进看守进程的 `workspace` 沙箱侧部分执行文件 API、持久化确认与租约续约；后者是模块的实现位置，不使 `workspace` 反向依赖 `warden`。本地代理与 LLM 网关之间、本地代理与出口代理之间、平台 MCP 服务器与 `connectorhub` 之间是运行时 HTTP 调用，不是代码依赖，不出现在图中。
 
 ## 逻辑部署架构
 
@@ -228,7 +229,7 @@ graph TD
 
 - 控制面模块 `runcontroller`、`llmgateway`、`connectorhub`、`humanchannel`、`secrets`、`workspace`、`sandboxprovider` 之间只经外部接口契约交互；`suspendpolicy` 链接进 `runcontroller` 进程，`agentprotocol` 链接进控制面服务与看守进程，都不单独成进程；其余模块到进程的映射由部署配置决定。
 - 沙箱是一个进程树：看守进程是沙箱容器的 PID 1，Agent 进程是看守进程以管道驱动的子进程；看守进程崩溃即沙箱崩溃，运行实例走重建与「回合被中断」路径（[ADR-warden-is-pid1](../adr/adr-warden-is-pid1.md)）。Agent 进程能到达的网络端点受 I6 约束，见架构不变量。
-- 看守进程与 `runcontroller` 之间只有出站流与入站端点；看守进程对 `llmgateway` 与 `connectorhub` 的调用是附运行实例令牌的运行时 HTTP 调用，不承载协议消息。消息、重放、状态对账与恢复触发方式见模块间调用关系。控制面按 `generation` 判定并拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求，出口路径的失效判定方式见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
+- 看守进程与 `runcontroller` 之间只有出站流与入站端点；控制面循环驱动器经沙箱地址调用看守进程的 `ToolExec` gRPC 服务，该调用附运行实例令牌并按代校验，不经过只服务 `/terminal` 与界面文件访问的入站路由。看守进程对 `llmgateway` 与 `connectorhub` 的调用是附运行实例令牌的运行时 HTTP 调用，不承载协议消息。消息、重放、状态对账与恢复触发方式见模块间调用关系。控制面按 `generation` 判定并拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求，出口路径的失效判定方式见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - LLM 路径：Agent 进程 → 本地代理 → LLM 网关 → Anthropic API。本地代理与 LLM 网关之间是 HTTP 调用，Anthropic API 只由 LLM 网关访问，凭据换取与代校验见认证与授权边界（[ADR-two-tier-llm-proxy](../adr/adr-two-tier-llm-proxy.md)）。
 - 外部系统路径：Agent 进程 → 本地代理（CONNECT 或 HTTP 前置，附运行实例身份）→ 出口代理 → 允许主机。本地代理不做 MITM，出口策略的内容与落地见安全边界。平台出口代理属 `connectorhub`，是 k8s 路径的出口网关，`sandboxprovider` 的 k8s 子模块向其推送每运行实例出口策略并落地 NetworkPolicy；Substrate 路径的出口代理是 Substrate 出口网关。平台操作、状态式轮询与 webhook 接收由 `connectorhub` 在控制面完成。
 - 提供者层：agent-sandbox 控制器、节点冻结代理、k8s 入站路由（wake-router）、Substrate 控制面、Substrate 路由器与 Substrate 出口网关都是控制面之外的进程，`sandboxprovider` 通过它们的 API 预配、挂起、恢复与销毁沙箱。
@@ -326,7 +327,7 @@ Kubernetes 集群内的划分：
 
 ## 模块间调用关系
 
-全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
+全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容；同一端口提供 `ToolExec` gRPC 服务，供控制面循环驱动器使用。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
 
 回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如经连接器的同步外部调用、实时接入中的审批）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。
 
@@ -538,7 +539,7 @@ flowchart LR
 | 外部事件 | 外部系统到 `connectorhub` | 原始 webhook 负载与 `delivery_id`；状态式轮询只产生完成事件 | 连接器事件日志，`delivery_id` 唯一，保留期不短于最长订阅超时 |
 | 订阅完成事件 | `connectorhub` 到 `runcontroller`（汇入契约） | `event_id` 由 `(sub_id, 终态)` 派生，内容派生 `dedup_key`；原始 webhook 以附件引用（可取回的 URI 与内容哈希）放入载荷，载荷不超过 S_max，大内容由 `connectorhub` 自行存放，Agent 经平台 MCP 服务器附运行实例令牌取回 | `inbox` 表，主键 `(run_id, inbox_seq)`，`(run_id, dedup_key)` 唯一 |
 | 人类消息与审批决定 | `humanchannel` 到 `runcontroller`（汇入契约） | 收件箱事件，`kind` 为消息或审批决定；实时接入状态作为运行实例事实写入 | `inbox` 表与运行实例事实表（`run_fact`） |
-| 投递批次 | `runcontroller` 到看守进程（出站流 `Deliver`） | 信封 `{run_id, generation, msg_seq, ack_msg_seq}` 加 `batch[{inbox_seq, event_id, dedup_key, kind, payload, occurred_at, redelivery}]`、`through_seq`、`target`、`resume_session_id` | 投递进度为 `run.cursor_accepted` 与 `run.cursor_consumed`；沙箱侧去重为工作区内的投递意图日志 `.platform/deliveries.jsonl` |
+| 投递批次 | `runcontroller` 到看守进程（出站流 `Deliver`） | 信封 `{run_id, generation, msg_seq, ack_msg_seq}` 加 `batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`、`through_seq`、`target`、`resume_session_id` | 投递进度为 `run.cursor_accepted` 与 `run.cursor_consumed`；沙箱侧去重为工作区内的投递意图日志 `.platform/deliveries.jsonl` |
 | Agent 输入 | 看守进程的 Agent 驱动器到 Agent 进程 | 按 `target` 翻译为 Agent 原生输入：下一条用户消息、工具结果或权限决定 | Agent 自身的会话记录，位于工作区内的 `CLAUDE_CONFIG_DIR` |
 | 唤醒信号 | 看守进程的本地代理与平台 MCP 服务器（出站流）、`llmgateway`、`connectorhub`、定时器到 `runcontroller` | 引用阻塞条件或代范围等待条件的 `kind` 与 `ref`，带 `generation`，不进入收件箱 | `wake_signal` 表，在运行实例行锁内消费 |
 | LLM 请求与响应 | Agent 进程到本地代理（回环 HTTP），本地代理到 LLM 网关（附运行实例令牌），LLM 网关到上游 | 流式响应；本地代理的单次回放缓存键为 `(run_id, generation, request_hash)`，网关回放存储按 `request_id` 取回 | `llm_request` 表与 LLM 网关的回放存储 |
@@ -601,7 +602,7 @@ graph LR
 - **出口路径的失效判定**：k8s 路径上本地代理附加的运行实例身份为运行实例令牌，平台出口代理对每个请求经 `runcontroller` 的代查询接口校验令牌中的代、运行实例是否已终态与本代沙箱是否已被判定作废，不使用缓存的代，不通过的请求被拒绝并计入旧代拒绝计数。Substrate 路径的出口策略以（运行实例，代）为键，在为该代预配或认领沙箱时落地；本代沙箱作废、回合边界销毁的确认（提供者确认）、进入 `Degraded`、放弃、显式结束与代递增的事务同时写入撤销对应代（代递增时为递增前的代）出口策略的效果记录，撤销即墓碑，已撤销的代拒绝此后的落地与更新；撤销在其执行截止之前完成时，残余窗口不超过该截止，截止前未能生效时（例如 Substrate 控制面不可达），窗口延续到撤销生效或该代沙箱删除完成（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - **控制面与沙箱提供者**：`sandboxprovider` 的 k8s 子模块以其 k8s RBAC 身份操作 Sandbox CR 与 Pod，其中原地缩放需要 `pods/resize` 子资源的 patch 权限；`sandboxprovider` 的 Substrate 子模块经路由器调用 `/wake` 的身份是 SPIFFE 身份（[REF-spiffe](../references.md)），且必须在路由器的入站白名单内。
 - **控制面与看守进程的出站认证**：看守进程主动外连 `runcontroller` 建立出站流，`Hello` 携带绑定代的运行实例令牌（协议字段 `resume_token`）与 `workspace_lease_id`；`runcontroller` 以 `HelloAck.accepted` 或 `HelloAck.fenced` 应答；令牌签名或 `run_id` 无效，或令牌中的代与信封 `generation` 不符时，以不可重试认证失败状态关闭流；依赖调用失败时以可重试状态关闭流；运行实例已终态时回 `Shutdown`。
-- **入站端点的调用方**：Substrate 提供者下入站调用方必须持有 SPIFFE 身份且在白名单内；k8s 提供者下 `/readyz` 由 kubelet 探针调用，恢复不经入站端点，`/terminal` 与界面文件访问经 k8s 入站路由。`/terminal` 的实时接入只在 `humanchannel` 完成用户身份校验后建立。
+- **入站端点的调用方**：Substrate 提供者下入站调用方必须持有 SPIFFE 身份且在白名单内；k8s 提供者下 `/readyz` 由 kubelet 探针调用，恢复不经入站端点，`/terminal` 与界面文件访问经 k8s 入站路由；控制面循环驱动器经沙箱地址调用 `ToolExec`，以运行实例令牌鉴权，不经过入站路由。`/terminal` 的实时接入只在 `humanchannel` 完成用户身份校验后建立。
 - **人类通道的用户身份与项目归属**：`humanchannel` 在控制面校验人类用户的身份，并把消息、审批决定与实时接入归属到该用户有权访问的项目下的运行实例；写入收件箱的人类事件携带用户身份。
 - **凭据作用域**：凭据对象按项目作用域授权到外部系统；外部系统定义的 `token_minting` 规定签发凭据的 `ttl` 与 `scopes`；每次凭据使用在审计记录中关联 `run_id`、`generation`、外部系统与操作。
 

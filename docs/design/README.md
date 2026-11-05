@@ -13,6 +13,15 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent（托管的
 | 模块 | 文档 |
 | --- | --- |
 | `runcontroller` | [runcontroller](modules/design-runcontroller.md) |
+| `llmgateway` | [llmgateway](modules/design-llmgateway.md) |
+| `connectorhub` | [connectorhub](modules/connectorhub/README.md) |
+| `sandboxprovider` | [sandboxprovider](modules/sandboxprovider/README.md) |
+| `agentprotocol` | [agentprotocol](modules/design-agentprotocol.md) |
+| `secrets` | [secrets](modules/design-secrets.md) |
+| `humanchannel` | [humanchannel](modules/design-humanchannel.md) |
+| `warden` | [看守进程](modules/warden/README.md) |
+| `suspendpolicy` | [suspendpolicy](modules/design-suspendpolicy.md) |
+| `workspace` | [workspace](modules/design-workspace.md) |
 
 ## 对照
 

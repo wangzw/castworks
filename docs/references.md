@@ -22,3 +22,4 @@
 | REF-otel-genai-semconv | OpenTelemetry GenAI semantic conventions | 生成式 AI 调用的追踪、指标与事件属性约定（gen_ai.*） | <https://github.com/open-telemetry/semantic-conventions-genai> | — |
 | REF-anthropic-streaming | Streaming Messages（Claude API 文档） | Claude Messages API 的服务器发送事件流格式，含内容事件与 ping 保活事件 | <https://platform.claude.com/docs/en/build-with-claude/streaming> | anthropic-version 2023-06-01 |
 | REF-spiffe | SPIFFE | 工作负载身份标准：SPIFFE ID 与可验证身份文档（SVID） | <https://spiffe.io/docs/latest/spiffe-about/overview/> | — |
+| REF-envoy | Envoy Proxy 文档 | 云原生服务代理，提供 CONNECT 终止、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 过滤器 | <https://www.envoyproxy.io/docs/envoy/latest/> | — |
