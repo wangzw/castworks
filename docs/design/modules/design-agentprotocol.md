@@ -220,7 +220,7 @@ stateDiagram-v2
 
 ### 消息闭集
 
-下表按方向穷举当前协议版本的应用消息种类，是应用消息种类的闭集。`Hello` 与 `HelloAck` 是握手帧，`Ack` 是确认帧，三者的 `msg_seq` 均为 0；应用消息按流序号规则编号。新增应用消息种类须递增协议版本，并同时扩展编解码、两端处理器与本节表格。
+下表按方向穷举当前协议版本的应用消息种类，是应用消息种类的闭集。`Hello` 与 `HelloAck` 是握手帧，`Ack` 是确认帧，三者的 `msg_seq` 均为 0；应用消息按流序号规则编号。新增或删除应用消息种类须递增协议版本，并同时扩展或收缩编解码、两端处理器与本节表格。
 
 两个方向共用确认帧 `Ack`：帧体为空，只以信封的 `ack_msg_seq` 确认对向消息；不占流序号、不写入重放缓冲、不去重，也不需要被确认。没有应用消息可搭载确认时，发送方按配置周期发送确认帧。
 
@@ -229,7 +229,7 @@ stateDiagram-v2
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
 | `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq` | 出站流首帧。以 `resume_token` 认证并声明代与工作区租约，提交状态摘要。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放。 |
-| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|request\|timer, ref, fire_at, predicted_ms}`、`bg_jobs_changed{job_ids}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为回合事件；`event_seq` 在同一回合内单调，用于丢弃重复与乱序事件。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。 |
+| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms}`、`bg_jobs_changed{job_ids}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为回合事件；`event_seq` 在同一回合内单调，用于丢弃重复与乱序事件。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。 |
 | `WaitDeclared` | `wait_id`、`scope: run\|generation`、`conditions[{cond_id, kind, ref}]`、`deadline`、`safe_to` | 仅 L2 协作式 Agent 使用；沙箱内的 L2 进程驱动器经出站流发送，控制面循环驱动器经 `runcontroller` 的 `RunService.DeclareWait` 提交同一组字段。向控制面追加显式等待条件。`kind=timer` 的条件必须引用已存在且同范围的 `timer` 行，否则整条声明被拒绝并计数；带 `deadline` 时登记同范围的 `declared_deadline` 定时器。 |
 | `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`throttled_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。 |
 | `Accepted` | `delivery_id`、`through_seq`、`fed` | 接受记录同步写入[工作区](../../glossary.md)[投递意图日志](../../glossary.md)后才发送。`fed` 报告本批按日志去重后是否仍有事件喂给 Agent；`fed=false` 时不为本批启动 Agent，控制面不转 `InTurn`。 |
@@ -242,7 +242,6 @@ stateDiagram-v2
 | `llm.request.started` | `request_id`、`mode: passthrough\|hold`、`predicted_ms` | 本地代理获得上游响应头，或确认同一逻辑请求在途之后上报。`mode` 决定阻塞条件的冻结上限取 `F_stream` 或 `F_cap(llm)`；`predicted_ms` 是等待时长的单点预测，`suspendpolicy` 按来源先验把它展开为分位区间与置信度。 |
 | `llm.first_token` | `request_id` | 收到首个内容事件后上报，保活事件不计入；每个逻辑请求至多一次。控制面据此写 `wake_hint` 事实供预测性恢复，并按已等待时长重估同一 `request_id` 的剩余等待；不单独满足阻塞条件。 |
 | `llm.request.completed`、`llm.request.failed` | `request_id`；失败另带 `reason` | LLM 请求完成或失败；满足同一 `request_id` 的阻塞条件。`failed` 可以在 `started` 之前发出（网关不可达、准入失败），此时只写失败信号并关闭该 `request_id` 的在途行。`reason` 取 `upstream_error`、`upstream_timeout`、`stream_interrupted`、`admission_failed`、`replay_missing`。 |
-| `request.completed`、`request.failed` | `request_id`；失败另带 `reason` | 经[平台 MCP 服务器](../../glossary.md)发起的同步连接器操作完成或失败；与同一 `request_id` 的等待条件匹配。 |
 | `ToolExecResponse` | `exec_id`、`status`、`exit_code`、`result`、`error` | 工具执行请求的终态应答；`status` 取 `completed`、`failed`、`cancelled`，`error` 只在失败时非空。按 `(run_id, generation, exec_id)` 匹配请求。 |
 | `ToolExecData` | `exec_id`、`stream: stdout\|stderr`、`offset`、`data`、`eof` | 工具执行输出分片；`offset` 从该流起点计，接收方按偏移续传，重复或乱序分片被丢弃。`eof` 表示该流结束。 |
 
@@ -383,6 +382,8 @@ sequenceDiagram
 图固定冻结与恢复期间的消息顺序：`PrepareSuspend` 与 `ReadyToSuspend` 以 `suspend_id` 幂等，`Thaw` 与 `Thawed` 以 `freeze_id` 幂等；看守进程在冻结期间继续收发协议消息，控制面的确认只在消息处理事务提交后推进。流在冻结期间中断时，双方按走查的规则重连、对账与重放；`PrepareSuspend`、`ReadyToSuspend`、`Thaw` 与 `Thawed` 的重放不重复执行效果，因为链接方按 `suspend_id` 与 `freeze_id` 幂等。
 
 ### 场景：等 PR 门禁的订阅与销毁重建
+
+PR 由第三方工具经出口代理创建，本场景从 `subscribe_event` 开始，不经过平台的外部操作工具。
 
 ```mermaid
 sequenceDiagram

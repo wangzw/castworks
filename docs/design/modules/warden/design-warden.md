@@ -17,7 +17,8 @@
 - **活动度采集**：按固定周期采集 `Activity` 的字段，包括 PSI、进程态、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、冻结状态与 `freeze_id`。结果是控制面获得不依赖 Agent 配合的忙闲证据，`suspendpolicy` 与 `runcontroller` 据此判断能否挂起。
 - **工作区租约续约**：以 `lease_id` 与代周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
 - **投递意图日志**：`Deliver` 到达后先在 `.platform/deliveries.jsonl` 追加 `accepted{seq}` 并同步写入，按日志去重后把事件喂给 Agent；观察到回合开始后追加 `consumed{seq, turn_id}` 并同步写入，再发出 `Consumed`。结果是至少一次投递在跨代重建后仍可由日志去重，重建后不重复处理已消费事件（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
-- **平台 MCP 服务器**：向 Agent 暴露闭集工具，把订阅、阻塞等待、人类输入、定时与外部系统操作翻译为对 `connectorhub`、`humanchannel` 的带令牌调用；阻塞型调用临近冻结上限时返回已转为订阅或定时的结果。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
+- **平台 MCP 服务器**：向 Agent 暴露闭集工具，把订阅、阻塞等待、人类输入与定时翻译为对 `connectorhub`、`humanchannel` 的带令牌调用；阻塞型调用临近冻结上限时返回已转为订阅或定时的结果。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
+- **工具接入声明执行**：按项目作用域下发的工具接入声明向 Agent 进程与 `ToolExec.exec` 注入凭据占位符环境变量与非秘密配置，合并已批准的第三方 MCP 服务器配置；只注入字面占位符，不解析、不换取、不缓存真实凭据。结果是第三方工具经同一组环境变量使用平台的出口凭据通道，平台不需要知道哪个工具使用了哪条通道。
 - **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 exec、文件读写、流式输出与后台作业帧，按代校验；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，且驱动器无需持有运行实例令牌。
 - **出站流与状态对账**：始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，发送 `Hello`、`AgentEvent`、`Activity`、`Accepted`、`Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`Busy`、`Thawed`、`LeaseLost`、本地代理与平台 MCP 服务器的请求事件与 `ToolExec` 响应/数据帧，处理 `HelloAck`、`Deliver`、`PrepareSuspend`、`CancelSuspend`、`Thaw`、`Resumed`、`LiveState`、`Shutdown`、`Fenced`、`TokenRotate` 与 `ToolExec` 请求/取消帧；断连后退避重连、重放未确认消息并以 `Hello` 做状态对账。结果是控制面以持久化状态而非事件历史恢复一致（I10）。
 - **令牌持有与轮换**：持有沙箱内唯一的运行实例令牌，按 `TokenRotate` 替换；令牌过期且未收到新令牌之前，不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求。结果是沙箱内不出现长期凭据或 LLM 密钥（I6）。
@@ -75,7 +76,6 @@
 | 发出 | `ReadyToSuspend`、`Busy`、`Thawed` | 挂起就绪、挂起前置不满足或取消确认、解冻完成；均以 `suspend_id` 或 `freeze_id` 幂等 |
 | 发出 | `LeaseLost` | 工作区租约在到期前无法续约 |
 | 发出 | `llm.request.started`、`llm.first_token`、`llm.request.completed`、`llm.request.failed` | 本地代理的 LLM 在途状态；`mode` 决定冻结上限取 `F_stream` 还是 `F_cap(llm)` |
-| 发出 | `request.completed`、`request.failed` | 平台 MCP 服务器代理的同步连接器操作完成或失败 |
 | 接收 | `HelloAck` | `accepted`、`fenced{current_generation}`、`desired_state`、`last_received_msg_seq`、`owner_epoch`、游标与实时接入状态；决定是否继续投递与重连 |
 | 接收 | `Deliver` | 一批投递事件、`through_seq`、`target` 与 `resume_session_id`；投递只在此消息上到达 |
 | 接收 | `PrepareSuspend`、`CancelSuspend`、`Thaw` | 挂起前置、冻结变体、截止时间与强制选项；取消与解冻 |
@@ -103,7 +103,7 @@
 
 文件 API 为界面提供工作区文件的读取，包括列目录与读文件；路径限定在运行实例子目录内，请求经入站路由到达，按入站路由的调用方身份（`humanchannel` 完成用户身份与项目归属校验）与实时接入状态鉴权。看守进程以自身持有的运行实例令牌核对请求携带的代，并校验当前租约的持有者为自身；请求本身不携带令牌。文件 API 不提供事件通道。
 
-本地代理监听回环地址，是 Agent 进程唯一的 LLM 与外部系统 HTTP 出口。Agent 不持有令牌，本地代理在转发时附加运行实例令牌；LLM 请求转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理。本地代理不做 MITM，不替换凭据，模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
+本地代理监听回环地址，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器。Agent 不持有令牌，本地代理在转发时附加运行实例令牌；LLM 请求转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理。本地代理与透明拦截器都不做 MITM，不替换凭据，TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
 ### 平台 MCP 工具
 
@@ -111,14 +111,25 @@
 
 | 工具 | 结果 |
 | --- | --- |
+| `list_events` | 列出当前运行实例可订阅的外部系统事件：事件类型、可匹配字段、身份键、终态与订阅参数；只读，不产生阻塞等待 |
 | `subscribe_event` | 在 `connectorhub` 登记订阅并返回 `sub_id`；登记事务对已到达事件回溯匹配，已终态的外部对象合成完成事件 |
 | `wait_for` | 阻塞等待指定条件；临近冻结上限时返回已转为订阅与 `sub_id` 的结果，要求 Agent 结束回合 |
 | `request_human_input` | 请求人类输入；异步渠道经回合边界承接，实时接入中阻塞等待 |
 | `sleep_until` | 登记定时；阻塞型在 DRAIN 或临近上限时转为运行实例范围定时器并返回已转为定时的结果 |
-| 外部系统操作 | 经 `connectorhub` 执行同步或异步操作，返回结果并登记预关联锚 |
 | 附件取回 | 附运行实例令牌向存放方取回附件引用中的内容 |
 
-per-server timeout 配置为 `F_cap(approval / wait_for / request)` 加安全余量，且不得大于 MCP 传输上限；`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限，实际约束是 HTTP 首字节 60 s、HTTP idle 300 s 加 30 s 检查粒度与 stdio idle 1800 s 加 30 s 检查粒度；`F_cap(request)` 与 `F_cap(timer)` 由 `suspendpolicy` 按传输类型与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应操作、驱动器的超时预算与本模块文档。
+`list_events`、`subscribe_event` 与 `wait_for` 的 MCP 描述向 Agent 说明：先用 `list_events` 查看可用事件；`wait_for` 是短等待，临近冻结上限时自动转为订阅；`subscribe_event` 登记后事件作为下一回合输入。
+
+### 等待方式的选择
+
+平台不向 Agent 暴露冻结上限的具体数值；Agent 按下列规则选择等待方式。
+
+- 短等待用 `wait_for`。平台在临近冻结上限时自动转为订阅，返回「已转为订阅，请结束本回合」；Agent 收到该结果必须结束回合，不得重试 `wait_for`。
+- 长等待或不确定时长直接调用 `subscribe_event` 并结束回合。订阅属于运行实例，不绑定工具调用；事件到达后经收件箱在下一回合投递，沙箱可在等待期间挂起。
+- 需要继续当前工作可以登记订阅后继续当前回合，事件留到下一回合处理。
+- 不要用 Bash、curl 或其他外部工具轮询外部系统；轮询使沙箱无法挂起，且与订阅重复。
+
+per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于 MCP 传输上限；`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限，实际约束是 HTTP 首字节 60 s、HTTP idle 300 s 加 30 s 检查粒度与 stdio idle 1800 s 加 30 s 检查粒度；`F_cap(timer)` 由 `suspendpolicy` 按传输类型与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增平台工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应接口、驱动器的超时预算与本模块文档；第三方工具不进入此表，经工具接入声明与出口代理接入。
 
 ### 入站端点
 
@@ -409,9 +420,9 @@ sequenceDiagram
 
 ### 平台 MCP 服务器
 
-平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的带令牌调用，并向 Agent 驱动器提供事件。`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对事件日志回溯匹配；`wait_for` 阻塞到条件满足或临近冻结上限，临近上限时返回已转为订阅与 `sub_id` 的结果；`request_human_input` 在异步渠道以回合边界承接，在实时接入中阻塞等待；`sleep_until` 登记定时，阻塞型在 DRAIN 或临近上限时转为运行实例范围定时器；外部系统操作经 `connectorhub` 执行并登记预关联锚；附件取回附运行实例令牌向存放方请求。
+平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的带令牌调用，并向 Agent 驱动器提供事件。`list_events` 从 `connectorhub` 的事件目录取得当前运行实例可订阅的事件；`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对事件日志回溯匹配；`wait_for` 阻塞到条件满足或临近冻结上限，临近上限时返回已转为订阅与 `sub_id` 的结果；`request_human_input` 在异步渠道以回合边界承接，在实时接入中阻塞等待；`sleep_until` 登记定时，阻塞型在 DRAIN 或临近上限时转为运行实例范围定时器；附件取回附运行实例令牌向存放方请求。第三方工具不经过平台 MCP 服务器，它们经本地代理与出口代理执行。
 
-工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，`wait_for` 的 `ref` 只取 `lifetime: once` 的订阅，`sleep_until` 以 `scope=run` 发出定时请求。per-server timeout 配置为 `F_cap(approval / wait_for / request)` 加安全余量，且不得大于 MCP 传输上限；工具超时返回错误结果，不无限占用回合。
+工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，`wait_for` 的 `ref` 只取 `lifetime: once` 的订阅，`sleep_until` 以 `scope=run` 发出定时请求。per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于 MCP 传输上限；工具超时返回错误结果，不无限占用回合。
 
 ### ToolExec 与文件访问
 
@@ -427,7 +438,7 @@ sequenceDiagram
 
 收到 `Resumed{drain=true}` 后，看守进程按 `suspend_id` 幂等记录 DRAIN 标志。已处于等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即返回终止等待的结果：审批以「需人工批准，批准后以消息通知」拒绝；`wait_for` 返回「已转为订阅，请结束本回合」；阻塞型 `sleep_until` 先转为运行实例范围定时器，再返回「已转为定时，请结束本回合」。之后发起的阻塞型 `sleep_until` 仍照常发出 `wait_started{kind=timer}`，但定时范围变为运行实例范围。
 
-DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周期重发 `Resumed{drain=true}`，看守进程只按 `suspend_id` 幂等处理，不中断回合、不销毁沙箱。LLM 等待由本地代理回放跑完本次请求到回合末；同步连接器操作的结果由平台 MCP 服务器直接返回，不进入 DRAIN。
+DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周期重发 `Resumed{drain=true}`，看守进程只按 `suspend_id` 幂等处理，不中断回合、不销毁沙箱。LLM 等待由本地代理回放跑完本次请求到回合末。
 
 ## 错误与失败语义
 
@@ -473,9 +484,11 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 
 新增驱动器（例如 Codex、OpenHands 或 Gemini CLI）实现同一套 Agent 驱动器接口：把该 Agent 的原生回合、工具、权限询问、等待与后台作业翻译为协议事件；把 `Deliver` 的 `target` 翻译为原生输入；定义以挂起为目的的退出路径与恢复句柄。新增驱动器不修改 `runcontroller`、`suspendpolicy` 或本模块文档的协议消息；接口变更须同时覆盖进程驱动器与控制面循环驱动器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
-### 新增平台 MCP 工具
+### 新增平台工具与第三方工具接入
 
-新增工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限与 DRAIN 行为；运行实例令牌的鉴权方式；超时预算。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的操作定义、Agent 驱动器的超时配置与本模块文档。
+新增平台工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限与 DRAIN 行为；运行实例令牌的鉴权方式；超时预算。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的接口、Agent 驱动器的超时配置与本模块文档。
+
+第三方工具不进入平台 MCP 闭集。新增第三方工具只改项目作用域的工具接入声明：声明凭据占位符环境变量、第三方 MCP 服务器与允许主机；平台不为其增加工具、不识别其操作，也不改变本地代理与出口代理的实现。
 
 ### 新增冻结变体
 

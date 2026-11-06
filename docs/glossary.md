@@ -32,14 +32,19 @@
 | 控制面循环驱动器 | control-plane loop driver | 控制面内的 Agent 驱动器实现，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 接口使用沙箱，不假定沙箱内存在 Agent 进程 |
 | 本地代理 | local proxy | 看守进程内不被冻结的 HTTP 代理，Agent 进程的全部出站 HTTP 流量经它中继：LLM 请求转发到 LLM 网关，外部系统请求以 CONNECT 或 HTTP 前置转发到出口代理 |
 | LLM 网关 | LLM gateway | 控制面中代理 LLM 调用的服务：凭据换取、代校验、在途跟踪、回放存储、限流计费 |
-| 连接器 | Connector | 按外部系统定义接入一个外部系统的组件：出口策略、操作、事件源、订阅匹配 |
-| 外部系统定义 | ExternalSystem | 描述一个外部系统的认证方式、出口策略、操作、事件源与关联键的声明 |
+| 连接器 | Connector | 按外部系统定义接入一个外部系统的组件：出口策略、事件源、订阅匹配、完成条件与状态式轮询 |
+| 外部系统定义 | ExternalSystem | 描述一个外部系统的认证方式、出口策略、事件源、完成条件目录、关联键与关联键身份键的声明；不声明具体操作 |
 | 协作层级 | cooperation level | Agent 向托管环境提供信号的程度：L0 纯观测、L1 驱动器中介、L2 协作式 |
 | 投递意图日志 | delivery intent log | 看守进程写在工作区内的投递记录，使事件去重在沙箱重建后仍然有效 |
 | 恢复准入 | resume admission | 对等待恢复的运行实例按机制限速与优先级放行的队列 |
 | 实时接入 | live attachment | 人在平台界面的会话中活跃、已连接沙箱终端，或界面正在经沙箱读取工作区文件的状态 |
 | 人类通道 | human channel | 把聊天界面、即时通讯、Issue 评论等人类输入与审批决定写入收件箱的模块 |
-| 平台 MCP 服务器 | platform MCP server | 看守进程提供给 Agent 的 MCP（[REF-mcp](references.md)）工具集合：登记订阅、阻塞等待、请求人类输入、定时等待、外部系统操作 |
+| 平台 MCP 服务器 | platform MCP server | 看守进程提供给 Agent 的 MCP（[REF-mcp](references.md)）工具集合：列出可订阅事件、登记订阅、阻塞等待、请求人类输入、定时等待、附件取回；不执行第三方操作 |
+| 事件目录 | event catalogue | 平台 MCP 服务器向 Agent 投影的可订阅事件集合：事件类型、可匹配字段、身份键、终态与订阅参数；由 `connectorhub` 按运行实例可用的外部系统生成 |
+| 工具接入声明 | tool profile | 控制面按项目下发的第三方工具与 MCP 服务器声明：凭据占位符环境变量、非秘密配置、stdio MCP 服务器与允许主机；位于工作区之外，工作区 `.mcp.json` 不生效 |
+| 占位符环境变量 | placeholder environment variable | 值为 `{{<system>.<name>}}` 形式占位符的环境变量，由看守进程注入第三方工具；真实凭据仍只在出口代理内存中出现 |
+| 完成条件目录 | completion catalogue | 外部系统定义中按事件类型声明的 `verify` 集合；订阅按事件类型查找状态核对方式，不按操作名查找 |
+| 关联键身份键 | identity key | `events.identity_keys` 声明的关联键子集；一次性订阅的关联键必须至少包含其中一个，用于限制宽泛匹配 |
 | 出口策略 | egress policy | 连接器为每个运行实例生成的允许出口主机集合与请求头凭据占位符替换规则，由沙箱提供者落地；未列入的主机默认拒绝 |
 | 出口代理 | egress proxy | 落地出口策略的托管侧代理，接收本地代理中继的 Agent 流量，在发往允许主机时把凭据占位符替换为真实凭据；k8s 路径为 connectorhub 的平台出口代理，Substrate 路径为 Substrate 出口网关（[REF-substrate](references.md)） |
 | 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, expires_at} 记录；看守进程以首次续约绑定持有者并周期续约，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除后接管工作区 |

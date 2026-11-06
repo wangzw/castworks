@@ -65,7 +65,7 @@ type Driver interface {
 type StartSpec struct {
     ResumeHandle string        // 恢复句柄；为空表示新会话
     Cwd          string        // 与工作区挂载路径逐字一致
-    Env          []string      // 驱动器专属环境变量
+    Env          []string      // 驱动器专属环境变量；含工具接入声明的凭据占位符环境变量与非秘密配置
 }
 
 type Fed struct {
@@ -115,7 +115,7 @@ type DriverState struct {
 | `tool_started{call_id}` | 开始一次工具调用，或发出一次 `ToolExec` 调用之前 | `call_id` 由驱动器分配，同一回合唯一 |
 | `tool_ended{call_id}` | 工具调用结束或失败 | 与 `tool_started` 配对；未配对的调用在 `turn_ended` 时清理 |
 | `permission_requested{id, call_id, blocking}` | 循环需要审批 | `blocking` 表示是否在回合中阻塞等待 |
-| `wait_started{call_id, kind, ref, fire_at, predicted_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`request`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer` |
+| `wait_started{call_id, kind, ref, fire_at, predicted_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer` |
 | `subscription_created{sub_id, since_cursor}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记 |
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
 | `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 未结束的作业使运行实例保持活动 |
@@ -156,7 +156,7 @@ type DriverState struct {
 
 | 操作 | 控制面循环的用法 |
 | --- | --- |
-| exec | 执行工具命令，返回执行标识、退出码与标准输出、标准错误流 |
+| exec | 执行工具命令，返回执行标识、退出码与标准输出、标准错误流；命令继承工具接入声明的凭据占位符环境变量与非秘密配置 |
 | 文件读 | 读取运行实例子目录内的文件，作为工具结果的一部分 |
 | 文件写 | 在运行实例子目录内写入文件，作为工具副作用 |
 | 流式输出 | 按输出偏移续传一次执行或后台作业的输出；断线后从上次偏移继续 |
@@ -271,7 +271,7 @@ sequenceDiagram
 | `phase` | `starting`、`in_turn`、`blocked`、`boundary` 或 `exited`；与 `agent_state.phase` 一致 |
 | `turn_id` | 当前或最近一个回合的标识 |
 | `session_id` | 循环的恢复句柄；由控制面循环定义并持久化 |
-| `blocked_on` | 当前的阻塞条件；`kind` 取 `llm`、`request`、`timer`、`approval` 或 `wait_for` |
+| `blocked_on` | 当前的阻塞条件；`kind` 取 `llm`、`timer`、`approval` 或 `wait_for` |
 | `bg_jobs` | 未结束的 `ToolExec` 后台作业 |
 | `running_tools` | 未配对的工具调用 |
 | `loop_state_ref` | 循环状态的引用；恢复时按它加载 |

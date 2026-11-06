@@ -79,7 +79,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 | 路由器 `ResumeActor` | 以 `ate-target-actor` 头定位 actor，调用方需具备 `can_resume`；路由器恢复 actor 并停泊请求直到 `wakeupProbe` 就绪 |
 | `wakeupProbe` | 在 actor 模板中声明为看守进程的 `/readyz:80`；就绪之前路由器不释放停泊请求 |
 | `parked-request-budget` | 路由器停泊请求的预算；默认 5 s，部署时必须调到不小于恢复 p95 加 `/readyz` 余量；约 500 MB actor 的恢复可能超过 5 s，未调大时停泊请求会被提前切断 |
-| EgressPolicy API | 以 `(run_id, generation)` 为键落地允许的主机、`replaceHeaders` 规则与凭据引用（`project_id`、`system`、`auth_method`、`scopes`）；MITM 由出口网关执行 |
+| EgressPolicy API | 以 `(run_id, generation)` 为键落地允许的主机、`replaceHeaders` 规则、凭据引用（`project_id`、`system`、`auth_method`、`scopes`）与通道模式；MITM 由出口网关执行 |
 | 凭据提供者协议 | 出口网关在解析占位符时调用 `secrets` 实现的凭据提供者；本子模块不调用该协议 |
 | 外部 CSI 卷 | actor 卷类型 `external`，每 actor 一卷；由 CSI 驱动动态供给 |
 | `durableDir` | 退化卷类型；挂起时上传对象存储，沙箱外无读取接口 |
@@ -263,7 +263,7 @@ flowchart LR
 
 1. `connectorhub` 经 `PutEgressPolicy` 推送每运行实例出口策略；本子模块按 `run_id` 保存，策略内容不解释。
 2. 预配与认领时，提供者按 `(run_id, generation)` 生成本代副本并落地为 EgressPolicy；快照恢复沿用同代副本，不重新生成；推送的更新只同步到尚未撤销的代。
-3. EgressPolicy 把允许的主机与 `replaceHeaders` 规则交给 Substrate 出口网关。网关以 MITM 终止连接，只替换请求中已存在的占位符请求头，缺头不注入；未列入的主机默认拒绝。actor 镜像信任出口网关的 CA；git 的 Basic 与 Bearer 头同样由出口网关替换，需要本地签名的客户端改用连接器操作。
+3. EgressPolicy 把允许的主机与 `replaceHeaders` 规则交给 Substrate 出口网关。网关以 MITM 终止连接，只替换请求中已存在的占位符请求头，缺头不注入；未列入的主机默认拒绝。策略中的通道模式原样透传给沙箱内本地 DNS 与透明拦截器；拦截器不终止 TLS，只把原始字节流转给出口网关。actor 镜像信任出口网关的 CA；git 的 Basic 与 Bearer 头同样由出口网关替换，需要本地签名的客户端不受支持。
 4. 网关在解析占位符时调用 `secrets` 实现的凭据提供者；凭据提供者不查询运行实例当前代，代的范围由 EgressPolicy 的落地与撤销界定。真实凭据只在网关替换请求头时出现，不进入 actor 的文件系统、环境变量或进程内存，也不物化为 k8s Secret。
 5. `RevokeEgressPolicy` 按 `(run_id, generation)` 撤销该代副本并写撤销墓碑；已撤销的代拒绝此后的落地与更新。撤销由 `runcontroller` 在代递增、进入 `Degraded`、放弃、显式结束、本代沙箱作废与回合边界销毁的提供者确认的事务内写 `revoke_egress` 效果，提供者在效果执行时撤销。
 6. 撤销在效果记录的截止之前生效时，残余窗口不超过该截止；截止前未能生效时，例如 Substrate 控制面不可达，窗口延续到撤销生效或该代 actor 删除完成。凭据提供者不可用时出口请求失败关闭，不回退到 k8s Secret 或静态凭据。

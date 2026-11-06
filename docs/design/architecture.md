@@ -87,10 +87,10 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 | `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待与定时器的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与失效判定；事件源的汇入契约；纠正性对账器 | 控制面 |
 | `suspendpolicy` | 挂起决策函数；冻结中复评与升级梯（冻结时长达到上限后依次切换到快照或 `DRAIN` 的顺序）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程（[ADR-suspendpolicy-as-library](../adr/adr-suspendpolicy-as-library.md)） |
 | `agentprotocol` | 看守进程与控制面之间的协议：信封、消息、出站流与入站端点、重放与去重、协议版本 | 共享库，链接进控制面服务与看守进程 |
-| `warden` | 看守进程：进程监督、Agent 驱动器、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、工作区租约续约、投递意图日志、本地代理、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1 |
+| `warden` | 看守进程：进程监督、Agent 驱动器、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、工作区租约续约、投递意图日志、本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1 |
 | `sandboxprovider` | 沙箱提供者的能力自描述接口；沙箱预配、挂起、恢复与按代销毁，整代销毁之后拒绝该代及更早代的沙箱创建；冻结、解冻与缩小 CPU request 以 `freeze_id` 标识，已解冻的 `freeze_id` 不再接受冻结与缩小；运行实例结束或失败后按运行实例释放运行实例级资源，释放之后拒绝该运行实例的一切创建；按节点查询冻结态内存与可分配内存；预热池；出口策略在预配与认领沙箱时按代落地，按代撤销，撤销之后拒绝该代的落地与更新。子模块 k8s 负责 Sandbox CR、节点冻结代理、原地缩放、平台出口代理配置与 NetworkPolicy 落地、入站路由；子模块 substrate 负责 actor 模板、Suspend 与 Resume、路由器唤醒与 EgressPolicy 落地；出口网关的凭据提供者（credential provider）协议由 `secrets` 实现，出口网关调用 | 控制面与节点，节点冻结代理为 DaemonSet |
 | `llmgateway` | 以运行实例令牌与调用方身份换取 LLM 凭据、`generation` 校验、在途请求表与在途请求事实的登记、实例续租、回放存储、限流、计费与审计 | 控制面 |
-| `connectorhub` | 外部系统定义与连接器：出口策略生成、k8s 路径的平台出口代理、同步与异步操作、webhook 落盘与状态式轮询、订阅登记与回溯匹配、预关联锚（平台操作返回时登记的运行实例与关联键值，带 TTL，匹配到的事件先暂存到运行实例的未认领区）、订阅完成事件写入收件箱 | 控制面 |
+| `connectorhub` | 外部系统定义与连接器：出口策略生成、k8s 路径的平台出口代理、webhook 落盘与状态式轮询、订阅登记与回溯匹配、完成条件目录、订阅完成事件写入收件箱；不执行第三方操作 | 控制面 |
 | `humanchannel` | 聊天界面、即时通讯与 Issue 评论到收件箱的适配，审批决定，在线与「正在输入」信号，实时接入状态 | 控制面 |
 | `secrets` | 密钥库对接、运行实例令牌的签发与轮换、凭据换取、调用方授权与使用审计 | 控制面 |
 | `workspace` | 工作区的绑定、持久化确认、沙箱外访问与工作区租约；按提供者区分的持久化实现；看守进程的文件 API | 控制面与看守进程 |
@@ -173,7 +173,7 @@ graph TD
         egw["Substrate 出口网关"]
     end
     subgraph sb["沙箱"]
-        warden["看守进程，PID 1：本地代理、平台 MCP 服务器、Agent 驱动器"]
+        warden["看守进程，PID 1：本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、Agent 驱动器"]
         agent["Agent 进程，Claude Code"]
     end
     subgraph ext["外部系统"]
@@ -214,8 +214,8 @@ graph TD
     agent --> warden
     warden -->|"HTTP"| gw
     gw --> anthropic
-    warden -->|"本地代理中继"| eproxy
-    warden -->|"本地代理中继"| egw
+    warden -->|"本地代理或拦截器中继"| eproxy
+    warden -->|"本地代理或拦截器中继"| egw
     eproxy --> github
     eproxy --> biz
     egw --> github
@@ -231,7 +231,7 @@ graph TD
 - 沙箱是一个进程树：看守进程是沙箱容器的 PID 1，Agent 进程是看守进程以管道驱动的子进程；看守进程崩溃即沙箱崩溃，运行实例走重建与「回合被中断」路径（[ADR-warden-is-pid1](../adr/adr-warden-is-pid1.md)）。Agent 进程能到达的网络端点受 I6 约束，见架构不变量。
 - 看守进程与 `runcontroller` 之间只有出站流与入站端点；控制面循环驱动器作为库链接进 `runcontroller`，其 `ToolExec` 帧经该运行实例的出站流往返，由 `runcontroller` 在写入前按所有权、代与终态校验，不经过沙箱地址或入站路由。看守进程对 `llmgateway` 与 `connectorhub` 的调用是附运行实例令牌的运行时 HTTP 调用，不承载协议消息。消息、重放、状态对账与恢复触发方式见模块间调用关系。控制面按 `generation` 判定并拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求，出口路径的失效判定方式见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - LLM 路径：Agent 进程 → 本地代理 → LLM 网关 → Anthropic API。本地代理与 LLM 网关之间是 HTTP 调用，Anthropic API 只由 LLM 网关访问，凭据换取与代校验见认证与授权边界（[ADR-two-tier-llm-proxy](../adr/adr-two-tier-llm-proxy.md)）。
-- 外部系统路径：Agent 进程 → 本地代理（CONNECT 或 HTTP 前置，附运行实例身份）→ 出口代理 → 允许主机。本地代理不做 MITM，出口策略的内容与落地见安全边界。平台出口代理属 `connectorhub`，是 k8s 路径的出口网关，`sandboxprovider` 的 k8s 子模块向其推送每运行实例出口策略并落地 NetworkPolicy；Substrate 路径的出口代理是 Substrate 出口网关。平台操作、状态式轮询与 webhook 接收由 `connectorhub` 在控制面完成。
+- 外部系统路径：Agent 进程 → 本地代理（CONNECT 或 HTTP 前置）或透明拦截器（本地 DNS 指向前者）→ 出口代理 → 允许主机。两者都附运行实例身份，都不做 MITM；TLS 终止与凭据替换由出口代理承担。出口策略的内容与落地见安全边界。平台出口代理属 `connectorhub`，是 k8s 路径的出口网关，`sandboxprovider` 的 k8s 子模块向其推送每运行实例出口策略并落地 NetworkPolicy；Substrate 路径的出口代理是 Substrate 出口网关。平台操作、状态式轮询与 webhook 接收由 `connectorhub` 在控制面完成。
 - 提供者层：agent-sandbox 控制器、节点冻结代理、k8s 入站路由（wake-router）、Substrate 控制面、Substrate 路由器与 Substrate 出口网关都是控制面之外的进程，`sandboxprovider` 通过它们的 API 预配、挂起、恢复与销毁沙箱。
 - 人：平台界面、即时通讯与 Issue 评论等经 `humanchannel` 进入收件箱。沙箱终端在 `humanchannel` 完成身份校验后经入站路由到达看守进程的 `/terminal`，界面对工作区文件的读取请求经同一入站路由到达看守进程的文件 API：k8s 提供者的入站路由只服务 `/terminal` 与界面文件访问，事件驱动的恢复由控制面直调沙箱提供者；Substrate 提供者的入站经 Substrate 路由器。平台界面会话活跃，终端已连接，或界面正在经沙箱读取工作区文件期间，运行实例处于实时接入状态。
 
@@ -295,12 +295,12 @@ graph TD
     sbpod --> sharedfs
     warm --> sharedfs
     sbpod -->|"出站流与 LLM 请求"| cpsvc
-    sbpod -->|"本地代理中继"| eproxy
+    sbpod -->|"本地代理或拦截器中继"| eproxy
     eproxy --> github
     worker --> actor
     router --> actor
     actor -->|"出站流与 LLM 请求"| cpsvc
-    actor -->|"本地代理中继"| egw
+    actor -->|"本地代理或拦截器中继"| egw
     egw --> github
     scp --> obj
     scp --> pg
@@ -329,7 +329,7 @@ Kubernetes 集群内的划分：
 
 全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容；`ToolExec` 帧随出站流往返，由 `runcontroller` 从进程内控制面循环驱动器转发，不占用入站端点。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
 
-回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如经连接器的同步外部调用、实时接入中的审批）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。
+回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如阻塞型审批、`wait_for` 与阻塞型定时）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。第三方工具调用不是阻塞条件，不进入这条路径。等待方式的选择（短等待用 `wait_for`、长等待用 `subscribe_event` 并结束回合）由平台 MCP 工具契约给出，见 [warden](modules/warden/design-warden.md)。
 
 ```mermaid
 sequenceDiagram
@@ -512,12 +512,12 @@ flowchart LR
     driver -->|"accepted 与 consumed"| intent
     driver -->|"原生输入"| agent
     proxy -->|"llm.request.completed 出站流"| wake
-    mcp -->|"request.completed 出站流"| wake
     gw -->|"完成或失败 汇入契约"| wake
-    hub -->|"同步调用完成"| wake
     timer -->|"代范围定时器触发"| wake
     timer -->|"运行实例范围定时器到期通知"| inbox
     wake --> rc
+    agent -->|"MCP 工具调用"| mcp
+    mcp -->|"登记订阅与取附件"| hub
     agent -->|"HTTP 回环地址"| proxy
     proxy -->|"附运行实例令牌"| gw
     gw --> upstream
@@ -543,9 +543,9 @@ flowchart LR
 | Agent 输入 | 看守进程的 Agent 驱动器到 Agent 进程 | 按 `target` 翻译为 Agent 原生输入：下一条用户消息、工具结果或权限决定 | Agent 自身的会话记录，位于工作区内的 `CLAUDE_CONFIG_DIR` |
 | 唤醒信号 | 看守进程的本地代理与平台 MCP 服务器（出站流）、`llmgateway`、`connectorhub`、定时器到 `runcontroller` | 引用阻塞条件或代范围等待条件的 `kind` 与 `ref`，带 `generation`，不进入收件箱 | `wake_signal` 表，在运行实例行锁内消费 |
 | LLM 请求与响应 | Agent 进程到本地代理（回环 HTTP），本地代理到 LLM 网关（附运行实例令牌），LLM 网关到上游 | 流式响应；本地代理的单次回放缓存键为 `(run_id, generation, request_hash)`，网关回放存储按 `request_id` 取回 | `llm_request` 表与 LLM 网关的回放存储 |
-| 外部系统请求 | Agent 进程到本地代理（CONNECT 或 HTTP 前置），本地代理到出口代理（附运行实例身份），出口代理到允许主机 | 携带凭据占位符的 HTTP 请求，出口代理替换占位符后转发；出口代理的请求头与响应头事件作为在途信号上报 | 不持久化 |
+| 外部系统请求 | Agent 进程到本地代理（CONNECT 或 HTTP 前置）或透明拦截器（本地 DNS 指向），两者到出口代理（附运行实例身份），出口代理到允许主机 | 携带凭据占位符的 HTTP 请求，出口代理终止 TLS、替换占位符后转发；拦截器只转发原始 TLS 字节，不终止 TLS；出口代理的请求头与响应头事件作为在途信号上报 | 不持久化 |
 | 凭据 | 密钥库到 LLM 网关与 `connectorhub`（以运行实例令牌与调用方身份换取）、密钥库到出口代理（以运行实例令牌与调用方身份换取，替换占位符） | 沙箱内只存在形如 `{{github.token}}` 的占位符与看守进程持有的运行实例令牌 | `secrets` 对接的密钥库 |
-| 出口策略 | `connectorhub` 到 `sandboxprovider` 再到出口代理 | 每运行实例的允许主机与占位符替换规则；Substrate 为以（运行实例，代）为键的 EgressPolicy，由 `sandboxprovider` 在预配与认领沙箱时按代落地，撤销后该代拒绝再次落地与更新；k8s 为平台出口代理配置与 NetworkPolicy | `connectorhub` 生成的每运行实例出口策略；Substrate 的按代副本由 `sandboxprovider` 据它落地 |
+| 出口策略 | `connectorhub` 到 `sandboxprovider` 再到出口代理与沙箱内本地 DNS | 每运行实例的允许主机、占位符替换规则与按主机通道模式；Substrate 为以（运行实例，代）为键的 EgressPolicy，由 `sandboxprovider` 在预配与认领沙箱时按代落地，撤销后该代拒绝再次落地与更新；k8s 为平台出口代理配置与 NetworkPolicy | `connectorhub` 生成的每运行实例出口策略；Substrate 的按代副本由 `sandboxprovider` 据它落地 |
 | 运行实例令牌 | 控制面到看守进程（出站流 `TokenRotate`） | 短期 JWT，签发、持有与校验见认证与授权边界 | 只由看守进程持有 |
 
 事件与唤醒信号的写入事务各自重评估唤醒谓词（I5）。LLM 流量不走占位符注入，凭据换取与在途跟踪在 LLM 网关完成；外部系统流量的占位符替换与默认拒绝见安全边界。决策依据见 [ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md) 与 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)。
@@ -570,7 +570,7 @@ flowchart LR
 **外部调用错误**的划分标准是重做同一调用是否会产生第二个外部副作用。托管侧只自动重试带幂等键的调用，其余调用的失败作为结果交回 Agent 决定。按该标准划分的举例：
 
 - 可重试：LLM 请求，以 `(run_id, generation, request_hash)` 命中单次回放缓存，恢复后本地代理按 `request_id` 向 LLM 网关取回已完成响应（[ADR-two-tier-llm-proxy](../adr/adr-two-tier-llm-proxy.md)）；订阅的 `verify` 状态查询与状态式轮询，二者只读外部对象状态；入站 webhook 的接收，以 `delivery_id` 唯一约束吸收发送方的重发。
-- 不可重试：会创建或改变外部对象的连接器操作（例如 `create_pull_request`），其失败作为操作结果返回 Agent；LLM 网关实例失联时在途请求不由托管侧重发，合成失败信号后由 Agent 自身的重试机制重新发起请求，合成规则见故障与降级。
+- 不可重试：第三方工具对有外部副作用的操作的重试由 Agent 决定，平台不代为重发；LLM 网关实例失联时在途请求不由托管侧重发，合成失败信号后由 Agent 自身的重试机制重新发起请求，合成规则见故障与降级。
 
 **状态机层错误**只有 `Degraded` 与 `Failed`。不以挂起为目的的销毁（显式结束、进入 `Degraded`、放弃、本代沙箱作废、`fence_and_bump` 对旧代的销毁与各种单个沙箱的销毁）不受 I9 约束，被销毁的会话分别由恢复句柄、回合被中断通知与兜底摘要承接。预配或 `Resuming` 连续失败，Agent 进程以恢复句柄启动连续失败，或投递持续可重试失败，达到次数上限后进入 `Degraded`；`Degraded` 经兜底路径（经恢复准入重建，恢复句柄无法启动时改用新会话）回到 `Active`，或放弃进入终态 `Failed`。`Ended` 不是错误，只由显式结束触发。沙箱在回合中丢失（例如看守进程崩溃、冻结中的 Pod 被驱逐、工作区租约过期）不是状态机层错误，而是重建路径：`runcontroller` 写入内部可投递事件「回合被中断」（按 `generation` 与回合标识去重），经恢复准入放行时递增代。
 
@@ -598,7 +598,7 @@ graph LR
 图中每条边标注的是该边上的认证依据；图不表达的约束如下。
 
 - **运行实例令牌**由 `secrets` 签发，只由看守进程持有，经出站流上的 `TokenRotate` 轮换。Agent 进程不持有任何令牌：它的 LLM 流量只能到达本地代理（`ANTHROPIC_BASE_URL` 指向回环地址），它的外部系统流量经本地代理前置，由本地代理附加运行实例身份。
-- **LLM 网关与连接器的代校验**：LLM 网关与连接器用运行实例令牌与调用方身份向 `secrets` 换取真实凭据，并校验令牌中的 `generation` 等于运行实例当前代，当前代取自 `runcontroller` 的代查询接口，有外部副作用的连接器操作不使用缓存的代；代不匹配，运行实例已终态，或本代沙箱已被判定作废（已确认删除、判定丢失或进入 `Degraded`）的请求被拒绝并计入旧代拒绝计数。重建时代递增即令旧代令牌失效，见数据一致性与事务边界。
+- **LLM 网关与连接器的代校验**：LLM 网关与连接器用运行实例令牌与调用方身份向 `secrets` 换取真实凭据，并校验令牌中的 `generation` 等于运行实例当前代，当前代取自 `runcontroller` 的代查询接口，订阅登记与 k8s 路径的每个出口请求不使用缓存的代；代不匹配，运行实例已终态，或本代沙箱已被判定作废（已确认删除、判定丢失或进入 `Degraded`）的请求被拒绝并计入旧代拒绝计数。重建时代递增即令旧代令牌失效，见数据一致性与事务边界。
 - **出口路径的失效判定**：k8s 路径上本地代理附加的运行实例身份为运行实例令牌，平台出口代理对每个请求经 `runcontroller` 的代查询接口校验令牌中的代、运行实例是否已终态与本代沙箱是否已被判定作废，不使用缓存的代，不通过的请求被拒绝并计入旧代拒绝计数。Substrate 路径的出口策略以（运行实例，代）为键，在为该代预配或认领沙箱时落地；本代沙箱作废、回合边界销毁的确认（提供者确认）、进入 `Degraded`、放弃、显式结束与代递增的事务同时写入撤销对应代（代递增时为递增前的代）出口策略的效果记录，撤销即墓碑，已撤销的代拒绝此后的落地与更新；撤销在其执行截止之前完成时，残余窗口不超过该截止，截止前未能生效时（例如 Substrate 控制面不可达），窗口延续到撤销生效或该代沙箱删除完成（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 - **控制面与沙箱提供者**：`sandboxprovider` 的 k8s 子模块以其 k8s RBAC 身份操作 Sandbox CR 与 Pod，其中原地缩放需要 `pods/resize` 子资源的 patch 权限；`sandboxprovider` 的 Substrate 子模块经路由器调用 `/wake` 的身份是 SPIFFE 身份（[REF-spiffe](../references.md)），且必须在路由器的入站白名单内。
 - **控制面与看守进程的出站认证**：看守进程主动外连 `runcontroller` 建立出站流，`Hello` 携带绑定代的运行实例令牌（协议字段 `resume_token`）与 `workspace_lease_id`；`runcontroller` 以 `HelloAck.accepted` 或 `HelloAck.fenced` 应答；令牌签名或 `run_id` 无效，或令牌中的代与信封 `generation` 不符时，以不可重试认证失败状态关闭流；依赖调用失败时以可重试状态关闭流；运行实例已终态时回 `Shutdown`。
@@ -652,6 +652,9 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 | 看守进程崩溃 | 看守进程是沙箱 PID 1，其崩溃即沙箱崩溃；`runcontroller` 在出站流丢失且 Pod 消失或工作区租约过期后进入重建路径，回合中丢失时写入「回合被中断」事件，经恢复准入放行时递增代（[ADR-warden-is-pid1](../adr/adr-warden-is-pid1.md)） |
 | `runcontroller` 副本崩溃 | 另一副本按运行实例所有者租约与 `owner_epoch` 接管；处于过渡态的运行实例由对账器按截止时间幂等重驱动，`WakeQueued` 的运行实例由新所有者按原排队时刻重建准入队列；看守进程的出站流重连后以 `Hello` 与 `HelloAck` 对账 |
 | LLM 网关实例失联 | `llmgateway` 经汇入契约登记在途请求并按实例续租，续租过期后 `runcontroller` 对该实例的全部在途请求合成 `llm_failed` 唤醒信号（`reason=gateway_lost`）；已完成并持久化到回放存储的响应由本地代理按 `request_id` 取回 |
+| 第三方工具返回 401 或 403 | 工具未发送认证头时上游返回 401；占位符发往未允许主机或没有匹配注入规则时出口代理返回 403；错误作为工具结果返回 Agent，平台不补头、不重试 |
+| 第三方 MCP 服务器崩溃或初始化超时 | 该服务器的工具返回错误结果并计数，服务器按声明重启或在下次启动时拉起；不改变运行实例状态 |
+| 占位符未被替换 | 工具未把占位符放进请求头时上游收到占位符并返回错误；出口代理按头名与主机匹配规则，不感知工具身份 |
 | webhook 丢失或乱序 | 状态式轮询按订阅遍历外部对象当前状态并合成完成事件；订阅登记时按 `verify` 核对外部对象状态；事件按 `occurred_at` 排序；`lifetime: once` 的订阅完成后，同对象的迟到事件由 `connectorhub` 丢弃并审计 |
 | 冻结中的 Pod 被驱逐 | 状态机把「`Suspended{frozen}` 且沙箱已死」转入重建路径；`preStop` 先解冻再终止；`safe-to-evict=false` 标注（[REF-cluster-autoscaler-faq](../references.md)）只约束集群自动扩缩器，不阻止内存压力驱逐 |
 | 原地放大进入 `Deferred` | 解冻与放大并行，不等待放大；`Deferred` 超过阈值且处于回合边界则销毁重建以迁移，回合中则以低权重继续运行 |
@@ -662,7 +665,7 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 
 ### 可观测性
 
-设计要求的指标如下，实现可以增加指标但不得缺少其中任何一项：`idle_while_scheduled_ratio`（已调度却空闲的时间占比）、按机制统计的挂起与恢复次数及时延分布、`wakeup_latency`（事件到达至投递）、`resume_queue_depth` 与按优先级的排队时长、`pool_miss_rate`、按节点的 `frozen_mem_ratio`、`resize_deferred` 的计数与持续时间、在途请求数（LLM 网关与连接器）、订阅对账差异数、旧代拒绝计数、抖动预算耗尽次数。
+设计要求的指标如下，实现可以增加指标但不得缺少其中任何一项：`idle_while_scheduled_ratio`（已调度却空闲的时间占比）、按机制统计的挂起与恢复次数及时延分布、`wakeup_latency`（事件到达至投递）、`resume_queue_depth` 与按优先级的排队时长、`pool_miss_rate`、按节点的 `frozen_mem_ratio`、`resize_deferred` 的计数与持续时间、在途请求数（LLM 网关与本地代理观察到的外部连接）、订阅对账差异数、旧代拒绝计数、抖动预算耗尽次数。
 
 LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_ai` 语义约定（[REF-otel-genai-semconv](../references.md)），使一次 LLM 请求在本地代理、LLM 网关与上游之间可以按同一追踪关联。
 
@@ -688,7 +691,8 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 ### 安全边界
 
 - **沙箱边界。** Agent 以每运行实例的 uid 运行，uid 由控制器全局唯一分配并固定；Agent 进程启动时设置 `no_new_privs` 并清空 capability bounding set，镜像内没有 sudo 与 setuid 二进制；看守进程以 root 运行并作为 PID 1 监督 Agent。Agent 进程能到达的网络端点受 I6 约束。
-- **网络出口。** 出口代理默认拒绝全部主机，只按运行实例的出口策略放行允许的主机；凭据只以占位符（例如 `{{github.token}}`）进入沙箱，由出口代理在发往允许主机时替换为真实凭据（[ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md)）。Agent 进程的外部系统流量经本地代理前置到出口代理，本地代理对未放行的目标立即拒绝而不是黑洞。Substrate 提供者把出口策略落地为以（运行实例，代）为键的 EgressPolicy，k8s 提供者落地为平台出口代理配置加 NetworkPolicy，git 流量经平台反向代理重写。出口路径按代校验：k8s 路径的平台出口代理对每个请求按附带的运行实例令牌经代查询接口校验代、终态与作废状态，不使用缓存；Substrate 路径在本代沙箱作废、进入 `Degraded`、放弃、显式结束与代递增时撤销对应代的出口策略，残余窗口的上界见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
+- **网络出口。** 出口代理默认拒绝全部主机，只按运行实例的出口策略放行允许的主机；凭据只以占位符（例如 `{{github.token}}`）进入沙箱，由出口代理在发往允许主机时替换为真实凭据（[ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md)）。Agent 进程的外部系统流量经本地代理或透明拦截器前置到出口代理，两者对未放行的目标立即拒绝而不是黑洞。Substrate 提供者把出口策略落地为以（运行实例，代）为键的 EgressPolicy，k8s 提供者落地为平台出口代理配置加 NetworkPolicy，git 流量经平台反向代理重写。出口路径按代校验：k8s 路径的平台出口代理对每个请求按附带的运行实例令牌经代查询接口校验代、终态与作废状态，不使用缓存；Substrate 路径在本代沙箱作废、进入 `Degraded`、放弃、显式结束与代递增时撤销对应代的出口策略，残余窗口的上界见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。网络通道由外部系统定义的 `access.mode` 与 `access.host_modes` 按主机选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由沙箱内本地 DNS 把域名解析到回环拦截器。`mitm` 与需要注入凭据的 `proxy` 目标要求沙箱信任平台 CA，信任来源为镜像预置或运行时注入；证书固定目标不支持凭据注入。
+- **第三方工具接入。** 工具接入声明由控制面按项目下发，位于工作区之外，Agent 只读；工作区 `.mcp.json` 被忽略。声明只携带凭据占位符，不携带真实凭据；第三方 MCP 服务器的可执行文件来自镜像内预置并固定版本与摘要，`allowed_hosts` 是出口策略允许主机的子集。平台不按工具绑定网络通道，同一组环境变量可被多个工具共用。
 - **凭据。** 真实凭据不跨越沙箱边界：沙箱内不持有任何长期凭据与 LLM 密钥，真实凭据只在托管侧进程（`secrets` 对接的密钥库、LLM 网关、`connectorhub`、出口代理）的内存中出现；运行实例令牌是沙箱内唯一的凭据，只由看守进程持有。
 - **工作区隔离。** 运行实例子目录权限 0700，项目根 0711，每个运行实例目录设配额；认领过的预热 Pod 不回收复用；可选加固为在 `hostUsers: false` 下由看守进程以 mount namespace 只绑定本运行实例的子目录。
 - **hooks 与权限设置。** Agent 的 hooks 与权限设置通过 Claude Code 的托管策略设置文件（[REF-claude-code-settings](../references.md)）注入，文件位于工作区之外，Agent 对工作区的写入改变不了它们；`PreToolUse` hook 显式设置 `timeout` 与 `onFailure: block`，超时放行的默认行为被覆盖。
@@ -700,15 +704,15 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 
 | 编号 | 不变量 | 违反的表现 |
 | --- | --- | --- |
-| I1 | Agent 每一次可能阻塞的对外交互经过本地代理、LLM 网关、连接器、Agent 驱动器之一 | 沙箱直连外部的阻塞调用 |
-| I2 | 订阅登记时对已到达的连接器事件日志回溯匹配，并核对外部对象当前状态；正确性不依赖事件与登记的先后 | 事件先于订阅到达而丢失 |
+| I1 | Agent 每一次可能阻塞的对外交互经过本地代理、透明拦截器、LLM 网关、连接器、Agent 驱动器之一；中介不等于产生唤醒信号，第三方工具调用经本地代理与出口代理但不进入阻塞条件 | 沙箱直连外部的阻塞调用 |
+| I2 | 订阅登记时对已到达的连接器事件日志回溯匹配，并核对外部对象当前状态；正确性不依赖事件与登记的先后，操作返回前到达的事件由回溯覆盖 | 事件先于订阅到达而丢失 |
 | I3 | 挂起决策在运行实例行锁内评估唤醒谓词，为真则不挂起 | 事件已在收件箱中仍然挂起 |
 | I4 | 可投递事件至少一次投递；去重状态随工作区持久化并跨代有效；`cursor_accepted` 按 `Accepted` 累计前进且 CAS 带 `generation` | 同一事件被 Agent 处理两次 |
 | I5 | 唤醒谓词在每次事件或信号写入的事务内以及每次进入 Suspended 时重评估；纠正性对账器周期兜底 | 挂起与唤醒并发时唤醒丢失 |
-| I6 | 沙箱内不持有任何长期凭据与 LLM 密钥；Agent 进程能到达的网络端点只有看守进程在回环地址上提供的本地代理与平台 MCP 服务器 | 沙箱环境变量中出现令牌，或 Agent 进程直连回环地址之外的端点 |
+| I6 | 沙箱内不持有任何长期凭据与 LLM 密钥，只持有占位符；Agent 进程能到达的网络端点只有看守进程在回环地址上提供的本地代理、平台 MCP 服务器、本地 DNS 与透明拦截器；stdio 第三方 MCP 是 Agent 的本地子进程 | 沙箱环境变量中出现真实令牌，或 Agent 进程直连回环地址之外的端点 |
 | I7 | 代 `generation` 单调递增；沙箱侧消息、令牌、工作区写入、游标推进与出口请求都按 `generation` 校验 | 旧代沙箱的 Ack 或副作用被接受 |
 | I8 | 唤醒集合（条件或截止时间）为空的运行实例不得被挂起 | 看门狗冻结后无人唤醒 |
-| I9 | 以挂起为目的的沙箱销毁仅在同时满足以下条件后执行：Agent 进程正常退出；无在途请求；无其他进程；工作区已持久化（共享文件系统为 fsync 完成，`durableDir` 为同步快照上传完成）；恢复句柄已落库。不以挂起为目的的销毁（显式结束、进入 `Degraded`、放弃、本代沙箱作废、`fence_and_bump` 对旧代的销毁、销毁态连接、`sandbox_id` 核对不符与完成事务校验失败的单个销毁、「沙箱丢失」守卫的反向求差）不受此约束，其会话分别由恢复句柄、回合被中断通知与兜底摘要承接 | `--resume` 丢失最后一回合 |
+| I9 | 以挂起为目的的沙箱销毁仅在同时满足以下条件后执行：Agent 进程正常退出；无在途请求（LLM 在途为空，且本地代理无外部在途连接）；无其他进程；工作区已持久化（共享文件系统为 fsync 完成，`durableDir` 为同步快照上传完成）；恢复句柄已落库。不以挂起为目的的销毁（显式结束、进入 `Degraded`、放弃、本代沙箱作废、`fence_and_bump` 对旧代的销毁、销毁态连接、`sandbox_id` 核对不符与完成事务校验失败的单个销毁、「沙箱丢失」守卫的反向求差）不受此约束，其会话分别由恢复句柄、回合被中断通知与兜底摘要承接 | `--resume` 丢失最后一回合 |
 | I10 | 运行实例的所有过渡态有截止时间且可幂等重驱动；出站流断连后以状态对账而非事件历史恢复一致 | 控制面重启后运行实例卡在过渡态 |
 
 I1 与 I6 的决策依据为 [ADR-host-owns-all-wake-sources](../adr/adr-host-owns-all-wake-sources.md)；I2、I3、I5 与 I8 为 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)；I4 为 [ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)；I7 为 [ADR-generation-fencing](../adr/adr-generation-fencing.md)，持久化事实的代范围划分为 [ADR-generation-scoped-waits](../adr/adr-generation-scoped-waits.md)；I9 为 [ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)，其中工作区持久化确认按沙箱提供者区分的依据为 [ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)；I10 为 [ADR-state-based-reconciliation](../adr/adr-state-based-reconciliation.md)。

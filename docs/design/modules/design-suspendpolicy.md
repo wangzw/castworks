@@ -128,7 +128,7 @@ type ReviewResult struct {
 - **`remove`**：`runcontroller` 执行「显式结束」时在事务提交后调用，把条目从进程内队列移除并从槽位计数中释放；对不存在的条目幂等。它不改变 `run` 行，持久事实已由该转移清空。
 - **`on_resumed`**：恢复完成时调用，返回新的 `flap_counter`；`runcontroller` 把它写入 `run` 行。
 - **`approve_predictive`**：`runcontroller` 在 `wake_check` 的 `wake_hint` 分支于行锁内调用。输入为运行实例子状态、`wake_hint` 的来源标识、来源类型与置信度、`policy_state`；返回是否批准与更新后的 `policy_state`（批准的来源标识已加入 `PredictiveDone`）。
-- **`idle_evidence`**：`runcontroller` 在 L0 的「看门狗空闲」判定中于行锁内调用。输入为活动度摘要、累计静默时长、在途请求数、后台作业集合与 `cursor` 位置；判据为累计静默不短于 `Q_quiet`、无在途请求、无后台作业且无已接受未消费的输入。
+- **`idle_evidence`**：`runcontroller` 在 L0 的「看门狗空闲」判定中于行锁内调用。输入为活动度摘要、累计静默时长、在途请求数、后台作业集合与 `cursor` 位置；判据为累计静默不短于 `Q_quiet`、无在途请求、无后台作业、无已接受未消费的输入，且进程树中除 Agent 主进程外无其他进程。
 - **`busy_retry`**：看守进程回 `Busy` 时返回 `retry_after`，`runcontroller` 据此写 `review_at`；取值随 `policy_state.BusyCount` 指数增长，上限 60 s。
 - **`failure_backoff`**：无应答或提供者失败时返回下一次复评的绝对时刻；取值随 `PolicyState.NoResponseCount` 或 `PolicyState.ProviderFailures` 指数增长，上限 10 min。
 - **`jitter`**：为定时类等待、探测定时器与退避重试的到期时刻加随机偏移，返回落库的到期时刻；偏移范围见参数表，重驱动不重新抽样。
@@ -247,6 +247,7 @@ type DecisionContext struct {
     TurnBoundary        bool
     Channel             string           // 决定 G_turn_grace 的渠道类型
     BlockedOn           *BlockedOn       // kind、mode、since、predicted_ms
+    RunningTools        []string         // 运行中的工具 call_id
     BGJobs              []BGJob
     Prediction          *Prediction      // 来源与单点预测；p25、p90 由 predict 展开
     LiveAttach          bool
@@ -316,7 +317,7 @@ type NodePressure struct {
 | `KEEP` | 冻结仍然覆盖剩余等待，继续冻结 | 写下一次 `review_at`，不改机制 | 沙箱停在冰里，策略盯着下一次复评时刻 |
 | `SNAPSHOT` | 冻结无法覆盖剩余等待，升级为快照 | 先解冻，再由 `runcontroller` 发起快照 | 把整块冰封存起来，释放内存与 CPU |
 | `DESTROY` | 回合边界、宽限期已过且 I9 预检通过，升级为销毁重建 | 先解冻，再由 `runcontroller` 发起销毁并落库恢复句柄 | 把冰倒掉，下次按会话恢复重建 |
-| `DRAIN` | 回合中到达冻结上限且无法快照，解冻并让 Agent 走到回合边界；`request` 解冻后留在阻塞态 | 解冻并由驱动器把当前等待转为回合边界；`request` 按普通唤醒处理 | 把冰化开，让 Agent 自己走到回合门口 |
+| `DRAIN` | 回合中到达冻结上限且无法快照，解冻并让 Agent 走到回合边界 | 解冻并由驱动器把当前等待转为回合边界 | 把冰化开，让 Agent 自己走到回合门口 |
 
 ## 核心算法与流程
 
@@ -340,6 +341,7 @@ type NodePressure struct {
 ```text
 decide(ctx) -> Decision:
   d = Decision{Mode: NONE, NextReviewAt: now + T_nofreeze(ctx.FlapCounter)}
+  if ctx.RunningTools 非空: return d                 # 运行中的工具视为活动
   if ctx.BGJobs 非空:
       if 所有作业的 Elapsed < bg_job_timeout: return d
       d.Force = true                                      # 超时终止后台作业后继续
@@ -402,7 +404,6 @@ freezeCapExpired(ctx, now) =
 | `MCP 传输上限` | HTTP/SSE：首字节前 60 s，首字节后 330 s；stdio：1830 s | 由 MCP 客户端的首字节、idle 与检查粒度决定；平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的上限生效。`MCP_TOOL_TIMEOUT` 默认约 28 小时，不构成约束 |
 | `F_cap(approval)` | `min(hook 超时, per-server timeout, MCP 传输上限) − 60 s` | 回合中审批的冻结上限，各项按墙钟计时（hook 超时见 [REF-claude-code-hooks](../../references.md)） |
 | `F_cap(wait_for)` | 与 `F_cap(approval)` 相同 | 回合中阻塞等待的冻结上限；默认路径是在冻结前转为订阅 |
-| `F_cap(request)` | `MCP 传输上限 − 60 s` | 同步连接器操作经平台 MCP 服务器代理；该种类的 `DRAIN` 只表示解冻并退出冻结，不进入 `Draining` |
 | `F_cap(timer)` | 取 `F_cap(wait_for)` | 阻塞型定时等待与阻塞等待共用上限；到达上限时转为运行实例范围定时器 |
 | `F_cap(boundary)` | 无上限 | 回合边界冻结只受宽限期与内存压力约束；`blocked_on` 为空，`freeze_cap` 为空 |
 | `F_signal` | 30 s | `Freeze{signal}` 的单次冻结上限；`freezeDecision` 对 signal 变体取 `min(F_cap(kind), F_signal)`，超过时只能快照或 `DRAIN` |
@@ -476,7 +477,7 @@ freezeCapExpired(ctx, now) =
 
 - **快照**：能力集合含 `Snapshot`，实时接入无效，且预测等待仍超过 `T_snapshot` 或宽限期已过而 I9 不成立时返回 `SNAPSHOT`；冻结上限到达时 `SNAPSHOT` 是首选。
 - **回合边界销毁**：`turn_phase∈{boundary, idle}`、`now ≥ grace_deadline`、`f_cap_reached=false`、`safe_to.destroy` 为真且升级梯不选快照时返回 `DESTROY`；`runcontroller` 另做 I9 预检，不通过时按 `KEEP` 处理。
-- **回合中 `DRAIN`**：冻结上限到达且不能快照时返回 `DRAIN`；`runcontroller` 解冻后把当前等待转为回合边界，回合结束后按零宽限期复评并走销毁路径。`blocked_on.kind=request` 同样返回 `DRAIN`，但该种类的 `DRAIN` 只表示解冻并退出冻结，`runcontroller` 按普通唤醒处理，写 `resume_intent=normal`，不进入 `Draining`。
+- **回合中 `DRAIN`**：冻结上限到达且不能快照时返回 `DRAIN`；`runcontroller` 解冻后把当前等待转为回合边界，回合结束后按零宽限期复评并走销毁路径。第三方工具调用是 `running_tools`，不是 `blocked_on`，不触发回合中冻结；长等待由 Agent 转为订阅并结束回合。
 - **实时接入**：实时接入有效值为真时只返回 `KEEP`，或在冻结上限到达时返回 `DRAIN`；节点内存压力不构成例外。无 `Snapshot` 能力时，冻结上限到达同样只返回 `DRAIN`。终端或文件通道的接入另行中止进行中的快照或销毁尝试。
 
 `DRAIN` 的处置按等待种类给出，均由 `runcontroller` 与看守进程执行，策略只给出 `DRAIN` 这一结果：
@@ -487,7 +488,6 @@ freezeCapExpired(ctx, now) =
 | `approval` | PreToolUse hook 以「需人工批准，批准后以消息通知」拒绝，回合结束；决定到达后以定向投递续接 |
 | `wait_for` | 平台 MCP 工具返回「等待已转为订阅，请结束本回合」 |
 | `timer` | 先把代范围定时器改为运行实例范围定时器并登记等待，再返回「已转为定时，请结束本回合」；到期以内部通知送达 |
-| `request` | 返回 `DRAIN` 但不排空：解冻后回到 `BlockedOn`，`runcontroller` 写 `resume_intent=normal`，完成后由平台 MCP 服务器直接返回，此后不再冻结 |
 
 冻结中升级一律先解冻：快照中不包含被冻结的进程树，解冻完成后再发起快照；销毁模式先解冻，再关闭 stdin 让 Agent 正常退出。升级尝试在解冻之后回退时回到 `Active`，由 `maybe_suspend` 依 `policy_state` 中的失败次数退避。
 
@@ -564,7 +564,7 @@ freezeCapExpired(ctx, now) =
 | 提供者无应答或失败 | `N_provider` 由 `runcontroller` 按 `provider_suspend` 效果记录的 `attempts` 计数，达到 `N_provider` 后由 `runcontroller` 转「提供者挂起失败」；`policy_state.ProviderFailures` 只记录供退避使用的连续失败次数，退避时刻由 `failure_backoff` 给出。两个计数都在成功进入 `suspended` 或 `active` 后清零 |
 | 实时接入 | `review` 只返回 `KEEP` 或 `DRAIN`；`decide` 只返回 `NONE`、`FREEZE` 或 `FREEZE_SHRINK`，不返回 `SNAPSHOT` 或 `DESTROY`；终端或文件通道的接入另行中止进行中的挂起尝试 |
 | 已过冻结上限的阻塞 | `decide` 不再返回冻结；回合中按能力改返回快照或 `NONE`，回合边界按销毁或快照处置 |
-| 冻结上限到达 | `review` 只返回 `SNAPSHOT` 或 `DRAIN`，不返回 `DESTROY` 或 `KEEP`；`blocked_on.kind=request` 返回 `DRAIN` 但不排空，解冻后回到阻塞态且不再冻结 |
+| 冻结上限到达 | `review` 只返回 `SNAPSHOT` 或 `DRAIN`，不返回 `DESTROY` 或 `KEEP`；`running_tools` 非空时不挂起，第三方工具调用不是 `blocked_on` |
 | 宽限期未过或冻结上限到达时的销毁 | `review` 不返回 `DESTROY`：宽限期未过时返回 `KEEP`，冻结上限到达时只返回 `SNAPSHOT` 或 `DRAIN` |
 | 冻结中升级失败 | 解冻之后由 `runcontroller` 回到 `Active` 并退避；策略不在解冻期间返回新的挂起机制 |
 

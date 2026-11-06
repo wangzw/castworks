@@ -122,10 +122,10 @@ type MintedCredential struct {
 - `Target.Kind` 的取值为闭集 `llm` 与 `external_system`。`Kind=llm` 时 `System` 为 LLM 提供方，`AuthMethod` 为该提供方的认证方式，`System` 与 `AuthMethod` 均由调用方传入，取值来自调用方的部署配置；`Kind=external_system` 时 `System` 为 `ExternalSystem` 名，`AuthMethod` 取自该外部系统定义的 `auth.methods`。
 - 凭据对象按 `(ProjectID, Kind, System, AuthMethod)` 读取；这组字段在项目内是唯一键，同一项目可存在多个同 `kind` 对象，按这组字段读取即可消歧；重复定义视为部署配置错误，返回 `ErrCredentialNotConfigured` 并告警。对象不存在或 `status=disabled` 返回 `ErrCredentialNotConfigured`。
 - `Target.Scopes` 非空时必须是授权范围的子集，超出返回 `ErrScopeDenied`，不铸造、不返回凭据，并写拒绝审计；为空时使用授权范围。授权范围在 `token_minting.scopes` 非空时取它，否则取凭据对象的 `scopes`。本次实际范围在 `Target.Scopes` 非空时取它，否则取授权范围；对 `token_minting` 为空的凭据，不允许收窄：`Target.Scopes` 必须为空或等于授权范围，否则返回 `ErrScopeDenied`，此时本次实际范围等于授权范围。`MintedCredential.Scopes` 返回本次实际范围。
-- `Usage.Operation` 由调用方传入且必须非空，为空返回 `ErrInvalidArgument`：LLM 为 `llm.request`，连接器操作为 `operations[].name`，占位符替换为占位符、请求方法与目标主机。本模块不校验 `Operation` 与 `Kind` 的匹配，审计记录关联调用方身份。
+- `Usage.Operation` 由调用方传入且必须非空，为空返回 `ErrInvalidArgument`：LLM 为 `llm.request`，状态核对为 `verify:<event>`，占位符替换为占位符、请求方法与目标主机。本模块不校验 `Operation` 与 `Kind` 的匹配，审计记录关联调用方身份。
 - 调用方身份与授权：`ExchangeCredential` 以 mTLS 暴露，调用方身份即客户端的 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)）；本模块在入口按部署白名单校验该身份，并把身份映射到允许的 `(Kind, System, AuthMethod)` 集合，三者均必填。身份缺失由 mTLS 在握手阶段拒绝，不进应用层；身份与目标授权在 `VerifyRunToken` 之后校验。身份不在白名单返回未认证错误，写 `denied` 审计，`run_id` 与 `generation` 取令牌载荷。目标不在允许集合返回 `ErrTargetNotAuthorized`，不读取凭据对象，不暴露其存在性，写 `denied` 审计。典型映射：`llmgateway` 允许 `Kind=llm`；`connectorhub` 与其平台出口代理允许 `Kind=external_system`；每个调用方的 `System` 与 `AuthMethod` 允许集合由部署配置枚举，不因 `Kind` 相同而默认放行。
 - 返回的 `MintedCredential` 只给控制面调用方。本模块不把它写入工作区、不交给看守进程、不放进沙箱环境变量或文件。
-- 有外部副作用的操作在换取前经 `Generations.Current` 取得当前代并比较，不使用缓存的代；LLM 请求可按 `llmgateway` 的 `T_gen_cache` 缓存代查询结果。调用方在换取返回后仍以令牌载荷中的代核对。
+- 调用方在换取前按其入口规则校验代：订阅登记与 k8s 路径的出口请求不使用缓存的代，LLM 请求可按 `llmgateway` 的 `T_gen_cache` 缓存代查询结果。调用方在换取返回后仍以令牌载荷中的代核对。
 - 错误分类：`ErrInvalidToken`、`ErrTokenExpired`、`ErrInvalidArgument`、`ErrCredentialNotConfigured`、`ErrScopeDenied` 与 `ErrTargetNotAuthorized` 为不可重试；调用方身份缺失在 mTLS 握手阶段拒绝；身份不在白名单返回未认证错误，同样不可重试；密钥库不可达、审计存储不可用与铸造上游的暂时性失败为可重试。
 
 ### 审计接口
@@ -422,7 +422,7 @@ flowchart TB
 | `kind` | `llm` 或 `external_system` |
 | `system` | LLM 提供方或 `ExternalSystem` 名 |
 | `auth_method` | 认证方式 |
-| `operation` | 操作标识；LLM 为 `llm.request`（由调用方传入），连接器为 `operations[].name`，占位符替换为占位符、请求方法与目标主机 |
+| `operation` | 操作标识；LLM 为 `llm.request`（由调用方传入），状态核对为 `verify:<event>`，占位符替换为占位符、请求方法与目标主机 |
 | `scopes` | 排序后的本次实际范围，审计幂等键的组成字段 |
 | `decision` | `allowed` 或 `denied` |
 | `reason` | 拒绝原因；允许时为空 |
@@ -457,9 +457,9 @@ flowchart TB
 | 3 | `secrets` 校验 `T3`，读取 LLM 凭据对象 `v2`，按 `token_minting` 铸造真实凭据，`expires_at=T+10min`，写 `allowed` 审计 | 审计记录 `A1{R, 3, llm, llm.request}` |
 | 4 | `llmgateway` 以真实凭据访问上游并转发响应 | 无变化 |
 | 5 | `T+13:20`，`runcontroller` 的 `rotate_token` 截止调度触发（本应有存活沙箱且有出站流）；`secrets` 签发 `T3'`，`exp=T+33:20`；`runcontroller` 经出站流发送 `TokenRotate`，看守进程保存 `T3'` | `run.token_expires_at=T+33:20`；`outbox` 的 `rotate_token` 为 `done` |
-| 6 | `T+22min`，一条仍在途的请求携带 `T3` 到达 `connectorhub`；`VerifyRunToken(T3)` 返回 `expired=true` | `connectorhub` 拒绝请求并写 `denied` 审计 `A2{R, 3, github, create_pull_request}`；`secrets` 未铸造凭据 |
-| 7 | `T+23min`，本地代理以 `T3'` 重试；`connectorhub` 校验有效、当前代仍为 3，换取 GitHub 凭据 | `secrets` 读取 `v7`，铸造 `exp=T+83min`、`scopes=[repo:read]` 的真实凭据，写 `A3{R, 3, github, create_pull_request}` |
-| 8 | `T+30min`，运行实例的代递增到 4；一条携带 `T3'` 的请求到达 `connectorhub` | `connectorhub` 经 `Generations.Current` 得到代 4，拒绝并不调用换取；写 `A4{R, 3, github, create_pull_request}`，`reason` 记录当前代 4；`secrets` 未铸造凭据 |
+| 6 | `T+22min`，一条仍在途的出口请求携带 `T3` 到达平台出口代理；`VerifyRunToken(T3)` 返回 `expired=true` | 出口代理拒绝请求并写 `denied` 审计 `A2{R, 3, github, Authorization 头占位符}`；`secrets` 未铸造凭据 |
+| 7 | `T+23min`，本地代理以 `T3'` 重试；平台出口代理校验有效、当前代仍为 3，换取 GitHub 凭据 | `secrets` 读取 `v7`，铸造 `exp=T+83min`、`scopes=[repo:read]` 的真实凭据，写 `A3{R, 3, github, Authorization 头占位符}` |
+| 8 | `T+30min`，运行实例的代递增到 4；一条携带 `T3'` 的请求到达平台出口代理 | 出口代理经 `Generations.Current` 得到代 4，拒绝并不调用换取；写 `A4{R, 3, github, Authorization 头占位符}`，`reason` 记录当前代 4；`secrets` 未铸造凭据 |
 
 走查的结论：令牌的有效期与代的递增是独立维度。`T3` 在 `T+22min` 因过期被拒绝，`T3'` 在代递增后仍签名有效且未过期，但调用方的代比较使它失效。轮换在旧令牌到期前完成，换取路径没有出现无可用令牌的窗口。审计在凭据返回前落库，拒绝使用同样留下记录。
 
@@ -524,14 +524,18 @@ Substrate 路径：
 4. 本模块读取项目作用域内的凭据对象，铸造真实凭据，写审计，返回给出口网关。
 5. 出口网关替换占位符后转发；凭据只在出口网关内存中用于该请求。
 
-git 流量经平台反向代理重写，Basic 与 Bearer 头同样由出口侧注入；需要本地签名的客户端改用连接器操作。k8s 路径与 Substrate 路径都不把真实凭据交给沙箱，也不在沙箱内生成签名。
+git 流量经平台反向代理重写，Basic 与 Bearer 头同样由出口侧注入；需要本地签名的客户端不受支持。k8s 路径与 Substrate 路径都不把真实凭据交给沙箱，也不在沙箱内生成签名。
+
+### 占位符环境变量与第三方工具
+
+看守进程把 `GH_TOKEN={{github.token}}` 这类占位符写入 Agent 与 `ToolExec.exec` 的环境变量，第三方工具把它放进请求头；真实凭据仍只由出口代理在允许主机上换取。`secrets` 不新增面向沙箱的接口，沙箱进程不能直接调用本模块；所有换取都来自出口代理、LLM 网关或 `connectorhub` 的状态核对。审计粒度因而是凭据使用的主机、方法、占位符与 `verify:<event>`，不是第三方工具的操作名；平台不感知工具执行了什么操作。
 
 ### 审计
 
 每次换取与占位符解析写一条审计记录，拒绝同样写一条。`operation` 的取值规则：
 
 - LLM 流量：`llm.request`，由 `llmgateway` 在 `Usage.Operation` 中传入。
-- 连接器操作：外部系统定义中的 `operations[].name`，例如 `create_pull_request`。
+- 状态核对：`verify:<event>`，由 `connectorhub` 在只读查询时传入。
 - 占位符替换：占位符、请求方法与目标主机，由出口代理传入。
 
 `secrets` 在返回真实凭据之前写 `allowed` 记录；凭据对象未配置、认证方式不匹配、请求的授权范围超出凭据对象的授权范围、铸造失败与拒绝提供时写 `denied` 记录，并返回对应错误。调用方的代不匹配、终态与本代作废拒绝由调用方调用 `ReportDenial` 记录，`secrets` 不重复记录；这类记录的 `source` 为 `caller`。审计记录以 `(run_id, caller_identity, kind, usage_id, decision, system, auth_method, operation, 排序后的 scopes, source)` 幂等，同一判定重复写入不新增记录；暂时性失败写 `denied` 后重试成功时，`allowed` 另记一条，两者都保留。记录只追加，不更新、不删除。
