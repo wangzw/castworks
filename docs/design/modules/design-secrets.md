@@ -39,7 +39,7 @@
 | 术语 | 英文对照 | 适用范围 | 定义 |
 | --- | --- | --- | --- |
 | 凭据对象 | credential object | secrets | 密钥库中按项目、凭据类别、外部系统与认证方式存放的长期凭据及其元数据，含 `secret_schema` 与 `token_minting` |
-| 项目作用域 | project scope | secrets | 凭据对象按 `project_id` 隔离的授权范围；换取只解析调用方所指项目下的凭据对象 |
+| 项目作用域 | project scope | secrets | 凭据对象按 `project_id` 隔离的可见范围；换取只解析调用方所指项目下的凭据对象 |
 | 凭据换取 | credential exchange | secrets | 以运行实例令牌与调用方身份换取真实凭据的处理，含身份与授权校验、令牌校验、授权范围校验、铸造与审计 |
 | 调用方身份 | caller identity | secrets | 控制面调用方在 mTLS 客户端证书中携带的工作负载身份；secrets 按它限制可换取的凭据类别、系统与认证方式 |
 | 授权范围 | authorization scope | secrets | 凭据对象允许请求使用的 `scopes` 集合；`token_minting.scopes` 非空时取它，否则取凭据对象的 `scopes` |
@@ -50,7 +50,7 @@
 
 ## 外部接口契约
 
-稳定性承诺按接口类别给出：令牌接口与凭据换取接口对控制面调用方稳定；凭据提供者接口对 Substrate 出口网关稳定；密钥库后端、凭据路径与缓存布局是实现细节，不是契约。
+稳定性承诺按接口类别给出：令牌接口、凭据换取接口与拒绝上报接口对控制面调用方稳定；凭据提供者接口对 Substrate 出口网关稳定；密钥库后端、凭据路径与缓存布局是实现细节，不是契约。
 
 ### 运行实例令牌接口
 
@@ -198,7 +198,6 @@ type ProviderRequest struct {
 
 type ProviderResponse struct {
     Value     string
-    Scopes    []string // 本次实际范围
     ExpiresAt time.Time
 }
 ```
@@ -207,12 +206,12 @@ type ProviderResponse struct {
 - 接口以 mTLS 暴露；出口网关以 SPIFFE 身份作为客户端证书调用，`secrets` 在入口按该身份与部署白名单校验允许的 `(Kind, System, AuthMethod)` 集合。身份不在白名单的调用方返回未认证错误，写 `denied` 审计，不暴露凭据对象是否存在；目标不在允许集合返回 `ErrTargetNotAuthorized`，同样写 `denied` 审计。
 - 请求中的 `Generation` 只作为审计上下文；本模块不查询 `runcontroller` 的当前代，代校验由 EgressPolicy 的落地与撤销承担。
 - 返回的真实凭据只由出口网关用于替换占位符，不返回沙箱。
-- 请求缺少可解析的凭据对象或请求的授权范围超出凭据对象的授权范围时返回 `ErrCredentialNotConfigured` 或 `ErrScopeDenied`，并写拒绝审计。`Scopes` 为空表示使用授权范围；响应中的 `Scopes` 为本次实际范围。
+- 请求缺少可解析的凭据对象或请求的授权范围超出凭据对象的授权范围时返回 `ErrCredentialNotConfigured` 或 `ErrScopeDenied`，并写拒绝审计。`Scopes` 为空表示使用授权范围；本次实际范围写入 `secrets` 的审计记录，不随响应返回。
 - 其余错误分类与 `ExchangeCredential` 对齐：密钥库不可达、审计存储不可用与铸造上游的暂时性失败为可重试；铸造上游的永久性错误为不可重试；均不返回凭据，审计不可用时失败关闭。
 
 ### 稳定承诺
 
-- 令牌接口与凭据换取接口的方法名、字段名与错误分类稳定；`ExchangeCredential` 是唯一的稳定换取方法；新增 `CredentialKind` 取值或认证方式扩展闭集，属于版本化变更。
+- 令牌接口、凭据换取接口与拒绝上报接口的方法名、字段名与错误分类稳定；`ExchangeCredential` 是唯一的稳定换取方法；新增 `CredentialKind` 取值或认证方式扩展闭集，属于版本化变更。
 - `VerifyRunToken` 的有效、过期、无效与不可达结果稳定；调用方依赖其区分过期与[失效判定](../../glossary.md)。
 - 凭据提供者接口随 Substrate 的 credential provider 协议版本；`secrets` 的密钥库后端可替换，Substrate 出口网关不感知后端。
 - 凭据路径、密钥库查询语句、缓存键与审计存储布局不是契约。
@@ -227,7 +226,7 @@ type ProviderResponse struct {
 - `llmgateway`：以运行实例令牌与调用方身份调用 `ExchangeCredential`，`Target.Kind=llm`，`System` 与 `AuthMethod` 取 `llmgateway` 部署配置中的 LLM 提供方与认证方式；校验令牌后按 `Generations.Current` 比较代。
 - `connectorhub`：以运行实例令牌与调用方身份换取外部系统凭据；[订阅](../../glossary.md)登记与有外部副作用的操作不使用缓存的代。平台出口代理以调用方身份调用 `ExchangeCredential`，对 k8s 路径的每个出口请求换取凭据并逐请求校验代。
 - 控制面 mTLS：调用方身份由部署的 mTLS 基础设施提供，本模块不签发调用方身份。
-- `humanchannel`：用 `VerifyRunToken` 校验附件取回请求携带的运行实例令牌；不换取外部系统凭据。
+- `humanchannel`：用 `VerifyRunToken` 校验附件取回请求携带的运行实例令牌；拒绝路径调用 `ReportDenial`，附件取回不涉及凭据目标，`kind` 为空；不换取外部系统凭据。
 - 审计存储：另一项外部依赖，由部署配置决定介质；本模块通过内部 `appendAudit` 写入，对控制面调用方以 `ReportDenial` 接收上报的拒绝记录，不参与运行实例状态的数据库事务。
 
 ## UML 图
@@ -443,7 +442,7 @@ flowchart TB
 | `placeholder` | 请求 | 待替换的占位符 |
 | `operation` | 请求 | 占位符、请求方法与目标主机，由出口网关构造 |
 | `scopes` | 请求 | 本次请求的范围；为空表示使用授权范围 |
-| `value`、`scopes`、`expires_at` | 响应 | 真实凭据、本次实际范围与到期时刻 |
+| `value`、`expires_at` | 响应 | 真实凭据与到期时刻；本次实际范围只写入审计记录 |
 
 ## 核心算法与流程
 
@@ -554,7 +553,7 @@ git 流量经平台反向代理重写，Basic 与 Bearer 头同样由出口侧�
 Substrate 路径选择以 credential provider 插件对接密钥库。约束如下：
 
 - `secrets` 实现 credential provider 协议，出口网关在每次占位符解析时调用；真实凭据在请求时按当前策略解析，不物化为 k8s Secret，因而不引入凭据副本与 Secret 读权限的分发路径。
-- 请求携带 `usage_id`、`project_id`、`run_id`、`generation`、`kind`、`system`、`auth_method`、`placeholder`、`operation` 与 `scopes`；`project_id` 取自 `connectorhub` 生成的出口策略，`usage_id` 取出口网关的请求标识，`kind` 固定为 `external_system`，`scopes` 为空表示使用授权范围，响应返回本次实际范围。
+- 请求携带 `usage_id`、`project_id`、`run_id`、`generation`、`kind`、`system`、`auth_method`、`placeholder`、`operation` 与 `scopes`；`project_id` 取自 `connectorhub` 生成的出口策略，`usage_id` 取出口网关的请求标识，`kind` 固定为 `external_system`，`scopes` 为空表示使用授权范围，本次实际范围写入 `secrets` 的审计记录。
 - 出口网关以 mTLS 客户端证书携带 SPIFFE 身份调用，`secrets` 在入口按该身份与部署白名单校验；其他身份调用返回未认证错误。
 - 提供者不查询 `runcontroller` 的当前代。代的范围由 EgressPolicy 的落地与撤销界定：策略只为当前代落地，撤销即墓碑；撤销的触发穷举见出口代理的凭据来源的 Substrate 路径，残余窗口上界见认证与授权边界（ADR-generation-fencing）。
 - 出口网关只在 `(run_id, generation)` 命中已落地策略时调用提供者；策略撤销后不再解析占位符。
@@ -576,7 +575,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 | 代不匹配 | 由调用方经 `Generations.Current` 判定，`secrets` 不参与；调用方拒绝请求，不调用换取或丢弃换取结果，计入旧代拒绝计数并写拒绝审计 |
 | 项目下无凭据对象 | `ErrCredentialNotConfigured`，不可重试；写 `denied` 审计 |
 | 认证方式与凭据对象不匹配 | `ErrCredentialNotConfigured`，不可重试；写 `denied` 审计 |
-| 请求的授权范围超出凭据对象的授权范围 | `ErrScopeDenied`，不可重试；写 `denied` 审计，不铸造；`Target.Scopes` 为空时使用授权范围，不触发该错误 |
+| 请求的授权范围超出凭据对象的授权范围，或 `token_minting` 为空而 `Target.Scopes` 不等于授权范围 | `ErrScopeDenied`，不可重试；写 `denied` 审计，不铸造；`Target.Scopes` 为空时使用授权范围，不触发该错误 |
 | 密钥库不可达或超时 | 可重试；有效期内的缓存可继续服务，缓存不可用时换取失败，不返回过期凭据 |
 | 令牌签名密钥不可用 | `IssueRunToken` 失败；`runcontroller` 的效果按退避重试；已签发令牌在 `exp` 前继续有效，预配等待令牌签发 |
 | 铸造被上游拒绝 | 区分上游的暂时性与永久性错误；暂时性错误可重试，永久性错误不可重试；均不返回凭据，写 `denied` 审计 |
