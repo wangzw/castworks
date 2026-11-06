@@ -1,8 +1,14 @@
 # substrate 子模块
 
-substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口落到 agent-substrate/substrate（[REF-substrate](../../../references.md)）：以 actor 模板声明镜像、卷、网络与唤醒探针，以 Suspend 与 Resume 承载内存快照挂起，以 Substrate 路由器承载入站唤醒，以 EgressPolicy 落地出口策略与凭据占位符替换，以预热 worker 缩短启动时延。它不具备冻结能力，不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：actor 是整体可挂起的进程容器，Suspend 把内存与进程状态写入快照并释放计算资源，Resume 由经路由器的入站请求触发并把请求停泊到[看守进程](../../../glossary.md)就绪（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
+substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口落到 agent-substrate/substrate（[REF-substrate](../../../references.md)）。它拥有 actor 的创建与认领、[快照](../../../glossary.md)的[挂起](../../../glossary.md)与恢复、入站唤醒的路由承载、[出口策略](../../../glossary.md)的落地与撤销，以及预热 worker 的容量；不具备[冻结](../../../glossary.md)能力，不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：actor 是整体可挂起的进程容器，挂起以内存快照换出计算资源，恢复由经路由器的入站请求唤醒（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
 
-文档较长，不宜顺序通读。第一次阅读依次取：职责、外部接口契约中的接口映射与路由器契约、走查、Suspend 与 Resume、EgressPolicy 落地、外部 CSI 卷与 durableDir 退化；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑、停泊与代的范围自测迟到调用。
+文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射与路由器契约、走查、Suspend 与 Resume、EgressPolicy 落地、外部 CSI 卷与 durableDir 退化；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑、停泊与代的范围自测迟到调用。
+
+## 核心概念
+
+本子模块的机制是内存快照挂起与路由器唤醒。actor 在 Substrate 中整体承载[看守进程](../../../glossary.md)与 Agent 进程；挂起以 MEMORY 保真度把进程内存与运行状态持久化为快照并释放计算资源，快照恢复不重建进程，而是在同一[代](../../../glossary.md)内恢复快照。快照恢复的入口是 Substrate 路由器：提供者以 `ate-target-actor` 头调用 `/wake`，路由器恢复 actor 并把入站请求停泊到 `wakeupProbe` 就绪，恢复窗口内的请求不丢失。
+
+系统需要它，因为托管环境要在 Agent 等待 LLM、外部系统或人类时释放[沙箱](../../../glossary.md)的计算资源，并在依赖解除后以快照恢复替代冷启动，且恢复期间的入站请求不丢失。机制为何按能力分层、为什么在冻结与快照之间这样取舍，见 [ADR-capability-tiered-suspension](../../../adr/adr-capability-tiered-suspension.md)。
 
 ## 职责
 

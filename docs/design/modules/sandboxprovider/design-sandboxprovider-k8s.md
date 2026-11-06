@@ -1,8 +1,12 @@
 # k8s 子模块
 
-k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口落到 Kubernetes：以 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../../../references.md)）的 Sandbox CR 承担沙箱的运行实例级外壳，以节点冻结代理对 Agent 子 cgroup 执行冻结，以原地缩放缩小 CPU request，以预热池缩短重建时延，以 NetworkPolicy 与平台出口代理承载出口路径，以 wake-router 承载入站终端与文件访问。它不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：Sandbox CR 是跨代保留的外壳，Pod 是某一[代](../../../glossary.md)的执行载体，节点冻结代理只冻结 Pod 内的 Agent 进程树，[看守进程](../../../glossary.md)与探针始终运行（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
+k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../../../references.md)）落到 Kubernetes，文档围绕冻结作用域这一机制组织。它不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：Sandbox CR 是跨代保留的外壳，Pod 是某一[代](../../../glossary.md)的执行载体，[节点冻结代理](../../../glossary.md)只冻结 Pod 内的 Agent 进程树，[看守进程](../../../glossary.md)与探针始终运行（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
 
-文档较长，不宜顺序通读。第一次阅读依次取：职责、外部接口契约中的接口映射与 RBAC、走查、冻结与解冻、销毁与重建、预热池与认领、入站路由；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑与幂等规则自测迟到调用。
+文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射与 RBAC、走查、冻结与解冻、销毁与重建、预热池与认领、入站路由；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑与幂等规则自测迟到调用。
+
+## 核心概念
+
+本子模块的机制是[冻结](../../../glossary.md)作用域：k8s 路径上的[沙箱](../../../glossary.md)不是一个整体，而是三层可分别处置的载体。Sandbox CR 是跨代保留的外壳，以 `spec.operatingMode` 决定是否重建 Pod，与之配套的 PVC 与 Service 同样跨代保留；Pod 是某一[代](../../../glossary.md)的执行载体，带代标注与 UID；容器内的 Agent 子 cgroup 才是实际被冻结的进程树。冻结只落在子 cgroup，是因为[看守进程](../../../glossary.md)留在父 cgroup 且必须始终可运行：冻结期间它应答探针、续约[工作区租约](../../../glossary.md)并维持[出站流](../../../glossary.md)，控制面因此可以探测沙箱就绪并经出站流驱动解冻与投递。外壳与 Pod 分离，则让[挂起](../../../glossary.md)与重建各自独立：挂起只停 Agent 进程树、保留 Pod，[销毁重建](../../../glossary.md)只换 Pod、保留外壳与[工作区](../../../glossary.md)。两者合起来，系统才能在不结束[运行实例](../../../glossary.md)的前提下释放计算资源（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
 
 ## 职责
 

@@ -1,8 +1,12 @@
 # 控制面循环驱动器
 
-控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一：接口被沙箱内的[进程驱动器](../../../glossary.md)与本模块共用，规定两种 Agent 循环向 `runcontroller` 发出的事件、`Deliver` 到原生输入的翻译、挂起与恢复语义，以及 `ToolExec` 的使用方式。本模块的实现运行在控制面，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 使用沙箱，不假定沙箱内存在 Agent 进程。第一版只定义该接口；接口的实现形式定为链接进 `runcontroller` 进程的库：它不持有运行实例令牌，不建立第二条协议会话，`ToolExec` 帧经该运行实例已有的出站流承载。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对后者只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
+控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一，与[沙箱](../../../glossary.md)内的[进程驱动器](../../../glossary.md)共用同一接口。其实现运行在控制面，以链接进 `runcontroller` 进程的库形式存在，运行平台原生 Agent 的模型循环；第一版只定义该接口。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对后者只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
-文档较长，第一次阅读按以下顺序：职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
+文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
+
+## 核心概念
+
+本模块围绕两种循环共用的 Agent 驱动器接口组织：接口把 Agent 循环与 `runcontroller` 之间的交互固定为同一套契约，循环位置不改变 `runcontroller` 看到的事件、投递与挂起恢复语义。沙箱内的进程驱动器驱动 Claude Code 进程，本模块的控制面循环驱动器在控制面运行平台原生 Agent 的模型循环；两者实现同一接口，[收件箱](../../../glossary.md)、游标与[唤醒谓词](../../../glossary.md)共用一套规则。控制面循环把沙箱只当工具执行器，不假定其中存在 Agent 进程、会话文件或 hook；实现形式是链接进 `runcontroller` 进程的库，`ToolExec` 帧沿该运行实例已有的[出站流](../../../glossary.md)往返。系统需要这个机制：控制面循环因此不持有[运行实例令牌](../../../glossary.md)，也不建立第二条协议会话；平台原生 Agent 的循环不必打包进沙箱镜像，新增一种循环不改变 `runcontroller`、`suspendpolicy` 或协议消息。
 
 ## 职责
 
