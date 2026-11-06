@@ -166,7 +166,7 @@ type AttachmentStore interface {
 依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致。
 
 - `runcontroller`：汇入契约（`AppendInbox`、`SetRunFact`）、`RunService.Get` 与 `Generations.Current`。本模块是事件源，只经这些接口写入与读取，`runcontroller` 不反向调用本模块。
-- `secrets`：`VerifyRunToken` 与拒绝路径的 `AppendAudit`。附件取回请求携带运行实例令牌，本模块直接依赖 `secrets` 的校验函数，不引入对 `runcontroller` 表的读取。
+- `secrets`：`VerifyRunToken` 与拒绝路径的 `ReportDenial`。附件取回请求携带运行实例令牌，本模块直接依赖 `secrets` 的校验函数，不引入对 `runcontroller` 表的读取。
 - PostgreSQL：本模块自己的通道绑定、消息与决定记录、接入会话与附件对象；这些写入在本模块自身事务内完成，与汇入调用不在同一事务。
 - 不依赖 `workspace`、`sandboxprovider`、`warden`、`connectorhub` 与 `llmgateway`：文件内容由 `workspace` 读取，终端流经入站路由，二者都是运行时调用而非代码依赖。人类通道是托管环境拥有的唤醒源之一（[ADR-host-owns-all-wake-sources](../../adr/adr-host-owns-all-wake-sources.md)）。
 - 审批决定在异步渠道以 `defer` 推迟到回合边界（[回合边界](../../glossary.md)），决定到达后以恢复句柄续接；实时接入中审批阻塞等待，策略切换见 [ADR-turn-boundary-destroy](../../adr/adr-turn-boundary-destroy.md)。

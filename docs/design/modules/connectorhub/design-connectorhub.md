@@ -174,7 +174,7 @@ Authorization: Bearer <运行实例令牌>
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本模块依赖 `runcontroller`、`secrets`、`sandboxprovider` 与外部系统，存储为 PostgreSQL 与附件存储；`runcontroller` 不反向调用本模块，本模块不依赖 `warden`、`llmgateway`、`humanchannel` 与 `workspace`。
 
 - `runcontroller`：汇入契约的 `AppendInbox`、`AppendWakeSignal`、`SetRunFact{inflight_request}` 与 `RenewSourceLease`，以及代查询接口 `Generations.Current`。本模块不读 `runcontroller` 的表；订阅完成事件只以 `subscription_completed` 写入，超时只以 `subscription_status=expired` 写入。
-- `secrets`：运行实例令牌的签名与过期校验、外部系统凭据的换取、webhook 签名密钥的读取。真实凭据只在控制面进程内存中出现，不写入定义、事件日志、收件箱或附件。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.AppendAudit` 写 `denied` 记录。
+- `secrets`：运行实例令牌的签名与过期校验、外部系统凭据的换取、webhook 签名密钥的读取。真实凭据只在控制面进程内存中出现，不写入定义、事件日志、收件箱或附件。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.ReportDenial` 写 `denied` 记录。
 - `sandboxprovider`：出口策略接口 `PutEgressPolicy`。出口策略的按代落地、按代撤销、平台出口代理配置与 NetworkPolicy 的落地归该模块；本模块不预配、不挂起、不销毁沙箱。
 - 外部系统：HTTP API 的只读查询、同步操作与 webhook 发送方。外部系统的可用性、限流与重试策略不在本模块控制范围内。
 - PostgreSQL：保存本模块的订阅、事件日志、认领记录、预关联锚、未认领区、同步操作与附件元数据，提供唯一索引、行锁与事务。
@@ -676,9 +676,9 @@ webhook 事件到达时，若关联键命中未过期的锚，事件写入该运
 出口策略的输入是运行实例可用的外部系统定义集合。可用集合由该运行实例的项目作用域凭据授权决定，本模块不扩大授权范围。对每个定义，取其 `access.upstreams`、`access.inject` 与 `access.git`：
 
 - `AllowedHosts` 是所有定义 `upstreams` 的并集。未列入的主机默认拒绝；本地代理对未放行目标立即拒绝而不是黑洞。
-- `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder, system, auth_method, scopes}`；后三项取该定义 `auth.methods` 中与占位符对应的凭据对象，作用域取 `token_minting.scopes`；只替换已有请求头，缺头不注入。
+- `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder, system, auth_method, scopes}`；后三项取该定义 `auth.methods` 中与占位符对应的凭据对象，作用域取 `token_minting.scopes`，为空时回退到凭据对象的 `scopes`；只替换已有请求头，缺头不注入。
 - `Git` 存在 `reverse_proxy_rewrite` 时，git 客户端的目标主机重写为平台 git 代理，git 的 Basic 或 Bearer 头由出口路径注入；`system`、`auth_method` 与 `scopes` 同样随规则携带。
-- `project_id` 取运行实例所属项目（`RunView.project_id`），出口代理以 `(project_id, run_id, generation)`、`system`、`auth_method` 与 `scopes` 向 `secrets` 换取凭据；凭据只在出口代理内存中持有到 `ExpiresAt`，不写入出口策略、配置或日志。缺失 `project_id`、凭据对象或作用域不足时，该条注入规则不生效并按默认拒绝处置，出口请求被拒绝并计入审计。
+- `project_id` 取运行实例所属项目（`RunView.project_id`）。出口代理以调用方身份调用 `secrets.ExchangeCredential`：`ProjectID` 取 `project_id`，`Target` 为 `{Kind=external_system, System, AuthMethod, Scopes}`，`Usage` 为 `{RunID, Generation, Operation, UsageID}`；其中 `System`、`AuthMethod` 与 `Scopes` 取注入规则，`Usage.Operation` 取占位符、请求方法与目标主机，`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接。凭据只在出口代理内存中持有到 `ExpiresAt`，不写入出口策略、配置或日志。缺失 `project_id`、凭据对象未配置或认证方式不匹配时返回 `503`；请求的授权范围超出凭据对象的授权范围时返回 `403`；出口请求被拒绝并计入审计。
 
 出口策略以运行实例为键生成，`Revision` 递增，经 `PutEgressPolicy` 推送给沙箱提供者。沙箱提供者在预配与认领沙箱时按代落地，并把更新同步到尚未撤销的代；按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动。推送失败时保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试；默认拒绝使未列入的主机不会因推送失败而放行。
 
