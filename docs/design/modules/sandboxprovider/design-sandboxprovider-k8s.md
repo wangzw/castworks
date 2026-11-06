@@ -239,7 +239,7 @@ flowchart TD
 | `SandboxProjection` | `(run_id, generation)` | `sandbox_id`、`operating_mode`、`pod_uid`、`node`、`placement` | Sandbox CR 与 Pod 的映射 |
 | `PodAnnotation` | `pod_uid` | `generation`、`freeze_id`、`shrink_baseline`、`safe_to_evict` | 代标注、冻结标识、缩容基线与驱逐保护 |
 | `FreezeTrace` | `freeze_id` | `pod_uid`、`cgroup_path`、`frozen_at`、`thawed_at`、`shrink_applied` | 冻结与解冻的幂等和冻结墓碑 |
-| `ResizeRecord` | `freeze_id` | `original_request`、`applied_request`、`phase` | 缩小、放大与 `Deferred` 状态 |
+| `ResizeRecord` | `freeze_id` | `original_request`、`desired_request`、`applied_request`、`phase` | 缩小、放大与 `Deferred` 状态；`desired_request` 跨 Pod 重建保留，用于恢复后重放 |
 | `EgressConfig` | `run_id` | `policy`、`landed_at` | 平台出口代理配置与 NetworkPolicy 的落地；不维护按代副本 |
 | `WarmShard` | `(image, spec, node_pool 或可用区)` | `capacity`、`available`、`claimed` | 预热池分片 |
 | `RouteEntry` | `sandbox_id` | `inflight`、`parked`、`last_probe`、`retry_after` | wake-router 的单飞与停泊 |
@@ -282,7 +282,8 @@ flowchart TD
 4. 解冻：`Thaw` 按 `freeze_id` 写 `agent/cgroup.freeze=0`，恢复期放大与解冻并行。`runcontroller` 在提供者解冻返回之后经出站流发送 `Thaw`，看守进程观察到子 cgroup 未冻结后上报 `Thawed`。已解冻的 `freeze_id` 不再接受冻结与缩小，迟到的冻结与缩小被冻结墓碑拒绝。
 5. 批处理：节点冻结代理按节点 CPU 余量分批执行解冻，批内各沙箱的 `freeze_id` 独立幂等；批大小与恢复准入的机制限速共同约束同时在途的解冻数，排队等待时间计入 `EstimateResume` 与准入排队估计，不隐含在解冻路径的 p95 目标内。
 6. 驱逐保护：冻结态 Pod 标注 `safe-to-evict=false`；`preStop` 先解冻再终止，避免 SIGTERM 送给冻结进程。节点内存压力下 Pod 仍可能被驱逐，`runcontroller` 把冻结态且沙箱已死的运行实例转入重建路径。
-7. 原地放大：放大请求提交后可能进入 `Deferred`，提供者经 `ResizeStatus` 暴露实际 request 与期望 request。`Deferred` 超过阈值且处于回合边界时，`runcontroller` 选择销毁重建以迁移；回合中则以低权重继续运行，不等待放大完成。
+7. 原地放大：放大请求提交后可能进入 `Deferred`，提供者经 `ResizeStatus` 暴露实际 request 与期望 request。`Deferred` 期间期望 request 仍占用调度额度，容量判定以期望 request 为准；超过阈值且处于回合边界时，`runcontroller` 选择销毁重建以迁移，回合中则以低权重继续运行，不等待放大完成。
+8. 缩放结果不跨 Pod 重建保留：`spec.operatingMode=Suspended` 会删除 backing Pod，恢复或重建后的新 Pod 只带创建时的原始 request。提供者必须把目标 CPU request 持久化在 `ResizeRecord` 中，并在新 Pod 就绪后重新提交 `pods/resize`，不能依赖旧 Pod 的注解或 kubelet 保留缩放结果。
 
 ### 销毁与重建
 

@@ -395,7 +395,7 @@ flowchart LR
     SUB -.-> EI
 ```
 
-能力集合与挂起机制都是闭合集合。`Freeze{cgroup}` 与 `Freeze{signal}` 都映射到冻结，`Freeze{cgroup}` 与 `InPlaceResize` 组合映射到冻结加原地缩小；`Freeze{signal}` 只允许短冻结，不能与原地缩小组合；`Snapshot` 映射到快照；`Destroy` 映射到销毁重建。`WarmPool` 不产生新的挂起机制，它把销毁重建的恢复路径分为预热池认领与冷启动；`EgressInject` 也不产生挂起机制，它只影响出口策略的落地方式。k8s 提供者声明冻结、销毁、原地缩小与预热池；Substrate 提供者声明快照、销毁、预热池与出口注入。缺失的能力由 `suspendpolicy` 降级，图中不画不可选的机制。
+能力集合与挂起机制都是闭合集合。`Freeze{cgroup}` 与 `Freeze{signal}` 都映射到冻结，`Freeze{cgroup}` 与 `InPlaceResize` 组合映射到冻结加原地缩小；`Freeze{signal}` 只允许短冻结，不能与原地缩小组合；`Snapshot` 映射到快照；`Destroy` 映射到销毁重建。`WarmPool` 不产生新的挂起机制，它把销毁重建的恢复路径分为预热池认领与冷启动；`EgressInject` 也不产生挂起机制，它只影响出口策略的落地方式。k8s 提供者声明冻结、销毁、原地缩小与预热池；Substrate 提供者声明快照、销毁、预热池与出口注入。缺失的能力由 `suspendpolicy` 降级，图中不画不可选的机制。`InPlaceResize` 的结果不跨 Pod 重建保留：`Shrink` 的目标 request 必须持久化在 `ResizeRecord` 中，新 Pod 就绪后按它重新提交 `pods/resize`，不能依赖旧 Pod 的注解。
 
 ## 核心数据结构
 

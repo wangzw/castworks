@@ -70,7 +70,7 @@ castworks 是一个托管 AI Agent 环境。完整的第三方 Agent 作为进�
 
 | 层级 | 含义 | 托管环境可用的信号 | 允许的挂起机制 |
 | --- | --- | --- | --- |
-| L0 纯观测 | Agent 不配合托管环境 | 本地代理、LLM 网关与连接器的在途请求；沙箱活动度，例如 PSI（[REF-linux-psi](../references.md)）、进程态、限流计数 | 冻结，且必须附带探测定时器；显式结束时销毁 |
+| L0 纯观测 | Agent 不配合托管环境 | 本地代理、LLM 网关与连接器的在途请求；沙箱活动度，例如 per-cgroup PSI（[REF-linux-psi](../references.md)）、进程态、限流计数 | 冻结，且必须附带探测定时器；显式结束时销毁 |
 | L1 驱动器中介（Claude Code） | Agent 驱动器以无头协议驱动 Agent | L0 的全部信号，加上 Agent 驱动器提供的信号，例如回合开始与结束、`idle` 与 `requires_action` 状态（[REF-claude-agent-sdk-typescript](../references.md)）、工具开始与结束、权限询问、平台 MCP 工具调用（[REF-mcp](../references.md)）、hooks（[REF-claude-code-hooks](../references.md)） | 回合中冻结，有快照能力时可快照；回合边界销毁重建 |
 | L2 协作式 | 平台原生 Agent 显式声明等待并保证状态已落盘 | 显式 `WaitDeclared` | 任意声明的等待点：回合中冻结或快照，回合边界可销毁重建 |
 
@@ -309,9 +309,9 @@ graph TD
 Kubernetes 集群内的划分：
 
 - 控制面命名空间：控制面服务多副本部署。`runcontroller` 的副本以运行实例所有者租约划分运行实例，租约规则见并发模型。
-- k8s 提供者沙箱节点池：沙箱 Pod 由 agent-sandbox 的 Sandbox CR 管理，单容器，看守进程为 PID 1，Agent 进程树位于容器 cgroup 下的子 cgroup `agent` 中，节点冻结代理以写入 `agent/cgroup.freeze` 执行冻结与解冻。节点冻结代理为特权 DaemonSet，沙箱节点池的每个节点一个 Pod。预热池为 SandboxWarmPool 与 SandboxClaim：预热 Pod 在创建时挂载共享文件系统的项目根，认领时看守进程切换到运行实例子目录。沙箱 Pod 的 NetworkPolicy 默认拒绝出口，只放行控制面地址、LLM 网关与平台出口代理。Pod 规格与原地缩放、驱逐保护、cgroup 迁移与入站路由的机制见 [sandboxprovider 的 k8s 子模块](modules/sandboxprovider/design-sandboxprovider-k8s.md)。
+- k8s 提供者沙箱节点池：沙箱 Pod 由 agent-sandbox 的 Sandbox CR 管理，单容器，看守进程为 PID 1，Agent 进程树位于容器 cgroup 下的子 cgroup `agent` 中，节点冻结代理以写入 `agent/cgroup.freeze` 执行冻结与解冻。节点冻结代理为特权 DaemonSet，沙箱节点池的每个节点一个 Pod。预热池为 SandboxWarmPool 与 SandboxClaim：预热 Pod 在创建时挂载共享文件系统的项目根，认领时看守进程切换到运行实例子目录。沙箱 Pod 的 NetworkPolicy 默认拒绝出口，只放行控制面地址、LLM 网关与平台出口代理。Pod 规格与原地缩放、驱逐保护、cgroup 迁移与入站路由的机制见 [sandboxprovider 的 k8s 子模块](modules/sandboxprovider/design-sandboxprovider-k8s.md)。原地缩放结果不跨 Pod 重建保留：`OperatingMode=Suspended` 删除 Pod 后，提供者必须按持久化的目标 request 在新 Pod 就绪后重新提交 `pods/resize`。
 - 平台出口代理：`connectorhub` 的 k8s 路径出口网关进程，部署在控制面命名空间之外，出口策略的落地方式见安全边界。
-- Substrate worker 节点池：actor 由 Substrate 的 worker 承载，预热由预热 worker 承担，actor 镜像以看守进程为 PID 1。工作区优先为每 actor 一卷的外部 CSI 卷（例如 NFS CSI 驱动），CSI 不可用时退到 `durableDir`，退化配置下回合边界的销毁改用同步挂起、上传完成后才返回（[ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)）。Substrate 控制面、路由器与出口网关部署在集群内：恢复由路由器的入站请求触发，请求等待直到 `/readyz` 就绪；出口网关以 MITM 落地出口策略，actor 镜像信任网关 CA。actor 模板、唤醒探针、等待预算与 EgressPolicy 的细节见 [sandboxprovider 的 substrate 子模块](modules/sandboxprovider/design-sandboxprovider-substrate.md)。
+- Substrate worker 节点池：actor 由 Substrate 的 worker 承载，预热由预热 worker 承担，actor 镜像以看守进程为 PID 1。工作区优先为每 actor 一卷的外部 CSI 卷（例如 NFS CSI 驱动），CSI 不可用时退到 `durableDir`，退化配置下回合边界的销毁改用同步挂起、上传完成后才返回（[ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)）。Substrate 控制面、路由器与出口网关部署在集群内：恢复由路由器的入站请求触发，请求等待直到 `/readyz` 就绪；出口网关以 MITM 落地出口策略，actor 镜像信任网关 CA。actor 模板、唤醒探针、等待预算与 EgressPolicy 的细节见 [sandboxprovider 的 substrate 子模块](modules/sandboxprovider/design-sandboxprovider-substrate.md)。外部 CSI 仍为预览特性，需开启 ExternalVolumes 与 CSIDriverConfig；gVisor 下没有 Docker；`parked-request-budget` 必须不小于恢复 p95 加 `/readyz` 余量。
 - 共享文件系统：RWX 文件系统（例如 CephFS、JuiceFS、NFS、EFS 类），由沙箱节点池的每个节点挂载，无卷挂接步骤、无节点亲和；文件系统需 `no_root_squash`，或由看守进程 `seteuid` 后创建目录；目录权限、uid 与配额见安全边界。块存储（RWO PV）为退化配置，有节点或可用区亲和，不能预绑定预热池。Agent 二进制与依赖缓存放在镜像内，不放共享文件系统。
 
 集群外：
@@ -322,7 +322,7 @@ Kubernetes 集群内的划分：
 
 前提条件穷举：
 
-- k8s 提供者：In-Place Pod Resize 可用（Kubernetes 1.35 及以上）；`sandboxprovider` 具有 `pods/resize` 子资源的 patch 权限；沙箱节点为 cgroup v2，`cgroup.freeze` 与 PSI 可用；集群允许部署特权 DaemonSet 并访问容器运行时；agent-sandbox 控制器已安装（API `v1beta1`）；RWX 共享文件系统，或退化配置的 RWO 块存储；NetworkPolicy 由集群网络实施。
+- k8s 提供者：In-Place Pod Resize 可用（Kubernetes 1.35 及以上）；`sandboxprovider` 具有 `pods/resize` 子资源的 patch 权限；沙箱节点为 cgroup v2，`cgroup.freeze` 可写，`agent` 子 cgroup 的 `cpu.pressure`、`io.pressure` 与 `memory.pressure` 可读；冻结完成以 `cgroup.events` 的 `frozen` 字段判定，不以进程态 T 判定；集群允许部署特权 DaemonSet 并访问容器运行时；agent-sandbox 控制器已安装（API `v1beta1`）；RWX 共享文件系统，或退化配置的 RWO 块存储；NetworkPolicy 由集群网络实施。
 - Substrate 提供者：k8s 具备 PodCertificateRequest 与 ClusterTrustBundle API；节点运行 gVisor，microVM 模式需要 KVM；节点内核 6.7 及以上；PostgreSQL；对象存储（GCS 原生支持，S3 经插件）。
 
 ## 模块间调用关系
@@ -678,7 +678,7 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 | 解冻：事件到达至 Agent 可接收 | p95 < 200 ms | 冻结机制 |
 | 快照恢复：同节点本地快照且无在途请求 | p95 < 2 s | 快照机制 |
 | 快照恢复：通用 | p95 < 5 s | 快照机制 |
-| 预热池认领重建 | p95 < 10 s | 共享文件系统；Agent 二进制与依赖缓存在镜像内；启动期外联快速失败；池非空 |
+| 预热池认领重建 | p95 < 10 s | 共享文件系统；Agent 二进制与依赖缓存在镜像内；启动期非必要外联已关闭（RST 与黑洞在启动期都约 5 s，不能只靠快速失败）；MCP 初始化超时已显式下调；池非空 |
 | 冷启动重建 | p95 < 20 s | 共享文件系统 |
 | 冷启动重建 | p95 < 60 s | 块存储 |
 | `idle_while_scheduled_ratio` | < 10% | 全部机制 |

@@ -504,7 +504,7 @@ sequenceDiagram
 
 ### Agent 状态目录、投递意图日志与已初始化标记
 
-- `CLAUDE_CONFIG_DIR` 指向 `<run_id>/.platform/agent-config/`，Claude Code 的 `projects/<project>/<session-id>.jsonl` 随之位于工作区，跨代保留；各代沙箱的 cwd 逐字一致，`cleanupPeriodDays` 不小于工作区保留期（[REF-claude-code-settings](../../references.md)）。
+- `CLAUDE_CONFIG_DIR` 指向 `<run_id>/.platform/agent-config/`，Claude Code 的 `projects/<project>/<session-id>.jsonl` 随之位于工作区，跨代保留；各代沙箱的 cwd 逐字一致，使工具相对路径与会话记录稳定，`--resume` 按 `session_id` 查找而不依赖 cwd，`--continue` 才以 cwd 为作用域；`cleanupPeriodDays` 不小于工作区保留期（[REF-claude-code-settings](../../references.md)）。
 - 投递意图日志位于 `<run_id>/.platform/deliveries.jsonl`；`accepted{seq}` 在喂给 Agent 之前同步写入，`consumed{seq, turn_id}` 在观察到回合开始后同步写入，重建后由控制面从消费位置重投，看守进程按日志去重。
 - 已初始化标记位于 `<run_id>/.platform/initialized`；看守进程在首次初始化完成后写入，重建后读取。标记不放在 rootfs，避免销毁重建后重复初始化。
 - 这些路径由绑定与看守进程共同固定；`workspace` 保证目录存在与权限，`warden` 保证写入时机与 fsync。`runcontroller` 只要求销毁前持久化完成，不读取内容。

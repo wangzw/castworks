@@ -114,7 +114,7 @@
 | 外部系统操作 | 经 `connectorhub` 执行同步或异步操作，返回结果并登记预关联锚 |
 | 附件取回 | 附运行实例令牌向存放方取回附件引用中的内容 |
 
-`MCP_TOOL_TIMEOUT` 配置为 `F_cap(approval / wait_for)` 加 60 s 以上，冻结上限据此反推；`F_cap(request)` 与 `F_cap(timer)` 由 `suspendpolicy` 按工具超时与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应操作、驱动器的超时预算与本模块文档。
+per-server timeout 配置为 `F_cap(approval / wait_for / request)` 加安全余量，且不得大于 MCP 传输上限；`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限，实际约束是 HTTP 首字节 60 s、HTTP idle 300 s 加 30 s 检查粒度与 stdio idle 1800 s 加 30 s 检查粒度；`F_cap(request)` 与 `F_cap(timer)` 由 `suspendpolicy` 按传输类型与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应操作、驱动器的超时预算与本模块文档。
 
 ### 入站端点
 
@@ -279,13 +279,13 @@ sequenceDiagram
 
 | 字段 | 含义 |
 | --- | --- |
-| `psi.cpu`、`psi.io`、`psi.mem` | cgroup v2 的 PSI `some` 值；`cpu` 或 `io` 的 `some` 大于零表示进程树在最近窗口内发生过资源停滞 |
+| `psi.cpu`、`psi.io`、`psi.mem` | `agent` 子 cgroup 的 `cpu.pressure`、`io.pressure`、`memory.pressure` 的 `some` 值；`cpu` 或 `io` 的 `some` 大于零表示进程树在最近窗口内发生过资源停滞。读取 per-cgroup PSI，不读 `/proc/pressure` |
 | `procs{R, D, S, T, Z}` | Agent 进程树中各进程态的计数；`R` 与 `D` 表示运行或不可中断等待，`T` 表示已停止 |
-| `throttled_usec` | `cpu.stat` 的累计限流微秒；相邻样本的增量表示采样窗口内发生过限流 |
+| `throttled_usec` | 容器父 cgroup 的 `cpu.stat` 累计限流微秒；相邻样本的增量表示采样窗口内发生过限流。`agent` 子 cgroup 的该值通常恒为 0，不能作为限流证据 |
 | `last_fork_at` | 最近一次观察到 fork 的时刻 |
 | `ws_write_fds` | 进程树持有的工作区写文件描述符数量 |
 | `io_bytes`、`net_bytes` | 累计块设备 I/O 与网络字节 |
-| `frozen`、`freeze_id` | Agent 子 cgroup 的冻结状态与当前冻结标识；`signal` 变体取看守进程的冻结执行记录 |
+| `frozen`、`freeze_id` | Agent 子 cgroup 的冻结状态与当前冻结标识；`cgroup` 变体从 `agent/cgroup.events` 的 `frozen` 字段读取，`signal` 变体取看守进程的冻结执行记录。cgroup 冻结后进程态仍是 S，不能以 T 态判定冻结完成 |
 
 活动度样本只含观测值，不含忙闲判定；判定规则与阈值归 `suspendpolicy`。`frozen` 在 `Active` 中为真且 `freeze_id` 不等于 `aborted_suspend_id` 时，控制面判定本代沙箱作废。
 
@@ -312,7 +312,7 @@ sequenceDiagram
 | `stopped_pids` | `signal` 变体已停止的 PID 集合 |
 | `thawed` | 是否已执行解冻；为真时该标识拒绝新的冻结，缩小请求的幂等由 `sandboxprovider` 按同一标识维护 |
 
-`cgroup` 变体的状态从 `agent/cgroup.freeze` 读取，`signal` 变体的状态从进程态 `T` 读取。两种变体都以 `freeze_id` 幂等，`Thawed` 按同一标识上报。
+`cgroup` 变体的状态从 `agent/cgroup.events` 的 `frozen` 字段读取（写入仍为 `agent/cgroup.freeze`），`signal` 变体的状态从进程态 `T` 读取。cgroup 冻结后进程态仍为 S，冻结完成的判定必须轮询 `cgroup.events`。两种变体都以 `freeze_id` 幂等，`Thawed` 按同一标识上报。
 
 ## 核心算法与流程
 
@@ -381,7 +381,7 @@ sequenceDiagram
 
 `PrepareSuspend` 携带 `suspend_id`、`mode`、`variant`、`deadline` 与 `require{process_exit, no_bg_procs, no_ws_write_fds, sync}`，可选 `force`。看守进程先核对前置条件：`process_exit` 要求 Agent 已正常退出；`no_bg_procs` 要求后台作业集合为空；`no_ws_write_fds` 要求进程树没有工作区写文件描述符；`sync` 要求工作区持久化确认完成。任一不满足时回 `Busy{suspend_id, reason, retry_after}`。
 
-`Freeze{cgroup}`：看守进程不写 cgroup，只上报 `ReadyToSuspend`；节点冻结代理在收到控制面的冻结调用后写 `agent/cgroup.freeze`；控制面以冻结确认作为 `Suspended` 的依据。收到 `Thaw{freeze_id}` 后，看守进程读取 `agent/cgroup.freeze`，观察到未冻结即上报 `Thawed{freeze_id}`；进程树从未冻结时立即上报。
+`Freeze{cgroup}`：看守进程不写 cgroup，只上报 `ReadyToSuspend`；节点冻结代理在收到控制面的冻结调用后写 `agent/cgroup.freeze`；控制面以冻结确认作为 `Suspended` 的依据。收到 `Thaw{freeze_id}` 后，看守进程读取 `agent/cgroup.events` 的 `frozen` 字段，观察到未冻结即上报 `Thawed{freeze_id}`；进程树从未冻结时立即上报。
 
 `Freeze{signal}`：按运行实例 uid 扫描 `/proc`，对不在 `stopped_pids` 中的 PID 发送 `SIGSTOP`，直到连续两次扫描没有新 PID 且全部处于 T 态；每轮扫描后记录 `scan_rounds`。轮次上限由 `suspendpolicy` 的冻结参数给出；超限或截止到期时对已停止 PID 发送 `SIGCONT`，记录 `thawed=true`，回 `Busy{suspend_id, reason, retry_after}`。收敛后上报 `ReadyToSuspend{suspend_id, frozen_at, procs_remaining}`。收到 `Thaw{freeze_id}` 后对 `stopped_pids` 发送 `SIGCONT`，上报 `Thawed`。
 
@@ -391,7 +391,7 @@ sequenceDiagram
 
 ### 活动度采集
 
-看守进程按固定周期读取 cgroup v2 与 `/proc`，组装 `Activity` 样本：PSI 的 `cpu`、`io`、`mem` 的 `some` 值；Agent 进程树中 R、D、S、T、Z 态的计数；`cpu.stat` 的 `throttled_usec` 累计值；最近 fork 时刻；工作区写文件描述符数量；累计 I/O 与网络字节；冻结状态与 `freeze_id`。`cgroup` 变体从 `agent/cgroup.freeze` 读取冻结状态，`signal` 变体从冻结执行记录读取。
+看守进程按固定周期读取 cgroup v2 与 `/proc`，组装 `Activity` 样本：`agent` 子 cgroup 的 `cpu.pressure`、`io.pressure`、`memory.pressure` 的 `some` 值；Agent 进程树中 R、D、S、T、Z 态的计数；容器父 cgroup 的 `cpu.stat` 的 `throttled_usec` 累计值；最近 fork 时刻；工作区写文件描述符数量；累计 I/O 与网络字节；冻结状态与 `freeze_id`。`cgroup` 变体从 `agent/cgroup.events` 读取冻结状态，`signal` 变体从冻结执行记录读取。
 
 采集只上报观测值，不判断忙闲。`suspendpolicy` 把以下信号解释为忙：PSI 的 `cpu` 或 `io` 的 `some` 大于零；存在 R 或 D 态进程；S 态进程的 `wchan` 为 `nanosleep` 或 `hrtimer`；`throttled_usec` 在采样窗口内增长；最近 fork 时刻在窗口内；工作区写文件描述符变化。静默窗与迟滞由策略给出，采集周期由策略与配置共同约束。
 
@@ -407,7 +407,7 @@ sequenceDiagram
 
 平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的带令牌调用，并向 Agent 驱动器提供事件。`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对事件日志回溯匹配；`wait_for` 阻塞到条件满足或临近冻结上限，临近上限时返回已转为订阅与 `sub_id` 的结果；`request_human_input` 在异步渠道以回合边界承接，在实时接入中阻塞等待；`sleep_until` 登记定时，阻塞型在 DRAIN 或临近上限时转为运行实例范围定时器；外部系统操作经 `connectorhub` 执行并登记预关联锚；附件取回附运行实例令牌向存放方请求。
 
-工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，`wait_for` 的 `ref` 只取 `lifetime: once` 的订阅，`sleep_until` 以 `scope=run` 发出定时请求。`MCP_TOOL_TIMEOUT` 配置为 `F_cap(approval / wait_for)` 加 60 s 以上；工具超时返回错误结果，不无限占用回合。
+工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，`wait_for` 的 `ref` 只取 `lifetime: once` 的订阅，`sleep_until` 以 `scope=run` 发出定时请求。per-server timeout 配置为 `F_cap(approval / wait_for / request)` 加安全余量，且不得大于 MCP 传输上限；工具超时返回错误结果，不无限占用回合。
 
 ### ToolExec 与文件访问
 
@@ -447,7 +447,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 令牌过期且未收到 `TokenRotate` | 不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求；等待轮换后恢复 |
 | 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递「回合被中断」；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)） |
 | 快照恢复后时钟跳变 | 以 `Resumed.wall_clock_now` 校时，再通知驱动器；恢复期间的超时以校时后的时钟计算 |
-| `MCP_TOOL_TIMEOUT` 到期 | 工具返回错误结果，不无限占用回合；阻塞型等待已转为订阅或定时时按转换结果返回 |
+| MCP 传输定时器（首字节、idle）或 per-server timeout 到期 | 工具返回错误结果，不无限占用回合；阻塞型等待已转为订阅或定时时按转换结果返回 |
 
 接口层的错误语义见外部接口契约：`Shutdown`、`Fenced` 与不可重试认证失败是三种终止语义；可重试关闭不终止 Agent；`Busy` 与 `DeliveryFailed` 都携带重试依据。
 

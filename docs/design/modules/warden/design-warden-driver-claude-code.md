@@ -257,7 +257,7 @@ sequenceDiagram
 | `blocking` | 是否以阻塞等待处理；实时接入与并行工具调用退回时为真 |
 | `deferred` | 是否已返回 `defer` 并以回合边界结束 |
 | `decision` | 允许或拒绝；允许可携带 `updatedInput`，拒绝携带消息 |
-| `deadline` | 阻塞等待的截止时间；取 hook 超时与 MCP 工具超时的较小值 |
+| `deadline` | 阻塞等待的截止时间；取 hook 超时、per-server timeout 与 MCP 传输上限的较小值 |
 
 ### 后台作业记录
 
@@ -310,12 +310,18 @@ claude -p --output-format stream-json --input-format stream-json --verbose [--re
 | `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` | `1` | 产生 `session_state_changed` 的 `idle` 与 `requires_action` |
 | `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING` | `0` | 存在后台任务时仍报告 `idle`；后台作业由驱动器另行登记 |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` | 被中断回合在 `--resume` 时自动续接，作为降级路径 |
+| `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` | 不超过工作区保留期 | 只对早于该时长的被中断回合自动续接；超过时按新会话或合成摘要处理 |
 | `CLAUDE_CODE_MAX_RETRIES` | 默认 10 | Claude Code 对上游请求的重试次数 |
 | `API_TIMEOUT_MS` | 默认 600000 | 响应头超时；不限制流式响应体的总时长 |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` | 关闭遥测与更新检查等非必要外联，避免冷启动等待 |
 | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` | 策略开关 | 置位时禁用后台任务；是否置位由策略决定 |
+| `MCP_TIMEOUT` | 显式下调，覆盖默认值 | MCP 服务器启动与初始化超时；默认值可能使冷启动等满 30 s |
+| `MCP_CONNECT_TIMEOUT_MS` | 显式下调 | MCP 连接超时 |
+| `MCP_TOOL_TIMEOUT` | per-server timeout = `F_cap + safety_margin` | 工具调用超时；不得超过 MCP 传输上限 |
 
-`ANTHROPIC_BASE_URL` 是 Agent 与本地代理之间唯一的 LLM 配置；Agent 不持有令牌。`CLAUDE_CONFIG_DIR` 与 cwd 在各代沙箱逐字一致，cwd 的变化会使 `--resume` 找不到会话。`cleanupPeriodDays` 不小于工作区保留期。
+`ANTHROPIC_BASE_URL` 是 Agent 与本地代理之间唯一的 LLM 配置；Agent 不持有令牌。`CLAUDE_CONFIG_DIR` 与 cwd 在各代沙箱逐字一致，使工具相对路径与会话记录稳定；`--resume` 按 `session_id` 查找，不依赖 cwd，`--continue` 才以 cwd 为作用域。`cleanupPeriodDays` 不小于工作区保留期。
+
+**续接与悬空工具调用。** 空提示续接对非 defer 的悬空 `tool_use` 直接拒绝并中止启动，不重跑该调用。带提示续接则保留被切断的调用，并合成一个 `is_error` 的 interrupted `tool_result` 交回模型，模型可能据此重试；有副作用的调用必须按可能重试设计幂等，不能假设被切断的调用一定被丢弃。启用 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` 时同时设置最大年龄，避免把过旧的被中断回合当作当前回合自动续接。
 
 ### 流式输入会话
 
@@ -350,7 +356,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 **异步渠道。** hook 返回 `permissionDecision: "defer"`，Claude Code 以 `stop_reason: tool_deferred` 结束回合；驱动器发出 `permission_requested{blocking=false}` 与 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 从驱动器取回决定并返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
 
-**实时接入。** hook 阻塞等待，驱动器发出 `permission_requested{blocking=true}`；决定到达后交给挂起的 hook。hook 显式设置 `timeout` 与 `onFailure: block`，覆盖 Claude Code 超时后默认放行的行为；超时按阻塞处理并返回拒绝结果，不默认放行。阻塞等待的冻结上限取 hook 超时与 MCP 工具超时的较小值减去安全余量，两者按墙钟计时，冻结期间照常流逝；取值归 `suspendpolicy`。
+**实时接入。** hook 阻塞等待，驱动器发出 `permission_requested{blocking=true}`；决定到达后交给挂起的 hook。hook 显式设置 `timeout` 与 `onFailure: block`，覆盖 Claude Code 超时后默认放行的行为；超时按阻塞处理并返回拒绝结果，不默认放行。阻塞等待的冻结上限取 hook 超时、per-server timeout 与 MCP 传输上限的较小值减去安全余量，各项按墙钟计时，冻结期间照常流逝；取值归 `suspendpolicy`。
 
 同一回合有多个并行工具调用时，`defer` 被忽略，退回阻塞等待；各调用的审批决定以定向投递分别送达，只有剩一个阻塞调用时才允许冻结。审批决定在沙箱销毁之前到达时，在同一代的已建立流上送达；销毁之后到达时，在新代以 `--resume` 续接。
 
@@ -358,7 +364,9 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 驱动器向 Claude Code 注入平台 MCP 服务器的连接配置，工具集合与语义归平台 MCP 服务器；本模块负责以下接入工作：把工具调用的开始与结束翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，把 `subscribe_event`、`sleep_until` 与 `wait_for` 的结果翻译为 `subscription_created`、`timer_requested{scope=run}` 与 `wait_started{kind=wait_for}`，以及设置 `MCP_TOOL_TIMEOUT`。
 
-`MCP_TOOL_TIMEOUT` 配置为 `F_cap(approval / wait_for)` 加 60 s 以上，冻结上限据此反推。工具超时返回错误结果，不无限占用回合；已经转为订阅或定时的阻塞型调用按转换结果返回。工具调用的开始与结束必须配对；进程退出时未配对的调用由驱动器清理，并在 `turn_ended{bg_procs}` 中报告剩余进程。
+`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限；实际约束是 MCP 客户端的 HTTP 首字节 60 s、首字节后 idle 300 s 加 30 s 检查粒度，以及 stdio idle 1800 s 加 30 s 检查粒度。per-server timeout 配置为 `F_cap(approval / wait_for / request)` 加安全余量，且不得大于对应的传输上限；超过传输上限时以传输上限为准。平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的窗口生效；`wait_for` 的默认路径是在冻结前转为订阅。工具超时返回错误结果，不无限占用回合；已经转为订阅或定时的阻塞型调用按转换结果返回。工具调用的开始与结束必须配对；进程退出时未配对的调用由驱动器清理，并在 `turn_ended{bg_procs}` 中报告剩余进程。
+
+启动期非必要外联必须由 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 关闭；RST 与黑洞在启动期都约 5 s，不能只依赖本地代理立即拒绝。MCP 初始化默认可等满 30 s，必须显式下调 `MCP_TIMEOUT` 与 `MCP_CONNECT_TIMEOUT_MS`，否则冷启动目标会被默认值拖到阈值之外。
 
 ### 销毁安全点
 
@@ -431,7 +439,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 | `PreToolUse` hook 超时 | `onFailure: block` 生效，返回拒绝结果并带消息；不默认放行，不无限阻塞 |
 | 审批决定的目标已失效 | 回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递 |
 | 并行工具调用使 `defer` 被忽略 | 退回阻塞等待；各决定以定向投递分别送达，不销毁 |
-| 平台 MCP 工具超时 | 工具返回错误结果，回合继续；已转为订阅或定时的调用按转换结果返回 |
+| 平台 MCP 传输定时器或 per-server timeout 到期 | 工具返回错误结果，回合继续；已转为订阅或定时的调用按转换结果返回 |
 | 快照恢复后时钟跳变 | 丢弃旧截止时间并按校时后的时钟重建；不重放已交付输入 |
 | 后台作业未结束 | 运行实例视为活动，不挂起；超时按策略终止，或回合边界不构成 I9 安全点 |
 | `Fenced` 或 `Shutdown{graceful=false}` | 强制终止：`SIGTERM`、退出码 143、杀死 Bash 进程树、执行 `SessionEnd` hook |

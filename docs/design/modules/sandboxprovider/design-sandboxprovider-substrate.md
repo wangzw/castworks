@@ -72,7 +72,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 | Suspend 与 Resume API | 按 `suspend_id` 执行 MEMORY 快照；按 `resume_id` 在同一代内恢复；挂起与恢复对同一 actor 串行 |
 | 路由器 `ResumeActor` | 以 `ate-target-actor` 头定位 actor，调用方需具备 `can_resume`；路由器恢复 actor 并停泊请求直到 `wakeupProbe` 就绪 |
 | `wakeupProbe` | 在 actor 模板中声明为看守进程的 `/readyz:80`；就绪之前路由器不释放停泊请求 |
-| `parked-request-budget` | 路由器停泊请求的预算；默认 5 s，部署时按快照恢复与冷启动的时延调大 |
+| `parked-request-budget` | 路由器停泊请求的预算；默认 5 s，部署时必须调到不小于恢复 p95 加 `/readyz` 余量；约 500 MB actor 的恢复可能超过 5 s，未调大时停泊请求会被提前切断 |
 | EgressPolicy API | 以 `(run_id, generation)` 为键落地允许的主机、`replaceHeaders` 规则与凭据引用（`project_id`、`system`、`auth_method`、`scopes`）；MITM 由出口网关执行 |
 | 凭据提供者协议 | 出口网关在解析占位符时调用 `secrets` 实现的凭据提供者；本子模块不调用该协议 |
 | 外部 CSI 卷 | actor 卷类型 `external`，每 actor 一卷；由 CSI 驱动动态供给 |
@@ -88,11 +88,20 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - `agentprotocol`：恢复完成以看守进程发送 `Hello` 为观察；`/readyz` 是路由器的 `wakeupProbe`，`/wake` 返回表示出站流已重建。入站端点不承载事件内容，投递只在出站流上进行。
 - Substrate 控制面：执行 actor 的创建、认领、Suspend 与 Resume；快照保留期限由 `SnapshotReceipt` 返回。Substrate 控制面不可达时预配、挂起与恢复返回暂时性错误。
 - Substrate 路由器：以 `ate-target-actor` 头调用 `/wake`，恢复 actor 并停泊请求直到 `/readyz` 就绪；调用方持有 SPIFFE 身份并在白名单内。路由器同时承载 `/terminal` 与界面文件访问；事件投递与 `ToolExec` 帧都不经该路由，快照恢复经 `/wake` 触发；`ToolExec` 帧随看守进程的出站流往返，与路由器唤醒路径相互独立。
-- Substrate 出口网关：把 EgressPolicy 落地为 MITM 代理，以 `replaceHeaders` 替换请求头中的凭据占位符，默认拒绝未列入的主机；actor 镜像信任出口网关的 CA。出口网关在解析占位符时调用 `secrets` 的凭据提供者，以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取真实凭据；真实凭据不进入 actor。
+- Substrate 出口网关：把 EgressPolicy 落地为 MITM 代理，以 `replaceHeaders` 替换请求头中的凭据占位符，默认拒绝未列入的主机；actor 镜像信任出口网关的 CA。出口网关在解析占位符时调用 `secrets` 的凭据提供者，以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取真实凭据；真实凭据不进入 actor。EgressPolicy 的 `CredentialHeader` 只携带 `credential_uri` 时，`credential_uri` 编码上述项目、系统、认证方式与作用域，由凭据提供者解析；提供者版本不支持编码时，须扩展其请求字段，不能把字段丢弃后按默认凭据处理。
 - 对象存储：承载快照与 `durableDir` 上传数据；GCS 原生支持，S3 经插件。
 - PostgreSQL：Substrate 控制面的存储。
-- 外部 CSI 驱动：为每 actor 供给一卷外部 CSI 卷；写穿持久、崩溃不丢、沙箱外可经同一导出访问，内容不进快照。
+- 外部 CSI 驱动：为每 actor 供给一卷外部 CSI 卷；写穿持久、崩溃不丢、沙箱外可经同一导出访问，内容不进快照。该能力仍为预览特性，需开启 ExternalVolumes、注册 CSIDriverConfig，并确认 NFS 导出可从沙箱外访问。
 - 部署前提：k8s 具备 PodCertificateRequest 与 ClusterTrustBundle API；节点运行 gVisor，microVM 模式需要 KVM；节点内核 6.7 及以上；PostgreSQL 与对象存储可用；路由器与出口网关可达，SPIFFE 信任域已配置，控制面身份在路由器白名单内；actor 镜像信任出口网关 CA，凭据提供者可达。
+
+**验证前提与已知限制。** 以下条件未满足时，Substrate 提供者不能进入阶段 1：
+
+- 外部 CSI 卷仍是预览特性：需开启 ExternalVolumes、注册 CSIDriverConfig，并确保 NFS 导出可从沙箱外访问；内容不进快照，恢复后不能依赖快照回滚工作区。
+- gVisor 下没有 Docker：编译测试类负载不能假设容器内可运行 Docker，需预装工具链或改用外部构建服务。
+- `parked-request-budget` 默认 5 s，必须调到不小于恢复 p95 加 `/readyz` 余量；约 500 MB actor 的恢复可能超过 5 s，未调大时停泊请求会被提前切断。
+- MEMORY 快照恢复不保证旧 TCP 连接可被及时察觉；看守进程必须在恢复后主动断开 Agent 的旧连接，不能依赖读超时。
+- S3 插件在当前版本仍需试点确认；对象存储优先 GCS，S3 作为待验证选项。
+- 路由器 `/wake`、EgressPolicy 与凭据提供者需要在目标集群完成端到端试点；仅凭文档与源码不能判定 go。
 
 ## UML 图
 

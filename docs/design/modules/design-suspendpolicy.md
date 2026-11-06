@@ -320,12 +320,12 @@ type NodePressure struct {
 
 一个运行实例在 k8s 提供者上等待 LLM 响应，沙箱能力集合为 `{Freeze{cgroup}, InPlaceResize, Destroy, WarmPool}`，不具快照能力。初始 `run` 行：`state=active`、`turn_phase=in_turn`、`blocked_on={kind: llm, mode: hold, since: T0}`、`last_resumed_at=T0−10min`、`policy_state` 的抖动预算余额为 20 s、`flap_counter=0`。LLM 直方图给出 p25=40 s、p50=60 s、p90=180 s，置信度 0.8。
 
-1. `T0`：`runcontroller` 在行锁内调用 `decide`。唤醒谓词为假，无后台作业，`D_lo=p50=60 s ≥ T_nofreeze(3 s)`；`turn_boundary=false`，无 `Snapshot`；`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`f_cap=F_cap(llm)=客户端请求超时−60 s=540 s`、`grace=0`、`next_review_at=T0+3 s`。`run` 行写入 `suspend_mode=freeze`、`freeze_cap=540 s`，冻结落地后 `freeze_deadline=T0+540 s`；`policy_state` 的抖动预算扣除冻结成本 0.1 s，余额 19.9 s。
-2. `T0+3 s`：`review_at` 到期，`review` 输入 `FrozenFor=3 s`、`turn_phase=in_turn`、`blocked_on.kind=llm`、`FCapReached=false`，节点压力低于 ρ_soft，返回 `KEEP`、`next_review_at=min(T_snapshot 点, T0+540 s−safety_margin)`。
-3. `T0+540 s−safety_margin`：`FCapReached=true`。能力集合无 `Snapshot`，回合中不能销毁，返回 `DRAIN`；`DRAIN` 本身不扣减预算。`runcontroller` 的「冻结上限处置」执行 `DRAIN` 分支：解冻，本地代理回放跑完本次请求，响应在解冻后交付，回合结束后运行实例进入 `Draining`。
+1. `T0`：`runcontroller` 在行锁内调用 `decide`。唤醒谓词为假，无后台作业，`D_lo=p50=60 s ≥ T_nofreeze(3 s)`；`turn_boundary=false`，无 `Snapshot`；`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`f_cap=F_cap(llm)=min(客户端请求超时 600 s, 300 s 看门狗)−60 s=240 s`、`grace=0`、`next_review_at=T0+3 s`。`run` 行写入 `suspend_mode=freeze`、`freeze_cap=240 s`，冻结落地后 `freeze_deadline=T0+240 s`；`policy_state` 的抖动预算扣除冻结成本 0.1 s，余额 19.9 s。
+2. `T0+3 s`：`review_at` 到期，`review` 输入 `FrozenFor=3 s`、`turn_phase=in_turn`、`blocked_on.kind=llm`、`FCapReached=false`，节点压力低于 ρ_soft，返回 `KEEP`、`next_review_at=min(T_snapshot 点, T0+240 s−safety_margin)`。
+3. `T0+240 s−safety_margin`：`FCapReached=true`。能力集合无 `Snapshot`，回合中不能销毁，返回 `DRAIN`；`DRAIN` 本身不扣减预算。`runcontroller` 的「冻结上限处置」执行 `DRAIN` 分支：解冻，本地代理回放跑完本次请求，响应在解冻后交付，回合结束后运行实例进入 `Draining`。
 4. 回合结束：`runcontroller` 经「排空完成」写 `grace_deadline=now()`，调用 `decide(trigger=drain_done)`。`turn_boundary=true`，`D_lo` 仍为 60 s，剩余宽限期为 `max(0, grace_deadline−now)=0`，`D_lo > 0`；`Destroy` 可用且 `safe_to.destroy` 为真，返回 `DESTROY`、`grace=0`，抖动预算扣除销毁成本 10 s、余额 9.9 s。销毁落地后 `run` 行为 `state=suspended, substate=destroyed`。
 5. 外部事件到达：汇入事务的条件 UPDATE 把 `run` 行转 `wake_queued`，`resume_intent=normal`。入队时 `mechanism(destroyed, caps, normal)` 返回 `warm_claim`；`admit` 携带该机制入队，`queued_at` 为转入时刻。
-6. 放行：`thaw` 桶之外的 `warm_claim` 桶按预热池余量与补充速率放行，回调携带 `warm_claim`。`runcontroller` 校验 `resume_mode` 相等后进入 `resuming`，分配 `slot_lease`；新代 `Hello` 到达后 `enter_active`，提交后调用 `release`。本次实际等待 540 s，长于 p90=180 s，不属于「挂起后很快被唤醒」，`on_resumed` 返回 `flap_counter=0`。
+6. 放行：`thaw` 桶之外的 `warm_claim` 桶按预热池余量与补充速率放行，回调携带 `warm_claim`。`runcontroller` 校验 `resume_mode` 相等后进入 `resuming`，分配 `slot_lease`；新代 `Hello` 到达后 `enter_active`，提交后调用 `release`。本次实际等待 240 s，长于 p90=180 s，不属于「挂起后很快被唤醒」，`on_resumed` 返回 `flap_counter=0`。
 
 走查体现的约束：`f_cap` 来自初判而不是复评；复评只能把冻结引向快照、销毁或 `DRAIN`，不能延长冻结上限；入队时的机制在放行时只读；队列与槽位在 `run` 行之外只是缓存。
 
@@ -393,11 +393,12 @@ freezeCapExpired(ctx, now) =
 | `T_snap_min`（Substrate gVisor 增量快照） | 20 s | Substrate 提供者的快照门槛（[REF-substrate](../../references.md)） |
 | `T_snap_min`（全量 microVM 快照） | 60 s；写入按 4 s/GiB 计 | 全量快照提供者的门槛 |
 | `T_shrink` | 由 `sandboxprovider` 的原地缩小成本估计决定 | 预测等待超过此值才在冻结时附带原地缩小 CPU request |
-| `F_stream` | 120 s | 直通模式下单次冻结上限，取自 Claude Code 流式看门狗 300 s 的安全余量（[REF-claude-code-network-config](../../references.md)） |
-| `F_cap(llm)` | 客户端请求超时 − 60 s | 缓存模式下 LLM 等待的冻结上限；客户端请求超时由 `llmgateway` 随预测输入给出，缺省 10 min（走查中的 540 s 由 600 s 减 60 s 得到） |
-| `F_cap(approval)` | `min(hook 超时, MCP 工具超时) − 60 s` | 回合中审批的冻结上限，两者按墙钟计时（hook 超时见 [REF-claude-code-hooks](../../references.md)） |
-| `F_cap(wait_for)` | 与 `F_cap(approval)` 相同 | 回合中阻塞等待的冻结上限 |
-| `F_cap(request)` | 平台 MCP 工具超时 − 60 s | 同步连接器操作经平台 MCP 服务器代理，与工具超时同源；该种类的 `DRAIN` 只表示解冻并退出冻结，不进入 `Draining` |
+| `F_stream` | 120 s | 直通模式下单次冻结上限，低于 Claude Code 事件级与字节级看门狗默认的 300 s 并保留安全余量（[REF-claude-code-network-config](../../references.md)） |
+| `F_cap(llm)` | 默认 240 s，即 `min(客户端请求超时, 300 s 看门狗) − 60 s` | 缓存模式下 LLM 等待的冻结上限；客户端请求超时由 `llmgateway` 随预测输入给出。本地代理保证冻结期间转发保活事件且两级看门狗已调高的部署，可放宽到 `客户端请求超时 − 60 s`（缺省 540 s）；默认部署不按 540 s 使用 |
+| `MCP 传输上限` | HTTP/SSE：首字节前 60 s，首字节后 330 s；stdio：1830 s | 由 MCP 客户端的首字节、idle 与检查粒度决定；平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的上限生效。`MCP_TOOL_TIMEOUT` 默认约 28 小时，不构成约束 |
+| `F_cap(approval)` | `min(hook 超时, per-server timeout, MCP 传输上限) − 60 s` | 回合中审批的冻结上限，各项按墙钟计时（hook 超时见 [REF-claude-code-hooks](../../references.md)） |
+| `F_cap(wait_for)` | 与 `F_cap(approval)` 相同 | 回合中阻塞等待的冻结上限；默认路径是在冻结前转为订阅 |
+| `F_cap(request)` | `MCP 传输上限 − 60 s` | 同步连接器操作经平台 MCP 服务器代理；该种类的 `DRAIN` 只表示解冻并退出冻结，不进入 `Draining` |
 | `F_cap(timer)` | 取 `F_cap(wait_for)` | 阻塞型定时等待与阻塞等待共用上限；到达上限时转为运行实例范围定时器 |
 | `F_cap(boundary)` | 无上限 | 回合边界冻结只受宽限期与内存压力约束；`blocked_on` 为空，`freeze_cap` 为空 |
 | `F_signal` | 30 s | `Freeze{signal}` 的单次冻结上限；`freezeDecision` 对 signal 变体取 `min(F_cap(kind), F_signal)`，超过时只能快照或 `DRAIN` |
@@ -434,6 +435,8 @@ freezeCapExpired(ctx, now) =
 | 退避上限（`Busy`） | 60 s | `busy_retry` 返回值随 `BusyCount` 指数增长的上限 |
 | 退避上限（无应答与提供者失败） | 10 min | `failure_backoff` 返回值随 `NoResponseCount` 或 `ProviderFailures` 指数增长的上限 |
 | `safety_margin` | `T_resume(thaw) + 10 s`（默认 40 s），由本模块定义 | 冻结态入队截止取 `freeze_deadline−safety_margin`；取值覆盖解冻的过渡态截止与重连时延上界，保证强制放行后仍能在冻结上限之前完成解冻 |
+
+`F_cap` 的取值不能由 `MCP_TOOL_TIMEOUT` 反推。该变量默认约 28 小时，实际约束来自 MCP 客户端的传输定时器：HTTP/SSE 首字节 60 s，首字节后 idle 300 s 加 30 s 检查粒度；stdio idle 1800 s 加 30 s 检查粒度。冻结跨越任一窗口时，恢复后超时会先于已就绪响应生效；`wait_for` 的默认路径是在冻结前转为订阅，平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的窗口生效。平台部署必须显式设置 per-server timeout 为 `F_cap_max + safety_margin`，且不得大于传输上限。
 
 ### 挂起机制闭集与能力选择
 

@@ -22,6 +22,26 @@
 | agent-sandbox 认领时延（单个与 100 并发）与池补充前置时间 L；共享文件系统的 `mkdir`、`chown`、`fsync` 时延与 `root_squash` 行为；块存储 `attach` 在 50 与 200 并发下的时延（[REF-agent-sandbox](references.md)） | 预热池容量公式、冷启动目标与工作区隔离实现 | 通过——100 并发认领满足 p95 < 10 s，池补充前置时间 L 可测；共享文件系统的 `mkdir`、`chown`、`fsync` 支持 I9 的持久化确认，`root_squash` 行为与工作区设计一致；块存储 `attach` 时延与目标一致。不通过——并发认领显著劣化，或 `root_squash` 阻止目录创建；此时池按分片扩容，或改由看守进程 `seteuid` 后创建目录。 |
 | Substrate 试点：看守进程作 PID 1 在 gVisor 下驱动 Claude Code；约 500 MB actor 的 Suspend 与 Resume 时延与快照大小；经路由器 `/wake` 唤醒；EgressPolicy 占位符注入；S3 插件；`parked-request-budget`；编译测试类负载；MEMORY 快照恢复后的时钟与旧连接；外部 CSI 卷；`durableDir` 退化配置（[REF-substrate](references.md)） | Substrate 提供者的 go 与 no-go | 通过——阶段 0 的 go 判定全部满足。不通过——任一阻断项无法成立且无补偿路径；此时第一版只交付 k8s 提供者，Substrate 提供者顺延。 |
 
+## 当前验证结论
+
+验证环境为 macOS arm64、Docker Desktop Linux 容器（cgroup v2）、Kubernetes 1.36.4 与 Claude Code 2.1.318；没有在目标 Linux/k8s 集群或 Substrate 上完成端到端实测。下表的「通过」表示机制、官方文档与本机实验相互印证，不是目标环境验收。
+
+| 事项 | 结论 | 已确立 | 仍需目标环境实测 |
+| --- | --- | --- | --- |
+| 看门狗 | 通过（机制） | 看门狗按单调时钟计时；30 s、120 s 冻结后正常续流；320 s 冻结后在解冻后约 0.35 s 触发中止并重试；自定义 `ANTHROPIC_BASE_URL` 下事件级与字节级默认 300 s。`F_stream=120 s` 安全 | 600 s 端点、cgroup freezer、Substrate VM 挂起、真实网关保活 |
+| `--permission-prompt-tool` 与 defer | 通过 | 参数仍存在但被 `--help` 隐藏；入参 `{tool_name, input, tool_use_id}`，返回单文本块内的 `PermissionResult`；`allow`、`deny`、`updatedInput` 均生效；`defer` 只在 `-p` 单工具回合生效；不带 prompt 的 `--resume` 以同一 `tool_use_id` 再次触发 `PreToolUse` | 并行批次忽略 defer、`tool_deferred_unavailable`、Linux 镜像 |
+| `--resume` 与悬空工具调用 | 部分证实 | 空提示续接对非 defer 悬空 `tool_use` 直接拒绝；`session_id` 默认不变，`--fork-session` 才换新 ID；带提示续接保留被切断调用并合成 `is_error` 的 interrupted `tool_result`，模型可能重试 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 的运行级自动续接、`MAX_AGE`、工具是否重跑 |
+| 关闭 stdin 与 cwd | 部分证实 | JSONL 在进程退出前已写入，退出后立即可读；`--resume` 跨 cwd 可用，`--continue` 以 cwd 为作用域 | 非 `--bare` 命令、`tool_use`/`tool_result` 回合、Linux 共享文件系统 fsync |
+| MCP 工具超时 | **不通过** | `MCP_TOOL_TIMEOUT` 默认约 28 小时，但 HTTP 首字节 60 s、HTTP idle 300 s、stdio idle 1800 s 是更紧的约束；冻结跨越任一窗口时，恢复后超时先于已就绪响应生效；实测 stdio 冻结 12 s、超时 5 s 时 3/3 判超时 | cgroup 同时冻结、审批路径、`wait_for` 实现后复测、HTTP idle 跨 300 s |
+| 托管策略设置 | 通过（限定） | Linux 容器内 `-p` 下 managed settings 生效且优先级最高；`allowManagedHooksOnly` 只允许托管来源，屏蔽用户、项目、本地 hooks，更低层级不能覆盖 | PreToolUse 用例、`settings.local.json`、`CLAUDE_CONFIG_DIR` 用户 hooks、目标镜像只读根 |
+| cgroup、PSI 与 50 进程冻结 | 部分证实 | PSI 可读；`agent` 子 cgroup 可冻结/解冻；树形实测冻结标志 1.805 ms、解冻标志 2.923 ms（单次采样）；SIGSTOP 3～4 轮收敛；冻结完成须读 `cgroup.events`，进程态仍为 S；`throttled_usec` 须读容器父 cgroup | 目标节点端到端 p95、非特权 Pod 挂载、真实多线程 Agent |
+| 原地缩放与 Deferred | 部分证实 | 缩小 CPU request 约 0.1～0.27 s 生效，不重启、不重建，并释放调度额度；agent-sandbox 主线控制器不回滚 resources；容量边界处进入 Deferred | 恰好 80% 分配的统计、Deferred 持续 10 min 以上、Pod 重建后缩放重放 |
+| 冷启动 | 部分证实 | 2 核 + 50 MB 约 8.0 s，250m + 50 MB 约 14.4 s；外联黑洞与 RST 都约 5.15 s；MCP 初始化最长可等满 30 s | 目标集群 p95、真实会话夹具、共享文件系统、amd64 |
+| 预热池与工作区时延 | 部分证实 | agent-sandbox 文档给出 burst 约 300 claims/s、p90 ≤ 200 ms、持续每池 70～85/s、Pod 冷启动约 42～50 s p50；`root_squash` 将 uid 0 映射为 65534 | 单次与 100 并发认领 p95、池补充 L、RWX `mkdir/chown/fsync`、50/200 并发 attach |
+| Substrate 试点 | 阻断 | PID 1、MEMORY 快照、`/wake`、`parked-request-budget`、EgressPolicy、S3 插件与 `durableDir` 在文档与源码中存在 | 500 MB Suspend/Resume、外部 CSI、gVisor 下无 Docker、旧 TCP 连接、go/no-go |
+
+结论对设计的修改已写入 [suspendpolicy](design/modules/design-suspendpolicy.md) 的 MCP 传输上限与 `F_cap`、[Claude Code 驱动器](design/modules/warden/design-warden-driver-claude-code.md) 的续接与 MCP 超时、[warden](design/modules/warden/design-warden.md) 的 per-cgroup PSI 与 `cgroup.events`、[sandboxprovider k8s](design/modules/sandboxprovider/design-sandboxprovider-k8s.md) 的缩放重放与 [sandboxprovider substrate](design/modules/sandboxprovider/design-sandboxprovider-substrate.md) 的试点前提。
+
 ## 分阶段实施路线
 
 阶段以技术门槛划分。每阶段的「交付物」是该阶段结束时必须存在且可观察的能力，「进入下一阶段的条件」是下一阶段开始前必须成立的观察结果。
@@ -51,7 +71,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 - Substrate 的 go 或 no-go 结论已确定，并反映为第一版交付的提供者范围。
 - k8s 冻结路径的 cgroup 挂载属性与 PSI 可读性、原地缩放、认领与工作区时延均得到通过结论或明确的回退路径。
-- Claude Code 的冻结与续接行为、MCP 超时、托管设置生效均得到通过结论或明确的回退路径，`F_stream`、`F_cap` 与 `T_nofreeze` 的取值已确定或已触发设计更新。
+- Claude Code 的冻结与续接行为、MCP 超时、托管设置生效均得到通过结论或明确的回退路径：MCP 超时一项已判定不通过，回退路径为按 MCP 传输类型重算 `F_cap`，并让 `wait_for` 在冻结前转为订阅；`F_stream`、`F_cap` 与 `T_nofreeze` 的取值已确定或已触发设计更新。
 
 ### 阶段 1：最小挂起恢复闭环
 
