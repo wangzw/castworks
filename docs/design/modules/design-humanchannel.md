@@ -106,17 +106,18 @@ type RunFact struct {
     SourceSeq  int64
     ObservedAt time.Time
     LiveAttach *LiveAttach                // {Channel, Attached, TTL}
-    WakeHint   *WakeHint                  // {Generation, RequestID}
+    WakeHint   *WakeHint                  // {Generation, Origin, RequestID}
 }
 
 type WakeHint struct {
     Generation int
+    Origin     string                     // 固定为 ui
     RequestID  string
 }
 ```
 
 - `AppendInbox` 以 `(run_id, dedup_key)` 幂等；命中且关联键（`permission_id`）相同时返回已分配的序号，本模块按成功处理并停止重试；命中而关联键不同时按不可重试冲突拒绝并审计，不写第二行。不可重试错误丢弃并审计；暂时性错误以同一 `dedup_key` 退避重试。
-- `SetRunFact{live_attach}` 只接受更大的 `SourceSeq`；接入值为真的实时接入事实以写入时刻加 `LiveAttach.TTL` 为有效期，接入值为假的事实没有有效期。`SetRunFact{wake_hint}` 按 `(run_id, generation, request_id)` 幂等；`request_id` 由界面为每次「正在输入」事件给出，同一次事件的重复上报复用同一值，不同输入事件使用新值。
+- `SetRunFact{live_attach}` 只接受更大的 `SourceSeq`；接入值为真的实时接入事实以写入时刻加 `LiveAttach.TTL` 为有效期，接入值为假的事实没有有效期。`SetRunFact{wake_hint}` 以 `Origin=ui` 写入，按 `(run_id, generation, origin, request_id)` 幂等；`request_id` 由界面为每次「正在输入」事件给出，同一次事件的重复上报复用同一值，不同输入事件使用新值。
 - 汇入契约是写入收件箱事件与运行实例事实的唯一入口，`runcontroller` 不反向调用本模块（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
 
 ### 控制面服务与代查询

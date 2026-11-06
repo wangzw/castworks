@@ -239,9 +239,9 @@ stateDiagram-v2
 | `Busy` | `suspend_id`、`reason`、`retry_after` | 挂起前置条件不满足；`reason=cancelled` 是 `CancelSuspend` 的确认；`retry_after` 给出复评时刻。 |
 | `Thawed` | `suspend_id` | `suspend_id` 取冻结标识 `freeze_id`；按 `freeze_id` 幂等。`signal` 变体在自行解冻进程树之后上报，`cgroup` 变体在观察到 Agent 子 cgroup 未冻结之后上报，进程树从未冻结时立即上报。 |
 | `LeaseLost` | `lease_id`、`expires_at` | [工作区租约](../../glossary.md)续约失败后上报；看守进程冻结或杀死 Agent 进程树并停止写入。 |
-| `llm.request.started` | `request_id`、`request_hash`、`mode: passthrough\|hold`、`predicted_ms` | 本地代理向上游发起请求后上报；`mode` 决定阻塞条件的冻结上限取 `F_stream` 或 `F_cap(llm)`。 |
-| `llm.first_token` | `request_id` | 收到首个响应事件；用于预测性恢复提示与等待时长重估，不单独满足阻塞条件。 |
-| `llm.request.completed`、`llm.request.failed` | `request_id`；失败另带 `reason` | LLM 请求完成或失败；满足同一 `request_id` 的阻塞条件。 |
+| `llm.request.started` | `request_id`、`mode: passthrough\|hold`、`predicted_ms` | 本地代理获得上游响应头，或确认同一逻辑请求在途之后上报。`mode` 决定阻塞条件的冻结上限取 `F_stream` 或 `F_cap(llm)`；`predicted_ms` 是等待时长的单点预测，`suspendpolicy` 按来源先验把它展开为分位区间与置信度。 |
+| `llm.first_token` | `request_id` | 收到首个内容事件后上报，保活事件不计入；每个逻辑请求至多一次。控制面据此写 `wake_hint` 事实供预测性恢复，并按已等待时长重估同一 `request_id` 的剩余等待；不单独满足阻塞条件。 |
+| `llm.request.completed`、`llm.request.failed` | `request_id`；失败另带 `reason` | LLM 请求完成或失败；满足同一 `request_id` 的阻塞条件。`failed` 可以在 `started` 之前发出（网关不可达、准入失败），此时只写失败信号并关闭该 `request_id` 的在途行。`reason` 取 `upstream_error`、`upstream_timeout`、`stream_interrupted`、`admission_failed`、`replay_missing`。 |
 | `request.completed`、`request.failed` | `request_id`；失败另带 `reason` | 经[平台 MCP 服务器](../../glossary.md)发起的同步连接器操作完成或失败；与同一 `request_id` 的等待条件匹配。 |
 | `ToolExecResponse` | `exec_id`、`status`、`exit_code`、`result`、`error` | 工具执行请求的终态应答；`status` 取 `completed`、`failed`、`cancelled`，`error` 只在失败时非空。按 `(run_id, generation, exec_id)` 匹配请求。 |
 | `ToolExecData` | `exec_id`、`stream: stdout\|stderr`、`offset`、`data`、`eof` | 工具执行输出分片；`offset` 从该流起点计，接收方按偏移续传，重复或乱序分片被丢弃。`eof` 表示该流结束。 |

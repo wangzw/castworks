@@ -22,7 +22,7 @@
 - **准入槽位**：在并发型限额下维护每个运行实例的槽位租约，放行时分配，离开恢复时释放；槽位到期视为已释放，重驱动前经 `reacquire_slot` 重新取得。
 - **准入排队估计**：向 `runcontroller` 提供按 `run` 行计算队列位置与预计恢复时刻的函数，不读所有者副本的准入队列。
 - **定时抖动**：为定时类等待与退避时刻给出随机抖动，分散同时到期的定时风暴。
-- **预测性恢复批准**：对同一 `request_id` 至多批准一次预测性恢复，批准结果记入 `policy_state`，由 `runcontroller` 触发。
+- **预测性恢复批准**：对同一 `wake_hint` 来源标识至多批准一次预测性恢复，批准结果记入 `policy_state`，由 `runcontroller` 触发。
 - **策略状态与复位**：定义 `policy_state` 的序列化内容，在每次决策与复评时输出更新后的状态，并在恢复完成时经 `on_resumed` 给出新的预测失准计数。
 
 ### 非职责
@@ -127,7 +127,7 @@ type ReviewResult struct {
 - **`release`**：离开 `resuming` 的转移在提交后调用；副本在提交后、调用前崩溃时由 `slot_expires_at` 到期回收。
 - **`remove`**：`runcontroller` 执行「显式结束」时在事务提交后调用，把条目从进程内队列移除并从槽位计数中释放；对不存在的条目幂等。它不改变 `run` 行，持久事实已由该转移清空。
 - **`on_resumed`**：恢复完成时调用，返回新的 `flap_counter`；`runcontroller` 把它写入 `run` 行。
-- **`approve_predictive`**：`runcontroller` 在 `wake_check` 的 `wake_hint` 分支于行锁内调用。输入为运行实例子状态、`request_id`、来源类型与置信度、`policy_state`；返回是否批准与更新后的 `policy_state`（批准的 `request_id` 已加入 `PredictiveDone`）。
+- **`approve_predictive`**：`runcontroller` 在 `wake_check` 的 `wake_hint` 分支于行锁内调用。输入为运行实例子状态、`wake_hint` 的来源标识、来源类型与置信度、`policy_state`；返回是否批准与更新后的 `policy_state`（批准的来源标识已加入 `PredictiveDone`）。
 - **`idle_evidence`**：`runcontroller` 在 L0 的「看门狗空闲」判定中于行锁内调用。输入为活动度摘要、累计静默时长、在途请求数、后台作业集合与 `cursor` 位置；判据为累计静默不短于 `Q_quiet`、无在途请求、无后台作业且无已接受未消费的输入。
 - **`busy_retry`**：看守进程回 `Busy` 时返回 `retry_after`，`runcontroller` 据此写 `review_at`；取值随 `policy_state.BusyCount` 指数增长，上限 60 s。
 - **`failure_backoff`**：无应答或提供者失败时返回下一次复评的绝对时刻；取值随 `PolicyState.NoResponseCount` 或 `PolicyState.ProviderFailures` 指数增长，上限 10 min。
@@ -248,7 +248,7 @@ type DecisionContext struct {
     Channel             string           // 决定 G_turn_grace 的渠道类型
     BlockedOn           *BlockedOn       // kind、mode、since、predicted_ms
     BGJobs              []BGJob
-    Prediction          *Prediction      // 来源、p25、p50、p90、样本数
+    Prediction          *Prediction      // 来源与单点预测；p25、p90 由 predict 展开
     LiveAttach          bool
     Caps                CapabilitySet
     PolicyState         PolicyState
@@ -285,7 +285,7 @@ type PolicyState struct {
     BusyCount         int
     NoResponseCount   int
     ProviderFailures  int
-    PredictiveDone    []string             // 已做预测性恢复的 request_id
+    PredictiveDone    []string             // 已做预测性恢复的 wake_hint 来源标识
     ConfidencePenalty map[string]float64   // 直方图桶的置信度降级
     LastDecisionAt    time.Time
     LastReviewAt      time.Time
@@ -305,7 +305,7 @@ type NodePressure struct {
 }
 ```
 
-`Prediction` 由调用方从事件携带的预测值填充；`llm.request.started` 与 `wait_started` 已有的 `predicted_ms` 是单点预测，分位区间与样本数由事件源模块在汇入前计算并随上下文传入，协议消息不因本模块增加字段。`PolicyState` 序列化为 `run.policy_state`，所有权转移后由新所有者从该列恢复；`runcontroller` 不解释其内容。
+`DecisionContext.Prediction` 由调用方按 `blocked_on` 或 `wait_started` 写入来源与单点预测；`predict` 以该单点值作为 `p50`，按来源先验的比例系数展开 `p25` 与 `p90`，样本数与置信度取来源先验。`llm.first_token` 到达后，剩余等待取 `max(0, predicted_ms − (now − blocked_on.since))`。`llmgateway` 的直方图只用于校准先验与诊断，不逐请求传入。`PolicyState` 序列化为 `run.policy_state`，所有权转移后由新所有者从该列恢复；`runcontroller` 不解释其内容。
 
 ### 状态一览
 
@@ -497,7 +497,7 @@ freezeCapExpired(ctx, now) =
 
 | 等待 | 来源与键 | 先验或重估 | 置信度 |
 | --- | --- | --- | --- |
-| LLM | LLM 网关按 (model, thinking 预算档, max_tokens 档, 输入 token 档) 维护首 token 与总时长直方图 | 首 token 到达后按已出 token 速率重估 | `min(1, n/30) × (1 − 离散度) × (1 − ConfidencePenalty[bucket])` |
+| LLM | LLM 网关按 (model, thinking 预算档, max_tokens 档, 输入 token 档) 维护首 token 与总时长直方图；单点预测随 `llm.request.started` 到达 | 首 token 到达后剩余等待取 `max(0, predicted_ms − 已等待时长)` | `min(1, n/30) × (1 − 离散度) × (1 − ConfidencePenalty[bucket])` |
 | 同步外部调用 | 连接器按 (system, operation) 直方图 | 多数低于 `T_nofreeze`，默认不挂起 | 同上 |
 | CI 与异步事件 | 连接器按 (repo, workflow) 历史 | 无历史时用全局先验 p50 5–10 min | 同上；先验 0.3 |
 | 人 | 按渠道与在线态先验 | UI 活跃 0.5–2 min；UI 打开未活跃 5–30 min；即时通讯分钟到小时；Issue 与邮件小时到天 | 有在线信号 0.6，否则 0.3 |
@@ -542,13 +542,13 @@ freezeCapExpired(ctx, now) =
 
 ### 预测性恢复批准
 
-预测性恢复属于可选能力，默认关闭；启用后的输入为本地代理的首 token 或输出接近预测长度、CI 订阅按历史 p50 时长接近完成、界面「正在输入」信号。`approve_predictive` 的批准条件为：运行实例处于 `suspended.*`、`wake_hint` 对应的 `request_id` 未在 `policy_state.PredictiveDone` 中、抖动预算有余量、该等待来源的置信度不低于预测性恢复置信度阈值（0.7）。批准结果写入返回的 `policy_state.PredictiveDone`，由 `runcontroller` 在同一事务写回；`runcontroller` 以 `wake_reason=predictive` 转入 `wake_queued` 并走同一准入队列。
+预测性恢复属于可选能力，默认关闭；启用后的输入为本地代理的首 token 或输出接近预测长度、CI 订阅按历史 p50 时长接近完成、界面「正在输入」信号。`approve_predictive` 的批准条件为：运行实例处于 `suspended.*`、`wake_hint` 的来源标识 `<origin>:<request_id>` 未在 `policy_state.PredictiveDone` 中、抖动预算有余量、该等待来源的置信度不低于预测性恢复置信度阈值（0.7）。批准结果写入返回的 `policy_state.PredictiveDone`，由 `runcontroller` 在同一事务写回；`runcontroller` 以 `wake_reason=predictive` 转入 `wake_queued` 并走同一准入队列。
 
 ### 策略状态与复位
 
-`policy_state` 的内容穷举为：抖动预算的窗口起点与已用额度；探测退避；`Busy`、无应答与提供者失败的次数；已完成预测性恢复的 `request_id`；严重失准的直方图桶的置信度降级；最近一次决策与复评时刻。字段结构由本库定义，`runcontroller` 只透传并在每次 `decide`、`review` 的同一事务写回返回的 `State`：`decide` 写回预算扣减与窗口起点、`LastDecisionAt`、`ProbeBackoff` 与 `ConfidencePenalty`；`review` 写回预算扣减、`LastReviewAt`、`ProbeBackoff` 与 `ConfidencePenalty`；`approve_predictive` 写回 `PredictiveDone`。`BusyCount`、`NoResponseCount`、`ProviderFailures` 由 `runcontroller` 在对应事件上就地更新，`decide`、`review` 原样带回传入值。
+`policy_state` 的内容穷举为：抖动预算的窗口起点与已用额度；探测退避；`Busy`、无应答与提供者失败的次数；已完成预测性恢复的 `wake_hint` 来源标识；严重失准的直方图桶的置信度降级；最近一次决策与复评时刻。字段结构由本库定义，`runcontroller` 只透传并在每次 `decide`、`review` 的同一事务写回返回的 `State`：`decide` 写回预算扣减与窗口起点、`LastDecisionAt`、`ProbeBackoff` 与 `ConfidencePenalty`；`review` 写回预算扣减、`LastReviewAt`、`ProbeBackoff` 与 `ConfidencePenalty`；`approve_predictive` 写回 `PredictiveDone`。`BusyCount`、`NoResponseCount`、`ProviderFailures` 由 `runcontroller` 在对应事件上就地更新，`decide`、`review` 原样带回传入值。
 
-复位规则：`on_resumed` 在恢复完成时返回新的 `flap_counter`，实际等待落在预测区间 `[p25, p90]` 时为 0；实际等待明显短于预测区间、挂起后很快被唤醒时递增，并在 `T_nofreeze` 的放大曲线上生效；实际等待长于区间不递增。`Busy`、无应答与提供者失败次数在成功进入 `suspended` 或 `active` 后清零；预算按固定窗口重置，不在恢复时重置；`PredictiveDone` 按 `request_id` 保留到收件箱清理下界越过对应事件。
+复位规则：`on_resumed` 在恢复完成时返回新的 `flap_counter`，实际等待落在预测区间 `[p25, p90]` 时为 0；实际等待明显短于预测区间、挂起后很快被唤醒时递增，并在 `T_nofreeze` 的放大曲线上生效；实际等待长于区间不递增。`Busy`、无应答与提供者失败次数在成功进入 `suspended` 或 `active` 后清零；预算按固定窗口重置，不在恢复时重置；`PredictiveDone` 按来源标识保留到收件箱清理下界越过对应事件。
 
 ## 错误与失败语义
 

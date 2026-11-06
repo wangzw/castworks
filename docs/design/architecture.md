@@ -343,7 +343,7 @@ sequenceDiagram
     W->>W: 本地代理选定直通或缓存模式，附运行实例令牌
     W->>G: 转发请求
     G->>G: 校验令牌中的 generation，换取 LLM 凭据，登记在途请求，转发上游
-    W->>R: llm.request.started{request_id, request_hash, mode, predicted_ms}
+    W->>R: llm.request.started{request_id, mode, predicted_ms}
     R->>R: InTurn 转 BlockedOn{llm, request_id}
     R->>R: suspendpolicy 决策 FREEZE，Active 转 Suspending{freeze}
     R->>W: PrepareSuspend{suspend_id, mode=freeze, deadline}

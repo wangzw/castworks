@@ -86,12 +86,12 @@
 
 | 事件 | 时机 | 字段 | 约束 |
 | --- | --- | --- | --- |
-| `llm.request.started` | 上游请求已发出且获得响应头，或已确认同一逻辑请求在途之后 | `request_id`、`request_hash`、`mode`、`predicted_ms` | 每个逻辑请求一次；在任何内容事件转发之前发出；`mode` 自此不再改变 |
+| `llm.request.started` | 获得上游响应头，或确认同一逻辑请求在途之后 | `request_id`、`mode`、`predicted_ms` | 每个逻辑请求一次；在任何内容事件转发之前发出；`mode` 自此不再改变 |
 | `llm.first_token` | 收到首个内容事件 | `request_id` | 每个逻辑请求至多一次；`ping` 不计入 |
 | `llm.request.completed` | 上游流正常结束 | `request_id` | 每个逻辑请求一次；与网关的 `llm_completed` 命中同一阻塞条件 |
-| `llm.request.failed` | 上游失败、取回缺失或不可重试的准入失败 | `request_id`、`reason` | 每个逻辑请求一次；客户端看门狗中止不单独构成失败 |
+| `llm.request.failed` | 上游失败、取回缺失或不可重试的准入失败 | `request_id`、`reason` | 每个逻辑请求一次；`reason` 取 `upstream_error`、`upstream_timeout`、`stream_interrupted`、`admission_failed`、`replay_missing`；客户端看门狗中止不单独构成失败；可在 `started` 之前发出 |
 
-`predicted_ms` 为等待时长的预测值，由本地代理在请求开始时取得并随事件上报；预测来源与置信度归 `suspendpolicy` 与 `llmgateway`，本地代理不解释该值。事件在 `llm.request.started` 之后按 `first_token`、`completed` 或 `failed` 的顺序至多各出现一次；重发命中不重复上报 `started`。
+`predicted_ms` 是等待时长的单点预测，由本地代理按请求形态在请求开始时给出；分位区间与置信度由 `suspendpolicy` 展开，本地代理不解释该值。`first_token`、`completed` 与 `failed` 每个逻辑请求至多出现一次；除准入失败或网关不可达时先发的 `failed` 外，它们都在 `started` 之后按 `first_token`、`completed` 或 `failed` 的顺序出现；重发命中不重复上报 `started`。
 
 ## 依赖
 
@@ -228,7 +228,7 @@ sequenceDiagram
 | --- | --- | --- | --- | --- |
 | 1 | Agent 向回环地址发送请求 | 请求形态为 LLM；计算 `request_hash=h-9`，选定 `mode=hold`，生成 `request_id=r-3`；状态 `selected` | 无 | 无 |
 | 2 | 本地代理向网关发送 `POST /v1/messages`，携带令牌、`r-3`、`h-9`、`hold` | 状态仍为 `selected`；建立上游连接 | 无 | 无 |
-| 3 | 网关返回响应头并开始转发 SSE | 状态转 `hold`；`buffer` 为空 | 建立进行中的条目，键为 `(run-7, 6, h-9)` | `llm.request.started{request_id=r-3, request_hash=h-9, mode=hold, predicted_ms}` |
+| 3 | 网关返回响应头并开始转发 SSE | 状态转 `hold`；`buffer` 为空 | 建立进行中的条目，键为 `(run-7, 6, h-9)` | `llm.request.started{request_id=r-3, mode=hold, predicted_ms}` |
 | 4 | 首个内容事件到达 | 写入 `buffer`；`forwarded_seq` 不前进 | 条目追加事件 | `llm.first_token{request_id=r-3}` |
 | 5 | `runcontroller` 决定冻结，节点冻结代理冻结 Agent 进程树 | 本地代理不被冻结，上游连接保持；继续缓冲内容事件，只向 Agent 转发 `ping` | 条目继续增长 | 无 |
 | 6 | Claude Code 的看门狗在 300 s 未收到内容后中止并重发同一请求 | 状态转 `aborted`；上游不取消，继续读入本地缓存 | 条目仍为进行中 | 无 |
