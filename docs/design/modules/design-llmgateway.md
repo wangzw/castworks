@@ -14,10 +14,10 @@
 
 - **请求准入与代校验**：校验运行实例令牌的签名、过期时间与 `run_id`，再经 `runcontroller` 的 `Generations.Current` 比较令牌中的代与当前代；令牌无效、[运行实例](../../glossary.md)已终态或本代已作废时拒绝请求。被拒绝的请求不换取凭据、不产生上游调用，并计入旧代拒绝计数。
 - **凭据换取**：以运行实例令牌与调用方身份向 `secrets` 换取真实 LLM 凭据，目标为本模块部署配置中的 LLM 提供方与认证方式；凭据只在网关进程内存中持有至到期；凭据不写入数据库、回放条目，也不返回本地代理。
-- **在途登记与实例续租**：转发上游前在 `llm_request` 表登记请求，并对 Agent 的 LLM 请求经 [汇入契约](../../glossary.md) `SetRunFact{inflight_request}` 写入在途请求事实与实例租约；以 `RenewSourceLease` 周期续租，使实例失联可由 `runcontroller` 判定。
+- **在途登记与实例续租**：转发上游前在 `llm_request` 表登记请求，并对 Agent 的 LLM 请求经 [汇入契约](../../glossary.md) `SetRunFact{inflight_request}` 写入在途请求事实与实例租约；只在本实例存在 `purpose=agent` 的在途请求事实时以 `RenewSourceLease` 周期续租，使实例失联可由 `runcontroller` 判定。
 - **流式转发**：按原顺序转发 Anthropic Messages 的 SSE 事件与 ping 保活事件，不合并、不重排、不改写内容事件；同时把事件写入该请求的回放缓冲。
 - **终态持久化与信号**：上游正常结束、返回错误、超时、流中断或流内 `error` 事件时，在同一事务提交回放条目与 `llm_request.status`；提交后对 Agent 的 LLM 请求经汇入契约写入 `llm_completed` 或 `llm_failed` [唤醒信号](../../glossary.md)。
-- **宿主侧分类请求的区别处置**：识别本地代理为[看守进程](../../glossary.md)自身发起的分类请求附加的 `x-castworks-purpose: classifier`，按分类请求的形态校验该标记，照常执行令牌与代校验、限流、凭据换取、计费、审计与回放写入，但不写在途请求事实、不写唤醒信号；结果是分类请求不影响 `runcontroller` 的 I9 预检（[架构不变量](../architecture.md#架构不变量)）中的「本代无在途请求」，也不进入阻塞条件与[静止冻结](../../glossary.md)的静止证据，成本仍按运行实例计入。
+- **宿主侧分类请求的区别处置**：识别本地代理为[看守进程](../../glossary.md)自身发起的分类请求附加的 `x-castworks-purpose: classifier`，按分类请求的形态校验该标记，照常执行令牌与代校验、限流、凭据换取、计费、审计与回放写入，但不写在途请求事实、不写唤醒信号、不参与实例租约，其在途行按网关自身的超时 `T_classifier_timeout` 跟踪；结果是分类请求不影响 `runcontroller` 的 I9 预检（[架构不变量](../architecture.md#架构不变量)）中的「本代无在途请求」，也不进入阻塞条件与[静止冻结](../../glossary.md)的静止证据，成本仍按运行实例计入。
 - **单次回放**：以 `(run_id, generation, request_hash)` 保证客户端重发与恢复取回命中已登记请求或回放条目，不产生第二次上游请求；上游在未收到任何响应体内容前的有限次重试属于同一逻辑请求内的重试。按 `(run_id, request_id)` 保存终态响应，供本地代理在[快照](../../glossary.md)恢复或[销毁重建](../../glossary.md)后取回，取回不再次访问上游。
 - **限流、计费与审计**：在凭据换取与转发之前按运行实例限流；按上游响应的 `usage` 记录输入与输出 token；审计凭据换取、代校验结果与请求终态，关联 `run_id`、`generation` 与 `request_id`。
 - **时延直方图**：按 `model`、`thinking` 预算档、`max_tokens` 档与输入 token 档维护 Agent 的 LLM 请求的首 token 时延与总时长直方图，随 OpenTelemetry 指标导出，供校准 `suspendpolicy` 的 LLM 先验与诊断；直方图不逐请求传入 `runcontroller`，宿主侧分类请求不进入直方图，只按结果计数。
@@ -89,7 +89,7 @@ current, err := Generations.Current(ctx, runID) // {Generation, Terminal, Fenced
 ```
 
 - `SetRunFact{inflight_request}` 在转发上游之前调用，只用于 `llm_request.purpose=agent` 的行，宿主侧分类请求不调用；`InFlightRequest.Instance` 取网关实例标识，`InitialTTL` 取本次登记的租约有效期。调用失败时按错误类别处置：不可重试错误使请求失败，已插入的行按登记失败规则处置，暂时性错误返回 `503`；都不转发上游。
-- `RenewSourceLease` 只延长租约，不改变在途请求事实；续租成功同样刷新本实例 `purpose=classifier` 的在途行，但控制面没有这些行的在途请求事实，实例失联时不为它们合成信号。续租周期小于 `InitialTTL` 减去时钟余量；续租失败时网关按退避重试续租，期间暂停接收新请求，续租成功后恢复准入。连续失败至 `lease_expires_at` 到期时，本实例停止准入与终态提交，已登记的行按回收规则处置；已有上游请求在租约有效期内继续完成并提交回放。
+- `RenewSourceLease` 只延长租约，不改变在途请求事实，只在本实例存在 `purpose=agent` 的在途请求事实时调用。本实例的一个在途请求事实在该请求的 `SetRunFact{inflight_request}` 成功时成立，在其唤醒信号写入成功、因不可重试错误被丢弃或终态提交的 CAS 失败时关闭；在途请求事实全部关闭后本实例停止续租，`source_lease` 随其 `expires_at` 过期，下一次 `SetRunFact{inflight_request}` 在同一事务以 `InitialTTL` 重新延长或建立租约。宿主侧分类请求不登记在途请求事实，也不参与实例租约：它不触发续租，其行不随续租刷新，在网关内按 `T_classifier_timeout` 跟踪（见[宿主侧分类请求](#宿主侧分类请求)）。`runcontroller` 对不存在的 `source_lease` 行按成功返回且不写入、不创建行（幂等的空操作），租约只由 `SetRunFact{inflight_request}` 建立；续租成功因而不证明租约行存在，网关按续租结果只刷新本实例尚未到期的 `purpose=agent` 在途行。续租周期小于 `InitialTTL` 减去时钟余量；续租返回暂时性错误或 `runcontroller` 不可达时网关按退避重试续租，期间暂停接收新请求（返回 `503`），续租成功后恢复准入；续租的不可重试错误属于部署或实现缺陷，告警并同样按续租失败处置。连续失败至本实例 `purpose=agent` 在途行的 `lease_expires_at` 到期时，本实例停止准入，这些行的终态提交随之失败并按回收规则处置；已有上游请求在租约有效期内继续完成并提交回放。
 - `AppendWakeSignal` 只为 `purpose=agent` 的行调用；`Kind` 闭集为 `llm_completed` 与 `llm_failed`；`Ref` 取规范 `request_id`（首次登记行上的标识）；`Reason` 只在 `llm_failed` 时写入，取值闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`。`gateway_lost` 只由 `runcontroller` 的「事件源实例失联」守卫合成。
 - `Generations.Current` 返回当前代、是否终态与本代是否作废。LLM 请求的代查询结果可缓存不超过 `T_gen_cache`（`1 s`），缓存窗口内代递增、进入终态或作废的运行实例可能多接受一次请求；`Terminal` 或 `Fenced` 为真时拒绝请求。
 - `SetRunFact{inflight_request}` 的不可重试错误使请求失败，已插入的行按登记失败规则处置；暂时性错误按幂等键退避重试。`AppendWakeSignal` 在终态提交之后调用，其不可重试错误只丢弃信号并计入审计或旧代拒绝计数，不改变已提交的终态条目与本地代理收到的响应；暂时性错误按幂等键退避重试。本模块不直接读写 `run`、`inbox`、`wake_signal`、`source_request` 与 `source_lease` 表。
@@ -129,7 +129,7 @@ cred, err := ExchangeCredential(ctx, ExchangeRequest{
 
 依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖 `runcontroller` 与 `secrets`，存储为 PostgreSQL，上游为 Anthropic API；`runcontroller` 不反向调用本模块。
 
-- `runcontroller`：[汇入契约](../../glossary.md)与代查询接口。在途请求事实、实例租约、完成与失败信号按[运行实例](../../glossary.md)写入，宿主侧分类请求不写在途请求事实与信号；代查询用于请求准入，对宿主侧分类请求同样执行。这些调用都由本模块发起，`runcontroller` 不感知本模块。
+- `runcontroller`：[汇入契约](../../glossary.md)与代查询接口。在途请求事实、实例租约、完成与失败信号按[运行实例](../../glossary.md)写入，宿主侧分类请求不写在途请求事实与信号，也不参与实例租约；代查询用于请求准入，对宿主侧分类请求同样执行。这些调用都由本模块发起，`runcontroller` 不感知本模块。
 - `secrets`：运行实例令牌校验与 LLM 凭据换取；调用 `ExchangeCredential` 时以调用方身份认证，`Target.Kind=llm`。真实凭据只在本模块与上游之间使用，不跨越沙箱边界（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.ReportDenial` 写 `denied` 记录。
 - PostgreSQL：`llm_request` 表与回放条目的持久化，提供唯一索引、行锁与状态 CAS。
 - Anthropic API：上游 LLM 服务。流式响应的 SSE 事件与 ping 保活事件按 Anthropic Messages API 的格式处理（[REF-anthropic-streaming](../../references.md)）；网关不定义上游协议。
@@ -187,13 +187,14 @@ stateDiagram-v2
     Failed --> Replayed: 本地代理按 request_id 取回
     Replayed --> [*]: 保留期结束
     note right of InFlight
-        网关实例失联时行保持 in_flight 直至租约到期；
+        网关实例失联时行保持 in_flight 直至 lease_expires_at 到期；
+        purpose=agent 的行随实例租约到期，purpose=classifier 的行按 T_classifier_timeout 到期；
         runcontroller 为 purpose=agent 的行合成 llm_failed{gateway_lost}，
         到期行由回收规则删除
     end note
 ```
 
-状态闭集为 `in_flight`、`completed`、`failed` 与 `replayed`。`in_flight` 的条目不可取回；终态条目提交后才可被本地代理取回，取回把行置为 `replayed`，重复取回返回同一内容而不访问上游。网关实例失联不引入新状态：行保持 `in_flight` 直至租约到期，控制面合成 `llm_failed{gateway_lost}`；租约到期后行由回收规则删除，取回返回 `404`。已完成或失败的条目仍可被本地代理取回。`purpose=classifier` 的行走同一生命周期，区别只在控制面侧：登记不写在途请求事实，终态不写唤醒信号，网关实例失联时没有对应的合成信号，到期行同样由回收规则删除。状态与表的对应关系见状态一览与在途请求表。
+状态闭集为 `in_flight`、`completed`、`failed` 与 `replayed`。`in_flight` 的条目不可取回；终态条目提交后才可被本地代理取回，取回把行置为 `replayed`，重复取回返回同一内容而不访问上游。网关实例失联不引入新状态：行保持 `in_flight` 直至租约到期，控制面合成 `llm_failed{gateway_lost}`；租约到期后行由回收规则删除，取回返回 `404`。已完成或失败的条目仍可被本地代理取回。`purpose=classifier` 的行走同一生命周期，区别在控制面侧与到期时刻：登记不写在途请求事实，终态不写唤醒信号，`lease_expires_at` 取登记时刻加 `T_classifier_timeout` 且不随续租刷新，网关实例失联时没有对应的合成信号，到期行同样由回收规则删除。状态与表的对应关系见状态一览与在途请求表。
 
 ### 实例租约与失联处置活动图
 
@@ -201,27 +202,32 @@ stateDiagram-v2
 flowchart TD
     A["网关实例启动"] --> B["生成对每次启动唯一的实例标识"]
     B --> C["接收请求"]
-    C --> D{"续租有效"}
-    D -- "否" --> E["暂停接收新请求并按退避重试续租"]
-    E -->|"续租成功"| C
+    C --> D{"续租处于失败重试中"}
+    D -- "是" --> W["返回 503，不准入"]
+    D -- "否" --> I["请求准入与代校验通过"]
+    I --> N["插入 llm_request 行"]
+    N --> O{"purpose=agent"}
+    O -- "是" --> J["SetRunFact{inflight_request} 登记在途请求事实，source_lease 以 InitialTTL 延长或建立"]
+    O -- "否：宿主侧分类请求" --> X["lease_expires_at 取 registered_at + T_classifier_timeout，不参与实例租约"]
+    J --> K["转发上游：先写回放缓冲再转发"]
+    X --> K
+    K --> P["终态：提交回放条目"]
+    P --> Q{"purpose=agent"}
+    Q -- "是" --> L["写 llm_completed 或 llm_failed，该在途请求事实关闭"]
+    Q -- "否：宿主侧分类请求" --> Z["请求结束"]
+    L --> Z
+    T["续租周期到达"] --> U{"本实例存在 purpose=agent 的在途请求事实"}
+    U -- "否" --> V["不调用 RenewSourceLease；source_lease 随 expires_at 过期"]
+    U -- "是" --> R["RenewSourceLease"]
+    R -- "成功" --> S["刷新本实例尚未到期的 purpose=agent 在途行的 lease_expires_at，恢复准入"]
+    R -- "失败" --> E["暂停接收新请求并按退避重试续租"]
+    E -->|"续租成功"| S
     E -->|"租约到期"| F["source_lease 到期"]
     F --> G["runcontroller 为该实例已登记在途请求事实的请求合成 llm_failed{gateway_lost}"]
     G --> H["本地代理按 request_id 取回已完成回放；缺失则请求失败"]
-    D -- "是" --> I["请求准入与代校验通过"]
-    I --> N["插入 llm_request 行"]
-    N --> O{"purpose=agent"}
-    O -- "是" --> J["SetRunFact{inflight_request} 登记在途请求与 InitialTTL"]
-    O -- "否：宿主侧分类请求" --> K
-    J --> K["转发上游：先写回放缓冲再转发"]
-    K --> P["终态：提交回放条目"]
-    P --> Q{"purpose=agent"}
-    Q -- "是" --> L["写 llm_completed 或 llm_failed"]
-    Q -- "否：宿主侧分类请求" --> M
-    L --> M["周期 RenewSourceLease"]
-    M --> C
 ```
 
-活动图固定实例租约的续期与失联处置：续租失败时本实例暂停接收新请求并按退避重试续租，续租成功后恢复准入；已有上游请求在租约有效期内继续完成并提交回放，租约到期后其行由回收规则删除。`source_lease` 到期后由 `runcontroller` 的「事件源实例失联」守卫为已登记在途请求事实的请求合成 `llm_failed{gateway_lost}`；宿主侧分类请求没有在途请求事实，不产生合成信号，本地代理取回得到 `404` 后按失败返回驱动器。合成信号不撤销已完成回放；本地代理仍可按 `request_id` 取回。本模块不自行判定实例失联，也不写合成信号；它只保证实例标识对每次进程启动唯一并使续租按期到达。
+活动图固定实例租约的续期与失联处置：请求路径与续租周期相互独立，续租只在本实例存在 `purpose=agent` 的在途请求事实时发生，在途请求事实全部关闭后不再调用 `RenewSourceLease`，租约由下一次 `SetRunFact{inflight_request}` 重新延长或建立；`runcontroller` 对不存在的 `source_lease` 行按成功返回且不创建行，续租不能重建租约。续租失败时本实例暂停接收新请求并按退避重试续租，续租成功后恢复准入；已有上游请求在租约有效期内继续完成并提交回放，租约到期后其行由回收规则删除。`source_lease` 到期后由 `runcontroller` 的「事件源实例失联」守卫为已登记在途请求事实的请求合成 `llm_failed{gateway_lost}`；宿主侧分类请求没有在途请求事实，不参与实例租约，其行按 `T_classifier_timeout` 到期，不产生合成信号，本地代理取回得到 `404` 后按失败返回驱动器。合成信号不撤销已完成回放；本地代理仍可按 `request_id` 取回。本模块不自行判定实例失联，也不写合成信号；它只保证实例标识对每次进程启动唯一，并在本实例存在在途请求事实期间使续租按期到达。
 
 ## 核心数据结构
 
@@ -233,7 +239,7 @@ flowchart TD
 
 | 状态 | 一句话含义 | 当前动作（LLM 网关） | 直觉画面 |
 | --- | --- | --- | --- |
-| `in_flight` | 上游请求已登记、尚未产生终态 | 持有上游连接，写入回放缓冲并周期续租、刷新租约到期时刻 | 请求在途，回执未到 |
+| `in_flight` | 上游请求已登记、尚未产生终态 | 持有上游连接并写入回放缓冲；`purpose=agent` 的行随周期续租刷新 `lease_expires_at`，`purpose=classifier` 的行在 `T_classifier_timeout` 到达前结束 | 请求在途，回执未到 |
 | `completed` | 上游流正常结束，回放条目已提交 | 记录用量；`purpose=agent` 时写 `llm_completed` | 回执归档，等待取件 |
 | `failed` | 上游错误、超时、流中断或登记失败，失败条目已提交 | 记录失败原因；`purpose=agent` 的上游失败写 `llm_failed`，登记失败与宿主侧分类请求不写信号 | 回执盖失败章 |
 | `replayed` | 回放条目已被本地代理按 `request_id` 取回 | 返回已存条目，不再访问上游 | 回执被取走，存根留在柜里 |
@@ -247,10 +253,10 @@ flowchart TD
 | `request_id` | text | 本地代理生成的请求标识，网关归一后返回 |
 | `request_hash` | text | 本地代理计算的稳定摘要 |
 | `gateway_instance` | text | 登记该请求的网关实例标识 |
-| `lease_expires_at` | timestamptz | 所属网关实例租约的到期时刻；登记时取 `registered_at + InitialTTL`，每次 `RenewSourceLease` 成功后刷新本实例全部在途行 |
+| `lease_expires_at` | timestamptz | 行的到期时刻，回收规则与终态提交的 CAS 都以它为条件；`purpose=agent` 的行跟随所属网关实例的实例租约，登记时取 `registered_at + InitialTTL`，每次 `RenewSourceLease` 成功后刷新本实例尚未到期的 `purpose=agent` 在途行；`purpose=classifier` 的行按网关自身的超时，登记时取 `registered_at + T_classifier_timeout`，此后不刷新 |
 | `status` | text | `in_flight`、`completed`、`failed`、`replayed` |
 | `mode` | text | `passthrough` 或 `hold` |
-| `purpose` | text | `agent` 或 `classifier`；登记时取自请求头 `x-castworks-purpose`，缺省为 `agent`，此后不变；决定是否写在途请求事实与唤醒信号 |
+| `purpose` | text | `agent` 或 `classifier`；登记时取自请求头 `x-castworks-purpose`，缺省为 `agent`，此后不变；决定是否写在途请求事实与唤醒信号、是否参与实例租约以及 `lease_expires_at` 的取值 |
 | `model` | text | 上游模型标识 |
 | `replay_ref` | text | 单个回放条目的引用；`in_flight` 为空 |
 | `reason` | text | 失败原因；`failed` 与失败后的 `replayed` 非空，取值闭集见错误与失败语义 |
@@ -261,10 +267,10 @@ flowchart TD
 键与约束：
 
 - 主键为 `(run_id, request_id)`，使同一运行实例的 `request_id` 跨代唯一；唯一索引 `(run_id, generation, request_hash)` 是单次回放与重发去重的依据。
-- 索引 `(gateway_instance, status)` 用于实例续租时刷新在途行与实例失联后的请求定位；索引 `(lease_expires_at) WHERE status='in_flight'` 用于回收扫描；索引 `(finished_at)` 用于保留期清理。
+- 索引 `(gateway_instance, status)` 用于实例续租时刷新 `purpose=agent` 在途行与实例失联后的请求定位；索引 `(lease_expires_at) WHERE status='in_flight'` 用于回收扫描；索引 `(finished_at)` 用于保留期清理。
 - `replay_ref` 单值：每个 `(run_id, request_id)` 至多对应一个回放条目。`status=in_flight` 时 `replay_ref`、`reason`、`finished_at` 与 `replayed_at` 为空；`completed` 与 `failed` 时 `replay_ref` 与 `finished_at` 非空；`replayed` 保留原终态条目的 `replay_ref` 与 `finished_at`，另要求 `replayed_at` 非空。`purpose=classifier` 的行不调用 `SetRunFact{inflight_request}`，因而 `reason` 不取 `registration_failed`。
 - 行只保存元数据与回放引用，不保存请求正文。`gateway_instance` 记录登记该请求的实例；终态行可由任一副本取回，取回不要求实例仍存活。
-- 回收规则：`status=in_flight` 且 `lease_expires_at < now()` 的行视为失去所有者的行。任一网关实例在 `POST` 命中或 `GET` 读取这样的行时，以 CAS 删除该行（条件为 `status=in_flight` 且 `lease_expires_at < now()`），再按行不存在处置：`POST` 重新登记，`GET` 返回 `404`；后台扫描按同一条件清理。删除不产生回放条目，旧实例在租约到期后不再提交终态。
+- 回收规则：`status=in_flight` 且 `lease_expires_at < now()` 的行视为失去所有者的行。任一网关实例在 `POST` 命中或 `GET` 读取这样的行时，以 CAS 删除该行（条件为 `status=in_flight` 且 `lease_expires_at < now()`），再按行不存在处置：`POST` 重新登记，`GET` 返回 `404`；后台扫描按同一条件清理。规则对两种 `purpose` 相同，区别只在 `lease_expires_at` 的来源。删除不产生回放条目，旧实例在 `lease_expires_at` 到期后不再提交终态。
 
 ### 回放条目
 
@@ -292,14 +298,14 @@ flowchart TD
 | 2 | `VerifyRunToken` 通过；`Generations.Current` 返回 `{Generation: g, Terminal: false, Fenced: false}` | 无 | 无 | 无 |
 | 3 | 限流通过；`ExchangeCredential` 返回凭据 `C`，凭据只在内存 | 无 | 无 | 无 |
 | 4 | 插入 `llm_request(run_id, g, r1, h1, gateway_instance=I1, status=in_flight)`；`SetRunFact{inflight_request}` 成功 | 行 `r1` 为 `in_flight` | `source_request` 行 `r1` 为 `in_flight`；`source_lease(I1)` 以 `InitialTTL` 有效 | 无；尚未请求上游 |
-| 5 | 网关向上游发送请求，收到 SSE 事件与 ping，先写入回放缓冲，再按原顺序转发 | 行仍为 `in_flight` | 租约周期续租 | 缓冲增长，条目不可读 |
+| 5 | 网关向上游发送请求，收到 SSE 事件与 ping，先写入回放缓冲，再按原顺序转发；`r1` 是 `I1` 的在途请求事实，`I1` 按续租周期调用 `RenewSourceLease` | 行仍为 `in_flight`，`lease_expires_at` 随每次续租成功刷新 | `source_lease(I1)` 周期延长 | 缓冲增长，条目不可读 |
 | 6 | 沙箱被冻结，挂起决策发生在网关之外；本地代理持有到网关的连接，网关继续读取上游并转发 | 行仍为 `in_flight` | 租约继续续租 | 缓冲继续增长 |
-| 7 | 上游 `message_stop`：网关在同一事务提交回放条目 `E1` 与 `status=completed`、`replay_ref=E1`、`finished_at`；提交后写 `llm_completed` | 行 `r1` 为 `completed` | `wake_signal(llm_completed, ref=r1)` 写入 | `E1` 可读 |
+| 7 | 上游 `message_stop`：网关在同一事务提交回放条目 `E1` 与 `status=completed`、`replay_ref=E1`、`finished_at`；提交后写 `llm_completed`，`r1` 的在途请求事实关闭；`I1` 没有其他在途请求事实，停止续租 | 行 `r1` 为 `completed` | `wake_signal(llm_completed, ref=r1)` 写入，`source_request` 行 `r1` 置 `done`；`source_lease(I1)` 不再延长，随 `expires_at` 过期 | `E1` 可读 |
 | 8 | 快照或销毁断开本地代理与网关的连接；恢复后本地代理 `GET /v1/requests/r1`；网关以 CAS 置 `status=replayed`、`replayed_at` 并返回 `E1` | 行 `r1` 为 `replayed` | 无新增写入 | `E1` 保留至保留期结束 |
 | 9 | 对照失败路径：上游返回错误或流中断时，网关提交失败条目 `E1'` 与 `status=failed`、`reason`，提交后写 `llm_failed`；取回返回 `E1'` | 行 `r1` 为 `failed`，取回后为 `replayed` | `wake_signal(llm_failed, ref=r1, reason)` 写入 | `E1'` 可读 |
-| 10 | 对照宿主侧分类请求：本地代理以 `request_id=r2`、`request_hash=h2`、`mode=passthrough` 与 `x-castworks-purpose: classifier` 发送 `stream=false` 请求；准入、限流与凭据换取同步骤 2、3；插入行后不调用 `SetRunFact`，转发上游，终态提交 `E2` 后不写唤醒信号；本地代理取回 `E2` | 行 `r2` 为 `in_flight`、`purpose=classifier`，终态后为 `completed`，取回后为 `replayed` | 无写入；`source_request` 中没有 `r2`，`wake_signal` 中没有 `ref=r2` 的信号 | `E2` 可读 |
+| 10 | 对照宿主侧分类请求：本地代理以 `request_id=r2`、`request_hash=h2`、`mode=passthrough` 与 `x-castworks-purpose: classifier` 发送 `stream=false` 请求；准入、限流与凭据换取同步骤 2、3；插入行后不调用 `SetRunFact`，转发上游，终态提交 `E2` 后不写唤醒信号；`r2` 不计入 `I1` 的在途请求事实，`I1` 不因它调用 `RenewSourceLease`；本地代理取回 `E2` | 行 `r2` 为 `in_flight`、`purpose=classifier`、`lease_expires_at = registered_at + T_classifier_timeout` 且不刷新，终态后为 `completed`，取回后为 `replayed` | 无写入；`source_request` 中没有 `r2`，`wake_signal` 中没有 `ref=r2` 的信号，`source_lease(I1)` 不因 `r2` 延长 | `E2` 可读 |
 
-走查说明持久化点的先后：`SetRunFact{inflight_request}` 必须先于上游转发，使控制面在沙箱消失前知道请求存在；回放条目与状态必须先于唤醒信号提交，使被唤醒的本地代理总能取到终态条目。步骤 10 的宿主侧分类请求始终不出现在 `runcontroller` 侧，`r2` 是否在途不影响 I9 预检中的「本代无在途请求」。`llm_request` 的插入与 `SetRunFact{inflight_request}` 不在同一事务内，其间崩溃时行停在 `in_flight`，由实例租约到期后的合成失败信号承接，行在租约到期后由回收规则删除，不产生重复的上游调用。
+走查说明持久化点的先后：`SetRunFact{inflight_request}` 必须先于上游转发，使控制面在沙箱消失前知道请求存在；回放条目与状态必须先于唤醒信号提交，使被唤醒的本地代理总能取到终态条目。续租只覆盖在途请求事实存续的区间：步骤 4 的 `SetRunFact{inflight_request}` 建立租约，步骤 7 的唤醒信号关闭最后一个在途请求事实后停止续租。步骤 10 的宿主侧分类请求始终不出现在 `runcontroller` 侧，`r2` 是否在途不影响 I9 预检中的「本代无在途请求」，也不使 `I1` 续租。`llm_request` 的插入与 `SetRunFact{inflight_request}` 不在同一事务内，其间崩溃时行停在 `in_flight`，由实例租约到期后的合成失败信号承接，行在租约到期后由回收规则删除，不产生重复的上游调用。
 
 ### 请求准入与代校验
 
@@ -318,11 +324,11 @@ flowchart TD
 
 1. 按运行实例限流。超限返回 `429`，不换取凭据、不登记、不产生上游调用。
 2. 以运行实例令牌与调用方身份调用 `ExchangeCredential`。换取失败按 `secrets` 的错误分类返回 `401` 或 `503`，不登记。凭据在 `ExpiresAt` 之前可复用于同一运行实例的后续请求；换取与复用都记审计。
-3. 插入 `llm_request` 行，`status=in_flight`，`gateway_instance` 取当前实例标识，`lease_expires_at` 取登记时刻加 `InitialTTL`，`purpose` 取请求头 `x-castworks-purpose`，缺省为 `agent`。唯一索引 `(run_id, generation, request_hash)` 冲突时按已有行处置：已有行为 `completed`、`replayed` 或 `failed` 且 `reason≠registration_failed` 时直接返回回放条目；已有行为 `failed` 且 `reason=registration_failed` 时以 CAS 置回 `in_flight` 并重新执行登记；已有行为 `in_flight` 且 `gateway_instance` 为当前实例时返回 `202` 与规范 `request_id`；属于另一存活网关实例时返回 `409`；`lease_expires_at < now()` 时先按回收规则删除该行再登记。唯一索引 `(run_id, request_id)` 冲突时返回 `422`，由本地代理重新生成标识后重发；该状态与 `409`（同一逻辑请求由另一存活网关实例持有）语义不同，本地代理不得对 `422` 执行取回或退避。上述情形都不新建上游调用。冲突处置与本次请求是否带分类标记无关；置回 `in_flight` 后是否写在途请求事实、终态后是否写唤醒信号，都按已有行的 `purpose` 判定。
+3. 插入 `llm_request` 行，`status=in_flight`，`gateway_instance` 取当前实例标识，`purpose` 取请求头 `x-castworks-purpose`，缺省为 `agent`；`lease_expires_at` 在 `purpose=agent` 时取登记时刻加 `InitialTTL`，在 `purpose=classifier` 时取登记时刻加 `T_classifier_timeout`。唯一索引 `(run_id, generation, request_hash)` 冲突时按已有行处置：已有行为 `completed`、`replayed` 或 `failed` 且 `reason≠registration_failed` 时直接返回回放条目；已有行为 `failed` 且 `reason=registration_failed` 时以 CAS 置回 `in_flight`（`gateway_instance` 与 `lease_expires_at` 按本次登记重写）并重新执行登记；已有行为 `in_flight` 且 `gateway_instance` 为当前实例时返回 `202` 与规范 `request_id`；属于另一存活网关实例时返回 `409`；`lease_expires_at < now()` 时先按回收规则删除该行再登记。唯一索引 `(run_id, request_id)` 冲突时返回 `422`，由本地代理重新生成标识后重发；该状态与 `409`（同一逻辑请求由另一存活网关实例持有）语义不同，本地代理不得对 `422` 执行取回或退避。上述情形都不新建上游调用。冲突处置与本次请求是否带分类标记无关；置回 `in_flight` 后是否写在途请求事实、是否参与实例租约、终态后是否写唤醒信号，都按已有行的 `purpose` 判定。
 4. `purpose=agent` 的行调用 `SetRunFact{inflight_request}`；`purpose=classifier` 的行跳过本步，直接进入步骤 5。`InFlightRequest` 的 `Kind` 为 `llm`，`Instance` 取当前网关实例标识，`InitialTTL` 取本次租约有效期。`runcontroller` 在同一事务写入 `source_request` 与 `source_lease`。调用失败时以 CAS 把刚插入的 `in_flight` 行置为 `failed`、写入 `reason=registration_failed` 与失败回放条目，返回 `503`，不转发上游，不写唤醒信号；已并发拿到 `202` 的调用方取回该失败条目，不会看到行被删除。回放存储不可用时行保持 `in_flight`，由回收规则删除。
-5. 开始向上游转发，并周期调用 `RenewSourceLease`。续租周期小于 `InitialTTL` 减去时钟余量；每次续租成功后刷新本实例全部在途行（不区分 `purpose`）的 `lease_expires_at`，`lease_expires_at` 与 `source_lease.expires_at` 按同一 `InitialTTL` 与续租周期推进。`Instance` 对每次进程启动唯一，进程重启后不使用旧标识续租。
+5. 开始向上游转发。`purpose=agent` 的请求自步骤 4 成功起计入本实例的在途请求事实，本实例存在在途请求事实期间周期调用 `RenewSourceLease`，最后一个在途请求事实关闭后停止调用（关闭条件见对 `runcontroller` 的汇入调用）。续租周期小于 `InitialTTL` 减去时钟余量；每次续租成功后以 `gateway_instance` 等于本实例、`status=in_flight`、`purpose=agent` 且 `lease_expires_at > now()` 为条件刷新 `lease_expires_at`，`lease_expires_at` 与 `source_lease.expires_at` 按同一 `InitialTTL` 与续租周期推进；已到期的行不因续租成功复活。`purpose=classifier` 的行不计入在途请求事实，不触发续租，也不随续租刷新，`lease_expires_at` 保持登记时的取值。`Instance` 对每次进程启动唯一，进程重启后不使用旧标识续租。
 
-实例标识取进程启动时生成的唯一值，例如 Pod 名加启动时生成的随机串。网关进程重启后，属于旧实例的 `in_flight` 行不再续租；这些行保持 `in_flight`，其中 `purpose=agent` 的行由 `runcontroller` 的失联守卫合成失败信号，全部行在租约到期后由回收规则删除，同一 `request_hash` 的后续 `POST` 重新登记；已完成或失败的条目仍可由新实例取回。
+实例标识取进程启动时生成的唯一值，例如 Pod 名加启动时生成的随机串。网关进程重启后，属于旧实例的 `in_flight` 行不再续租；这些行保持 `in_flight`，其中 `purpose=agent` 的行由 `runcontroller` 的失联守卫合成失败信号，全部行在各自的 `lease_expires_at` 到期后由回收规则删除，同一 `request_hash` 的后续 `POST` 重新登记；已完成或失败的条目仍可由新实例取回。
 
 ### 上游转发与流式保活
 
@@ -343,7 +349,7 @@ flowchart TD
 
 回放条目与状态的提交先于唤醒信号。`purpose=classifier` 的行提交后不写唤醒信号，本段其余规则只适用于 `purpose=agent` 的行。提交事务成功后，网关调用 `AppendWakeSignal`：成功写 `llm_completed`，失败写 `llm_failed`，`Ref` 取规范 `request_id`，`Generation` 取请求登记时的代。信号写入失败时按退避重试；重复信号由 `(run_id, generation, kind, ref)` 幂等吸收。本地代理的出站流消息 `llm.request.completed` 与 `llm.request.failed` 也写入同一阻塞条件，先到者满足条件，后到者无效果。
 
-提交前崩溃时，行停在 `in_flight`，回放条目不存在；实例租约到期后由 `runcontroller` 合成 `llm_failed{gateway_lost}`，租约到期后行由回收规则删除，本地代理取回得到 `404` 并使该请求失败。提交后、信号前崩溃时，回放条目已可读，实例租约到期后同样合成失败信号；本地代理按 `request_id` 取回已完成条目并按条目内容交付，交付内容以回放条目为准。宿主侧分类请求在这两种崩溃下都没有合成信号：提交前崩溃时本地代理取回得到 `409` 或 `404`，在截止时间内拿不到终态条目即按失败返回驱动器；提交后崩溃时取回照常返回终态条目。
+提交前崩溃时，行停在 `in_flight`，回放条目不存在；实例租约到期后由 `runcontroller` 合成 `llm_failed{gateway_lost}`，租约到期后行由回收规则删除，本地代理取回得到 `404` 并使该请求失败。提交后、信号前崩溃时，回放条目已可读，实例租约到期后同样合成失败信号；本地代理按 `request_id` 取回已完成条目并按条目内容交付，交付内容以回放条目为准。宿主侧分类请求在这两种崩溃下都没有合成信号：提交前崩溃时，行在登记时取定的 `lease_expires_at`（`registered_at + T_classifier_timeout`）之前取回得到 `409`，之后按回收规则删除并返回 `404`，本地代理在截止时间内拿不到终态条目即按失败返回驱动器；提交后崩溃时取回照常返回终态条目。
 
 ### 回放取回
 
@@ -362,9 +368,10 @@ flowchart TD
 
 1. **标记的来源**：本地代理剥离 Agent 进程请求中的 `x-castworks-purpose`，Agent 进程只能经本地代理到达网关且取不到运行实例令牌（[架构不变量](../architecture.md#架构不变量) I6），因此到达网关的标记只来自看守进程自身发起的分类请求；本地代理剥离 Agent 进程附带的标记后，该请求按 `purpose=agent` 登记在途请求事实并写唤醒信号。网关拒绝不符合分类请求形态的标记：取值不是 `classifier`，或 `mode` 不是 `passthrough`，或请求体 `stream` 为真时返回 `400`，计入分类标记拒绝计数，不换取凭据、不登记、不产生上游调用。
 2. **照常执行的步骤**：请求准入与代校验、按运行实例限流（与 Agent 的 LLM 请求共用同一限额）、凭据换取、`llm_request` 登记与唯一索引判重、上游转发、终态持久化、回放取回、计费与审计，规则与 Agent 的 LLM 请求相同；行的 `purpose` 为 `classifier`。
-3. **不写入控制面的事实**：不调用 `SetRunFact{inflight_request}`，终态提交后不调用 `AppendWakeSignal`；本地代理也不为它发送 `llm.request.*`。`runcontroller` 因而没有它的 `source_request` 行与唤醒信号：它不影响 I9 预检中的「本代无在途请求」，不进入阻塞条件与静止证据，完成或失败不产生唤醒。网关实例失联时控制面不为它合成 `llm_failed{gateway_lost}`，其 `in_flight` 行在租约到期后由回收规则删除。
-4. **回放与沙箱消失**：响应写入回放条目，同一代内请求体相同的分类请求命中已有行或条目，不产生第二次上游调用。沙箱在分类请求在途时被快照或销毁，网关照常读取上游到终态并提交回放条目；本地代理不再取回它，条目在保留期满后删除。
-5. **计费、审计与可观测性**：用量按运行实例记录并标注 `purpose=classifier`，审计记录同样带 `purpose`。分类请求不进入时延直方图；网关导出分类请求计数与分类标记拒绝计数，见[时延直方图](#时延直方图)。
+3. **不写入控制面的事实**：不调用 `SetRunFact{inflight_request}`，终态提交后不调用 `AppendWakeSignal`；本地代理也不为它发送 `llm.request.*`。`runcontroller` 因而没有它的 `source_request` 行与唤醒信号：它不影响 I9 预检中的「本代无在途请求」，不进入阻塞条件与静止证据，完成或失败不产生唤醒。它不计入本实例的在途请求事实，不触发 `RenewSourceLease`。网关实例失联时控制面不为它合成 `llm_failed{gateway_lost}`，其 `in_flight` 行按网关自身的超时到期后由回收规则删除。
+4. **网关自身的超时**：分类请求不参与实例租约，网关以部署配置给出的 `T_classifier_timeout` 跟踪它。登记时 `lease_expires_at` 取 `registered_at + T_classifier_timeout`，此后不刷新，本实例有无在途请求事实、续租成功与否都不改变它；网关在 `lease_expires_at` 减去时钟余量时中止仍未结束的上游请求，按 `reason=upstream_timeout` 提交失败条目并返回 `504`。实例崩溃时，该行在 `lease_expires_at` 之前对其他实例的 `POST` 与 `GET` 返回 `409`，到期后由回收规则删除。
+5. **回放与沙箱消失**：响应写入回放条目，同一代内请求体相同的分类请求命中已有行或条目，不产生第二次上游调用。沙箱在分类请求在途时被快照或销毁，网关照常读取上游到终态并提交回放条目；本地代理不再取回它，条目在保留期满后删除。
+6. **计费、审计与可观测性**：用量按运行实例记录并标注 `purpose=classifier`，审计记录同样带 `purpose`。分类请求不进入时延直方图；网关导出分类请求计数与分类标记拒绝计数，见[时延直方图](#时延直方图)。
 
 ### 时延直方图
 
@@ -400,6 +407,8 @@ flowchart TD
 | `ExchangeCredential` 返回 `ErrTargetNotAuthorized`、`ErrCredentialNotConfigured` 或 `ErrInvalidArgument` | 部署或身份配置错误 | `503` | 无上游调用；不读取凭据对象；`ErrTargetNotAuthorized` 由 `secrets` 写 `denied` 审计；告警 | 不重试 |
 | mTLS 握手失败或 `ExchangeCredential` 返回未认证错误（身份不在白名单） | 部署或身份配置错误 | `503` | 无上游调用；告警；身份不在白名单时 `secrets` 写 `denied` 审计 | 不重试 |
 | `SetRunFact{inflight_request}` 失败 | 网关依赖错误或部署错误 | `503` | 行置 `failed`、`reason=registration_failed` 并写失败条目；不写唤醒信号 | 暂时性错误可重试 |
+| `RenewSourceLease` 返回暂时性错误、`runcontroller` 不可达或返回不可重试错误 | 网关依赖错误；不可重试错误为部署或实现缺陷 | 续租失败重试期间的新请求返回 `503` | 已准入请求继续；连续失败至 `purpose=agent` 在途行的 `lease_expires_at` 到期时本实例停止准入，这些行的终态提交失败并由回收规则删除，控制面合成 `llm_failed{gateway_lost}`；不可重试错误另告警 | 按退避重试续租 |
+| 续租时 `runcontroller` 没有本实例的 `source_lease` 行 | 不构成失败 | 续租按成功返回 | `runcontroller` 不写入、不创建行；网关只刷新尚未到期的 `purpose=agent` 在途行，租约由下一次 `SetRunFact{inflight_request}` 建立；清理任务只删除不被 `in_flight` 的 `source_request` 引用的租约行，空操作不影响失联判定 | 不重试 |
 | 回放存储不可用 | 网关依赖错误 | `503` | 不转发上游，避免产生无法回放的调用 | 可重试 |
 | 转发中回放写入失败 | 网关存储错误 | 流式保留截断响应；非流式返回 `503` | 中止上游读取，置 `failed`、`reason=stream_interrupted`，写已写入的事件与 `llm_failed{stream_interrupted}`；写入仍失败时行保持 `in_flight`，由回收规则删除 | 不重试 |
 | 上游 `401` 或 `403` 响应 | 网关依赖或凭据错误 | `502` | 写失败条目与 `llm_failed{upstream_error}`；告警 | 不重试 |
@@ -409,20 +418,21 @@ flowchart TD
 | 请求完整发出后的连接重置、读超时或上游 `5xx` | 上游错误 | 流式截断响应；非流式 `504` 或透传 `5xx` | 写失败条目与 `llm_failed{upstream_error}` 或 `llm_failed{upstream_timeout}`；不重试 | 不重试 |
 | HTTP `200` 的 SSE 流中出现 `event: error` | 上游错误 | 转发 `error` 事件后关闭 | 写失败条目与 `llm_failed{upstream_error}` | 不重试 |
 | 流在终态之前中断 | 上游错误 | 截断响应或失败 | 写失败条目与 `llm_failed{stream_interrupted}` | 不重试 |
+| 宿主侧分类请求到 `lease_expires_at` 减去时钟余量仍未结束 | 网关超时 | `504` | 中止上游请求，写失败条目，`reason=upstream_timeout`；不写唤醒信号 | 不重试 |
 | 网关实例失联 | 控制面合成 | 不经过本模块 | `runcontroller` 合成 `llm_failed{gateway_lost}`；已完成回放仍可取回 | 不重试 |
 | 令牌在请求期间过期 | 不影响已准入请求 | 继续 | 已换取凭据按自身有效期使用；新请求重新准入 | 不重试 |
 | 代在请求期间递增 | 不影响已完成的上游调用 | 继续 | 完成信号按登记的代写入，旧代被拒绝；旧代回放可由同一运行实例按 `request_id` 取回，新代同一 `request_hash` 按新请求登记 | 不重试 |
 | 回放缺失或已过保留期 | 取回错误 | `404` | 本地代理写 `llm.request.failed`；网关不重发上游 | Agent 以新请求重试 |
 
-`llm_request.reason` 的闭集为 `upstream_error`、`upstream_timeout`、`stream_interrupted` 与 `registration_failed`；`llm_failed` 信号的 `reason` 闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`，`registration_failed` 不写信号；`gateway_lost` 只由 `runcontroller` 合成。宿主侧分类请求按同一张表处置，副作用一列中的唤醒信号与在途请求事实对它不适用：网关不写 `llm_completed` 与 `llm_failed`，`SetRunFact{inflight_request}` 失败一行不会出现，网关实例失联时控制面没有对应的合成信号，`404` 由本地代理按失败返回驱动器而不写 `llm.request.failed`。重试的适用情形只有请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；其余 `4xx` 与 `5xx` 不重试。网关不把客户端错误转换为 `llm_failed`，因为客户端错误没有产生上游调用。
+`llm_request.reason` 的闭集为 `upstream_error`、`upstream_timeout`、`stream_interrupted` 与 `registration_failed`；`llm_failed` 信号的 `reason` 闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`，`registration_failed` 不写信号；`gateway_lost` 只由 `runcontroller` 合成。宿主侧分类请求按同一张表处置，副作用一列中的唤醒信号与在途请求事实对它不适用：网关不写 `llm_completed` 与 `llm_failed`，`SetRunFact{inflight_request}` 失败一行不会出现，`RenewSourceLease` 失败一行对它只影响准入、其行按 `T_classifier_timeout` 到期，网关实例失联时控制面没有对应的合成信号，`404` 由本地代理按失败返回驱动器而不写 `llm.request.failed`。重试的适用情形只有请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；其余 `4xx` 与 `5xx` 不重试。网关不把客户端错误转换为 `llm_failed`，因为客户端错误没有产生上游调用。
 
 ## 并发与事务边界
 
 ### 在途请求表的事务
 
-数据库事务不覆盖上游调用（[ADR-effect-record-after-commit](../../adr/adr-effect-record-after-commit.md)）。`llm_request` 的插入是单事务，唯一索引 `(run_id, generation, request_hash)` 决定同一逻辑请求的单一登记：并发插入中只有一个事务成功，其余事务读到已有行并按状态返回回放、`202` 或 `409`。插入与 `SetRunFact{inflight_request}` 不在同一数据库事务内：先提交插入，再调用汇入契约；汇入失败时以 CAS 把行置 `failed` 并写失败条目，返回 `503`，不转发上游。插入与汇入之间崩溃时行停在 `in_flight`，由实例租约到期后的合成失败信号承接，租约到期后行由回收规则删除。`purpose=classifier` 的行没有汇入步骤，插入提交后直接转发上游；其后崩溃时行停在 `in_flight`，没有合成信号，租约到期后由回收规则删除。
+数据库事务不覆盖上游调用（[ADR-effect-record-after-commit](../../adr/adr-effect-record-after-commit.md)）。`llm_request` 的插入是单事务，唯一索引 `(run_id, generation, request_hash)` 决定同一逻辑请求的单一登记：并发插入中只有一个事务成功，其余事务读到已有行并按状态返回回放、`202` 或 `409`。插入与 `SetRunFact{inflight_request}` 不在同一数据库事务内：先提交插入，再调用汇入契约；汇入失败时以 CAS 把行置 `failed` 并写失败条目，返回 `503`，不转发上游。插入与汇入之间崩溃时行停在 `in_flight`，由实例租约到期后的合成失败信号承接，租约到期后行由回收规则删除。`purpose=classifier` 的行没有汇入步骤，插入提交后直接转发上游；其后崩溃时行停在 `in_flight`，没有合成信号，在登记时取定的 `lease_expires_at`（登记时刻加 `T_classifier_timeout`）到期后由回收规则删除。
 
-`status` 的每次变更以 CAS 完成：终态提交以 `status=in_flight`、`gateway_instance` 等于本实例且 `lease_expires_at > now()` 为条件；取回以 `status IN (completed, failed)` 为条件置 `replayed`。CAS 失败时读取当前状态并按当前状态返回；终态提交的 CAS 失败时丢弃回放条目写入，不覆盖其他副本或并发请求写入的结果。
+`status` 的每次变更以 CAS 完成：终态提交以 `status=in_flight`、`gateway_instance` 等于本实例且 `lease_expires_at > now()` 为条件；取回以 `status IN (completed, failed)` 为条件置 `replayed`。续租成功后的刷新只改 `lease_expires_at`，以 `gateway_instance` 等于本实例、`status=in_flight`、`purpose=agent` 且 `lease_expires_at > now()` 为条件，与回收规则的删除条件互斥，已到期并可能正被其他副本回收的行不被刷新。CAS 失败时读取当前状态并按当前状态返回；终态提交的 CAS 失败时丢弃回放条目写入，不覆盖其他副本或并发请求写入的结果。
 
 ### 回放存储与完成信号的先后
 
@@ -432,9 +442,9 @@ flowchart TD
 
 ### 实例续租与失联
 
-网关实例标识对每次进程启动唯一；`SetRunFact{inflight_request}` 以 `InitialTTL` 建立 `source_lease`，`RenewSourceLease` 只延长租约。续租周期小于 `InitialTTL` 减去时钟余量。续租失败时网关按退避重试续租，期间暂停接收新请求，续租成功后恢复准入；已有上游请求在租约有效期内继续完成并提交回放，租约到期后由 `runcontroller` 为 `purpose=agent` 的行合成 `llm_failed{gateway_lost}`，全部在途行由回收规则删除。租约到期后本实例不再以旧标识续租，恢复服务需以新实例标识重新登记或重新调用 `SetRunFact{inflight_request}`。
+网关实例标识对每次进程启动唯一；`SetRunFact{inflight_request}` 以 `InitialTTL` 建立或延长 `source_lease`，`RenewSourceLease` 只延长已有的租约行，对不存在的行按成功返回且不写入、不创建行。本实例只在存在 `purpose=agent` 的在途请求事实时续租，续租周期小于 `InitialTTL` 减去时钟余量；在途请求事实全部关闭后停止续租，`source_lease` 随 `expires_at` 过期，下一个 `purpose=agent` 请求的 `SetRunFact{inflight_request}` 在同一事务重新延长或建立租约；续租成功的前提下，租约覆盖本实例每个在途请求事实的存续区间。续租成功不证明租约行存在，网关不据此推断控制面状态，只按刷新条件延长本实例尚未到期的 `purpose=agent` 在途行。续租失败时网关按退避重试续租，期间暂停接收新请求，续租成功后恢复准入；已有上游请求在租约有效期内继续完成并提交回放，租约到期后由 `runcontroller` 为 `purpose=agent` 的行合成 `llm_failed{gateway_lost}`，这些行由回收规则删除。租约到期后本实例不再以旧标识续租，恢复服务需以新实例标识重新登记或重新调用 `SetRunFact{inflight_request}`。`purpose=classifier` 的行不参与实例租约，按登记时取定的 `lease_expires_at` 提交终态或由回收规则删除，不受续租成败影响。
 
-实例失联不影响已完成或失败的条目：行保留原 `gateway_instance`，任一副本可按 `request_id` 取回。属于失联网关实例的 `in_flight` 行不再续租，也不由新实例重发上游；租约到期后由回收规则删除，本地代理取回得到 `404` 后使该请求失败，由 Agent 以新请求重试。多副本各自维护实例标识与租约，同一 `request_hash` 的行只属于一个实例。
+实例失联不影响已完成或失败的条目：行保留原 `gateway_instance`，任一副本可按 `request_id` 取回。属于失联网关实例的 `in_flight` 行不再刷新，也不由新实例重发上游；`lease_expires_at` 到期后由回收规则删除，本地代理取回得到 `404` 后使该请求失败，`purpose=agent` 的请求由 Agent 以新请求重试，`purpose=classifier` 的请求按失败返回驱动器。多副本各自维护实例标识与租约，同一 `request_hash` 的行只属于一个实例。
 
 ### 竞态用例
 
@@ -448,6 +458,10 @@ flowchart TD
 | 回放提交后、信号前崩溃 | 回放条目与 `status=completed` 已提交；进程崩溃；实例租约到期 | `runcontroller` 合成 `llm_failed{gateway_lost}`；本地代理按 `request_id` 取回完成条目并按条目内容交付 |
 | 代递增与在途请求 | 请求以代 `g` 准入；完成前运行实例进入代 `g+1` | 上游调用与回放条目按 `g` 完成；完成信号按 `g` 写入并被 `runcontroller` 按旧代拒绝；新代本地代理可按 `request_id` 取回 `g` 的条目，同一 `request_hash` 在新代按新请求登记 |
 | 实例租约到期与请求完成并发 | 租约已到期；上游恰好发送终态 | 终态提交以 `lease_expires_at > now()` 为条件，提交失败时网关丢弃写入并关闭上游连接；行由回收规则删除，本地代理取回 `404` 并以新请求重试；控制面可能已合成失败信号 |
+| 在途请求事实全部关闭与新的 Agent 请求登记并发 | 本实例最后一个在途请求事实的唤醒信号写入成功，网关停止续租；新的 `purpose=agent` 请求随即调用 `SetRunFact{inflight_request}` | `SetRunFact{inflight_request}` 在同一事务以 `InitialTTL` 延长或建立 `source_lease`，成功后该请求计入在途请求事实，网关恢复周期续租，首次续租在 `InitialTTL` 减去时钟余量之内到达；停止续租的区间内没有本实例登记的在途请求事实，租约过期不使失联守卫命中 |
+| 续租到达时租约行已不存在 | 网关发出 `RenewSourceLease`；`runcontroller` 侧该实例的 `source_lease` 行已被清理任务删除 | `runcontroller` 按成功返回且不创建行；清理任务只删除不被 `in_flight` 的 `source_request` 引用的租约行，空操作不影响失联判定；网关按刷新条件只延长尚未到期的 `purpose=agent` 在途行，已到期的行不复活，仍由回收规则删除 |
+| 续租连续失败与宿主侧分类请求在途 | 本实例续租连续失败，`purpose=agent` 在途行的 `lease_expires_at` 到期；同一实例上的分类请求仍在途 | 本实例停止准入；`purpose=agent` 行的终态提交失败并由回收规则删除，控制面合成 `llm_failed{gateway_lost}`；分类请求的行按登记时取定的 `lease_expires_at` 判定，到期前照常提交终态，到期后由回收规则删除 |
+| 只有宿主侧分类请求在途时实例崩溃 | 本实例只有 `purpose=classifier` 的 `in_flight` 行，没有在途请求事实，不续租；进程崩溃 | `runcontroller` 侧没有本实例登记的在途请求事实，不合成信号；行在 `lease_expires_at`（`registered_at + T_classifier_timeout`）之前对其他实例的取回返回 `409`，到期后由回收规则删除并返回 `404`；本地代理在截止时间内拿不到终态条目即按失败返回驱动器 |
 | 宿主侧分类请求在途与 I9 预检 | 分类请求行为 `in_flight`；`runcontroller` 在回合边界执行 I9 预检并决定销毁 | 控制面没有该请求的 `source_request` 行，预检的「本代无在途请求」不受它影响；网关照常读取上游到终态并提交回放条目，不写唤醒信号；沙箱销毁后本地代理不再取回，条目在保留期满后删除 |
 | 宿主侧分类请求完成与冻结中的运行实例 | 运行实例已冻结；同一代的分类请求在冻结期间到达终态 | 网关提交回放条目，不写 `llm_completed`；该请求既不满足阻塞条件，也不构成静止冻结的本代 LLM 完成唤醒；本地代理在看守进程内取回结果交给驱动器 |
 

@@ -27,7 +27,7 @@
 - **记录连接用途**：每次请求分类时按 Agent 侧连接端点记录该连接的用途，取 `llm` 或 `external`，并向看守进程提供按端点的查询；结果是冻结确认时的接收队列检查能排除承载 LLM 请求的连接，LLM 响应与保活事件在 Agent 侧未读的字节不触发入站数据唤醒，外部转发连接照常检查。
 - **观察冻结期间的入站载荷**：Agent 进程树处于冻结状态时，在 CONNECT 隧道、HTTP 前置请求与透明拦截器的拦截连接的上游一侧读到载荷字节，即通知看守进程发出 `conn.inbound{freeze_id}`，字节照常转发；结果是冻结期间到达 Agent 外部连接的数据触发唤醒，不被搁置到冻结上限。
 - **识别周期性连接**：按主机与归属对象（发起连接的工具调用或后台作业）记录外部系统连接的建立时刻，同一主机、同一归属对象的连接在窗口内以近似固定间隔重复出现时，向 Claude Code 驱动器提供周期性连接观测；结果是 Agent 以 Bash、curl 或脚本轮询外部系统而命令文本看不出等待时，驱动器仍能识别轮询型等待，观测只作等待意图的软输入，不进入 `conn.inbound`、安全点复核与 `Activity`。
-- **转发宿主侧分类请求**：沙箱侧配置的 `intent.classifier` 开启时，接受 Claude Code 驱动器的进程内分类请求，附运行实例令牌与分类标记 `x-castworks-purpose: classifier` 转发到 `llmgateway`；结果是分类不经 Agent 进程、不进入 Agent 上下文，按运行实例计费；它不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，分类请求因而不进入在途请求、阻塞条件、静止证据与 `Activity.llm_last_request_at`，不改变 Agent 的 LLM 等待信号与活动度观测。
+- **转发宿主侧分类请求**：沙箱侧配置的 `intent.classifier` 开启时，接受 Claude Code 驱动器的进程内分类请求，附运行实例令牌与分类标记 `x-castworks-purpose: classifier` 转发到 `llmgateway`；结果是分类不经 Agent 进程、不进入 Agent 上下文，按运行实例计费；它不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，也不让它参与事件源实例租约，分类请求因而不进入在途请求、阻塞条件、静止证据与 `Activity.llm_last_request_at`，不改变 Agent 的 LLM 等待信号与活动度观测。
 - **令牌轮换期间暂停转发**：令牌过期或临近到期且未收到 `TokenRotate` 时，不向上游发起新请求，已准入的请求继续；结果是沙箱内不出现长期凭据，也不使用过期令牌。
 - **快照恢复后取回**：恢复后按 `request_id` 向 `llmgateway` 取回已完成响应，按已转发的事件序号续传；结果是半死的上游连接不会把恢复拖到读超时，已到达的内容不重复交付。
 - **拒绝未放行目标**：对出口策略未放行的外部目标立即返回错误，不建立上游连接，不黑洞；结果是 Agent 的失败可见且可自行处理。
@@ -84,7 +84,7 @@
 
 `202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。`422` 只表示 `request_id` 与运行实例内已有行冲突，本地代理重新生成 `request_id`、保持同一 `request_hash` 与模式后重发，不执行取回；`request_hash` 与唯一索引使重发仍命中同一逻辑请求。
 
-宿主侧分类请求沿用同一请求契约：以 `POST /v1/messages` 发往 `llmgateway`，携带运行实例令牌、本地代理新生成的 `request_id`、`request_hash` 与分类标记 `x-castworks-purpose: classifier`，`x-castworks-mode` 取 `passthrough`，请求体为 `stream=false` 的 Messages API 请求。网关照常校验令牌、计费并写回放条目，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，也不写 `llm_completed` 或 `llm_failed` 唤醒信号；本地代理不为它上报 `llm.request.*`。分类请求因此不影响 I9 预检中的「本代无在途请求」，也不进入阻塞条件与静止证据。分类标记只出现在看守进程自身发起的分类请求上：本地代理转发 Agent 进程的 LLM 请求之前剥离其中的 `x-castworks-purpose`，Agent 无法让网关把自己的请求按分类请求处理。处置规则见[宿主侧分类请求](#宿主侧分类请求)。
+宿主侧分类请求沿用同一请求契约：以 `POST /v1/messages` 发往 `llmgateway`，携带运行实例令牌、本地代理新生成的 `request_id`、`request_hash` 与分类标记 `x-castworks-purpose: classifier`，`x-castworks-mode` 取 `passthrough`，请求体为 `stream=false` 的 Messages API 请求。网关照常校验令牌、计费并写回放条目，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，也不写 `llm_completed` 或 `llm_failed` 唤醒信号；分类请求不参与事件源实例租约，网关只在本实例存在 Agent 请求（`purpose=agent`）的在途事实时调用 `RenewSourceLease`，分类请求在网关内的跟踪按网关自身的超时处理；本地代理不为它上报 `llm.request.*`。分类请求因此不影响 I9 预检中的「本代无在途请求」，也不进入阻塞条件与静止证据。分类标记只出现在看守进程自身发起的分类请求上：本地代理转发 Agent 进程的 LLM 请求之前剥离其中的 `x-castworks-purpose`，Agent 无法让网关把自己的请求按分类请求处理。处置规则见[宿主侧分类请求](#宿主侧分类请求)。
 
 **对出口代理。** 外部系统请求保持方法、路径、请求头与请求体不变，本地代理附加运行实例身份并转发；`Authorization` 等头中的凭据占位符原样保留，由出口代理在发往允许主机时替换。占位符可以来自 Agent 的命令参数，也可以来自看守进程注入的工具环境变量；本地代理不区分来源。CONNECT 隧道建立后，本地代理只转发字节流，不解析隧道内的 TLS。k8s 路径的出口代理对每个请求按运行实例令牌校验代、终态与作废状态；Substrate 路径按以运行实例与代为键的出口策略放行（[REF-substrate](../../../references.md)）。出口代理的校验与撤销归 `connectorhub` 与 `sandboxprovider`，本地代理不缓存放行结果。
 
@@ -121,7 +121,7 @@
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway` 与出口代理的调用是运行时 HTTP 调用，不是代码依赖。
 
 - `agentprotocol`：请求事件的信封、消息类型、发送顺序与重放；本地代理只实现事件内容与时序。
-- `llmgateway`：`POST /v1/messages` 与 `GET /v1/requests/{request_id}` 的请求头、状态码与回放取回语义，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- `llmgateway`：`POST /v1/messages` 与 `GET /v1/requests/{request_id}` 的请求头、状态码与回放取回语义，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号，也不为它续租事件源实例租约；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - 出口代理：CONNECT 与 HTTP 前置的目标、运行实例身份与凭据占位符语义；k8s 路径为 `connectorhub` 的平台出口代理，Substrate 路径为 Substrate 出口网关。
 - Claude Code 的网络行为：流式空闲看门狗在未收到内容时中止并重发一次，已收到部分内容时保留截断结果（[REF-claude-code-network-config](../../../references.md)）。
 - Anthropic Messages API 的 SSE 格式：内容事件与 `ping` 保活事件的区分（[REF-anthropic-streaming](../../../references.md)）。
@@ -216,7 +216,7 @@ sequenceDiagram
     end
 ```
 
-图固定 LLM 与外部系统流量的分界：LLM 请求只到达 `llmgateway`，外部系统请求只到达出口代理，两者不交叉。`mode` 只改变本地代理向 Agent 转发内容事件的方式，网关对直通与缓存执行相同的转发与回放写入。外部系统请求不产生 `llm.request.*` 事件，也不进入收件箱；它们的在途连接由本地代理观察，用于[安全点](../../../glossary.md)复核，Agent 进程树冻结期间上游读到载荷字节时另触发看守进程的 `conn.inbound`，由 `runcontroller` 写为唤醒信号。LLM 请求的上游连接不触发入站载荷通知。周期性连接观测只交给驱动器的意图解析，不触发 `conn.inbound`，也不参与安全点复核；宿主侧分类请求由驱动器发起，不经过 Agent 进程与回环端点，也不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，`runcontroller` 看到的 LLM 等待与在途请求只来自 Agent 自己的请求。
+图固定 LLM 与外部系统流量的分界：LLM 请求只到达 `llmgateway`，外部系统请求只到达出口代理，两者不交叉。`mode` 只改变本地代理向 Agent 转发内容事件的方式，网关对直通与缓存执行相同的转发与回放写入。外部系统请求不产生 `llm.request.*` 事件，也不进入收件箱；它们的在途连接由本地代理观察，用于[安全点](../../../glossary.md)复核，Agent 进程树冻结期间上游读到载荷字节时另触发看守进程的 `conn.inbound`，由 `runcontroller` 写为唤醒信号。LLM 请求的上游连接不触发入站载荷通知。周期性连接观测只交给驱动器的意图解析，不触发 `conn.inbound`，也不参与安全点复核；宿主侧分类请求由驱动器发起，不经过 Agent 进程与回环端点，也不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，`runcontroller` 看到的 LLM 等待、在途请求与事件源实例租约的续租只来自 Agent 自己的请求。
 
 ## 核心数据结构
 
@@ -423,7 +423,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 3. 终态条目直接返回驱动器；`202` 与 `409` 在截止时间内退避后以 `GET /v1/requests/{request_id}` 取回；`422` 重新生成 `request_id` 后重发；截止时间到期或其余失败按失败返回，不重试。
 4. 全程不上报 `llm.request.*`，不更新 `llm_last_request_at` 与 `llm_last_retryable_failure_at`，不写 `conn_purpose`、`ext_conns`、请求记录与本地回放缓存。
 
-分类请求只携带驱动器交来的请求体，不读取工作区文件，也不附加 Agent 的请求头；它与 Agent 的请求不共享上游连接。冻结期间看守进程继续运行，分类请求照常进行；快照恢复后在途的分类请求按失败返回，不按 `request_id` 取回；销毁重建时在途的分类请求随沙箱丢弃，不计入看守进程侧安全点复核的外部在途连接；`llmgateway` 按分类标记不经 `SetRunFact{inflight_request}` 登记在途请求事实、不写 `llm_completed` 或 `llm_failed`（见 [llmgateway](../design-llmgateway.md#凭据换取与在途登记)），分类请求因此不影响 I9 预检中的「本代无在途请求」，也不进入阻塞条件与静止证据。`Fenced` 或 `Shutdown` 到达时停止接受新的分类请求，在途的按失败返回。
+分类请求只携带驱动器交来的请求体，不读取工作区文件，也不附加 Agent 的请求头；它与 Agent 的请求不共享上游连接。冻结期间看守进程继续运行，分类请求照常进行；快照恢复后在途的分类请求按失败返回，不按 `request_id` 取回；销毁重建时在途的分类请求随沙箱丢弃，不计入看守进程侧安全点复核的外部在途连接；`llmgateway` 按分类标记不经 `SetRunFact{inflight_request}` 登记在途请求事实、不写 `llm_completed` 或 `llm_failed`，也不让它参与事件源实例租约：网关只在本实例存在 Agent 请求（`purpose=agent`）的在途事实时调用 `RenewSourceLease`，分类请求在网关内的跟踪按网关自身的超时处理（见 [llmgateway](../design-llmgateway.md#凭据换取与在途登记)）。分类请求因此不影响 I9 预检中的「本代无在途请求」，不进入阻塞条件与静止证据，网关实例失联时也没有为它合成的唤醒信号，本地代理在取回失败或截止时间到期时按失败返回驱动器。`Fenced` 或 `Shutdown` 到达时停止接受新的分类请求，在途的按失败返回。
 
 分类标记只由进程内入口附加。回环端点上接受的 LLM 请求都来自 Agent 进程，本地代理在转发前剥离其中的 `x-castworks-purpose`，剥离后按 Agent 的 LLM 请求照常处理：选定模式、上报 `llm.request.*`、更新 `llm_last_request_at`，网关照常登记在途请求事实。Agent 因而无法借该标记让自己的请求脱离在途请求、阻塞条件与静止证据。
 
