@@ -122,7 +122,7 @@ type DriverState struct {
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
 | `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 携带完整集合；未结束的作业使回合边界不构成安全点；回合结束之后集合变化时作为回合外事件发出 |
 | `self_wake_changed{entries, crons_synced}` | 控制面循环驱动器不发出 | 由存在自唤醒源的驱动器发出；可作为回合外事件发出 |
-| `intent_observed{ref_kind, ref, class, target, expected_ms, source, confidence}` | 控制面循环驱动器不发出 | 由解析等待意图的驱动器发出；同一 `(ref_kind, ref)` 后到的覆盖先到的；可作为回合外事件发出 |
+| `intent_observed{ref_kind, ref, class, target, expected_ms, prior, source, confidence}` | 控制面循环驱动器不发出 | 由解析等待意图的驱动器发出；`prior{p25, p50, p90}` 只在 `source=signature` 时非空；同一 `(ref_kind, ref)` 后到的覆盖先到的；`ref_kind`、`class`、`source` 越出闭集或 `class` 不属于 `ref_kind` 对应的闭集时，接收方丢弃该事件并计数，不终止传输；可作为回合外事件发出 |
 | `state_changed{idle\|requires_action}` | 驱动器有对应的原生状态时；控制面循环没有原生状态时在回合结束发出 `state_changed{idle}` | 不替代 `turn_ended`；进程驱动器在没有进行中回合时发出的为回合外事件 |
 
 回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，`intent_observed` 按 `(ref_kind, ref)` 以后到者覆盖先到者，重复与乱序不改变结果。
@@ -152,7 +152,7 @@ type DriverState struct {
 4. 工作区[持久化确认](../../../glossary.md)完成；本代没有工作区写文件描述符。
 5. 需要销毁时，恢复句柄已确定并由 `SuspendReady.SessionID` 报告；控制面落库后才销毁。
 
-控制面循环没有自唤醒条目，I9 中「自唤醒条目都随续接恢复」一项恒成立。
+控制面循环没有自唤醒条目，I9 中关于自唤醒条目随续接恢复的一项恒成立；`SuspendRequest` 复用 `PrepareSuspend` 的字段语义，其中的 `self_wake_cutoff` 对控制面循环驱动器不起作用。进程驱动器在安全点只检查 `fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目，规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。
 
 `Resume` 分两种：同一代解冻时继续原循环，`SnapshotRestored` 重建超时与流偏移；新代续接时按恢复句柄加载循环状态，重新建立 `ToolExec` 调用，不重放未确认的工具调用。工具调用以 `call_id` 与 `exec_id` 标识，恢复后先查询结果，查询不到时把该调用作为失败结果交回循环，不重新执行有副作用的命令。
 

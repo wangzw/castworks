@@ -15,19 +15,19 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - **启动与保持进程**：以固定命令启动 Claude Code，在回合之间保持同一进程存活，只在 stdin 关闭或进程退出时结束；收到 `StartAgent{resume_session_id}` 时以 `--resume` 启动而不写入任何输入，进程已在运行时不做任何事。结果是同一代沙箱内的会话不需要每回合重建，恢复句柄只在跨代或进程退出后使用，没有投递时会话内定时也有进程承接。
 - **流式输入输出**：以 `stream-json` 读写 stdin 与 stdout，把用户消息、工具结果与权限决定写入 stdin，把 Assistant、User、Result、Session State 与任务消息读出；结果是 Agent 的原生信号成为可解析的事件流。
 - **环境变量注入**：为 Agent 进程设置 `ANTHROPIC_BASE_URL`、`CLAUDE_CONFIG_DIR`、会话状态与后台任务上报相关变量，并注入项目作用域工具接入声明中的凭据占位符环境变量与非秘密配置；结果是 LLM 流量只到达本地代理，会话状态落在[工作区](../../../glossary.md)，第三方工具经占位符使用出口凭据通道，`idle` 只表示主循环空闲。
-- **托管策略设置注入**：以工作区之外的托管策略设置文件（Linux 为 `/etc/claude-code/managed-settings.json`，随镜像提供）注入 hooks 与权限设置，并以 `allowManagedHooksOnly` 屏蔽工作区内声明的 hooks；审批用的 `PreToolUse`，对账、旁证与意图解析用的 `Stop`、`SubagentStop` 与 `UserPromptSubmit`，提示用的 `PostToolUse`、`PostToolBatch`（兼作旁证）与 `SubagentStart` 都由看守进程提供的托管 hook 二进制实现，二进制随镜像放在工作区之外，经本地 IPC 向驱动器查询并同步返回。结果是审批、安全检查与提示不被 Agent 自身的写入改变。
+- **托管策略设置注入**：以工作区之外的托管策略设置文件（Linux 为 `/etc/claude-code/managed-settings.json`，随镜像提供）注入 hooks 与权限设置，并以 `allowManagedHooksOnly` 屏蔽工作区内声明的 hooks；审批用的 `PreToolUse`，对账、旁证与意图解析用的 `Stop`、`SubagentStop` 与 `UserPromptSubmit`，提示用的 `PostToolUse`、`PostToolBatch`（兼作旁证）与 `SubagentStart` 都由看守进程提供的托管 hook 二进制实现，二进制随镜像放在工作区之外，经看守进程的托管 hook IPC 端点向驱动器查询并同步返回，端点对查询方的认证由看守进程执行（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)）。结果是审批、安全检查与提示不被 Agent 自身的写入改变。
 - **回合边界判定**：等待 `session_state_changed: idle` 与 `result.queued_turn_count=0` 都到齐，结合 `result.origin` 区分人类回合与任务通知回合；结果是驱动器只在回合边界发出 `turn_ended`，并向控制面报告回合位置；`queued_turn_count` 不计任务通知，后台作业非空的回合边界不构成安全点。
 - **事件翻译**：把工具开始与结束、权限询问、会话状态、订阅创建、定时请求、等待开始、后台任务集合与自唤醒条目的变化翻译为 `AgentEvent`；结果是 `runcontroller` 收到与控制面循环驱动器相同的闭集事件，另有只由本驱动器产生的 `self_wake_changed` 与 `intent_observed`（控制面循环驱动器的等待由 `WaitDeclared` 显式表达，不产生意图事件）。
 - **LLM 等待旁证**：以本地代理的 `llm.request.started` 为主信号，以 `UserPromptSubmit`、`PostToolBatch`、`Stop` 等 hook 事件为旁证；结果是 LLM 等待的开始与结束有独立于 Agent 自述的证据。
 - **审批路径**：实现 `PreToolUse` hook 的询问、`permissionDecision: "defer"` 的延迟、`stop_reason: tool_deferred` 的回合结束、以 `--resume` 不改写 prompt 的续接，以及实时接入中的阻塞等待；结果是回合中审批可以转为回合边界，或在不销毁沙箱时等待决定。
 - **平台 MCP 服务器接入**：向 Agent 提供平台 MCP 服务器的工具，设置工具超时，把阻塞型工具调用翻译为 `wait_started` 与 `tool_ended`，把 Agent 经可选参数 `expected_wait` 自报的预计等待时长翻译为 `subscription_created` 与 `wait_started` 的 `agent_expected_ms`，并在阻塞型调用被 Claude Code 自动转后台时通知平台 MCP 服务器以转换结果结束该调用；结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
 - **第三方 MCP 服务器接入**：合并项目作用域工具接入声明中已批准的第三方 MCP 服务器配置，只支持 stdio 本地子进程，注入其环境变量并管理生命周期，被自动转后台的第三方 MCP 调用计入后台作业；结果是第三方 MCP 工具经本地代理或[透明拦截器](../../../glossary.md)到出口代理执行，平台不为其增加平台工具。
-- **安全点检查**：在回合边界执行 I9 检查，核对后台作业为空与自唤醒条目都随续接恢复，关闭 stdin、等待正常退出，在 Agent 正常退出之后终止已声明的第三方 MCP 服务器（挂起路径中唯一终止的进程），复核本地代理与透明拦截器无外部在途连接、核对会话记录 JSONL 末尾、工作区持久化、进程与工作区写文件描述符，并上报 `ReadyToSuspend`；任一检查不满足时回 `Busy`，不为满足检查而终止后台作业、残留进程或孤儿进程。结果是销毁前会话已落盘，`--resume` 不丢失最后一回合，也不丢失 Agent 的运行态。
+- **安全点检查**：在回合边界执行 I9 检查，核对后台作业为空，以及 `fire_at` 为空或不早于 `PrepareSuspend.self_wake_cutoff` 的自唤醒条目都随续接恢复，关闭 stdin、等待正常退出，在 Agent 正常退出之后终止已声明的第三方 MCP 服务器（挂起路径中唯一终止的进程），复核本地代理与透明拦截器无外部在途连接、核对会话记录 JSONL 末尾、工作区持久化、进程与工作区写文件描述符，并上报 `ReadyToSuspend`；任一检查不满足时回 `Busy`，不为满足检查而终止后台作业、残留进程或孤儿进程。结果是销毁前会话已落盘，`--resume` 不丢失最后一回合，也不丢失 Agent 的运行态。
 - **快照恢复后的衔接**：在看守进程校时并清理旧 TCP 连接之后恢复事件处理，丢弃按旧时钟计算的 hook 截止时间，重新建立超时；结果是半死连接与时钟跳变不使驱动器误判回合状态。
 - **后台作业登记**：以 Claude Code 的 `background_tasks_changed` 为准、以 `task_started`、`task_updated`、`task_notification` 补充维护后台作业集合，不计 `ambient=true` 的任务，以进程表把 `local_bash` 任务关联到 PID 并发现孤儿进程，在集合变化时发出 `bg_jobs_changed`；结果是后台作业存活的运行实例不以挂起为目的销毁，冻结只在静止证据成立时发生。
 - **自唤醒源镜像**：从 `CronCreate`、`CronDelete`、`ScheduleWakeup`、Bash 工具的 `timeout` 与 `Monitor` 的 `timeout_ms` 维护自唤醒条目，在回合结束时以 `Stop` hook 输入的 `session_crons` 对账，在集合变化时发出带 `crons_synced` 的 `self_wake_changed`；结果是 Agent 自行触发的唤醒时刻进入唤醒集合，到点时进程可运行，托管侧不禁用、不拦截这些功能（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 - **等待意图解析**：从 Agent 本来就产生的信号（Bash 的 `command`、`description`、`timeout` 与 `run_in_background`，Agent 工具的 `description` 与 `subagent_type`，workflow 的描述，`Monitor` 的命令或 URL，`Stop` hook 输入的 `last_assistant_message`，本地代理观察到的周期性连接）解析前台工具调用、后台作业与回合的等待意图，按规则分类并匹配沙箱侧配置下发的等待签名，在 `intent.classifier` 开启时把规则判不了的文本交给宿主侧分类模型，以 `intent_observed` 上报。结果是控制面在机械层判不清的地方得到在等什么、预计多久、进程在工作、等待还是提供服务的软输入；意图只进入等待时长预测、宽限期选择、提示决策与指标，不进入单一条件门控、静止证据、I9 与唤醒集合（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
-- **情境提示**：在 `intent.hints` 开启时，对意图为 `waiting` 且命中等待签名的调用或作业建议改用 `subscribe_event`，对纯定时等待建议改用 `sleep_until`，提示经托管 hook 的 `PostToolUse` 与 `PostToolBatch` 输出的 `additionalContext` 搭载在 Agent 下一次本来就要发出的模型请求上，按签名控制频率并判定采纳；`SubagentStart` 常驻向子代理注入与平台 MCP 服务器 `instructions` 相同的等待方式契约。结果是同类等待的下一次可以改用订阅或定时，从只能冻结变为回合边界可销毁；提示可以被 Agent 忽略，驱动器不拒绝、不阻塞、不让对话继续、不强制转后台、不终止，也不为提示额外发出模型请求。
+- **情境提示**：在 `intent.hints` 开启时，对意图为 `waiting` 且命中等待签名的调用或作业建议改用 `subscribe_event`，对定时总长不短于 `T_hint_timer` 的纯定时等待建议改用 `sleep_until`，提示经托管 hook 的 `PostToolUse` 与 `PostToolBatch` 输出的 `additionalContext` 搭载在 Agent 下一次本来就要发出的模型请求上，按签名控制频率并判定采纳；`SubagentStart` 常驻向子代理注入与平台 MCP 服务器 `instructions` 相同的等待方式契约。结果是同类等待的下一次可以改用订阅或定时，从只能冻结变为回合边界可销毁；提示可以被 Agent 忽略，驱动器不拒绝、不阻塞、不让对话继续、不强制转后台、不终止，也不为提示额外发出模型请求。
 - **终止路径**：按优雅程度关闭 stdin 或发送 `SIGTERM`，杀死 Bash 进程树并执行 `SessionEnd` hook；结果是终止只用于失效判定与超时，以挂起为目的的销毁走正常退出路径；挂起路径中驱动器唯一终止的进程是 Agent 正常退出之后的已声明第三方 MCP 服务器（含其子进程），后台作业、残留进程与孤儿进程都不终止。
 - **投递意图日志写入**：在喂入事件之前追加并同步写入 `accepted{seq}`，观察到 `turn_started` 后追加并同步写入 `consumed{seq, turn_id}`；结果是跨代重建后的事件去重有工作区内的持久依据（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
 
@@ -43,6 +43,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - 限制 Agent 的功能不在本模块之内，托管侧也没有其他模块承担：驱动器不禁用、不拦截、不终止会话内定时、`Monitor`、后台 Bash、后台子代理、workflow 与长 MCP 调用的自动转后台，也不设置改变这些功能的环境变量；本模块只观测它们并翻译为事件（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 - LLM 请求的代理、模式选择、缓冲与回放取回归本地代理；本模块只消费其请求事件。
 - 平台 MCP 服务器的工具实现、令牌附加、订阅登记、`instructions` 文本与可选参数 `expected_wait`、`reason` 的定义与解析归看守进程的平台 MCP 服务器；本模块只接入工具、设置超时、翻译工具事件与 `agent_expected_ms`，并在 `SubagentStart` 注入同一份 `instructions` 文本。
+- 托管 hook IPC 端点及其对查询方的认证归看守进程（[托管 hook 的执行](design-warden.md#托管-hook-的执行)）；本模块只应答经端点到达的查询。
 - 等待意图的使用归 `suspendpolicy`（等待时长预测与宽限期选择）与 `runcontroller`（`run.intents` 的保存与删除、决策上下文与意图指标）；本模块只解析意图并发出 `intent_observed`。
 - 等待签名的定义、装载校验与下发归 `connectorhub`；本模块只按沙箱侧配置中的 `wait_signatures` 匹配。
 - 宿主侧分类请求的转发、令牌附加与按运行实例计费归本地代理与 `llmgateway`；本模块只构造分类请求并解析结果。
@@ -72,7 +73,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | --- | --- |
 | `Start` | 以固定命令启动进程，设置环境变量与托管策略设置，必要时带 `--resume <session_id>`；进程的 cgroup 迁移由看守进程的进程监督完成。`StartAgent{resume_session_id}` 经 `Start` 以 `--resume <session_id>` 启动，不写入 stdin，启动后阶段为 `boundary`；进程已在运行时为空操作 |
 | `Feed` | 把 `Deliver` 的 `target` 翻译为 stdin 上的 `stream-json` 用户消息；返回是否喂入、回合标识与 Agent 是否已退出 |
-| `PrepareForSuspend` | 只在回合边界执行 I9 检查；核对后台作业为空、自唤醒条目都随续接恢复，关闭 stdin、等待退出码，之后终止已声明的第三方 MCP 服务器（挂起路径中唯一终止的进程），核对 JSONL 末尾与工作区持久化；返回 `ReadyToSuspend` 字段 |
+| `PrepareForSuspend` | 只在回合边界执行 I9 检查；核对后台作业为空、`fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目都随续接恢复，关闭 stdin、等待退出码，之后终止已声明的第三方 MCP 服务器（挂起路径中唯一终止的进程），核对 JSONL 末尾与工作区持久化；返回 `ReadyToSuspend` 字段 |
 | `Resume` | 同一代解冻时继续原进程；新代或进程已退出时以 `--resume <session_id>` 启动，必要时不带 prompt |
 | `Terminate` | 优雅终止关闭 stdin；强制终止发送 `SIGTERM`、杀死 Bash 进程树并执行 `SessionEnd` hook |
 | `SnapshotRestored` | 校时完成后重新建立超时，丢弃按旧时钟计算的 hook 截止时间；进程保留时继续驱动 |
@@ -119,13 +120,13 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | `CronCreate`、`CronDelete`、`ScheduleWakeup` 的 `tool_use` 与 `tool_result` | `self_wake_changed{entries, crons_synced}` | `CronCreate` 产生 `kind=cron` 条目，`ScheduleWakeup` 产生 `kind=wakeup` 条目，`CronDelete` 移除对应条目；cron 表达式无法解析时 `fire_at` 为空 |
 | Bash 工具调用的 `timeout`、`Monitor` 的 `timeout_ms` | `self_wake_changed{entries, crons_synced}` | 分别产生 `kind=tool_timeout` 与 `kind=monitor_deadline` 条目 |
 | `Stop` 与 `SubagentStop` hook 输入的 `session_crons` | `self_wake_changed{entries, crons_synced}` | 回合结束（`Stop`）或子代理结束（`SubagentStop`）时以它为准增删 `kind=cron` 条目；本进程首次取得时 `crons_synced` 置真；集合与 `crons_synced` 都不变时不发 |
-| 前台工具调用的 `tool_use` 输入（Bash、Agent 工具、workflow、`Monitor`），以及归属于该调用的周期性连接 | `intent_observed{ref_kind=call, ref=call_id, class, target, expected_ms, source, confidence}` | 在该调用的 `tool_started` 之后、`tool_ended` 之前发出；`run_in_background=true` 的调用不发 `call` 意图 |
-| 后台作业进入 `bg_jobs`，作业发起调用的输入，以及归属于该作业的周期性连接 | `intent_observed{ref_kind=job, ref=job_id, class, target, expected_ms, source, confidence}` | 作业进入 `bg_jobs` 之后发出，离开之后不发；被自动转后台的调用产生的作业继承该调用的意图 |
-| `Stop` hook 输入的 `last_assistant_message` | `intent_observed{ref_kind=turn, ref=turn_id, class, target, expected_ms, source, confidence}` | 处理该回合的 `Stop` 输入时发出；下一回合已开始时丢弃 |
+| 前台工具调用的 `tool_use` 输入（Bash、Agent 工具、workflow、`Monitor`），以及归属于该调用的周期性连接 | `intent_observed{ref_kind=call, ref=call_id, class, target, expected_ms, prior, source, confidence}` | 在该调用的 `tool_started` 之后、`tool_ended` 之前发出；`run_in_background=true` 的调用不发 `call` 意图 |
+| 后台作业进入 `bg_jobs`，作业发起调用的输入，以及归属于该作业的周期性连接 | `intent_observed{ref_kind=job, ref=job_id, class, target, expected_ms, prior, source, confidence}` | 作业进入 `bg_jobs` 之后发出，离开之后不发；被自动转后台的调用产生的作业继承该调用的意图 |
+| `Stop` hook 输入的 `last_assistant_message` | `intent_observed{ref_kind=turn, ref=turn_id, class, target, expected_ms, prior, source, confidence}` | 处理该回合的 `Stop` 输入时发出；下一回合已开始时丢弃 |
 | 宿主侧分类模型的结果 | `intent_observed{..., source=classifier, confidence=0.6}` | 覆盖同一对象的规则结果；对象已结束（调用已 `tool_ended`、作业已离开 `bg_jobs`、下一回合已开始）时丢弃 |
 | 进程退出 | `turn_ended{reason, agent_exited=true, bg_procs}`；自唤醒条目变化时另发 `self_wake_changed{entries, crons_synced}` | 不就地重启；下一次投递或 `StartAgent` 以 `resume_session_id` 启动；后台作业集合清空，`survives_resume=false` 的自唤醒条目移除，意图表清空，不为清空发出 `intent_observed` |
 
-`turn_ended` 只在回合边界或进程退出时发出。回合边界的条件是 `result` 与 `idle` 齐备且 `result.queued_turn_count=0`；`queued_turn_count` 不计任务通知，`result.origin=task-notification` 的回合照常发出 `turn_ended`，但不视为人类回合。`bg_jobs_changed` 与 `self_wake_changed` 都携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换，或替换非 `cron` 条目并按 `entry_id` 合并 `cron` 条目（见[自唤醒源镜像](#自唤醒源镜像)）。这两种事件、`state_changed` 与 `intent_observed` 不受回合位置限制，没有进行中回合时同样发出。`intent_observed` 以 `(ref_kind, ref)` 标识对象，同一对象后到的覆盖先到的；`ref_kind=turn` 时 `ref` 为该回合的 `turn_id`，与回合外事件为空的信封字段 `turn_id` 无关。`class` 为 `unknown` 且 `target` 与 `expected_ms` 都为空的意图不发出，除非它覆盖同一对象已发出的意图；接收方没有某个对象的意图即按 `unknown` 处理。回合内事件的 `event_seq` 在同一回合内单调，接收方按它丢弃重复或乱序的回合内事件；没有进行中回合时发出的事件（下称回合外事件）`turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件的重复与乱序不改变结果。
+`turn_ended` 只在回合边界或进程退出时发出。回合边界的条件是 `result` 与 `idle` 齐备且 `result.queued_turn_count=0`；`queued_turn_count` 不计任务通知，`result.origin=task-notification` 的回合照常发出 `turn_ended`，但不视为人类回合。`bg_jobs_changed` 与 `self_wake_changed` 都携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换，或替换非 `cron` 条目并按 `entry_id` 合并 `cron` 条目（见[自唤醒源镜像](#自唤醒源镜像)）。这两种事件、`state_changed` 与 `intent_observed` 不受回合位置限制，没有进行中回合时同样发出。`intent_observed` 以 `(ref_kind, ref)` 标识对象，同一对象后到的覆盖先到的；`prior` 是命中签名的时长先验 `{p25, p50, p90}`，只在 `source=signature` 时非空，其余来源为空；`ref_kind=turn` 时 `ref` 为该回合的 `turn_id`，与回合外事件为空的信封字段 `turn_id` 无关。`class` 为 `unknown` 且 `target` 与 `expected_ms` 都为空的意图不发出，除非它覆盖同一对象已发出的意图；接收方没有某个对象的意图即按 `unknown` 处理。回合内事件的 `event_seq` 在同一回合内单调，接收方按它丢弃重复或乱序的回合内事件；没有进行中回合时发出的事件（下称回合外事件）`turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件的重复与乱序不改变结果。
 
 ## 依赖
 
@@ -174,7 +175,7 @@ stateDiagram-v2
     Exited --> [*]: 运行实例结束
 ```
 
-阶段闭集为 `starting`、`in_turn`、`blocked`、`boundary` 与 `exited`，与 `agent_state.phase` 一致。`blocked` 的子状态包括 LLM 等待、工具等待、阻塞型审批与阻塞型 MCP 等待；`requires_action` 是权限询问的会话状态，不单独成为阶段。`boundary` 表示进程存活而没有进行中的回合，是唯一允许以挂起为目的销毁的位置；以 `StartAgent` 启动的进程不写入输入，启动后直接处于 `boundary`。回合边界上 Claude Code 可能自行开始回合：后台任务结束时注入任务通知回合，会话内定时到点时开始定时触发的回合，两者的 `turn_started.delivery_id` 都为空。后台作业非空或存在 `survives_resume=false` 的自唤醒条目时，`boundary` 不构成安全点。`exited` 保留恢复句柄与退出码，下一次投递或 `StartAgent` 以它启动新进程，不就地重启。
+阶段闭集为 `starting`、`in_turn`、`blocked`、`boundary` 与 `exited`，与 `agent_state.phase` 一致。`blocked` 的子状态包括 LLM 等待、工具等待、阻塞型审批与阻塞型 MCP 等待；`requires_action` 是权限询问的会话状态，不单独成为阶段。`boundary` 表示进程存活而没有进行中的回合，是唯一允许以挂起为目的销毁的位置；以 `StartAgent` 启动的进程不写入输入，启动后直接处于 `boundary`。回合边界上 Claude Code 可能自行开始回合：后台任务结束时注入任务通知回合，会话内定时到点时开始定时触发的回合，两者的 `turn_started.delivery_id` 都为空。后台作业非空，或存在 `survives_resume=false` 的[有效自唤醒条目](../../../glossary.md)（界限按销毁形态取，见[安全点](#安全点)第 5 步）时，`boundary` 不构成安全点。`exited` 保留恢复句柄与退出码，下一次投递或 `StartAgent` 以它启动新进程，不就地重启。
 
 ### 审批 defer 与续接时序图
 
@@ -219,9 +220,9 @@ sequenceDiagram
     participant D as Claude Code 驱动器
     participant A as Agent 进程
     participant S as workspace
-    R->>W: PrepareSuspend{suspend_id, mode=destroy, require}
+    R->>W: PrepareSuspend{suspend_id, mode=destroy, require, self_wake_cutoff}
     W->>D: 进入安全点
-    D->>D: 核对回合边界、无在途请求、活动度静默、无后台作业、自唤醒条目都随续接恢复、除已声明的第三方 MCP 服务器外无其他进程、无工作区写文件描述符
+    D->>D: 核对回合边界、无在途请求、活动度静默、无后台作业、fire_at 为空或不早于 self_wake_cutoff 的自唤醒条目都随续接恢复、除已声明的第三方 MCP 服务器外无其他进程、无工作区写文件描述符
     D->>A: 关闭 stdin
     A-->>D: 正常退出并返回退出码
     D->>D: 终止已声明的第三方 MCP 服务器，复核无剩余进程与外部在途连接
@@ -357,6 +358,7 @@ sequenceDiagram
 | `class` | `call` 与 `job` 取闭集 `waiting`、`working`、`serving`、`unknown`；`turn` 取闭集 `question`、`completed`、`unknown` |
 | `target` | 等待对象的描述性标识，例如 `github:workflow_run:1234`；可空 |
 | `expected_ms` | 预计等待时长；可空 |
+| `prior` | 命中签名的时长先验 `{p25, p50, p90}`（毫秒），取自该签名的 `prior`；只在 `source=signature` 时非空，此时 `expected_ms` 取其中的 p50；其余来源为空 |
 | `source` | 闭集 `signature`、`self_report`、`keyword`、`classifier`；本驱动器发出的意图只取 `signature`、`keyword` 或 `classifier` |
 | `confidence` | 0～1；`signature` 为 0.9，`keyword` 为 0.3，`classifier` 为 0.6 |
 | `signature_id` | 命中的等待签名的 `id`；未命中为空 |
@@ -364,7 +366,7 @@ sequenceDiagram
 | `context` | 对象所在的上下文：主会话或某个子代理，按 stream-json 消息的 `parent_tool_use_id` 判定；只用于选择返回提示的 hook |
 | `classifier_pending` | 是否有进行中的宿主侧分类请求；每个对象至多一个 |
 
-`intent_observed` 携带 `{ref_kind, ref, class, target, expected_ms, source, confidence}`；`signature_id`、`correlation`、`context` 与 `classifier_pending` 只在驱动器内使用。
+`intent_observed` 携带 `{ref_kind, ref, class, target, expected_ms, prior, source, confidence}`；`signature_id`、`correlation`、`context` 与 `classifier_pending` 只在驱动器内使用。
 
 ### 提示频率状态
 
@@ -376,7 +378,7 @@ sequenceDiagram
 | `k` | 连续未采纳次数；采纳时归零，达到 2 时该键在本运行实例中此后不提示 |
 | `last_hint_turn` | 最近一次返回提示时的 `turn_ordinal`；从未提示为空 |
 | `window` | 待判定的提示：`{correlation, until_turn}`，`until_turn` 为 `last_hint_turn + N_adopt`；判定之后为空 |
-| `hinted`、`adopted`、`unadopted` | 已返回的提示、判为采纳与判为未采纳的计数；进入指标 |
+| `hinted`、`adopted`、`unadopted` | 已返回的提示、判为采纳与判为未采纳的计数，采纳的口径见[等待意图解析与情境提示](#等待意图解析与情境提示)中的「频率与采纳判定」；进入指标 |
 
 频率状态文件位于工作区，Agent 可以写入；其内容只影响提示的频率，不影响意图、事件与挂起。
 
@@ -412,7 +414,7 @@ sequenceDiagram
 | 4 | 控制面的 I9 预检因 `t-2` 不通过，选择冻结；10:10:05 之前按 `run.self_wake_at` 解冻 | `boundary`；进程冻结后解冻 | 无 |
 | 5 | 10:10:05 Claude Code 触发 `t-2`，自行开始回合 | `in_turn`；`turn_id=turn-13`；`t-2` 的 `fire_at` 已过且回合已开始，移除 | 无；发出 `turn_started{delivery_id=∅}` 与 `self_wake_changed{[c-1], crons_synced=true}` |
 | 6 | 回合结束，`Stop` 输入 `session_crons=[c-1]` | `boundary` | 无；发出 `turn_ended` |
-| 7 | 收到 `PrepareSuspend{mode=destroy}`；第 1 至 7 步通过（`c-1` 随续接恢复），关闭 stdin 并完成其余步骤 | `exited` | 等待工作区持久化确认；上报 `ReadyToSuspend{session_id=ses-1}`；控制面落库后销毁沙箱，`run.self_wake` 保留 `c-1` |
+| 7 | 收到 `PrepareSuspend{mode=destroy, self_wake_cutoff}`；第 1 至 7 步通过（第 5 步检查的条目只有 `c-1`，它随续接恢复），关闭 stdin 并完成其余步骤 | `exited` | 等待工作区持久化确认；上报 `ReadyToSuspend{session_id=ses-1}`；控制面落库后销毁沙箱，`run.self_wake` 保留 `c-1` |
 | 8 | 次日 09:00 之前，控制面按 `run.self_wake_at` 重建第 7 代；回合边界上 `self_wake` 非空而 Agent 进程未运行，发出 `StartAgent{resume_session_id=ses-1}` | 启动前；新驱动器的 `self_wake` 为空，`crons_synced=false` | 无 |
 | 9 | 以 `claude -p --resume ses-1` 启动，不写入 stdin | `boundary`；`self_wake` 为空，`crons_synced=false` | 无；集合与 `crons_synced` 都未变化，不发 `self_wake_changed` |
 | 10 | 09:00 Claude Code 恢复 `c-1` 并在到点时触发，自行开始回合 | `in_turn`；`turn_id=turn-14` | 无；发出 `turn_started{delivery_id=∅}` |
@@ -424,13 +426,13 @@ sequenceDiagram
 
 | 步骤 | 事件或调用 | 驱动器状态 | 持久写入 |
 | --- | --- | --- | --- |
-| 1 | Agent 在主会话调用 `Bash{command="gh run watch 1234", run_in_background=true}`（`call_id=t-5`） | 命中 `gh-run-watch`，算得意图 `waiting`、`target=github:workflow_run:1234`、`expected_ms=360000`、`signature`、0.9、`correlation={workflow_run.id: 1234}`；`run_in_background=true`，不登记 `call` 意图 | 无；发出 `tool_started{t-5}` |
-| 2 | `tool_result` 返回后台任务标识 `b-1`，`b-1` 进入后台任务集合 | `intents` 加入 `(job, b-1)`，继承第 1 步的意图；`gh-run-watch` 没有条目，首次命中，`pending_hints` 加入 `b-1`（主会话） | 无；发出 `tool_ended{t-5}`、`bg_jobs_changed{[b-1]}` 与 `intent_observed{job, b-1, waiting, github:workflow_run:1234, 360000, signature, 0.9}` |
+| 1 | Agent 在主会话调用 `Bash{command="gh run watch 1234", run_in_background=true}`（`call_id=t-5`） | 命中 `gh-run-watch`，算得意图 `waiting`、`target=github:workflow_run:1234`、`expected_ms=360000`、`prior={p25: 120000, p50: 360000, p90: 1200000}`、`signature`、0.9、`correlation={workflow_run.id: 1234}`；`run_in_background=true`，不登记 `call` 意图 | 无；发出 `tool_started{t-5}` |
+| 2 | `tool_result` 返回后台任务标识 `b-1`，`b-1` 进入后台任务集合 | `intents` 加入 `(job, b-1)`，继承第 1 步的意图；`gh-run-watch` 没有条目，首次命中，`pending_hints` 加入 `b-1`（主会话） | 无；发出 `tool_ended{t-5}`、`bg_jobs_changed{[b-1]}` 与 `intent_observed{job, b-1, waiting, github:workflow_run:1234, 360000, prior={120000, 360000, 1200000}, signature, 0.9}` |
 | 3 | Agent 在主会话调用 `Read`（`t-6`），其 `PostToolUse` 是作业登记之后主会话的首个 hook 查询 | `pending_hints` 清空；`gh-run-watch`：`k=0`、`last_hint_turn=41`、`window={workflow_run.id: 1234, until_turn=44}`、`hinted=1` | 异步写入 `.platform/hint-state.json`；hook 返回订阅建议作为 `additionalContext` |
-| 4 | Agent 在下一次模型请求读到提示，调用 `subscribe_event`（外部系统 github，事件 `workflow_run.completed`，`correlation={workflow_run.id: 1234}`，`expected_wait=10m`，`call_id=t-7`），平台 MCP 服务器登记 `sub-3` | `gh-run-watch`：窗口内出现同一关联对象的订阅，判为采纳；`window` 置空，`k=0`，`adopted=1` | 异步写入频率状态；发出 `tool_started{t-7}`、`subscription_created{sub-3, since_cursor, agent_expected_ms=600000}` 与 `tool_ended{t-7}` |
+| 4 | Agent 在下一次模型请求读到提示，调用 `subscribe_event`（外部系统 github，事件 `workflow_run.completed`，`correlation={workflow_run.id: 1234}`，`expected_wait=10m`，`call_id=t-7`），平台 MCP 服务器登记 `sub-3` | `gh-run-watch`：窗口内出现同一 `event_type`、同一关联对象的订阅（满足其一即可），判为采纳；`window` 置空，`k=0`，`adopted=1` | 异步写入频率状态；发出 `tool_started{t-7}`、`subscription_created{sub-3, since_cursor, agent_expected_ms=600000}` 与 `tool_ended{t-7}` |
 | 5 | 回合结束，`Stop` 输入的 `last_assistant_message` 为「已登记 workflow run 1234 的完成订阅，本回合的修改已全部提交。」 | `intents` 加入 `(turn, turn-20)`：`completed`、`keyword`、0.3 | 无；发出 `intent_observed{turn, turn-20, completed, keyword, 0.3}`；`result` 与 `idle` 齐备后发出 `turn_ended` |
 
-走查确认意图层的结论。`run_in_background=true` 的调用立即返回，意图挂在它产生的作业上，作业触发的提示在作业登记之后同一上下文的首个 `PostToolUse` 返回，Agent 在下一次模型请求才读到；采纳按窗口内同一关联对象的 `subscribe_event` 判定，`expected_wait` 只随 `subscription_created.agent_expected_ms` 上报，不产生 `intent_observed`。`b-1` 仍在运行，回合边界不构成安全点，这一次等待由静止冻结与入站数据唤醒兜住；回合意图为 `completed`，宽限期的选择归 [suspendpolicy](../design-suspendpolicy.md)。若 Agent 忽略提示（第 4 步没有发生），并在 `turn_ordinal=42` 的回合再次以 `gh run watch` 等待，该提示判为未采纳（`k=1`），退避到 `turn_ordinal ≥ 43` 才再次提示；再次提示后仍未采纳时 `k=2`，本运行实例此后不提示该签名。
+走查确认意图层的结论。`run_in_background=true` 的调用立即返回，意图挂在它产生的作业上，作业触发的提示在作业登记之后同一上下文的首个 `PostToolUse` 返回，Agent 在下一次模型请求才读到；签名意图携带签名的 `prior`，等待时长预测直接使用其中的三个分位（见 [suspendpolicy](../design-suspendpolicy.md)）。采纳按窗口内同一关联对象或同一 `event_type` 的 `subscribe_event` 判定，第 4 步若订阅的是 workflow run 1235 的 `workflow_run.completed`，同样判为采纳；`expected_wait` 只随 `subscription_created.agent_expected_ms` 上报，不产生 `intent_observed`。`b-1` 仍在运行，回合边界不构成安全点，这一次等待由静止冻结与入站数据唤醒兜住；回合意图为 `completed`，宽限期的选择归 [suspendpolicy](../design-suspendpolicy.md)。若 Agent 忽略提示（第 4 步没有发生），并在 `turn_ordinal=42` 的回合再次以 `gh run watch` 等待，该提示判为未采纳（`k=1`），退避到 `turn_ordinal ≥ 43` 才再次提示；再次提示后仍未采纳时 `k=2`，本运行实例此后不提示该签名。Agent 以前台 `sleep 20` 等待时，纯定时等待的定时总长短于 `T_hint_timer`，驱动器只发出 `waiting` 意图，不触发提示。
 
 ### 启动命令与环境变量
 
@@ -497,7 +499,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 ### 审批路径
 
-`PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。驱动器在 hook 与 Claude Code 之间传递询问与决定。按渠道分别处置：
+`PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。二进制经看守进程的托管 hook IPC 端点向驱动器查询，端点对查询方的认证见[托管 hook 的执行](design-warden.md#托管-hook-的执行)。驱动器在 hook 与 Claude Code 之间传递询问与决定。按渠道分别处置：
 
 **异步渠道。** 驱动器先发出 `permission_requested{blocking=false}`，hook 再返回 `permissionDecision: "defer"`，阶段保持 `in_turn`，不经过 `blocked`；Claude Code 以 `stop_reason: tool_deferred` 结束回合后，驱动器发出 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 从驱动器取回决定并返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
 
@@ -509,7 +511,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 驱动器向 Claude Code 注入平台 MCP 服务器的连接配置，并合并项目作用域工具接入声明中已批准的第三方 MCP 服务器；工作区内的 `.mcp.json` 被忽略，`--strict-mcp-config` 或等效配置只使用平台下发的服务器集合。工具集合与语义归平台 MCP 服务器与第三方服务器；本模块负责以下接入工作：把工具调用的开始与结束翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，把 `subscribe_event`、`sleep_until` 与 `wait_for` 的结果翻译为 `subscription_created`、`timer_requested{scope=run}` 与 `wait_started{kind=wait_for}`，处置被自动转后台的调用，以及设置 `MCP_TOOL_TIMEOUT`。
 
-**自报等待时长与 `instructions`。** Agent 调用 `subscribe_event`、`wait_for` 与 `sleep_until` 时可以填写可选参数 `expected_wait`（预计等待时长）与 `reason`（短文本），不填就没有；参数定义与解析归看守进程的[平台 MCP 工具](design-warden.md#平台-mcp-工具)，平台不提供单独的意图回报工具。平台 MCP 服务器把 `expected_wait` 换算为毫秒随工具事件交给驱动器，驱动器写入 `subscription_created.agent_expected_ms` 与 `wait_started.agent_expected_ms`（`wait_for` 与阻塞型 `sleep_until`），未填或无法解析时为空；它与平台给出的 `predicted_ms` 分开上报，来源不混，置信度由 `suspendpolicy` 按该运行实例的自报历史计算。非阻塞 `sleep_until` 只产生 `timer_requested`，到点时刻已由 `fire_at` 给出，`expected_wait` 不上报；`reason` 不进入协议事件。平台 MCP 服务器在初始化时以 `instructions` 提供等待方式的选择规则，内容与工具描述一致（见[等待方式的选择](design-warden.md#等待方式的选择)），驱动器的 `SubagentStart` hook 向子代理注入同一文本。
+**自报等待时长与 `instructions`。** Agent 调用 `subscribe_event`、`wait_for` 与 `sleep_until` 时可以填写可选参数 `expected_wait`（预计等待时长）与 `reason`（短文本），不填就没有；参数定义与解析归看守进程的[平台 MCP 工具](design-warden.md#平台-mcp-工具)，平台不提供单独的意图回报工具。平台 MCP 服务器把 `expected_wait` 换算为毫秒随工具事件交给驱动器，驱动器写入 `subscription_created.agent_expected_ms` 与 `wait_started.agent_expected_ms`（`wait_for` 与阻塞型 `sleep_until`），未填或无法解析时为空；它与平台给出的 `predicted_ms` 分开上报，来源不混，置信度由 `suspendpolicy` 按该运行实例的自报历史计算。非阻塞 `sleep_until` 只产生 `timer_requested`，到点时刻已由 `fire_at` 给出，`expected_wait` 不上报；`reason` 不进入协议事件，由平台 MCP 服务器连同 `run_id`、`call_id`、工具名与 `expected_wait` 写进结构化日志，供诊断与抽检。平台 MCP 服务器在初始化时以 `instructions` 提供等待方式的选择规则，内容与工具描述一致（见[等待方式的选择](design-warden.md#等待方式的选择)），驱动器的 `SubagentStart` hook 向子代理注入同一文本。
 
 第三方 MCP 服务器只支持 stdio 本地子进程，可执行文件来自镜像内预置并固定版本与摘要；进程是 Agent 的子进程，位于 `agent` 子 cgroup，随 Agent 冻结与解冻，服务器进程本身不进入 `bg_jobs`。本文所称已声明的第三方 MCP 服务器进程包含这些服务器进程的子进程，与 `Activity.mcp_procs` 的计数范围相同；安全点检查第 6、9 步与孤儿进程的判定都按此口径。Agent 退出后这些服务器没有客户端，驱动器终止它们；以挂起为目的的销毁中，终止发生在 Agent 正常退出之后（安全点第 9 步），这是挂起路径中唯一的进程终止动作，口径见[安全点](#安全点)。快照恢复后重连或重启，销毁重建后必然重启。远程 MCP 视为普通外部系统流量，经本地代理或透明拦截器到出口代理，不在沙箱内起进程。
 
@@ -532,7 +534,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 2. 本代无在途请求：本地代理的 LLM 在途请求为空，且本地代理与透明拦截器的外部在途连接计数为 0。
 3. 活动度静默不短于 `Q_quiet`：由看守进程的活动度采集提供，忙信号的解释归 `suspendpolicy`。
 4. 后台作业为空：`bg_jobs` 为空（含孤儿进程），对应 `PrepareSuspend.require.no_bg_procs`。
-5. 自唤醒条目都随续接恢复：`self_wake` 中不存在 `survives_resume=false` 的项。
+5. 自唤醒条目都随续接恢复：`self_wake` 中 `fire_at` 为空或不早于 `PrepareSuspend.self_wake_cutoff` 的条目里不存在 `survives_resume=false` 的项。
 6. 进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外无其他进程；存在残留进程或孤儿进程时回 `Busy`，驱动器不终止这些进程。
 7. 无工作区写文件描述符：`ws_write_fds` 为 0。
 8. 关闭 stdin，等待进程正常退出并取得退出码。
@@ -541,6 +543,8 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 11. 等待工作区持久化确认：共享文件系统为 fsync 完成；`durableDir` 退化配置下为同步挂起上传完成。
 
 第 4、5 步保证销毁不丢失 Agent 的运行态：后台任务与 `survives_resume=false` 的自唤醒条目（`wakeup`、`tool_timeout`、`monitor_deadline`）都只存在于当前进程，`--resume` 不恢复它们；`cron` 条目由 Claude Code 经 `--resume` 自行恢复，不阻止销毁。任一步不满足时运行实例只能冻结，冻结的条件由 `runcontroller` 与 `suspendpolicy` 判定。
+
+第 5 步的界限 `self_wake_cutoff` 是绝对时刻，只在 `mode=destroy` 时非空，取 `now − (L_self_wake(destroyed) + P_quiesce)`；`runcontroller` 在「发起挂起」与升级为销毁的「冻结中升级」时写入，与挂起尝试一起落库，重发的 `PrepareSuspend` 取同一值（[runcontroller](../design-runcontroller.md)）。`fire_at` 早于该界限的条目是按销毁形态计算的[过期自唤醒条目](../../../glossary.md)，视为已触发、待驱动器对账，不参与本步检查；`fire_at` 为空的条目照常检查。驱动器的口径因此与控制面 I9 预检一致：只看有效自唤醒条目与 `fire_at` 为空的条目。
 
 任何挂起路径都不终止进程，唯一的例外是第 9 步：已声明的第三方 MCP 服务器（含其子进程）是 Agent 按声明启动的子进程，Agent 正常退出后没有客户端，销毁重建后本来就要重启，驱动器在第 8 步取得退出码之后终止它们，不损失 Agent 的能力。后台作业、残留进程与孤儿进程都不终止，存在时回 `Busy`（第 4、6 步），由 Agent 自行结束。
 
@@ -594,13 +598,13 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 1. **建立时机**：`tool_timeout` 条目在 `tool_started` 时建立；`cron`、`wakeup` 与 `monitor_deadline` 条目在对应调用的 `tool_result` 成功返回时建立，`fire_at` 仍以 `tool_started` 时刻起算；`tool_result` 为错误结果时不建立。
 2. **对账**：`Stop`（每个回合结束）与 `SubagentStop` 的输入带 `session_crons{id, schedule, recurring, prompt}`。驱动器以它为准增删 `kind=cron` 条目：其中有而 `self_wake` 中没有的 `id` 加入，`schedule` 与 `recurring` 取自该项；`self_wake` 中有而其中没有的 `cron` 条目移除。对账不改动其余种类的条目。本进程第一次完成对账后 `crons_synced` 置真。
-3. **cron 表达式无法解析**：`fire_at` 置空并计数告警，条目照常加入集合，`survives_resume` 仍为真。`fire_at` 为空表示触发时刻未知，控制面无法保证到点时进程可运行，存在这样的条目时运行实例不挂起（`suspendpolicy.decide` 返回 `NONE`），直到该条目被 `CronDelete` 或对账移除。
+3. **cron 表达式无法解析**：`fire_at` 置空并计数告警，条目照常加入集合，`survives_resume` 仍为真。`fire_at` 为空表示触发时刻未知，控制面无法保证到点时进程可运行，存在这样的条目时运行实例不挂起（`suspendpolicy.decide` 返回 `NONE`），直到该条目被 `CronDelete` 或对账移除；运行实例处于挂起过程中或已挂起时出现这样的条目，控制面按必须唤醒处理，`wake_reason=timer`（规则归 [runcontroller](../design-runcontroller.md)）。
 4. **进程退出**：移除 `survives_resume=false` 的条目（它们只存在于已退出的进程中），集合变化时发出；`cron` 条目保留，`crons_synced` 保持退出前的取值，下一个以 `--resume` 启动的进程由 Claude Code 自行恢复这些作业。
 5. **发出时机**：`self_wake` 的成员、任一 `fire_at` 或 `crons_synced` 变化时发出 `self_wake_changed{entries, crons_synced}`，`entries` 为完整集合。驱动器在本代 Agent 进程启动后即可发出，不等待首次取得 `session_crons`：每次 Agent 进程启动时 `crons_synced` 置假，同代进程重启同样从假起算；为假时集合中的 `cron` 条目可能不完整（例如缺少 Claude Code 经 `--resume` 恢复的作业），首次取得 `session_crons` 并对账之后为真。接收方按 `crons_synced` 处理，规则归 [runcontroller](../design-runcontroller.md)：为真时整体替换 `run.self_wake`；为假时整体替换 `kind≠cron` 的条目，`cron` 条目按 `entry_id` 合并，集合中出现的覆盖同 `entry_id` 的已有条目，`run.self_wake` 中已有而集合中未出现的保留。同代进程重启后以 `crons_synced=false` 发出的集合因此清除上一进程遗留的 `wakeup`、`tool_timeout` 与 `monitor_deadline` 条目，保留 `cron` 条目；`crons_synced` 为假期间被 `CronDelete` 移除的 `cron` 条目留在 `run.self_wake` 中，直到下一次对账后以 `crons_synced=true` 的集合整体替换。
-6. **到点之前的恢复**：条目只用于让控制面在到点之前恢复运行实例。冻结中由控制面按 `run.self_wake_at` 解冻；销毁重建后，控制面在回合边界上 `self_wake` 非空而本代 Agent 进程未运行时发出 `StartAgent`，规则归 [runcontroller](../design-runcontroller.md)。控制面只以有效条目计算 `run.self_wake_at` 与等待上界：`fire_at` 非空且不早于 `now − (L_self_wake(substate) + P_quiesce)` 的条目；`fire_at` 早于该界限的条目视为已触发、待驱动器对账，不阻止挂起，驱动器按上表的移除条件、`recurring` 重算与 `session_crons` 对账更新或移除它们（规则归 runcontroller 与 [suspendpolicy](../design-suspendpolicy.md)）。
+6. **到点之前的恢复**：条目只用于让控制面在到点之前恢复运行实例。冻结中由控制面按 `run.self_wake_at` 解冻；销毁重建后，控制面在回合边界上 `self_wake` 非空而本代 Agent 进程未运行时发出 `StartAgent`，规则归 [runcontroller](../design-runcontroller.md)。控制面只以有效自唤醒条目计算 `run.self_wake_at` 与等待上界；过期自唤醒条目视为已触发、待驱动器对账，不阻止挂起，驱动器按上表的移除条件、`recurring` 重算与 `session_crons` 对账更新或移除它们（规则归 runcontroller 与 [suspendpolicy](../design-suspendpolicy.md)）。
 7. **`StartAgent` 之后**：驱动器以 `--resume <session_id>` 启动 Claude Code，不写入 stdin，阶段为 `boundary`。会话内定时由 Claude Code 自行恢复并在到点时触发，触发产生的回合是 Agent 自行开始的回合，`turn_started.delivery_id` 为空。
 
-`survives_resume=false` 的条目使回合边界不构成安全点（安全点第 5 步）：销毁会丢失只存在于当前进程的定时，运行实例因此只能冻结，到点前由控制面解冻。
+`fire_at` 不早于 `self_wake_cutoff` 且 `survives_resume=false` 的条目使回合边界不构成安全点（安全点第 5 步）：销毁会丢失只存在于当前进程的定时，运行实例因此只能冻结，到点前由控制面解冻。
 
 ### 等待意图解析与情境提示
 
@@ -633,13 +637,13 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 - `match.command` 是正则，在 Bash 的 `command`（作业取其发起调用的 `command`）与 `Monitor` 的命令中查找。
 - `match.request{host, method, path_regex}` 对 `Monitor` 的 URL 按主机与路径匹配。对网络请求的匹配需要路径级观察，路径只在出口代理可见，这一观察是可选能力；不具备时驱动器不以网络请求判定 `match.request` 命中，同一主机的重复连接只按周期性连接分类。
-- 命中后按 `correlation` 规则从匹配结果（正则的命名分组）提取关联键身份键的取值；`target` 由外部系统名、`event_type` 的对象部分与身份键取值拼成（`github:workflow_run:1234`），`expected_ms` 取 `prior` 的 p50，`class=waiting`，`confidence=0.9`。
+- 命中后按 `correlation` 规则从匹配结果（正则的命名分组）提取关联键身份键的取值；`target` 由外部系统名、`event_type` 的对象部分与身份键取值拼成（`github:workflow_run:1234`），意图的 `prior` 取签名的 `prior`，`expected_ms` 取其中的 p50，`class=waiting`，`confidence=0.9`。
 - `event_type` 属于该外部系统事件目录（与 `list_events` 一致）由 `connectorhub` 在装载时校验，驱动器不重复校验；正则无法编译的签名跳过并计数。
-- 没有签名命中的等待只做分类，不给订阅建议；纯定时等待另按频率键 `timer` 建议 `sleep_until`。
+- 没有签名命中的等待只做分类，不给订阅建议；纯定时等待另按频率键 `timer` 建议 `sleep_until`，门槛见下文「提示触发」。
 
 **周期性连接。** 本地代理与透明拦截器按主机与归属对象记录 Agent 外部连接的建立时刻并判定周期性连接，承载 LLM 请求与平台 MCP 交互的回环连接不在记录之列；判据与参数见[本地代理](design-warden-llmproxy.md#周期性连接观测)。归属对象由驱动器按连接所属进程判定：该进程或其祖先进程属于某个作业的 `pids` 时归该作业；否则 `running_tools` 中恰好有一个 Bash 调用时归该调用；其余情形不归属。归属为空的观测不产生意图；有归属的观测判为 `class=waiting`，`target` 取主机名，`source=keyword`，`confidence=0.3`，对象已有更高置信度的意图时不发出；撤销通知不改变已发出的意图。
 
-**宿主侧分类。** `intent.classifier` 开启时，规则结果为 `unknown` 的调用与作业（命令与描述）以及回合（最后一条消息）由看守进程经本地代理向 `llmgateway` 发出分类请求。请求只含待分类的文本与 `class` 闭集，不含会话记录，不经 Agent 进程，不进入 Agent 上下文，附运行实例令牌、按运行实例计费。本地代理把它标为宿主侧请求，不为它发出 `llm.request.*` 事件，不计入本地代理的请求记录、外部在途连接与 `Activity.llm_last_request_at`，因此它不形成 LLM 阻塞，不影响静止证据与看守进程侧的安全点复核；`llmgateway` 按普通请求登记在途请求事实，请求在网关结束之前 I9 预检中的「本代无在途请求」不成立（见[本地代理](design-warden-llmproxy.md#宿主侧分类请求)）。每个对象至多一个请求，失败与超时不重试；结果属于闭集时以 `source=classifier`、`confidence=0.6` 发出并覆盖规则结果，越出闭集按 `unknown` 处理，对象已结束时丢弃。hook 查询与回合边界判定都不等待分类结果；进入安全点时放弃进行中的分类请求。
+**宿主侧分类。** `intent.classifier` 开启时，规则结果为 `unknown` 的调用与作业（命令与描述）以及回合（最后一条消息）由看守进程经本地代理向 `llmgateway` 发出分类请求。请求只含待分类的文本与 `class` 闭集，不含会话记录，不经 Agent 进程，不进入 Agent 上下文，附运行实例令牌、按运行实例计费。本地代理转发时附上请求头 `x-castworks-purpose: classifier`（`purpose=classifier`），不为它发出 `llm.request.*` 事件，不计入本地代理的请求记录、外部在途连接与 `Activity.llm_last_request_at`；`llmgateway` 照常校验令牌并计费，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，也不写 `llm_completed` 或 `llm_failed` 唤醒信号。分类请求因此不进入阻塞条件与静止证据，不影响 I9 预检的「本代无在途请求」与看守进程侧的安全点复核。该标记只由看守进程自身发起的分类请求携带：本地代理剥离来自 Agent 进程的请求中的该请求头，`llmgateway` 不接受 Agent 侧的该标记（见[本地代理](design-warden-llmproxy.md#宿主侧分类请求)）。每个对象至多一个请求，失败与超时不重试；结果属于闭集时以 `source=classifier`、`confidence=0.6` 发出并覆盖规则结果，越出闭集按 `unknown` 处理，对象已结束时丢弃。hook 查询与回合边界判定都不等待分类结果；进入安全点时放弃进行中的分类请求。
 
 **发出规则。** 每个对象先按规则得到意图，宿主侧分类在规则之后补判；同一对象后到的结果只在置信度不低于当前意图时发出，接收方以它覆盖先到者。
 
@@ -647,16 +651,16 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 - `job` 意图在作业进入 `bg_jobs` 并发出 `bg_jobs_changed` 之后发出，作业离开 `bg_jobs` 之后不发。作业继承发起调用的意图：关联取任务消息携带的 `tool_use_id`，`run_in_background=true` 的 Bash 调用按其 `tool_result` 返回的后台任务标识关联；关联不上时不产生意图。周期性连接可以在作业存续期间更新它的意图。
 - `turn` 意图按上文「最后一条消息的分类」发出。
 - 意图的移除不发事件：接收方在调用 `tool_ended`、作业离开 `bg_jobs` 与下一回合开始时删除对应意图（规则归 [runcontroller](../design-runcontroller.md)）；驱动器在同样的时刻从 `intents` 移除对应项，进程退出时清空。
-- 驱动器按 `ref_kind`、`source` 与 `class` 对全部判定结果计数（含不发出的 `unknown`），与命中签名的前台等待时长、提示与采纳的计数经看守进程的指标通道导出；`runcontroller` 按收到的 `intent_observed` 统计的分类分布不含不发出的 `unknown`。
+- 驱动器按 `ref_kind`、`source` 与 `class` 对全部判定结果计数（含不发出的 `unknown`），与命中签名的前台等待时长、提示、采纳与未采纳的计数（采纳按下文「频率与采纳判定」的口径）经看守进程的指标通道导出；`runcontroller` 按收到的 `intent_observed` 统计的分类分布不含不发出的 `unknown`。
 
-**提示触发。** `intent.hints` 开启时，以下对象触发一次提示判定：意图为 `waiting` 且命中签名的调用或作业，建议 `subscribe_event` 并给出事件类型与关联键；纯定时等待的调用或作业，建议 `sleep_until`。`serving`、`working`、`unknown` 与未命中签名的 `waiting` 不触发。每个对象至多触发一次：`run_in_background=true` 的调用由它产生的作业触发；被自动转后台的调用产生的作业继承意图，不算新的触发。判定通过的提示进入 `pending_hints`，按以下规则返回：
+**提示触发。** `intent.hints` 开启时，以下对象触发一次提示判定：意图为 `waiting` 且命中签名的调用或作业，建议 `subscribe_event` 并给出事件类型与关联键；定时总长不短于 `T_hint_timer`（30 s）的纯定时等待调用或作业，建议 `sleep_until`。`serving`、`working`、`unknown` 与未命中签名的 `waiting` 不触发；定时总长短于 `T_hint_timer` 的纯定时等待不触发，改用 `sleep_until` 没有收益；定时总长算不出的纯定时等待同样不触发，提示内容需要的时长与到点时刻无从给出。每个对象至多触发一次：`run_in_background=true` 的调用由它产生的作业触发；被自动转后台的调用产生的作业继承意图，不算新的触发。判定通过的提示进入 `pending_hints`，按以下规则返回：
 
 - 调用触发的提示附在同一 `tool_use_id` 的 `PostToolUse` 上；该调用以错误结束、没有触发 `PostToolUse` 时，附在随后的 `PostToolBatch` 上。
 - 作业触发的提示附在作业登记之后、与发起调用处于同一上下文的首个 `PostToolUse` 上。
 - 每次 hook 查询至多返回一条提示，其余留待后续查询。
 - 待返回的提示在以下时刻丢弃，丢弃的提示不计为已提示：调用触发的提示所在回合结束；作业触发的提示对应的作业离开 `bg_jobs`；`intent.hints` 关闭；进程退出。
 
-`PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 出现在工具结果旁，模型在工具结束后的下一次模型请求才读到（[REF-claude-code-hooks](../../../references.md)），情境提示因此只改善同类等待的下一次，当下这一次由机械层兜住。这两个 hook 与审批 hook 同一机制，由看守进程提供的托管 hook 二进制实现，注册在托管策略设置中，在 `allowManagedHooksOnly` 下生效；二进制经本地 IPC 向驱动器查询后同步返回，耗时目标 10 ms 以内，查询失败或超时时以成功退出、不输出 `additionalContext`，不设置 `onFailure: block`。`Stop` 与 `SubagentStop` 的 `additionalContext`（会让对话继续）、`PreToolUse` 的 deny 与 ask（属于拦截）以及 `UserPromptSubmit` 不作为提示载体。
+`PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 出现在工具结果旁，模型在工具结束后的下一次模型请求才读到（[REF-claude-code-hooks](../../../references.md)），情境提示因此只改善同类等待的下一次，当下这一次由机械层兜住。这两个 hook 与审批 hook 同一机制，由看守进程提供的托管 hook 二进制实现，注册在托管策略设置中，在 `allowManagedHooksOnly` 下生效；二进制经看守进程的托管 hook IPC 端点向驱动器查询后同步返回，耗时目标 10 ms 以内，查询失败或超时时以成功退出、不输出 `additionalContext`，不设置 `onFailure: block`。端点对查询方的认证由看守进程执行，未通过认证的查询不到达驱动器，hook 二进制按查询失败处理（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)）。`Stop` 与 `SubagentStop` 的 `additionalContext`（会让对话继续）、`PreToolUse` 的 deny 与 ask（属于拦截）以及 `UserPromptSubmit` 不作为提示载体。
 
 **提示内容。** 提示只含事实、可选做法与可以忽略的说明，开头标明来自平台而不是用户，不超过 600 字符。订阅建议给出触发对象的命令、等待对象，以及 `subscribe_event` 所需的外部系统、事件类型与关联键，并写明「需要继续当前工作时可以登记订阅后继续」；纯定时建议给出定时时长与 `sleep_until` 的到点时刻，并写明「需要继续当前工作时可以登记定时后继续」。拼接后超过 600 字符时省略命令原文，仍超过时不提示并计数。订阅建议示例：
 
@@ -664,13 +668,14 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 [平台提示，不是用户消息] 刚才的 `gh run watch 1234` 在等待 GitHub workflow run 1234 完成。可选做法：调用 subscribe_event（外部系统 github，事件 workflow_run.completed，关联键 workflow_run.id=1234）后结束本回合，事件到达后作为下一回合的输入，等待期间沙箱可以挂起。需要继续当前工作时可以登记订阅后继续。此提示可以忽略。
 ```
 
-**频率与采纳判定。** 频率按[提示频率状态](#提示频率状态)的条目判定：同一频率键在每个运行实例首次命中时提示；之后仍出现同键的等待而上一次提示尚未采纳时判为未采纳，按 2^k 个回合退避；连续两次未采纳后本运行实例此后不提示该键。采纳指提示后 `N_adopt`（3）个回合内出现同一关联对象的 `subscribe_event`，或在纯定时提示后出现 `sleep_until`；判定以登记成功为准（`subscription_created`，或 `timer_requested`、阻塞型的 `wait_started{kind=timer}`），事件类型与关联键取该调用的 `tool_use` 输入。
+**频率与采纳判定。** 频率按[提示频率状态](#提示频率状态)的条目判定：同一频率键在每个运行实例首次命中时提示；之后同键再次触发提示判定而上一次提示尚未采纳时判为未采纳，按 2^k 个回合退避；连续两次未采纳后本运行实例此后不提示该键。订阅建议的采纳指提示后 `N_adopt`（3）个回合内出现同一关联对象或同一 `event_type` 的 `subscribe_event`，两者满足其一即可；纯定时建议的采纳指提示后 `N_adopt` 个回合内出现 `sleep_until`。判定以登记成功为准（`subscription_created`，或 `timer_requested`、阻塞型的 `wait_started{kind=timer}`），外部系统、事件类型与关联键取该调用的 `tool_use` 输入。
 
 ```text
-on_trigger(key, obj):                      # obj 的意图为 waiting 且命中签名，或为纯定时等待
+on_trigger(key, obj):                      # obj 的意图为 waiting 且命中签名，
+                                           # 或为定时总长不短于 T_hint_timer 的纯定时等待
   if pending_hints 中已有 key: return
   e = hint_state[key]                      # 没有条目时 k=0，last_hint_turn 与 window 为空
-  if e.window ≠ ∅:                         # 上一次提示尚未判定，又出现同键的等待
+  if e.window ≠ ∅:                         # 上一次提示尚未判定，同键再次触发
     e.window = ∅; e.k += 1; e.unadopted += 1
   if e.k ≥ 2: return                       # 连续两次未采纳
   if e.k > 0 and turn_ordinal < e.last_hint_turn + 2^e.k: return   # 退避
@@ -687,10 +692,11 @@ on_turn_started():
     e.window = ∅; e.k += 1; e.unadopted += 1        # 窗口内未采纳
 
 on_registered(call):                       # subscribe_event 或 sleep_until 登记成功
-  for e in hint_state where e.window ≠ ∅:
+  for e in hint_state where e.window ≠ ∅:  # 窗口非空即仍在 N_adopt 个回合之内
     if (e.key = timer and call 为 sleep_until) or
-       (call 为 subscribe_event and call.event = 签名(e.key).event_type
-        and call.correlation 含 e.window.correlation):
+       (e.key ≠ timer and call 为 subscribe_event and call.system = e.key.system
+        and (call.event = 签名(e.key).event_type                 # 同一 event_type
+             or call.correlation 含 e.window.correlation)):      # 同一关联对象
       e.window = ∅; e.k = 0; e.adopted += 1
 ```
 
@@ -699,6 +705,13 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 **静态契约。** 平台 MCP 服务器的 `instructions` 承载等待方式的选择规则，与工具描述一致；`SubagentStart` hook 常驻向子代理注入同一文本作为 `additionalContext`，长度在 10000 字符上限之内。静态契约不受 `intent.hints` 控制。
 
 **开关。** 沙箱侧配置中的 `intent{hints, classifier}` 由 `connectorhub` 生成、看守进程按 `revision` 应用：`intent.hints` 控制情境提示，默认关闭；`intent.classifier` 控制宿主侧分类，默认关闭；意图解析与 `intent_observed` 始终开启，不受开关控制。开关与 `wait_signatures` 的更新从应用时起对此后的触发生效，已发出的意图不重算；`intent.hints` 关闭时丢弃待返回的提示，频率状态保留。
+
+**参数。** 情境提示的参数如下；取值调整不改变提示的触发对象、载体与采纳口径。
+
+| 参数 | 默认值 | 含义与约束 |
+| --- | --- | --- |
+| `N_adopt` | 3 个回合 | 采纳窗口：提示返回后 `N_adopt` 个回合内出现符合口径的登记计为采纳，窗口过后仍未采纳计为未采纳 |
+| `T_hint_timer` | 30 s | 纯定时等待触发 `sleep_until` 建议的最短定时总长；短于此值或定时总长算不出的纯定时等待不提示 |
 
 ### 终止路径
 
@@ -734,7 +747,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 | 会话记录 JSONL 末尾不含本回合 | 回 `Busy`；等待 transcript 刷盘后重试，不销毁 |
 | 工作区持久化确认未完成 | 回 `Busy`；不销毁，恢复句柄不落库 |
 | 存在其他进程或工作区写文件描述符 | 回 `Busy`；不终止这些进程，不绕过 Agent 正常退出，由控制面在 `retry_after` 后复评 |
-| 自唤醒条目中存在 `survives_resume=false` 的项 | 回 `Busy`；不取消、不改写 Agent 的定时，回合边界不构成安全点 |
+| `fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目中存在 `survives_resume=false` 的项 | 回 `Busy`；不取消、不改写 Agent 的定时，回合边界不构成安全点 |
 | 已声明的第三方 MCP 服务器在回合边界保持外部长连接 | 回 `Busy`；不提前终止该服务器，由控制面在 `retry_after` 后复评；连接关闭之前不销毁 |
 | `PreToolUse` hook 超时 | `onFailure: block` 生效，返回拒绝结果并带消息；不默认放行，不无限阻塞 |
 | 审批决定的目标已失效 | 回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递 |
@@ -748,9 +761,9 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 | 快照恢复后时钟跳变 | 丢弃旧截止时间并按校时后的时钟重建；不重放已交付输入 |
 | 后台作业未结束 | 回合边界不构成安全点，安全点检查回 `Busy`；驱动器不终止后台作业，运行实例只能经静止冻结挂起 |
 | `Stop` 或 `SubagentStop` 输入的 `background_tasks` 与 `background_tasks_changed` 的集合不一致 | 以 `background_tasks_changed` 为准并计数；不改变 `bg_jobs` |
-| cron 表达式无法解析 | `fire_at` 置空并计数告警，条目照常随 `self_wake_changed` 发出；存在 `fire_at` 为空的条目时运行实例不挂起（`suspendpolicy.decide` 返回 `NONE`），直到该条目被 `CronDelete` 或对账移除 |
+| cron 表达式无法解析 | `fire_at` 置空并计数告警，条目照常随 `self_wake_changed` 发出；存在 `fire_at` 为空的条目时运行实例不挂起（`suspendpolicy.decide` 返回 `NONE`），直到该条目被 `CronDelete` 或对账移除；挂起过程中或已挂起时出现这样的条目，控制面按必须唤醒处理 |
 | 定时类工具调用的 `tool_result` 为错误结果 | 不建立条目；Bash 调用的 `tool_timeout` 条目随 `tool_ended` 移除 |
-| 托管 hook 二进制向驱动器查询超时，或驱动器不可达 | hook 以成功退出、不输出 `additionalContext`，工具结果与回合照常继续；该提示不计为已提示，留在 `pending_hints` 中等待后续查询或按丢弃规则丢弃；计数 |
+| 托管 hook 二进制向驱动器查询情境提示时超时、驱动器不可达，或查询未通过看守进程 IPC 端点的对端认证 | hook 以成功退出、不输出 `additionalContext`，工具结果与回合照常继续；该提示不计为已提示，留在 `pending_hints` 中等待后续查询或按丢弃规则丢弃；计数 |
 | 沙箱侧配置中的 `wait_signatures` 或 `intent` 缺失、无法解析 | 按签名为空、`intent.hints` 与 `intent.classifier` 都关闭处理；规则分类与 `intent_observed` 照常 |
 | 等待签名的正则无法编译 | 跳过该签名并计数，其余签名照常匹配 |
 | 宿主侧分类请求失败或超时 | 保留规则结果，不重试并计数；不影响回合、安全点与挂起 |
