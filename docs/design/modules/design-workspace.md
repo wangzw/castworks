@@ -483,6 +483,7 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 | `<project_root>/<run_id>/` | 工作区根，权限 0700，配额作用于此 | `Ensure` 创建（看守进程执行），Agent 与看守进程读写 |
 | `<run_id>/.platform/deliveries.jsonl` | 投递意图日志，`accepted{seq}` 与 `consumed{seq, turn_id}` 按行追加并同步写入 | 看守进程 |
 | `<run_id>/.platform/initialized` | 已初始化标记；存在即表示首次初始化完成，重建后据此跳过初始化 | 看守进程 |
+| `<run_id>/.platform/hint-state.json` | 情境提示的频率状态，异步写入、不要求同步；缺失或无法解析时从空状态起算，内容只影响提示频率（见 [Claude Code 驱动器](warden/design-warden-driver-claude-code.md)） | 看守进程 |
 | `<run_id>/.platform/agent-config/` | `CLAUDE_CONFIG_DIR` 指向的 Agent 状态目录，会话记录与项目状态随工作区持久化（[REF-claude-code-env-vars](../../references.md)） | Agent 进程 |
 
 `.platform` 是平台管理目录，Agent 的普通工作文件位于运行实例子目录的其他路径；Agent 状态目录、投递意图日志与已初始化标记都不放在 rootfs。

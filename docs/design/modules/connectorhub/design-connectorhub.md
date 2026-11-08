@@ -1,10 +1,10 @@
 # connectorhub
 
-`connectorhub` 坐在控制面，是外部系统与[运行实例](../../../glossary.md)之间的唯一入口。它拥有[外部系统定义](../../../glossary.md)、[连接器](../../../glossary.md)实例、[连接器事件日志](../../../glossary.md)、[订阅](../../../glossary.md)登记与订阅状态、[完成条件目录](../../../glossary.md)、[出口策略](../../../glossary.md)与[沙箱侧配置](../../../glossary.md)的生成与推送、[工具接入声明](../../../glossary.md)的装载与校验，以及 k8s 路径的平台出口代理子模块；它不执行第三方操作，不拥有[收件箱](../../../glossary.md)、[唤醒信号](../../../glossary.md)与运行实例状态，不拥有人类通道、LLM 流量与[沙箱](../../../glossary.md)生命周期。本模块向运行实例交付外部事件只有订阅完成事件一种形态，文档围绕连接器事件日志与订阅这对机制组织。
+`connectorhub` 坐在控制面，是外部系统与[运行实例](../../../glossary.md)之间的唯一入口。它拥有[外部系统定义](../../../glossary.md)、[连接器](../../../glossary.md)实例、[连接器事件日志](../../../glossary.md)、[订阅](../../../glossary.md)登记与订阅状态、[完成条件目录](../../../glossary.md)、[出口策略](../../../glossary.md)与[沙箱侧配置](../../../glossary.md)的生成与推送、[工具接入声明](../../../glossary.md)与[等待签名](../../../glossary.md)的装载与校验，以及 k8s 路径的平台出口代理子模块；它不执行第三方操作，不拥有[收件箱](../../../glossary.md)、[唤醒信号](../../../glossary.md)与运行实例状态，不拥有人类通道、LLM 流量、[沙箱](../../../glossary.md)生命周期与 Agent 的[等待意图](../../../glossary.md)。本模块向运行实例交付外部事件只有订阅完成事件一种形态，文档围绕连接器事件日志与订阅这对机制组织。
 
 心智模型：webhook 先落盘再应答，订阅登记先回溯再等待；正确性不依赖事件与登记谁先到达（I2）。
 
-文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、状态一览、走查、订阅登记与回溯匹配、webhook 摄入、完成事件构造与投递、去重、出口策略生成与推送；外部系统定义、外部接口契约、依赖、UML 图、核心数据结构与实现状态作为参考，在核对字段或调用时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按下文规则判断每个交错序列的结果，再与表中结论核对。
+文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、状态一览、走查、订阅登记与回溯匹配、webhook 摄入、完成事件构造与投递、去重、出口策略生成与推送；外部系统定义、等待签名、外部接口契约、依赖、UML 图、核心数据结构与实现状态作为参考，在核对字段或调用时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按下文规则判断每个交错序列的结果，再与表中结论核对。
 
 ## 核心概念
 
@@ -27,8 +27,9 @@
 - **订阅对账扫描**：按配置的扫描周期重新匹配留存事件，为命中且对该事件尚无认领记录的活动订阅补写认领，重投 `pending` 的完成事件投递记录，取消运行实例已终态的活动订阅，并把 `timeout_at` 已到期且仍为 `active` 的订阅置为 `expired` 并写入超时完成事件；以认领记录、投递记录的唯一键与订阅状态 CAS 幂等。
 - **订阅生命周期**：维护 `active`、`completed`、`expired`、`cancelled`；`lifetime: once` 完成后丢弃同对象的迟到事件并审计；超时以 CAS 置 `expired` 并经汇入契约写入超时完成事件；运行实例终态，或 `active` 订阅的完成事件投递被终态拒绝时取消订阅。
 - **出口策略生成与推送**：为每个运行实例生成允许主机、占位符替换规则与按主机通道模式，经 `PutEgressPolicy` 推送给沙箱提供者；未列入的主机默认拒绝；git 路径按 `reverse_proxy_rewrite` 生成重写规则。
-- **沙箱侧配置生成与推送**：在生成或更新出口策略的同一时机，以按主机通道模式与工具接入声明生成[沙箱侧配置](../../../glossary.md)（`SandboxConfig`），以同一次生成的 `Revision` 经 `runcontroller` 的 `PutSandboxConfig` 推送，由 `runcontroller` 在[出站流](../../../glossary.md)上发给[看守进程](../../../glossary.md)。
-- **工具接入声明装载与校验**：按项目装载[工具接入声明](../../../glossary.md)，生成出口策略时按该运行实例的出口策略校验，把通过校验的声明与按主机通道模式一起放入沙箱侧配置；校验不通过或 `SandboxConfig` 序列化后超过 32 KiB 时，声明不进入沙箱侧配置，记录审计并计数。
+- **沙箱侧配置生成与推送**：在生成或更新出口策略的同一时机，以按主机通道模式、工具接入声明、等待签名与项目的等待意图开关生成[沙箱侧配置](../../../glossary.md)（`SandboxConfig`），以同一次生成的 `Revision` 经 `runcontroller` 的 `PutSandboxConfig` 推送，由 `runcontroller` 在[出站流](../../../glossary.md)上发给[看守进程](../../../glossary.md)。
+- **工具接入声明装载与校验**：按项目装载[工具接入声明](../../../glossary.md)，生成出口策略时按该运行实例的出口策略校验，把通过校验的声明与按主机通道模式一起放入沙箱侧配置；校验不通过，或置空等待签名之后 `SandboxConfig` 序列化仍超过 32 KiB 时，声明不进入沙箱侧配置，记录审计并计数。
+- **等待签名装载与下发**：装载外部系统定义中的 `wait_signatures`，校验每条签名的匹配规则与关联键提取规则可解析、`event_type` 属于该外部系统的[事件目录](../../../glossary.md)（与 `list_events` 的投影一致）；生成沙箱侧配置时把运行实例可用外部系统的签名放入其中，供看守进程的 Agent 驱动器分类等待并给出订阅建议。校验不通过的签名不装载，记录审计并计数，定义的其余部分照常生效；`SandboxConfig` 序列化超过 32 KiB 时首先置空等待签名。
 - **令牌代校验**：订阅登记与 k8s 路径的每个出口请求按[运行实例令牌](../../../glossary.md)校验签名、[代](../../../glossary.md)、终态与作废状态；订阅登记不使用缓存的代。
 - **附件存放与取回**：存放超过 `S_max` 的原始负载，向平台 MCP 服务器提供附运行实例令牌的取回接口，按内容哈希校验内容。
 - **平台出口代理子模块（k8s 路径）**：终止 CONNECT 或 HTTP 前置请求，按运行实例白名单鉴权，替换请求头中的凭据占位符，再转发到允许主机；实现细节见子文档。
@@ -42,6 +43,7 @@
 - LLM 请求、LLM 凭据换取、LLM 在途请求与回放归 `llmgateway`；本模块不代理 LLM 流量，不处理 `llm.request.*` 消息。
 - 沙箱预配、[挂起](../../../glossary.md)、恢复、销毁与出口策略的按代落地、按代撤销归[沙箱提供者](../../../glossary.md)；本模块只生成并推送出口策略，不落地 NetworkPolicy 或 EgressPolicy；沙箱侧配置不经过沙箱提供者。
 - 收件箱、唤醒信号、等待、运行实例状态机、投递游标，以及沙箱侧配置的按运行实例保存与在出站流上的发送归 `runcontroller`；沙箱侧配置的应用与工具接入声明的注入归看守进程；本模块只经汇入契约写入，不直接向看守进程发送沙箱侧配置，不读 `run`、`inbox`、`wake_signal`、`wait`、`timer`、`outbox`、`run_fact`、`source_request` 与 `source_lease` 表。
+- 等待意图的解析、等待签名的匹配、情境提示与 `intent_observed` 的上报归看守进程的 [Claude Code 驱动器](../warden/design-warden-driver-claude-code.md)；意图在等待时长预测与宽限期选择中的使用归 `suspendpolicy`，`run.intents` 的保存归 `runcontroller`。本模块只定义并下发等待签名与等待意图开关，不接收等待意图，不向 Agent 发出提示，不按签名登记订阅。
 - 运行实例令牌的签发、轮换与签名校验归 `secrets`；本模块调用其校验函数，并读取代查询结果。
 - [工作区](../../../glossary.md)、[工作区租约](../../../glossary.md)与附件之外的持久文件归 `workspace`。
 - webhook 发送方的重试策略、外部系统的可用性与限流不在本模块控制范围内；本模块只保证已接收事件的落盘、幂等与可重驱动。
@@ -58,7 +60,7 @@
 
 ## 外部接口契约
 
-对外稳定承诺按以下类别给出：外部系统定义 schema、对 `runcontroller` 的汇入调用、对沙箱提供者的出口策略推送、沙箱侧配置的字段与语义、对平台 MCP 服务器的事件目录接口与附件取回接口。新增可选字段与新增闭集取值为兼容变更；删除字段、改变既有字段语义或改变既有闭集取值的含义不是兼容变更，需要新字段名。订阅标识 `sub_id`、回溯游标 `since_cursor`、完成事件标识 `event_id` 与去重键 `dedup_key` 的派生规则同样属于稳定承诺。
+对外稳定承诺按以下类别给出：外部系统定义 schema（含等待签名的结构与匹配语义）、对 `runcontroller` 的汇入调用、对沙箱提供者的出口策略推送、沙箱侧配置的字段与语义、对平台 MCP 服务器的事件目录接口与附件取回接口。新增可选字段与新增闭集取值为兼容变更；删除字段、改变既有字段语义或改变既有闭集取值的含义不是兼容变更，需要新字段名。订阅标识 `sub_id`、回溯游标 `since_cursor`、完成事件标识 `event_id` 与去重键 `dedup_key` 的派生规则同样属于稳定承诺。
 
 ### 外部系统定义
 
@@ -80,16 +82,43 @@ access:
   git: {mode: reverse_proxy_rewrite}
 events:
   sources:
-    - {type: webhook, path: /hooks/github, signature: hmac-sha256, delivery_id: X-GitHub-Delivery}
+    - type: webhook
+      path: /hooks/github
+      signature: hmac-sha256
+      delivery_id: X-GitHub-Delivery
+      event_types: [check_suite.completed, workflow_run.completed, pull_request_review.submitted, ...]
     - {type: poll, interval: 60s, kind: state_reconcile}
-  correlation_keys: [repository.full_name, pull_request.number, check_suite.head_sha]
-  identity_keys: [pull_request.number, check_suite.head_sha]
+  correlation_keys: [repository.full_name, pull_request.number, check_suite.head_sha, workflow_run.id]
+  identity_keys: [pull_request.number, check_suite.head_sha, workflow_run.id]
   correlation_normalization: {repository.full_name: lowercase}
   dedup_key: [event_type, repository.full_name, check_suite.id, conclusion]
   ordering: {occurred_at: updated_at}
   completions:
     - event: check_suite.completed
       verify: {api: check-suites, terminal: [success, failure, ...]}
+    - event: workflow_run.completed
+      verify: {api: workflow-runs, terminal: [success, failure, cancelled, ...]}
+wait_signatures:
+  - id: gh-run-watch
+    match: {command: '\bgh\s+run\s+watch\s+(?P<run_id>\d+)'}
+    event_type: workflow_run.completed
+    correlation: {workflow_run.id: '${run_id}'}
+    prior: {p25: 2m, p50: 6m, p90: 20m}
+  - id: gh-pr-checks-watch
+    match: {command: '\bgh\s+pr\s+checks\s+(?P<pr>\d+)\b.*\s--watch\b'}
+    event_type: check_suite.completed
+    correlation: {pull_request.number: '${pr}'}
+    prior: {p25: 3m, p50: 8m, p90: 25m}
+  - id: gh-pr-review-poll
+    match: {command: '\buntil\s+gh\s+pr\s+view\s+(?P<pr>\d+)\b.*;\s*do\s+sleep\b'}
+    event_type: pull_request_review.submitted
+    correlation: {pull_request.number: '${pr}'}
+    prior: {p25: 20m, p50: 2h, p90: 24h}
+  - id: gh-api-run-poll
+    match: {request: {host: api.github.com, method: GET, path_regex: '^/repos/(?P<owner>[^/]+)/(?P<repo>[^/]+)/actions/runs/(?P<run_id>\d+)$'}}
+    event_type: workflow_run.completed
+    correlation: {repository.full_name: '${owner}/${repo}', workflow_run.id: '${run_id}'}
+    prior: {p25: 2m, p50: 6m, p90: 20m}
 ```
 
 | 字段 | 类型 | 约束与含义 |
@@ -108,6 +137,7 @@ events:
 | `events.sources[].path` | string | webhook 的接收路径；同一路径只属于一个外部系统 |
 | `events.sources[].signature` | string | 闭集当前只有 `hmac-sha256`；签名密钥由 `secrets` 提供 |
 | `events.sources[].delivery_id` | string | 投递标识在请求头或负载中的字段路径；缺失时拒绝请求 |
+| `events.sources[].event_types` | string[] | webhook 事件源产生的规范化事件类型；事件目录据此投影没有完成条件的事件，等待签名的 `event_type` 据此校验 |
 | `events.sources[].interval` | duration | poll 的轮询周期 |
 | `events.sources[].kind` | string | poll 的闭集当前只有 `state_reconcile`；只产生完成事件 |
 | `events.correlation_keys` | string[] | 非空；关联键在原始负载中的字段路径 |
@@ -117,8 +147,33 @@ events:
 | `events.ordering.occurred_at` | string | 非空；事件发生时间在原始负载中的字段路径 |
 | `events.completions[].event` | string | 事件类型；与 `events.sources` 产生的事件类型对应 |
 | `events.completions[].verify` | object | `{api, terminal}`；`api` 是只读状态查询，`terminal` 是终态取值的闭集 |
+| `wait_signatures` | WaitSignature[] | 可选；等待签名列表，结构与语义见[等待签名](#等待签名) |
+| `wait_signatures[].id` | string | 定义内唯一；与定义名组成签名标识 `(system, id)` |
+| `wait_signatures[].match` | object | `command` 与 `request` 二选一：`command` 是对 Bash 命令的正则；`request` 为 `{host, method, path_regex}`，`host` 必须属于 `upstreams` |
+| `wait_signatures[].event_type` | string | 必须属于该外部系统事件目录投影的事件类型 |
+| `wait_signatures[].correlation` | map[string]string | 关联键字段路径到提取模板；键必须属于 `correlation_keys`，且至少包含一个 `identity_keys` |
+| `wait_signatures[].prior` | `{p25, p50, p90}` | 该类等待的时长先验；均为正的时长，`p25 ≤ p50 ≤ p90` |
 
-定义在装载时校验。闭集外取值、缺失必填字段、`inject.host` 或 `host_modes.host` 不在 `upstreams` 中、`inject.auth_method` 不在 `auth.methods` 中、`passthrough` 主机声明注入规则、`pinned_hosts` 的主机不在 `upstreams` 中或对应通道不是 `passthrough` 或存在注入规则、`identity_keys` 为空或不是 `correlation_keys` 的子集、`completions[].event` 为空或 `verify` 不成对时，该定义不装载，其 webhook 路径返回未找到。定义变更后，新登记使用新定义；已登记订阅保留登记时的 `dedup_spec`，不因字段路径变化而改变去重结果；出口策略与沙箱侧配置按新定义重新生成并推送。
+定义在装载时校验。闭集外取值、缺失必填字段、`inject.host` 或 `host_modes.host` 不在 `upstreams` 中、`inject.auth_method` 不在 `auth.methods` 中、`passthrough` 主机声明注入规则、`pinned_hosts` 的主机不在 `upstreams` 中或对应通道不是 `passthrough` 或存在注入规则、`identity_keys` 为空或不是 `correlation_keys` 的子集、`completions[].event` 为空或 `verify` 不成对时，该定义不装载，其 webhook 路径返回未找到。等待签名逐条校验，校验规则见[等待签名](#等待签名)；不通过的签名不装载，不影响定义的其余部分。定义变更后，新登记使用新定义；已登记订阅保留登记时的 `dedup_spec`，不因字段路径变化而改变去重结果；出口策略与沙箱侧配置按新定义重新生成并推送。
+
+### 等待签名
+
+[等待签名](../../../glossary.md)把 Agent 以第三方工具表达的一类等待对应到该外部系统事件目录中的一个事件类型，并给出关联键的提取规则与该类等待的时长先验。看守进程的 [Claude Code 驱动器](../warden/design-warden-driver-claude-code.md)以签名判定一次前台工具调用或后台作业在等待哪个外部对象；签名命中是情境提示中订阅建议的唯一依据，没有签名命中的等待只作分类，不给订阅建议。签名与由它得出的[等待意图](../../../glossary.md)只作软输入，不进入单一条件门控、静止证据、I9 与唤醒集合（[架构不变量](../../architecture.md#架构不变量) I11，[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）；签名匹配、提示与意图上报的规则见驱动器文档，先验在等待时长预测中的使用见 [suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度)。
+
+每条签名的字段语义如下。
+
+- `id`：在定义内唯一，`(system, id)` 标识一条签名；驱动器的提示频率与采纳判定按它归并，同一类等待在定义变更前后保持同一 `id`。
+- `match.command`：对 Bash 命令全文求值的正则，Claude Code 中取 Bash 工具输入的 `command`（[REF-claude-code-hooks](../../../references.md)）；未锚定时按子串匹配。正则按线性时间求值，不允许反向引用与环视；命名分组写作 `(?P<name>...)`，供 `correlation` 引用。
+- `match.request`：`{host, method, path_regex}`，按出口请求的目标主机、请求方法与请求路径（不含查询串）匹配；`host` 必须属于该定义的 `access.upstreams`，`path_regex` 的约束与 `match.command` 相同。沙箱侧对经 CONNECT 的请求只看到目标主机，请求路径只在终止 TLS 或解析明文请求的出口路径上可见，沙箱内的驱动器只对 `Monitor` 工具输入中的 URL 按 `host` 与 `path_regex` 匹配；出口流量上的路径级匹配是出口代理的可选能力（见[平台出口代理的扩展点](design-connectorhub-egress.md#扩展点)），提供条件见[实施路线与技术验证](../../../roadmap.md)。
+- `event_type`：必须属于事件目录对该外部系统投影的事件类型（`events.completions[].event` 与 `events.sources[].event_types` 的并集），与 `EventDescriptor.Event` 的取值规则一致；订阅建议中的事件类型因而总能经 `list_events` 查到。
+- `correlation`：关联键字段路径到提取模板的映射；模板由字面文本与 `${name}` 组成，`${name}` 引用 `match` 中的命名分组。键必须属于 `events.correlation_keys`，且至少包含一个[关联键身份键](../../../glossary.md)；提取值作为订阅建议中 `subscribe_event` 的 `correlation`，订阅登记时按 `correlation_normalization` 规范化。运行时某个被引用的分组未捕获时省略该键；省略后不含关联键身份键时，该次命中只作分类，不给订阅建议。
+- `prior`：`{p25, p50, p90}`，该类等待的时长先验，进入等待时长预测，不替代平台给出的单点预测。
+
+等待签名在装载定义时逐条校验，不通过的条件穷举为：`id` 在定义内重复；`match` 未声明 `command` 与 `request`，或两者同时声明；正则无法编译或含反向引用、环视；`request.host` 不属于 `access.upstreams`，或 `request.method` 不是 HTTP 方法名；`event_type` 不属于事件目录投影的事件类型；`correlation` 的键不属于 `correlation_keys`、不含关联键身份键，或模板引用了 `match` 中不存在的命名分组；`prior` 的取值不为正或不满足 `p25 ≤ p50 ≤ p90`。不通过的签名不装载，记录审计并计数；签名只作软输入，单条签名的错误不使该外部系统不可用，定义的其余部分照常装载。
+
+生成沙箱侧配置时，本模块取运行实例可用外部系统已装载签名的并集，每条附所属外部系统名，放入 `SandboxConfig` 的 `wait_signatures`；可用集合与出口策略、事件目录的投影相同。签名与工具接入声明走同一通道，看守进程按 `revision` 幂等应用；定义变更后签名随沙箱侧配置重新生成并推送。
+
+上文 GitHub 定义中的签名是参考实例：`gh run watch <id>` 对应 `workflow_run.completed`，按 `workflow_run.id` 关联；`gh pr checks <pr> --watch` 对应 `check_suite.completed`，按 `pull_request.number` 关联；`until gh pr view <pr> ...; do sleep` 形态的轮询循环对应 `pull_request_review.submitted`，按 `pull_request.number` 关联；`gh-api-run-poll` 是 `request` 形态，对 `Monitor` 的 URL 由驱动器匹配，对出口流量只在路径级匹配可用时生效。纯定时等待（`sleep N`，或循环体只有定时）不需要签名，驱动器对它建议改用 `sleep_until`。
 
 ### 对 runcontroller 的汇入调用
 
@@ -167,8 +222,10 @@ type EgressPolicySink interface {
 
 ```go
 type SandboxConfig struct {
-    Modes       []HostMode   // 同一修订 EgressPolicy 的 Modes
-    ToolProfile *ToolProfile // 项目作用域的工具接入声明；未配置、校验不通过或序列化后超过 32 KiB 时为空
+    Modes          []HostMode      // 同一修订 EgressPolicy 的 Modes
+    ToolProfile    *ToolProfile    // 项目作用域的工具接入声明；未配置、校验不通过或置空 WaitSignatures 后序列化仍超过 32 KiB 时为空
+    WaitSignatures []WaitSignature // 运行实例可用外部系统已装载等待签名的并集；序列化超过 32 KiB 时首先置空
+    Intent         IntentConfig    // 等待意图开关
 }
 
 type ToolProfile struct {
@@ -177,11 +234,28 @@ type ToolProfile struct {
     MCPServers    []MCPServer       // {Name, Command, Args, Env, Digest}；Command 为镜像内预置的可执行文件，Digest 为其固定摘要
     AllowedHosts  []string          // 第三方工具使用的主机
 }
+
+type WaitSignature struct {
+    System      string            // 所属外部系统名
+    ID          string            // 定义内唯一；(System, ID) 标识一条签名
+    Command     string            // match.command；与 Request 二选一
+    Request     *RequestMatch     // match.request：{Host, Method, PathRegex}
+    EventType   string            // 属于该外部系统的事件目录
+    Correlation map[string]string // 关联键字段路径到提取模板
+    Prior       WaitPrior         // {P25, P50, P90}，序列化为毫秒
+}
+
+type IntentConfig struct {
+    Hints      bool // 情境提示开关
+    Classifier bool // 宿主侧分类模型开关
+}
 ```
 
-- `SandboxConfig` 序列化为 `{modes, tool_profile}`，序列化后不超过 32 KiB；不含密钥，凭据只以占位符出现。超限的处置与工具接入声明校验不通过一致，见[出口策略生成与推送](#出口策略生成与推送)。
+- `SandboxConfig` 序列化为 `{modes, tool_profile, wait_signatures, intent}`，序列化后不超过 32 KiB；不含密钥，凭据只以占位符出现。超限时首先置空 `wait_signatures`，记录审计并计数；仍超限时的处置与工具接入声明校验不通过一致，见[出口策略生成与推送](#出口策略生成与推送)。
+- `wait_signatures` 中每条签名序列化为 `{system, id, match, event_type, correlation, prior}`，`match` 为 `{command}` 或 `{request: {host, method, path_regex}}`，字段语义见[等待签名](#等待签名)。
+- `intent` 序列化为 `{hints, classifier}`，取运行实例所属项目的配置，未配置时均为 `false`：`hints` 控制看守进程是否向 Agent 发出情境提示，`classifier` 控制看守进程是否经本地代理向 `llmgateway` 发出宿主侧分类请求。等待意图的解析与 `intent_observed` 的上报不受这两个开关控制。
 - 推送调用为 `PutSandboxConfig(run_id, revision, config)`：`config` 为序列化后的 `SandboxConfig`，`revision` 取同一次生成的 `EgressPolicy.Revision`，单调递增；幂等与错误见[对 runcontroller 的汇入调用](#对-runcontroller-的汇入调用)。
-- 每次生成或更新出口策略都推送，包括运行实例的首次生成；没有工具接入声明的运行实例也推送 `{modes, tool_profile: null}`，每个运行实例因而都有 `revision ≥ 1` 的沙箱侧配置。
+- 每次生成或更新出口策略都推送，包括运行实例的首次生成；没有工具接入声明与等待签名的运行实例也推送，`tool_profile` 为 `null`，`wait_signatures` 为空数组，每个运行实例因而都有 `revision ≥ 1` 的沙箱侧配置。
 - `runcontroller` 不解释 `config`，以出站流消息 `SandboxConfig{revision, config}` 发给看守进程；看守进程的应用规则见 [warden](../warden/design-warden.md#沙箱侧配置)。沙箱侧配置的字段与语义由本模块定义，字段变更须同步修改 warden。
 
 ### 对平台 MCP 服务器的事件目录接口
@@ -206,7 +280,7 @@ type EventCatalogue interface {
 ```
 
 - `system` 为空时返回该运行实例可用的全部外部系统事件。
-- `Event` 取 `events.completions[].event`；没有完成条件的 `until_cancelled` 事件取 `events.sources` 的事件类型。
+- `Event` 取 `events.completions[].event`；没有完成条件的 `until_cancelled` 事件取 `events.sources[].event_types`。等待签名的 `event_type` 按同一投影装载时校验，见[等待签名](#等待签名)。
 - `CorrelationKeys` 取 `events.correlation_keys`，`IdentityKeys` 取 `events.identity_keys`。
 - `Terminal` 取对应 `verify.terminal`；没有 `verify` 时为空，表示只依赖 webhook。
 - `Lifetime` 取该事件支持的生命周期；有完成条件的事件只支持 `once`。
@@ -260,6 +334,7 @@ classDiagram
         +map correlation_normalization
         +string[] dedup_key
         +Ordering ordering
+        +WaitSignature[] wait_signatures
     }
     class Auth {
         +string[] methods
@@ -282,8 +357,16 @@ classDiagram
         +string path
         +string signature
         +string delivery_id
+        +string[] event_types
         +string interval
         +string kind
+    }
+    class WaitSignature {
+        +string id
+        +Match match
+        +string event_type
+        +map correlation
+        +Prior prior
     }
     class ConnectorInstance {
         +string system_name
@@ -334,6 +417,7 @@ classDiagram
     ExternalSystem "1" --> "1" Access
     ExternalSystem "1" --> "0..*" Completion
     ExternalSystem "1" --> "0..*" EventSource
+    ExternalSystem "1" --> "0..*" WaitSignature
     ConnectorInstance "0..*" --> "1" ExternalSystem : 按 name 绑定
     Subscription "0..*" --> "1" ConnectorInstance : 登记到
     ConnectorEvent "0..*" --> "1" ExternalSystem : 属于
@@ -342,7 +426,7 @@ classDiagram
     EgressPolicy "0..*" --> "0..*" ConnectorInstance : 由定义并集生成
 ```
 
-类图只列键字段与关系字段，全部列见核心数据结构。`ExternalSystem` 是定义，`ConnectorInstance` 是定义与凭据作用域的运行时绑定；多个运行实例可共享同一连接器实例，但订阅与出口策略按运行实例归属。`Subscription` 归属一个运行实例与一个外部系统，跨沙箱重建保留；`ConnectorEvent` 是跨运行实例共享的日志事实，订阅通过认领记录与它关联。`Completion` 按事件类型声明 `verify`，订阅按事件类型查找，不绑定操作。`Attachment` 按事件归属，不按运行实例复制。图中不表达唯一索引、状态 CAS 与事务边界，这些约束见并发与事务边界。
+类图只列键字段与关系字段，全部列见核心数据结构。`ExternalSystem` 是定义，`ConnectorInstance` 是定义与凭据作用域的运行时绑定；多个运行实例可共享同一连接器实例，但订阅与出口策略按运行实例归属。`Subscription` 归属一个运行实例与一个外部系统，跨沙箱重建保留；`ConnectorEvent` 是跨运行实例共享的日志事实，订阅通过认领记录与它关联。`Completion` 按事件类型声明 `verify`，订阅按事件类型查找，不绑定操作。`WaitSignature` 的 `event_type` 取自 `Completion.event` 与 `EventSource.event_types` 的并集，签名不引用订阅，也不产生订阅。`Attachment` 按事件归属，不按运行实例复制。图中不表达唯一索引、状态 CAS 与事务边界，这些约束见并发与事务边界。
 
 ### 订阅登记与回溯匹配时序图
 
@@ -465,7 +549,8 @@ sequenceDiagram
 | `name` | string | 唯一 | 外部系统标识，连接器实例、连接器事件日志与订阅的命名空间 |
 | `auth` | object | `methods` 非空，每种方法有 `secret_schema` | 认证方法与短期凭据签发参数 |
 | `access` | object | `mode` 属于 `proxy`、`mitm`、`passthrough`，`upstreams` 非空 | 网络通道、出口允许主机、占位符注入规则与 git 重写 |
-| `events` | object | `correlation_keys`、`identity_keys`、`dedup_key`、`ordering.occurred_at` 非空 | webhook 与 poll 事件源、关联键、[关联键身份键](../../../glossary.md)、规范化、完成条件目录、去重键与时间字段 |
+| `events` | object | `correlation_keys`、`identity_keys`、`dedup_key`、`ordering.occurred_at` 非空 | webhook 与 poll 事件源及 webhook 产生的事件类型、关联键、[关联键身份键](../../../glossary.md)、规范化、完成条件目录、去重键与时间字段 |
+| `wait_signatures` | WaitSignature[] | 可选；逐条校验，不通过的签名不装载 | [等待签名](../../../glossary.md)：匹配规则、事件类型、关联键提取模板与时长先验 |
 | `credential_scope` | string | 连接器实例字段 | 项目作用域的凭据授权范围；凭据由 `secrets` 换取 |
 | `auth_method` | string | 属于定义的 `auth.methods` | 该连接器实例选用的认证方法 |
 
@@ -554,7 +639,9 @@ sequenceDiagram
 | `allowed_hosts` | string[] | 各定义 `upstreams` 的并集 | 允许出口的主机；未列入默认拒绝 |
 | `inject` | InjectRule[] | 每条 `{host, header, placeholder, system, auth_method, scopes}` | 请求头占位符替换规则；`system` 取定义名，`auth_method` 与 `scopes` 来自注入规则 |
 | `modes` | HostMode[] | 每条 `{host, mode}`，`mode` 取 `proxy`、`mitm`、`passthrough` | 沙箱侧本地 DNS 与透明拦截器的按主机通道选择 |
-| `tool_profile` | ToolProfile | 可空；未配置、校验不通过或 `SandboxConfig` 序列化后超过 32 KiB 时为空 | 本次生成的项目作用域工具接入声明；与 `modes` 一起组成该修订的沙箱侧配置，经 `PutSandboxConfig` 推送，不进入推送给沙箱提供者的出口策略 |
+| `tool_profile` | ToolProfile | 可空；未配置、校验不通过或置空 `wait_signatures` 后 `SandboxConfig` 序列化仍超过 32 KiB 时为空 | 本次生成的项目作用域工具接入声明；与 `modes`、`wait_signatures`、`intent` 一起组成该修订的沙箱侧配置，经 `PutSandboxConfig` 推送，不进入推送给沙箱提供者的出口策略 |
+| `wait_signatures` | WaitSignature[] | 可为空数组；`SandboxConfig` 序列化超过 32 KiB 时为空数组 | 本次生成的运行实例可用外部系统等待签名并集，每条附所属外部系统名；只进入沙箱侧配置 |
+| `intent` | `{hints, classifier}` | 两项均为布尔值，未配置时为 `false` | 本次生成时项目的等待意图开关；只进入沙箱侧配置 |
 | `git` | GitRule | `{mode, proxy_host, system, auth_method, scopes}` | git 反向代理重写规则及其凭据引用 |
 | `updated_at` | time | 非空 | 最近一次成功推送时刻 |
 
@@ -588,7 +675,7 @@ sequenceDiagram
 
 ### 外部系统定义装载与连接器实例
 
-定义从配置装载，按 `name` 建立连接器实例。装载时校验字段闭集、必填字段、`inject.host` 与 `host_modes.host` 属于 `upstreams`、`identity_keys` 是 `correlation_keys` 的子集、`completions[].event` 非空且 `verify` 成对、`events` 的 `correlation_keys`、`identity_keys`、`dedup_key` 与 `ordering.occurred_at` 非空。校验失败的定义不装载，其 webhook 路径返回未找到，并计数。连接器实例按项目作用域从 `secrets` 换取凭据；定义文件、连接器事件日志、订阅与附件都不保存真实凭据。
+定义从配置装载，按 `name` 建立连接器实例。装载时校验字段闭集、必填字段、`inject.host` 与 `host_modes.host` 属于 `upstreams`、`identity_keys` 是 `correlation_keys` 的子集、`completions[].event` 非空且 `verify` 成对、`events` 的 `correlation_keys`、`identity_keys`、`dedup_key` 与 `ordering.occurred_at` 非空。校验失败的定义不装载，其 webhook 路径返回未找到，并计数。定义通过校验后再逐条校验 `wait_signatures`，规则见[等待签名](#等待签名)；不通过的签名不装载，记录审计并计数，不影响定义与其余签名。连接器实例按项目作用域从 `secrets` 换取凭据；定义文件、连接器事件日志、订阅与附件都不保存真实凭据。
 
 定义变更后，新订阅使用新定义；已登记订阅保留 `dedup_spec` 副本。出口策略按新定义重新生成，以递增的 `Revision` 推送，沙箱提供者把更新同步到尚未撤销的代；同一次生成的沙箱侧配置以同一 `Revision` 经 `PutSandboxConfig` 推送。
 
@@ -671,9 +758,12 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 - `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder, system, auth_method, scopes}`；`system` 取定义名，`auth_method` 与 `scopes` 取注入规则，`scopes` 为空时由 `secrets` 按 `token_minting.scopes` 或凭据对象授权范围解析；只替换已有请求头，缺头不注入。
 - `Git` 存在 `reverse_proxy_rewrite` 时，git 客户端的目标主机重写为平台 git 代理，git 的 Basic 或 Bearer 头由出口路径注入；`system`、`auth_method` 与 `scopes` 同样随规则携带。
 - `project_id` 取运行实例所属项目（`RunView.project_id`）。出口代理以调用方身份调用 `secrets.ExchangeCredential`：`ProjectID` 取 `project_id`，`Target` 为 `{Kind=external_system, System, AuthMethod, Scopes}`，`Usage` 为 `{RunID, Generation, Operation, UsageID}`；其中 `System`、`AuthMethod` 与 `Scopes` 取注入规则，`Usage.Operation` 取占位符、请求方法与目标主机，`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接。凭据只在出口代理内存中持有到 `ExpiresAt`，不写入出口策略、配置或日志。缺失 `project_id`、凭据对象未配置或认证方式不匹配时返回 `503`；请求的授权范围超出凭据对象的授权范围时返回 `403`；出口请求被拒绝并计入审计。
-- `ToolProfile` 取运行实例所属项目的工具接入声明，生成时校验：`allowed_hosts` 是本次 `AllowedHosts` 的子集；`credential_env` 的每个占位符等于本次 `Inject` 中某条规则的 `placeholder`；`SandboxConfig` 序列化后不超过 32 KiB。校验不通过时 `ToolProfile` 为空，记录审计并计数，出口策略与沙箱侧配置的其余字段照常推送。
+- `WaitSignatures` 是运行实例可用外部系统已装载 `wait_signatures` 的并集，每条附所属外部系统名；可用集合与 `AllowedHosts` 的来源相同。
+- `Intent` 取运行实例所属项目的等待意图开关 `{hints, classifier}`，未配置时均为 `false`。
+- `ToolProfile` 取运行实例所属项目的工具接入声明，生成时校验：`allowed_hosts` 是本次 `AllowedHosts` 的子集；`credential_env` 的每个占位符等于本次 `Inject` 中某条规则的 `placeholder`。校验不通过时 `ToolProfile` 为空，记录审计并计数，出口策略与沙箱侧配置的其余字段照常推送。
+- 组装后的 `SandboxConfig` 序列化超过 32 KiB 时，首先把 `WaitSignatures` 置为空数组，记录审计并计数；仍超过时 `ToolProfile` 置空，按工具接入声明校验不通过处置。等待签名只作软输入，先于工具接入声明让出空间。
 
-出口策略以运行实例为键生成，`Revision` 递增，经 `PutEgressPolicy` 推送给沙箱提供者。沙箱提供者在预配与认领沙箱时按代落地，并把更新同步到尚未撤销的代；按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动。同一时机，本模块以同一 `Revision` 调用 `PutSandboxConfig` 推送沙箱侧配置，包括运行实例的首次生成；调用失败时以同一 `revision` 退避重试，运行实例已终态时丢弃该修订并计数。工具接入声明变更后，该项目运行实例的出口策略与沙箱侧配置重新生成，以递增的 `Revision` 推送。推送遇到沙箱提供者不可达或超时时保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试；默认拒绝使未列入的主机不会因推送失败而放行。
+出口策略以运行实例为键生成，`Revision` 递增，经 `PutEgressPolicy` 推送给沙箱提供者。沙箱提供者在预配与认领沙箱时按代落地，并把更新同步到尚未撤销的代；按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动。同一时机，本模块以同一 `Revision` 调用 `PutSandboxConfig` 推送沙箱侧配置，包括运行实例的首次生成；调用失败时以同一 `revision` 退避重试，运行实例已终态时丢弃该修订并计数。工具接入声明或项目的等待意图开关变更后，该项目运行实例的出口策略与沙箱侧配置重新生成，以递增的 `Revision` 推送。推送遇到沙箱提供者不可达或超时时保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试；默认拒绝使未列入的主机不会因推送失败而放行。
 
 Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符；`project_id` 与每条规则的 `system`、`auth_method`、`scopes` 一并写入策略文档，由 Substrate 出口网关的凭据提供者按同一组标识取得真实凭据；`Modes` 只经沙箱侧配置到达看守进程，不进入 Substrate 的 EgressPolicy。k8s 路径落地为平台出口代理配置与 NetworkPolicy，代理逐请求校验运行实例令牌中的代，并以策略中的同一组字段向 `secrets` 换取凭据。
 
@@ -728,7 +818,9 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 | 出口策略撤销 | 运行实例终态、本代作废、提供者确认（销毁落地）、进入降级、放弃、显式结束或代递增（`fence_and_bump`） | `runcontroller` 写 `revoke_egress` 效果；沙箱提供者按代撤销，已撤销的代拒绝落地与更新 | 该代出口请求被拒绝 |
 | 出口策略推送失败 | 沙箱提供者不可达或超时 | 保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试 | 已推送的修订继续生效，未列入主机仍拒绝 |
 | 出口策略推送被释放墓碑拒绝 | 运行实例级资源已由沙箱提供者释放 | 确定性，不重试；丢弃该修订并计数 | 该运行实例不再落地出口策略 |
-| 工具接入声明校验不通过 | 生成出口策略时工具接入声明未通过校验，或 `SandboxConfig` 序列化后超过 32 KiB | `ToolProfile` 置空，记录审计并计数；出口策略与沙箱侧配置的其余字段照常推送 | 该运行实例的看守进程不注入工具接入声明 |
+| 等待签名校验不通过 | 装载定义时某条签名命中[等待签名](#等待签名)所列的不通过条件 | 该签名不装载，记录审计并计数；定义与其余签名照常装载 | 该类等待只作分类，不给订阅建议；外部系统照常可用 |
+| 沙箱侧配置超限 | 组装后的 `SandboxConfig` 序列化超过 32 KiB | `WaitSignatures` 置为空数组，记录审计并计数；仍超限时按工具接入声明校验不通过处置 | 该运行实例的等待只作分类，不给订阅建议；工具接入声明在置空签名后不超限时照常注入 |
+| 工具接入声明校验不通过 | 生成出口策略时工具接入声明未通过校验，或置空 `WaitSignatures` 后 `SandboxConfig` 序列化仍超过 32 KiB | `ToolProfile` 置空，记录审计并计数；出口策略与沙箱侧配置的其余字段照常推送 | 该运行实例的看守进程不注入工具接入声明 |
 | 沙箱侧配置推送失败 | `PutSandboxConfig` 返回暂时性错误或超时 | 以同一 `revision` 退避重试 | 看守进程保持已应用的修订；首次推送成功之前看守进程不启动 Agent 主进程 |
 | 沙箱侧配置推送被终态拒绝 | `PutSandboxConfig` 返回运行实例已终态 | 确定性，不重试；丢弃该修订并计数 | 该修订不发给看守进程 |
 | 附件过期 | 取回时超过 `expires_at` | 返回 410 | Agent 收到附件不可取回 |
@@ -777,6 +869,8 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 - **新增认证方法**：在 `auth.methods` 与 `auth.secret_schema` 中增加条目，并在连接器实例中实现凭据适配；定义文件不携带凭据。
 - **新增事件完成条件**：在 `events.completions` 中增加事件类型与 `verify`；订阅按事件类型查找，不绑定操作。
 - **新增事件源类型**：超出 `webhook` 与 `poll` 的类型需要本模块实现新的摄入路径；闭集外的定义不装载。
+- **新增等待签名**：只在外部系统定义的 `wait_signatures` 中增加条目，不需要修改本模块与看守进程代码；前提是 `event_type` 属于该外部系统的事件目录，匹配形态属于 `command`、`request`。
+- **新增签名匹配形态**：超出 `command` 与 `request` 的形态需要同时扩展装载校验、`SandboxConfig` 的序列化与看守进程的匹配实现；闭集外形态的签名不装载。
 - **新增出口落地方式**：由沙箱提供者的能力集合决定；本模块只生成并推送 `EgressPolicy`，不感知落地机制。
 - **新增附件存储**：实现附件取回接口、内容哈希与保留期约束；附件 URI 对 Agent 不透明。
 - **新增订阅生命周期取值**：需要同时扩展状态闭集、完成事件语义与 `runcontroller` 的订阅等待关闭规则；闭集外的取值不装载。
@@ -801,4 +895,5 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 | 出口策略生成与推送 | 未实现 | — |
 | 沙箱侧配置推送 | 未实现 | — |
 | 工具接入声明装载与校验 | 未实现 | — |
+| 等待签名装载校验与下发 | 未实现 | — |
 | 附件存放与取回接口 | 未实现 | — |

@@ -52,6 +52,7 @@ flowchart TB
 | --- | --- | --- |
 | 等待与唤醒 | 外部唤醒源全部由托管侧组件持有，Agent 的自唤醒源由 Agent 自行触发、托管侧镜像进唤醒集合；等待由持久化收件箱、唤醒信号与等待行推导，唤醒谓词在运行实例行锁内求值 | [模块间调用关系](#模块间调用关系)、[runcontroller](modules/design-runcontroller.md) 的「唤醒谓词」与「自唤醒到期」 |
 | 挂起 | 挂起机制按沙箱提供者能力分层；以挂起为目的的销毁只在[安全点](../glossary.md)执行；后台作业存活或回合中多个 Agent 循环并发时只在静止证据成立时冻结；机制与时长由 `suspendpolicy` 决策 | [顶层模块](#顶层模块) 的挂起机制与回合边界销毁段、[runcontroller](modules/design-runcontroller.md) 的「静止冻结」、[suspendpolicy](modules/design-suspendpolicy.md) |
+| 机械层判不清的等待 | 机械层（静止冻结、入站数据唤醒、`sleep` 到期时刻的镜像）兜住当下这一次等待；Agent 驱动器从已有信号、平台 MCP 工具的可选自报参数与[等待签名](../glossary.md)匹配解析[等待意图](../glossary.md)，在工具结果旁附可以忽略的情境提示，让同类等待改用订阅或 `sleep_until`，从而改善下一次等待；意图只作软输入，进入等待时长预测与宽限期选择 | [顶层模块](#顶层模块) 的协作层级段、[Claude Code 驱动器](modules/warden/design-warden-driver-claude-code.md)、[suspendpolicy](modules/design-suspendpolicy.md) 的「等待时长预测与置信度」、[架构不变量](#架构不变量) I11 |
 | 投递 | 至少一次投递，收件箱以 `inbox_seq` 全序，`Accepted` 与 `Consumed` 分级确认，重建后从消费位置重投并由投递意图日志跨代去重 | [模块间调用关系](#模块间调用关系)、[runcontroller](modules/design-runcontroller.md) 的「投递与两级确认」 |
 | 一致性 | 每运行实例单写者；状态转移与持久化点同事务；跨进程副作用经效果记录在提交后执行；纠正性对账以持久化状态为准 | [跨切面设计](#跨切面设计) 的「数据一致性与事务边界」与「并发模型」 |
 | 失效判定 | 代单调递增；旧代沙箱的消息、令牌、工作区写入、游标推进与出口请求一律拒绝 | [跨切面设计](#跨切面设计) 的「认证与授权边界」、[架构不变量](#架构不变量) I7 |
@@ -71,10 +72,10 @@ castworks 是托管 AI Agent 环境。完整的第三方 Agent 作为进程运�
 | 层级 | 含义 | 托管环境可用的信号 | 允许的挂起机制 |
 | --- | --- | --- | --- |
 | L0 纯观测 | Agent 不配合托管环境 | 本地代理、LLM 网关与连接器的在途请求；沙箱活动度，例如 per-cgroup PSI（[REF-linux-psi](../references.md)）、CPU 用量、进程态、限流计数 | 冻结，且必须附带探测定时器；显式结束时销毁 |
-| L1 驱动器中介（Claude Code） | Agent 驱动器以无头协议驱动 Agent | L0 的全部信号，加上 Agent 驱动器提供的信号，例如回合开始与结束、`idle` 与 `requires_action` 状态（[REF-claude-agent-sdk-typescript](../references.md)）、工具开始与结束、权限询问、平台 MCP 工具调用（[REF-mcp](../references.md)）、hooks、后台任务集合（`background_tasks_changed`）与自唤醒条目；看守进程在冻结期间观察到的入站数据 | 回合中冻结，有快照能力时可快照；回合边界销毁重建；后台作业存活或回合中多个 Agent 循环并发时，静止冻结（只冻结） |
+| L1 驱动器中介（Claude Code） | Agent 驱动器以无头协议驱动 Agent | L0 的全部信号，加上 Agent 驱动器提供的信号，例如回合开始与结束、`idle` 与 `requires_action` 状态（[REF-claude-agent-sdk-typescript](../references.md)）、工具开始与结束、权限询问、平台 MCP 工具调用（[REF-mcp](../references.md)）、hooks、后台任务集合（`background_tasks_changed`）与自唤醒条目；看守进程在冻结期间观察到的入站数据；等待意图（软输入） | 回合中冻结，有快照能力时可快照；回合边界销毁重建；后台作业存活或回合中多个 Agent 循环并发时，静止冻结（只冻结） |
 | L2 协作式 | 平台原生 Agent 显式声明等待并保证状态已落盘 | 显式 `WaitDeclared` | 任意声明的等待点：回合中冻结或快照，回合边界可销毁重建；后台作业存活或回合中多个 Agent 循环并发时，静止冻结（只冻结） |
 
-对 L1 Agent 的处理方式是把长等待转化为回合边界：等外部事件经 `subscribe_event` 登记订阅后结束回合，等审批经 `defer` 结束回合；销毁重建后以 Claude Code 的 `--resume` 在回合边界续接会话。回合中只允许冻结或快照，冻结临近上限时平台 MCP 工具返回等待已转为订阅的结果（[ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)）。后台作业存活的回合边界不构成安全点：后台任务结束时 Claude Code 注入由任务通知开始的回合，宽限期不起算，运行实例只在静止证据成立时[静止冻结](../glossary.md)，机制见模块间调用关系。
+对 L1 Agent 的处理方式是把长等待转化为回合边界：等外部事件经 `subscribe_event` 登记订阅后结束回合，等审批经 `defer` 结束回合；销毁重建后以 Claude Code 的 `--resume` 在回合边界续接会话。回合中只允许冻结或快照，冻结临近上限时平台 MCP 工具返回等待已转为订阅的结果（[ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)）。后台作业存活的回合边界不构成安全点：后台任务结束时 Claude Code 注入由任务通知开始的回合，宽限期不起算，运行实例只在静止证据成立时[静止冻结](../glossary.md)，机制见模块间调用关系。机械层判不清的情形（在等什么、预计多久、某个进程是在工作、等待还是提供服务、回合是以提问还是以任务完成结束）由 Agent 驱动器解析[等待意图](../glossary.md)补足：意图来自工具输入、hook 输入、本地代理观察到的周期性连接、平台 MCP 等待工具的可选自报参数与[等待签名](../glossary.md)匹配，只作软输入进入等待时长预测、宽限期选择与提示决策（I11）；平台不向 Agent 提问，只在工具结果旁附可以忽略的情境提示，机制见 [Claude Code 驱动器](modules/warden/design-warden-driver-claude-code.md) 与 [suspendpolicy](modules/design-suspendpolicy.md)（[ADR-wait-intent-as-soft-input](../adr/adr-wait-intent-as-soft-input.md)）。
 
 **挂起机制按提供者能力分层。** 挂起机制是闭合集合：不挂起、冻结（可附带原地缩小 CPU request，依赖 Kubernetes In-Place Pod Resize，[REF-k8s-in-place-pod-resize](../references.md)）、快照、销毁重建。沙箱提供者以能力集合 `{Freeze{cgroup | signal}, Snapshot, Destroy, InPlaceResize, WarmPool, EgressInject}` 自描述，挂起策略只在能力允许的机制中选择，`Freeze{signal}` 只允许短冻结（[ADR-capability-tiered-suspension](../adr/adr-capability-tiered-suspension.md)）。系统实现 k8s 提供者与 Substrate 提供者，共用看守进程、协议与控制面（[ADR-dual-sandbox-providers](../adr/adr-dual-sandbox-providers.md)）：k8s 提供者基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../references.md)）与节点冻结代理，覆盖 `Freeze{cgroup | signal}`、`Destroy`、`WarmPool`、`InPlaceResize`，冻结由节点冻结代理对 Agent 子 cgroup（[REF-linux-cgroup-v2](../references.md)）执行，看守进程自身不冻结（[ADR-freeze-via-node-agent](../adr/adr-freeze-via-node-agent.md)）；Substrate 提供者基于 agent-substrate/substrate（[REF-substrate](../references.md)），覆盖 `Snapshot`、`Destroy`、`EgressInject`，不具备 `Freeze` 与 `WarmPool` 能力，新建 actor 从[模板快照](../glossary.md)恢复。
 
@@ -84,13 +85,13 @@ castworks 是托管 AI Agent 环境。完整的第三方 Agent 作为进程运�
 
 | 模块 | 职责 | 运行位置 |
 | --- | --- | --- |
-| `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待、定时器与 Agent 自唤醒条目的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与失效判定；事件源的汇入契约；[沙箱侧配置](../glossary.md)（`SandboxConfig`）的按运行实例保存与在出站流上发给看守进程；纠正性对账器 | 控制面 |
-| `suspendpolicy` | 挂起决策函数；静止证据与空闲证据；冻结中复评与升级梯（冻结中按快照、回合边界销毁、回合中 `DRAIN` 的偏好顺序选择离开冻结的方式）；策略参数；等待时长预测与置信度；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程（[ADR-suspendpolicy-as-library](../adr/adr-suspendpolicy-as-library.md)） |
+| `runcontroller` | 运行实例状态机；收件箱、唤醒信号、等待、定时器、Agent 自唤醒条目与等待意图的持久化；唤醒谓词评估；投递与 `Accepted`、`Consumed` 分级确认；代与失效判定；事件源的汇入契约；[沙箱侧配置](../glossary.md)（`SandboxConfig`）的按运行实例保存与在出站流上发给看守进程；纠正性对账器 | 控制面 |
+| `suspendpolicy` | 挂起决策函数；静止证据与空闲证据；冻结中复评与升级梯（冻结中按快照、回合边界销毁、回合中 `DRAIN` 的偏好顺序选择离开冻结的方式）；策略参数；等待时长预测与置信度（预测输入含 Agent 自报的预计等待与等待签名的时长先验）；抖动预算（每运行实例按机制成本记账的恢复时延预算，耗尽后只允许不挂起或冻结）；恢复准入与优先级；准入槽位到期后的重新取得；节点内存压力下升级对象的选取；定时类等待的随机抖动 | 库，链接进 `runcontroller` 进程（[ADR-suspendpolicy-as-library](../adr/adr-suspendpolicy-as-library.md)） |
 | `agentprotocol` | 看守进程与控制面之间的协议：信封、消息、出站流与入站端点、重放与去重、协议版本 | 共享库，链接进控制面服务与看守进程 |
-| `warden` | 看守进程：进程监督、Agent 驱动器（含后台作业登记与自唤醒源镜像）、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、经[引导接口](../glossary.md)领取运行实例令牌与 `lease_id`、沙箱侧配置的应用、工作区租约续约、投递意图日志、本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1；控制面循环驱动器子模块为库，链接进 `runcontroller` 进程 |
+| `warden` | 看守进程：进程监督、Agent 驱动器（含后台作业登记、自唤醒源镜像、等待意图解析与情境提示）、挂起与解冻的沙箱侧执行（含 `Freeze{signal}` 降级路径）、活动度采集、经[引导接口](../glossary.md)领取运行实例令牌与 `lease_id`、沙箱侧配置的应用、工作区租约续约、投递意图日志、本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、托管 hook 二进制、`ToolExec` 接口、重连与状态上报 | 沙箱内，PID 1；控制面循环驱动器子模块为库，链接进 `runcontroller` 进程 |
 | `sandboxprovider` | 沙箱提供者的能力自描述接口；沙箱预配、挂起、恢复与按代销毁，整代销毁之后拒绝该代及更早代的沙箱创建；冻结、解冻与缩小 CPU request 以 `freeze_id` 标识，已解冻的 `freeze_id` 不再接受冻结与缩小；运行实例结束或失败后按运行实例释放运行实例级资源，释放之后拒绝该运行实例的一切创建；按节点查询冻结态内存与可分配内存；预热池；出口策略在预配与认领沙箱时按代落地，按代撤销，撤销之后拒绝该代的落地与更新；提供引导接口，供看守进程以沙箱实例身份一次性领取运行实例令牌与 `lease_id`，领取时调用 `secrets` 签发令牌。子模块 k8s 负责 Sandbox CR、节点冻结代理、原地缩放、平台出口代理配置与 NetworkPolicy 落地、入站路由、引导接口的投射 ServiceAccount 令牌认证与预热 Pod 被认领时的 `/wake` 通知；子模块 substrate 负责 actor 模板、Suspend 与 Resume、路由器唤醒、EgressPolicy 落地与引导接口的 actor JWT 认证；出口网关的凭据提供者（credential provider）协议由 `secrets` 实现，出口网关调用 | 控制面与节点，节点冻结代理为 DaemonSet |
 | `llmgateway` | 以运行实例令牌与调用方身份换取 LLM 凭据、`generation` 校验、在途请求表与在途请求事实的登记、实例续租、回放存储、限流、计费与审计 | 控制面 |
-| `connectorhub` | 外部系统定义与连接器：出口策略生成、[工具接入声明](../glossary.md)的装载与校验、沙箱侧配置的生成与经 `runcontroller` 推送、k8s 路径的平台出口代理、webhook 落盘与状态式轮询、订阅登记与回溯匹配、完成条件目录、订阅完成事件写入收件箱；不执行第三方操作 | 控制面 |
+| `connectorhub` | 外部系统定义与连接器：出口策略生成、[工具接入声明](../glossary.md)的装载与校验、等待签名的装载校验、沙箱侧配置的生成与经 `runcontroller` 推送、k8s 路径的平台出口代理、webhook 落盘与状态式轮询、订阅登记与回溯匹配、完成条件目录、订阅完成事件写入收件箱；不执行第三方操作 | 控制面 |
 | `humanchannel` | 聊天界面、即时通讯与 Issue 评论到收件箱的适配，审批决定，在线与「正在输入」信号，实时接入状态 | 控制面 |
 | `secrets` | 密钥库对接、运行实例令牌的签发与轮换、凭据换取、调用方授权与使用审计 | 控制面 |
 | `workspace` | 工作区的绑定、[持久化确认](../glossary.md)、沙箱外访问与工作区租约；按提供者区分的持久化实现；看守进程的文件 API | 控制面与看守进程 |
@@ -336,7 +337,7 @@ Kubernetes 集群内的划分：
 
 全部协议消息经出站流传输：看守进程运行时始终维持一条主动外连控制面的 gRPC 双向流，信封含 `run_id`、`generation`、`msg_seq` 与 `ack_msg_seq`，发送方在重连后重放未确认消息，接收方按 `(generation, msg_seq)` 去重，`Hello` 与 `HelloAck` 交换 `last_received_msg_seq` 与全量状态摘要做状态对账。投递（`Deliver`）只在出站流上进行。沙箱侧配置同样只在出站流上下发：`connectorhub` 在为运行实例生成或更新出口策略的同一时机调用 `PutSandboxConfig`，每个运行实例都有 `revision ≥ 1` 的配置；`Hello` 携带看守进程已应用的 `sandbox_config_revision`（尚未应用为 0），`runcontroller` 回 `HelloAck{accepted}` 之后，若保存的 `sandbox_config_revision` 大于 `Hello.sandbox_config_revision`，在该流上发送 `SandboxConfig{revision, config}`；`PutSandboxConfig` 提高 `revision` 且运行实例有已接受的出站流时立即在该流上发送，运行实例挂起或没有流时只保存，下一次 `Hello` 时补发；`SandboxConfig` 沿用出站流的确认与重放，销毁态连接上不发送；看守进程按 `revision` 幂等应用，首次应用 `revision ≥ 1` 的配置之前不启动 Agent 主进程。看守进程在沙箱内监听 80 端口，其提供的入站端点 `/readyz`、`/wake` 与 `/terminal` 不承载事件内容，`/readyz` 的应答不以领取为条件，`/wake` 在看守进程尚未领取时先领取再建立出站流；`ToolExec` 帧随出站流往返，由 `runcontroller` 从进程内控制面循环驱动器转发，不占用入站端点。恢复的触发按沙箱提供者不同：Substrate 提供者的恢复是经路由器调用 `/wake`，路由器恢复 actor 并让请求等待直到 `/readyz` 就绪，`/wake` 返回即表示出站流已重建；k8s 提供者的恢复是节点冻结代理解冻，或把 Sandbox CR 改回 `Running`、从预热池认领，随后看守进程自行重连；从预热池认领时，`sandboxprovider` 经 wake-router 调用该 Pod 的 `/wake` 通知看守进程领取。消息定义见 [agentprotocol](modules/design-agentprotocol.md)。
 
-回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如阻塞型审批、`wait_for` 与阻塞型定时）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。第三方工具调用不是阻塞条件，不进入这条路径。等待方式的选择（短等待用 `wait_for`、长等待用 `subscribe_event` 并结束回合）由平台 MCP 工具契约给出，见 [warden](modules/warden/design-warden.md)。
+回合中等待 LLM 走冻结路径。参与方为 Agent 进程、看守进程（本地代理与 Agent 驱动器）、`llmgateway`、`runcontroller`（链接 `suspendpolicy`）与 `sandboxprovider`（含节点冻结代理）。其他回合中的等待类型（例如阻塞型审批、`wait_for` 与阻塞型定时）复用同样的消息与状态转移，只在唤醒源与冻结上限上不同。第三方工具调用不是阻塞条件，不进入这条路径。等待方式的选择（短等待用 `wait_for`、长等待用 `subscribe_event` 并结束回合）由平台 MCP 工具契约给出，平台 MCP 服务器的 `instructions` 与工具描述承载同一规则，见 [warden](modules/warden/design-warden.md)。
 
 ```mermaid
 sequenceDiagram
@@ -414,7 +415,7 @@ sequenceDiagram
     A->>W: result（queued_turn_count 为 0）与 session_state_changed idle
     W->>R: AgentEvent turn_ended 与 state_changed{idle}
     R->>R: InTurn 转 Boundary
-    Note over R,P: 宽限期 G_turn_grace 内按沙箱提供者能力冻结，期满复评
+    Note over R,P: 宽限期内按沙箱提供者能力冻结，期满复评；宽限期取 G_turn_grace，最近一次回合意图为 completed 时取 G_turn_grace_done
     alt 宽限期内未冻结
         R->>R: 唤醒谓词为假且 I9 前置检查通过，Active 转 Suspending{destroy}
     else 宽限期内已冻结
@@ -466,8 +467,8 @@ sequenceDiagram
 | --- | --- | --- |
 | 订阅登记 | 平台 MCP 服务器调用 `connectorhub` 时携带的运行实例令牌 `generation` 与当前代一致 | `subscription` 行（过滤、关联键、`completes_on`、`lifetime`、`since_cursor`、`timeout_at`）与同一事务内对连接器事件日志的回溯匹配（`connectorhub` 自身事务）；匹配命中或 `verify` 核对到已终态时经汇入契约写入的完成事件 |
 | InTurn 转 Boundary | `idle` 与 `result` 都已到齐且 `result.queued_turn_count` 为 0；`generation` 与 `turn_id` 匹配 | `turn_phase`、`last_turn_id`、`reason` |
-| Active 转 Suspending（宽限期内冻结） | 行锁内唤醒谓词为假；预测等待的保守值不低于 `T_nofreeze` 且不超过 `G_turn_grace`；Freeze 在沙箱提供者能力集内；距上次恢复不少于 `D_min`；无后台作业（后台作业存活的回合边界不起算宽限期，只可静止冻结；后台作业变为空时宽限期从该时刻起算） | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`grace_deadline`、`freeze_basis`（取 `condition`） |
-| Active 转 Suspending（销毁） | 预测等待的保守值超过 `G_turn_grace`；行锁内唤醒谓词为假；Destroy 在沙箱提供者能力集内；距上次恢复不少于 `D_min`；I9 前置检查通过，检查项穷举为：协作层级不是 L0；`idle` 已到（回合边界）；无后台作业；未过期的自唤醒条目中不存在 `survives_resume=false` 的项；本代无在途请求（本地代理与 LLM 网关登记的在途行）；活动度静默不短于 `Q_quiet`；进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外无其他进程 | `state`、`suspend_id`、`suspend_mode`、`transition_deadline` |
+| Active 转 Suspending（宽限期内冻结） | 行锁内唤醒谓词为假；预测等待的保守值不低于 `T_nofreeze` 且不超过宽限期（`G_turn_grace`，最近一次回合意图为 `completed` 时取 `G_turn_grace_done`）；Freeze 在沙箱提供者能力集内；距上次恢复不少于 `D_min`；无后台作业（后台作业存活的回合边界不起算宽限期，只可静止冻结；后台作业变为空时宽限期从该时刻起算） | `state`、`suspend_id`、`suspend_mode`、`transition_deadline`、`grace_deadline`、`freeze_basis`（取 `condition`） |
+| Active 转 Suspending（销毁） | 预测等待的保守值超过宽限期；行锁内唤醒谓词为假；Destroy 在沙箱提供者能力集内；距上次恢复不少于 `D_min`；I9 前置检查通过，检查项穷举为：协作层级不是 L0；`idle` 已到（回合边界）；无后台作业；未过期的自唤醒条目中不存在 `survives_resume=false` 的项；本代无在途请求（本地代理与 LLM 网关登记的在途行）；活动度静默不短于 `Q_quiet`；进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外无其他进程 | `state`、`suspend_id`、`suspend_mode`、`transition_deadline` |
 | Suspended{frozen} 转 Suspending（宽限期到期升级为销毁） | 冻结中复评选定 DESTROY；行锁内唤醒谓词为假；不处于实时接入；回合边界且 I9 前置检查通过（检查项同 Active 转 Suspending（销毁）） | `state`、`suspend_id`、`suspend_mode`、`suspend_origin=frozen`、`suspend_phase=thawing`、`transition_deadline` 与解冻的效果记录；`Thawed` 到达后行锁内重评估唤醒谓词并核对回合位置（[ADR-turn-position-persisted](../adr/adr-turn-position-persisted.md)）与终端、文件通道的接入，谓词为假，解冻期间回合未开始，且终端与文件通道的接入都无效时才发 `PrepareSuspend{destroy}`；谓词为真，解冻期间回合已开始（例如 Agent 自行开始回合），或终端或文件通道接入有效时回到 Active，不发 `PrepareSuspend` |
 | PrepareSuspend 到 ReadyToSuspend（看守进程侧） | Agent 驱动器的自唤醒条目中不存在 `survives_resume=false` 的项；Agent 驱动器关闭 stdin 后 Agent 正常退出并取得退出码；终止已声明的第三方 MCP 服务器（含其子进程）后进程树中无其他进程，这是挂起路径中看守进程唯一终止的进程，后台作业、残留进程与孤儿进程不终止；本地代理与透明拦截器无外部在途连接；会话记录 JSONL 末尾已含本回合记录；共享文件系统上的工作区 fsync 完成；无工作区写文件描述符；任一不满足时回 `Busy` | `ReadyToSuspend{suspend_id, mode, exited_at, session_id, procs_remaining, ws_write_fds}` 中的恢复句柄（`session_id`）非空时落入 `run` 行，为空时保留已落库的恢复句柄（例如本代未启动 Agent 进程的沙箱），同一事务写入调用沙箱提供者销毁的效果记录；看守进程侧无数据库写入 |
 | Suspending 转 Suspended | 恢复句柄（`session_id`）已落库；沙箱提供者确认销毁，`durableDir` 退化配置下为同步挂起已返回（上传完成）；行锁内重评估唤醒谓词为假 | `substate`、`self_wake_at`（有效自唤醒条目中最早的触发时刻减去按恢复机制的提前量，无有效条目时为空） |
@@ -482,7 +483,7 @@ sequenceDiagram
 
 ## 数据流
 
-跨模块边界流动的数据有事件、唤醒信号、自唤醒条目、LLM 请求、外部系统请求、凭据、出口策略、沙箱侧配置与运行实例令牌，穷举见数据形态表。事件从来源经连接器事件日志、订阅匹配与去重进入收件箱，由 `runcontroller` 投递，经看守进程的投递意图日志成为 Agent 输入；唤醒信号不进入收件箱，在运行实例行锁内满足阻塞条件与代范围的等待条件；自唤醒条目由看守进程的 Agent 驱动器经出站流上报，由 `runcontroller` 跨代保存，作为挂起期间自唤醒截止时间的来源；LLM 请求从 Agent 进程经本地代理到 LLM 网关再到上游；外部系统请求从 Agent 进程经本地代理或透明拦截器到出口代理再到允许主机；出口策略从 `connectorhub` 经 `sandboxprovider` 落地到出口代理，沙箱侧配置从 `connectorhub` 经 `runcontroller` 的出站流到达看守进程；首个运行实例令牌由看守进程经引导接口领取，此后的令牌经出站流轮换；真实凭据不跨越沙箱边界，其分布见安全边界。
+跨模块边界流动的数据有事件、唤醒信号、自唤醒条目、等待意图、LLM 请求、外部系统请求、凭据、出口策略、沙箱侧配置与运行实例令牌，穷举见数据形态表。事件从来源经连接器事件日志、订阅匹配与去重进入收件箱，由 `runcontroller` 投递，经看守进程的投递意图日志成为 Agent 输入；唤醒信号不进入收件箱，在运行实例行锁内满足阻塞条件与代范围的等待条件；自唤醒条目由看守进程的 Agent 驱动器经出站流上报，由 `runcontroller` 跨代保存，作为挂起期间自唤醒截止时间的来源；等待意图由看守进程的 Agent 驱动器经出站流上报，由 `runcontroller` 按对象保存最近一次，只作 `suspendpolicy` 的软输入；LLM 请求从 Agent 进程经本地代理到 LLM 网关再到上游；外部系统请求从 Agent 进程经本地代理或透明拦截器到出口代理再到允许主机；出口策略从 `connectorhub` 经 `sandboxprovider` 落地到出口代理，沙箱侧配置从 `connectorhub` 经 `runcontroller` 的出站流到达看守进程；首个运行实例令牌由看守进程经引导接口领取，此后的令牌经出站流轮换；真实凭据不跨越沙箱边界，其分布见安全边界。
 
 ```mermaid
 flowchart LR
@@ -526,7 +527,7 @@ flowchart LR
     driver -->|"accepted 与 consumed"| intent
     driver -->|"原生输入"| agent
     proxy -->|"llm.request.completed 与 conn.inbound 出站流"| wake
-    driver -->|"self_wake_changed 出站流"| rc
+    driver -->|"self_wake_changed 与 intent_observed 出站流"| rc
     gw -->|"完成或失败 汇入契约"| wake
     timer -->|"代范围定时器触发"| wake
     timer -->|"运行实例范围定时器到期通知"| inbox
@@ -561,11 +562,12 @@ flowchart LR
 | Agent 输入 | 看守进程的 Agent 驱动器到 Agent 进程 | 按 `target` 翻译为 Agent 原生输入：下一条用户消息、工具结果或权限决定 | Agent 自身的会话记录，位于工作区内的 `CLAUDE_CONFIG_DIR` |
 | 唤醒信号 | 看守进程的本地代理与透明拦截器（出站流，含冻结期间入站数据的 `conn.inbound`）、`llmgateway`、定时器到 `runcontroller`；审批决定与订阅完成对应的唤醒信号由 `runcontroller` 在写入收件箱的同一事务派生 | 引用阻塞条件、代范围等待条件或冻结尝试的 `kind` 与 `ref`，带 `generation`，不进入收件箱 | `wake_signal` 表，在运行实例行锁内消费 |
 | 自唤醒条目 | 看守进程的 Agent 驱动器到 `runcontroller`（出站流 `self_wake_changed`） | 条目集合加 `crons_synced`：为真时集合整体替换；为假时（驱动器尚未取得本进程的 `session_crons`）整体替换 `kind≠cron` 的条目，`cron` 条目按 `entry_id` 合并，集合中出现的覆盖同 `entry_id` 的已有条目，未出现的保留；每项 `{entry_id, kind, fire_at, survives_resume}`，`fire_at` 为空表示触发时刻未知；可在没有进行中回合时发出，顺序由出站流的 `msg_seq` 保证，重复与乱序不改变结果 | `run.self_wake`，跨代保留，新代进入 Active 时删除不随续接恢复的条目 |
-| LLM 请求与响应 | Agent 进程到本地代理（回环 HTTP），本地代理到 LLM 网关（附运行实例令牌），LLM 网关到上游 | 流式响应；本地代理的单次回放缓存键为 `(run_id, generation, request_hash)`，网关回放存储按 `request_id` 取回 | `llm_request` 表与 LLM 网关的回放存储 |
+| 等待意图 | 看守进程的 Agent 驱动器到 `runcontroller`（出站流 `intent_observed`）；Agent 自报的预计等待随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报 | `{ref_kind, ref, class, target, expected_ms, source, confidence}`，`ref_kind` 取 `call`、`job` 或 `turn`；同一 `(ref_kind, ref)` 后到的覆盖先到的；可在没有进行中回合时发出；`agent_expected_ms` 与平台给出的 `predicted_ms` 分开上报；控制面循环驱动器不产生意图 | `run.intents`，按 `(ref_kind, ref)` 保存最近一次意图，调用结束、作业离开后台作业集合或下一回合开始时删除对应条目；`agent_expected_ms` 存于对应的 `wait` 行与 `blocked_on` |
+| LLM 请求与响应 | Agent 进程到本地代理（回环 HTTP），本地代理到 LLM 网关（附运行实例令牌），LLM 网关到上游；看守进程的宿主侧意图分类请求（可选，默认关闭）经本地代理到 LLM 网关，不经 Agent 进程 | 流式响应；本地代理的单次回放缓存键为 `(run_id, generation, request_hash)`，网关回放存储按 `request_id` 取回 | `llm_request` 表与 LLM 网关的回放存储 |
 | 外部系统请求 | Agent 进程到本地代理（CONNECT 或 HTTP 前置）或透明拦截器（本地 DNS 指向），两者到出口代理（附运行实例身份），出口代理到允许主机 | 携带凭据占位符的 HTTP 请求，出口代理终止 TLS、替换占位符后转发；拦截器只转发原始 TLS 字节，不终止 TLS；出口代理的请求头与响应头事件作为在途信号上报 | 不持久化 |
 | 凭据 | 密钥库到 LLM 网关与 `connectorhub`（以运行实例令牌与调用方身份换取）、密钥库到出口代理（以运行实例令牌与调用方身份换取，替换占位符） | 沙箱内只存在形如 `{{github.token}}` 的占位符与看守进程持有的运行实例令牌 | `secrets` 对接的密钥库 |
 | 出口策略 | `connectorhub` 到 `sandboxprovider` 再到出口代理 | 每运行实例的允许主机、占位符替换规则与按主机通道模式；Substrate 为以（运行实例，代）为键的 EgressPolicy，由 `sandboxprovider` 在为该代预配沙箱时按代落地，快照恢复沿用同代副本，撤销后该代拒绝再次落地与更新；k8s 为平台出口代理配置与 NetworkPolicy | `connectorhub` 生成的每运行实例出口策略；Substrate 的按代副本由 `sandboxprovider` 据它落地 |
-| 沙箱侧配置 | `connectorhub` 到 `runcontroller`（汇入契约 `PutSandboxConfig`），`runcontroller` 到看守进程（出站流 `SandboxConfig`）；不经过 `sandboxprovider` | `{modes, tool_profile}`：按主机通道模式与工具接入声明；不含密钥，凭据只以占位符出现；序列化后不超过 32 KiB；`revision` 取同一次生成的 `EgressPolicy.Revision`，单调递增，看守进程按 `revision` 幂等应用 | `run.sandbox_config` 与 `run.sandbox_config_revision` |
+| 沙箱侧配置 | `connectorhub` 到 `runcontroller`（汇入契约 `PutSandboxConfig`），`runcontroller` 到看守进程（出站流 `SandboxConfig`）；不经过 `sandboxprovider` | `{modes, tool_profile, wait_signatures, intent{hints, classifier}}`：按主机通道模式、工具接入声明、该运行实例可用外部系统的等待签名，以及情境提示与宿主侧分类的开关（均默认关闭）；不含密钥，凭据只以占位符出现；序列化后不超过 32 KiB；`revision` 取同一次生成的 `EgressPolicy.Revision`，单调递增，看守进程按 `revision` 幂等应用 | `run.sandbox_config` 与 `run.sandbox_config_revision` |
 | 运行实例令牌 | `sandboxprovider` 的引导接口到看守进程（领取，首个令牌），`runcontroller` 到看守进程（出站流 `TokenRotate`，轮换） | 短期 JWT；领取响应为 `{run_id, generation, sandbox_id, lease_id, token, token_expires_at}`；签发、持有与校验见认证与授权边界 | 只由看守进程在内存中持有，不进入提供者的持久记录 |
 
 事件与唤醒信号的写入事务各自重评估唤醒谓词（I5）。LLM 流量不走占位符注入，凭据换取与在途跟踪在 LLM 网关完成；外部系统流量的占位符替换与默认拒绝见安全边界。决策依据见 [ADR-host-owns-external-wake-sources](../adr/adr-host-owns-external-wake-sources.md) 与 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)。
@@ -688,11 +690,12 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 | 预热池耗尽（k8s 提供者） | 恢复退化为冷启动重建，并发上限见并发模型；`pool_miss_rate` 上升；池容量按性能与容量目标中的公式重算 |
 | Substrate worker 容量耗尽 | 没有 worker 有余量时 `ResumeActor` 返回 `RESOURCE_EXHAUSTED`，`Provision` 与 `RestoreSnapshot` 返回暂时性错误，调用方按同一幂等键退避重试；Substrate 路径没有绕开 worker 的冷启动路径；WorkerPool 的容量是部署配置，见性能与容量目标 |
 | 引导接口领取失败 | 看守进程按响应码处置，各响应码的判定见 [sandboxprovider](modules/sandboxprovider/design-sandboxprovider.md)：401 不可重试；404 与 503 退避重试，从 1 s 起翻倍，上限 30 s，k8s 的 `/wake` 与 Substrate 的 `actor-name` 变化触发立即领取；409 时停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建；410 时退出 |
-| 沙箱侧配置推送失败或无法应用 | `PutSandboxConfig` 调用失败时 `connectorhub` 以同一 `revision` 退避重试；运行实例已终态时 `runcontroller` 拒绝，`connectorhub` 丢弃并计数；`SandboxConfig` 序列化后超过 32 KiB 时 `ToolProfile` 置空，记录审计并计数，其余照常；看守进程无法解析配置内容时保留上一次成功应用的配置并计数，从未成功应用时按 `modes` 与 `tool_profile` 均为空处理，并启动 Agent 主进程 |
+| 沙箱侧配置推送失败或无法应用 | `PutSandboxConfig` 调用失败时 `connectorhub` 以同一 `revision` 退避重试；运行实例已终态时 `runcontroller` 拒绝，`connectorhub` 丢弃并计数；`SandboxConfig` 序列化后超过 32 KiB 时首先把 `WaitSignatures` 置为空数组，仍超过时 `ToolProfile` 置空，均记录审计并计数，其余照常；看守进程无法解析配置内容时保留上一次成功应用的配置并计数，从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的开关均关闭处理，并启动 Agent 主进程 |
+| 托管 hook 二进制查询驱动器失败 | hook 不附 `additionalContext` 即返回，不阻断工具调用与回合，计数；该次情境提示缺失，当下这一次等待照常由机械层兜住 |
 
 ### 可观测性
 
-设计要求的指标如下，实现可以增加指标但不得缺少其中任何一项：`idle_while_scheduled_ratio`（已调度却空闲的时间占比）、按机制统计的挂起与恢复次数及时延分布、`wakeup_latency`（事件到达至投递）、`resume_queue_depth` 与按优先级的排队时长、`pool_miss_rate`、按节点的 `frozen_mem_ratio`、`resize_deferred` 的计数与持续时间、在途请求数（LLM 网关、本地代理与透明拦截器观察到的外部连接）、订阅对账差异数、旧代拒绝计数、抖动预算耗尽次数。
+设计要求的指标如下，实现可以增加指标但不得缺少其中任何一项：`idle_while_scheduled_ratio`（已调度却空闲的时间占比）、按机制统计的挂起与恢复次数及时延分布、`wakeup_latency`（事件到达至投递）、`resume_queue_depth` 与按优先级的排队时长、`pool_miss_rate`、按节点的 `frozen_mem_ratio`、`resize_deferred` 的计数与持续时间、在途请求数（LLM 网关、本地代理与透明拦截器观察到的外部连接）、订阅对账差异数、旧代拒绝计数、抖动预算耗尽次数、等待意图的分类分布（按 `ref_kind`、`class` 与 `source`）、命中等待签名的前台等待在全部前台等待中的时长占比、情境提示次数与采纳次数（按等待签名）、Agent 自报预计等待的命中率（实际等待落在自报值 ±50% 以内计命中）。等待意图的分类分布由 `runcontroller` 按收到的 `intent_observed` 统计，Agent 驱动器另对全部判定结果计数（含不发出的 `unknown`）；命中等待签名的前台等待时长、情境提示与采纳的计数由 Agent 驱动器统计，与本地代理的指标经同一通道发出；Agent 自报的命中率取自 `suspendpolicy` 记入 `policy_state` 的命中记录；这些指标都不另设协议消息。
 
 LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_ai` 语义约定（[REF-otel-genai-semconv](../references.md)），使一次 LLM 请求在本地代理、LLM 网关与上游之间可以按同一追踪关联。
 
@@ -719,10 +722,10 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 
 - **沙箱边界。** Agent 以每运行实例的 uid 运行，uid 由控制器全局唯一分配并固定；Agent 进程启动时设置 `no_new_privs` 并清空 capability bounding set，镜像内没有 sudo 与 setuid 二进制；看守进程以 root 运行并作为 PID 1 监督 Agent。Agent 进程能到达的网络端点受 I6 约束。
 - **网络出口。** 出口代理默认拒绝全部主机，只按运行实例的出口策略放行允许的主机，Substrate 出口网关另按 `sandboxprovider` 追加的规则放行引导接口主机与看守进程所连的控制面主机；凭据只以占位符（例如 `{{github.token}}`）进入沙箱，由出口代理在发往允许主机时替换为真实凭据（[ADR-host-owns-external-wake-sources](../adr/adr-host-owns-external-wake-sources.md)）。Agent 进程的外部系统流量经本地代理或透明拦截器前置到出口代理，两者对未放行的目标立即拒绝而不是黑洞。Substrate 提供者把出口策略落地为以（运行实例，代）为键的 EgressPolicy，k8s 提供者落地为平台出口代理配置加 NetworkPolicy，git 流量经平台反向代理重写。出口路径按代校验：k8s 路径的平台出口代理对每个请求按附带的运行实例令牌经代查询接口校验代、终态与作废状态，不使用缓存；Substrate 路径在本代沙箱作废、进入 `Degraded`、放弃、显式结束与代递增时撤销对应代的出口策略，残余窗口的上界见认证与授权边界（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。网络通道由外部系统定义的 `access.mode` 与 `access.host_modes` 按主机选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由沙箱内本地 DNS 把域名解析到回环拦截器。`mitm` 与需要注入凭据的 `proxy` 目标要求沙箱信任平台 CA，信任来源为镜像预置或运行时注入；证书固定目标不支持凭据注入。
-- **第三方工具接入。** 工具接入声明由 `connectorhub` 按项目装载与校验，与按主机通道模式组成沙箱侧配置，由 `connectorhub` 在生成或更新出口策略的同一时机经 `runcontroller` 的 `PutSandboxConfig` 汇入，`runcontroller` 在出站流上以 `SandboxConfig` 消息推送给看守进程，看守进程只读；沙箱侧配置不经过 `sandboxprovider`；`connectorhub` 在生成时校验 `SandboxConfig` 序列化后不超过 32 KiB，超限时与声明校验不通过的处置相同：`ToolProfile` 置空，记录审计并计数，其余照常；看守进程首次应用沙箱侧配置之前不启动 Agent 主进程；声明位于工作区之外，Agent 只读；工作区 `.mcp.json` 被忽略。声明只携带凭据占位符，不携带真实凭据；第三方 MCP 服务器的可执行文件来自镜像内预置并固定版本与摘要，`allowed_hosts` 是出口策略允许主机的子集，由 `connectorhub` 在生成出口策略时校验。平台不按工具绑定网络通道，同一组环境变量可被多个工具共用。
+- **第三方工具接入。** 工具接入声明由 `connectorhub` 按项目装载与校验，与按主机通道模式组成沙箱侧配置，由 `connectorhub` 在生成或更新出口策略的同一时机经 `runcontroller` 的 `PutSandboxConfig` 汇入，`runcontroller` 在出站流上以 `SandboxConfig` 消息推送给看守进程，看守进程只读；沙箱侧配置不经过 `sandboxprovider`；`connectorhub` 在生成时校验 `SandboxConfig` 序列化后不超过 32 KiB，超限时首先把 `WaitSignatures` 置为空数组，仍超限时与声明校验不通过的处置相同：`ToolProfile` 置空，记录审计并计数，其余照常；看守进程首次应用沙箱侧配置之前不启动 Agent 主进程；声明位于工作区之外，Agent 只读；工作区 `.mcp.json` 被忽略。声明只携带凭据占位符，不携带真实凭据；第三方 MCP 服务器的可执行文件来自镜像内预置并固定版本与摘要，`allowed_hosts` 是出口策略允许主机的子集，由 `connectorhub` 在生成出口策略时校验。平台不按工具绑定网络通道，同一组环境变量可被多个工具共用。
 - **凭据。** 真实凭据不跨越沙箱边界：沙箱内不持有任何长期凭据与 LLM 密钥，真实凭据只在托管侧进程（`secrets` 对接的密钥库、LLM 网关、`connectorhub`、出口代理）的内存中出现。沙箱内的凭据只有看守进程持有的运行实例令牌，以及 k8s 路径上只允许看守进程读取的投射 ServiceAccount 令牌；投射令牌不绑定任何 RBAC 权限，audience 为 `castworks-bootstrap`，只用于引导接口领取。Substrate 路径的 actor JWT 由出口网关在请求途中注入，不进入沙箱。
 - **工作区隔离。** 运行实例子目录权限 0700，项目根 0711，每个运行实例目录设配额；认领过的预热 Pod 不回收复用；可选加固为在 `hostUsers: false` 下由看守进程以 mount namespace 只绑定本运行实例的子目录。
-- **hooks 与权限设置。** Agent 的 hooks 与权限设置通过 Claude Code 的托管策略设置文件（[REF-claude-code-settings](../references.md)）注入，文件位于工作区之外，Agent 对工作区的写入改变不了它们；`PreToolUse` hook 显式设置 `timeout` 与 `onFailure: block`，超时放行的默认行为被覆盖。
+- **hooks 与权限设置。** Agent 的 hooks 与权限设置通过 Claude Code 的托管策略设置文件（[REF-claude-code-settings](../references.md)）注入，文件位于工作区之外，Agent 对工作区的写入改变不了它们；`PreToolUse` hook 显式设置 `timeout` 与 `onFailure: block`，超时放行的默认行为被覆盖。`PostToolUse`、`PostToolBatch` 与 `SubagentStart` hook 由看守进程提供的托管 hook 二进制实现，与审批 hook 同一机制，同受 `allowManagedHooksOnly` 约束；它们只返回 `additionalContext`，不返回拒绝、询问或让对话继续的输出；`Stop`、`SubagentStop` 与 `UserPromptSubmit` hook 只读取输入，不返回 `additionalContext`（I11）。
 - **多租户维度。** 数据模型保留 `tenant_id` 字段（租户维度），不实现跨租户配额与抢占；预热池与挂载根为单组织共享，工作区隔离对应单组织租户模型（[ADR-tenant-dimension-without-enforcement](../adr/adr-tenant-dimension-without-enforcement.md)）。
 
 ## 架构不变量
@@ -741,8 +744,9 @@ LLM 网关与本地代理发出的追踪与指标遵循 OpenTelemetry 的 `gen_a
 | I8 | 唤醒集合（条件或截止时间）为空的运行实例不得被挂起 | 看门狗冻结后无人唤醒 |
 | I9 | 以挂起为目的的沙箱销毁仅在同时满足以下条件后执行：Agent 进程正常退出；无在途请求（LLM 在途为空，且本地代理与透明拦截器无外部在途连接）；看守进程在 Agent 正常退出之后终止已声明的第三方 MCP 服务器（含其子进程），此后无其他进程，且无后台作业（含 Agent 进程内的后台子代理与 workflow），其他进程与后台作业都不由看守进程终止；未过期的自唤醒条目都随续接恢复；工作区已持久化（共享文件系统为 fsync 完成，`durableDir` 为同步快照上传完成）；恢复句柄已落库。不以挂起为目的的销毁（显式结束、进入 `Degraded`、放弃、本代沙箱作废、`fence_and_bump` 对旧代的销毁、销毁态连接、`sandbox_id` 核对不符与完成事务校验失败的单个销毁、「沙箱丢失」守卫的反向求差）不受此约束，其会话分别由恢复句柄、回合被中断通知与兜底摘要承接 | `--resume` 丢失最后一回合；销毁丢失后台作业或不随续接恢复的自唤醒条目 |
 | I10 | 运行实例的所有过渡态有截止时间且可幂等重驱动；出站流断连后以状态对账而非事件历史恢复一致 | 控制面重启后运行实例卡在过渡态 |
+| I11 | 等待意图只作软输入：只进入等待时长预测、宽限期选择、提示决策与指标，不进入单一条件门控、静止证据、I9 与唤醒集合；平台不以提问、拦截或强制继续的方式向 Agent 索取意图，不为获取意图额外发起 Agent 的模型调用，情境提示只搭载在 Agent 本来就要发出的下一次模型请求上，Agent 可以忽略 | 单一条件门控、静止证据、I9 前置检查或唤醒集合的结论随意图取值变化；为索取意图向 Agent 投递消息或额外发起其模型调用；以 `deny` 或 `ask` 拦截工具调用，或以 `Stop`、`SubagentStop` hook 让对话继续 |
 
-I1 与 I6 的决策依据为 [ADR-host-owns-external-wake-sources](../adr/adr-host-owns-external-wake-sources.md)；I2、I3、I5 与 I8 为 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)；I4 为 [ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)；I7 为 [ADR-generation-fencing](../adr/adr-generation-fencing.md)，持久化事实的代范围划分为 [ADR-generation-scoped-waits](../adr/adr-generation-scoped-waits.md)；I9 为 [ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)，其中工作区持久化确认按沙箱提供者区分的依据为 [ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)；I10 为 [ADR-state-based-reconciliation](../adr/adr-state-based-reconciliation.md)。
+I1 与 I6 的决策依据为 [ADR-host-owns-external-wake-sources](../adr/adr-host-owns-external-wake-sources.md)；I2、I3、I5 与 I8 为 [ADR-wait-on-durable-inbox](../adr/adr-wait-on-durable-inbox.md)；I4 为 [ADR-delivery-intent-log](../adr/adr-delivery-intent-log.md)；I7 为 [ADR-generation-fencing](../adr/adr-generation-fencing.md)，持久化事实的代范围划分为 [ADR-generation-scoped-waits](../adr/adr-generation-scoped-waits.md)；I9 为 [ADR-turn-boundary-destroy](../adr/adr-turn-boundary-destroy.md)，其中工作区持久化确认按沙箱提供者区分的依据为 [ADR-workspace-persistence-per-provider](../adr/adr-workspace-persistence-per-provider.md)；I10 为 [ADR-state-based-reconciliation](../adr/adr-state-based-reconciliation.md)；I11 为 [ADR-wait-intent-as-soft-input](../adr/adr-wait-intent-as-soft-input.md)。
 
 ## 实现状态
 

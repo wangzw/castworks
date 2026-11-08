@@ -14,6 +14,7 @@
 | --- |
 | [在持久化收件箱上等待](adr-wait-on-durable-inbox.md) |
 | [收件箱事件跨代保留、唤醒信号按代失效、代范围等待与定时器随代作废](adr-generation-scoped-waits.md) |
+| [等待意图只作软输入，经被动解析、等待签名与工具结果旁的提示获取](adr-wait-intent-as-soft-input.md) |
 
 ## 唤醒源与流量
 

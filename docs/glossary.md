@@ -12,6 +12,7 @@
 | 等待 | Wait | 运行实例当前等待的条件集合；由控制面从持久化事实推导，协作式 Agent 可追加显式条件 |
 | 唤醒谓词 | wake predicate | 判定运行实例是否应恢复的条件：阻塞条件或代范围的等待条件（探测定时器、显式声明、静止冻结登记的等待）已被唤醒信号满足，或冻结期间 Agent 持有的连接收到入站数据，或处于回合边界且存在可投递事件（含跨代重投区间内待重投的事件）或以 hook 的 `defer`（[REF-claude-code-hooks](references.md)）推迟的审批决定，或冻结的截止时间已到；自唤醒源的到期不属于唤醒谓词，由所有者侧截止时间驱动 |
 | 自唤醒源 | self-wake source | Agent 自行安排、到点由 Agent 进程自行触发而不经任何托管侧组件的唤醒来源，例如 Claude Code 的会话内定时（`CronCreate`、`ScheduleWakeup`）、`sleep` 进程、工具超时与 `Monitor` 截止；与之相对，LLM 完成、外部系统事件、人类消息与托管侧定时器经托管侧组件到达。托管侧观测其触发时刻并镜像进唤醒集合，每个已镜像的自唤醒安排称为自唤醒条目，触发时刻无法确定的条目同样镜像，其触发时刻为空 |
+| 等待意图 | wait intent | Agent 驱动器对某个前台工具调用、后台作业或回合推断出的等待性质：在等什么、预计多久，以及该调用或作业是在工作、等待还是提供服务，该回合是以提问结束还是以任务完成结束；每条意图带来源与置信度 |
 | 订阅 | Subscription | 运行实例对某外部系统事件的持久登记，含过滤条件、关联键、完成条件与生命周期 |
 | 回合 | Turn | Agent 从收到一条输入到停下等待下一条输入之间的工作段 |
 | 回合边界 | turn boundary | 回合结束、Agent 等待下一条输入的时刻；L1 与 L2 以挂起为目的销毁沙箱的唯一时点（L0 不以挂起为目的销毁） |
@@ -42,7 +43,7 @@
 | 直通模式 | passthrough | 本地代理在 LLM 请求开始时一次性选定的转发模式之一：逐条向 Agent 转发上游 SSE 事件；LLM 网关按同一事件顺序转发，模式不改变 LLM 网关的转发行为 |
 | 缓存模式 | hold | 本地代理在 LLM 请求开始时一次性选定的转发模式之一：缓冲内容事件、只向 Agent 转发 `ping` 保活事件，解冻后一次性交付；LLM 网关仍按同一事件顺序转发并保存回放 |
 | 连接器 | Connector | 按外部系统定义接入一个外部系统的组件：出口策略、事件源、订阅匹配、完成条件与状态式轮询 |
-| 外部系统定义 | ExternalSystem | 描述一个外部系统的认证方式、出口策略、事件源、完成条件目录、关联键与关联键身份键的声明；不声明具体操作 |
+| 外部系统定义 | ExternalSystem | 描述一个外部系统的认证方式、出口策略、事件源、完成条件目录、关联键、关联键身份键与等待签名的声明；不声明具体操作 |
 | 协作层级 | cooperation level | Agent 向托管环境提供信号的程度：L0 纯观测、L1 驱动器中介、L2 协作式 |
 | 投递意图日志 | delivery intent log | 看守进程写在工作区内的投递记录，使事件去重在沙箱重建后仍然有效 |
 | 恢复准入 | resume admission | 对等待恢复的运行实例按机制限速与优先级放行的队列 |
@@ -51,6 +52,7 @@
 | 人类通道 | human channel | 把聊天界面、即时通讯、Issue 评论等人类输入与审批决定写入收件箱的模块 |
 | 平台 MCP 服务器 | platform MCP server | 看守进程提供给 Agent 的 MCP（[REF-mcp](references.md)）工具集合：列出可订阅事件、登记订阅、阻塞等待、定时等待、附件取回；不执行第三方操作 |
 | 事件目录 | event catalogue | 平台 MCP 服务器向 Agent 投影的可订阅事件集合：事件类型、可匹配字段、关联键身份键、终态取值与订阅参数；由 `connectorhub` 按运行实例可用的外部系统生成 |
+| 等待签名 | wait signature | 外部系统定义中声明的等待识别规则：把匹配某一模式的命令或请求（例如 `gh run watch <id>`）识别为对该外部系统事件目录中某一事件类型的等待，并给出从匹配结果提取关联键的规则与该类等待的时长先验 |
 | 工具接入声明 | tool profile | 由 `connectorhub` 按项目装载与校验、随沙箱侧配置推送给看守进程的第三方工具与 MCP 服务器声明：凭据占位符环境变量、非秘密配置、stdio MCP 服务器与允许主机；位于工作区之外，工作区 `.mcp.json` 不生效 |
 | 占位符环境变量 | placeholder environment variable | 值为 `{{<system>.<name>}}` 形式占位符的环境变量，由看守进程注入第三方工具；真实凭据仍只在出口代理内存中出现 |
 | 完成条件目录 | completion catalogue | 外部系统定义中按事件类型声明的 `verify` 集合；订阅按事件类型查找状态核对方式，不按操作名查找 |
@@ -59,7 +61,7 @@
 | 终态取值 | terminal outcome | 外部对象在订阅关注维度上的结束取值，取自外部系统定义 `verify.terminal` 所列的闭集；订阅完成事件的 `event_id` 以它与 `sub_id` 派生 |
 | 出口策略 | egress policy | 连接器为每个运行实例生成的允许出口主机集合与请求头凭据占位符替换规则，由沙箱提供者落地；未列入的主机默认拒绝 |
 | 出口代理 | egress proxy | 落地出口策略的托管侧代理，接收本地代理与透明拦截器转来的 Agent 流量，在发往允许主机时把凭据占位符替换为真实凭据；k8s 路径为 connectorhub 的平台出口代理，Substrate 路径为 Substrate 出口网关 |
-| 沙箱侧配置 | SandboxConfig | 由 `connectorhub` 生成、经 `runcontroller` 在出站流上推送给看守进程、由看守进程只读的配置，内容为各主机的网络通道与工具接入声明，不含密钥，不经过 `sandboxprovider`；字段与语义由 `connectorhub` 定义，`runcontroller` 按运行实例保存并转发，不解释其字段 |
+| 沙箱侧配置 | SandboxConfig | 由 `connectorhub` 生成、经 `runcontroller` 在出站流上推送给看守进程、由看守进程只读的配置，内容为各主机的网络通道、工具接入声明、该运行实例可用外部系统的等待签名以及情境提示与宿主侧分类的开关，不含密钥，不经过 `sandboxprovider`；字段与语义由 `connectorhub` 定义，`runcontroller` 按运行实例保存并转发，不解释其字段 |
 | 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, expires_at} 记录；看守进程以首次续约绑定持有者并周期续约，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期，或沙箱提供者确认租约所属代的沙箱已删除后接管工作区 |
 | 持久化确认 | persistence confirmation | 在销毁沙箱前确认工作区写入已持久化的处理；`sync` 为 fsync 完成，`on_suspend` 为同步挂起上传完成 |
 | 运行实例所有者租约 | run owner lease | `run` 行上的 `owner_id`、`owner_epoch` 与 `owner_lease_expires_at`，决定该运行实例状态机的写者 |

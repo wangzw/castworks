@@ -16,6 +16,11 @@
 | 关闭 stdin 后进程退出与会话记录刷盘的先后；`CLAUDE_CONFIG_DIR` 与 cwd 变化对续接的影响（无头模式文档） | 安全点中的工作区持久化确认 | 通过——进程退出时可观察到本回合记录已写入会话记录文件，或存在可等待的刷盘完成判据；cwd 逐字一致且 `CLAUDE_CONFIG_DIR` 位于工作区内时续接成功。不通过——退出后会话记录文件仍缺本回合记录且无判据；此时销毁前改为同步快照上传确认，或改由新会话加合成摘要承接会话状态。 |
 | MCP 工具调用超时的默认值与可配置项；`SIGCONT` 后超时与已就绪响应的处理顺序；`wait_for` 阻塞调用在冻结 30、120、600 s 后的行为（[REF-mcp](references.md)） | `F_cap(approval/wait_for)` 与 `MCP_TOOL_TIMEOUT` | 通过——默认值与可配置项可确定；`SIGCONT` 后客户端先收到已就绪响应；冻结期间 `wait_for` 返回已转为订阅而非超时。不通过——冻结跨越超时导致调用被判失败；此时把 `F_cap` 下调到实测超时减 60 s，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果。 |
 | 托管策略设置文件在 `-p` 无头模式下对 hooks 与权限设置的生效；`allowManagedHooksOnly` 对工作区内设置与 `CLAUDE_CONFIG_DIR` 用户设置的屏蔽（[REF-claude-code-settings](references.md)） | hooks 注入位置与安全边界 | 通过——托管设置中的 hooks 与权限设置在 `-p` 下生效，工作区 `.claude/settings.json` 与 `CLAUDE_CONFIG_DIR` 用户设置中的 hooks 被屏蔽且不可覆盖。不通过——托管设置不生效，或可被工作区覆盖；此时审批 hook 不得放在工作区内，需重新确定注入位置并复核安全边界。 |
+| `-p` 下 `PostToolUse` 与 `PostToolBatch` hook 返回的 `additionalContext` 是否进入下一次模型请求，以及在请求中的位置（[REF-claude-code-hooks](references.md)） | 情境提示的载体；[ADR-wait-intent-as-soft-input](adr/adr-wait-intent-as-soft-input.md) 的失效条件 | 通过——本地代理观察到的下一次模型请求中含该 `additionalContext`，位于对应工具结果旁，且 hook 不引发额外的模型请求。不通过——该内容不进入模型请求，或只在回合结束之后出现；此时 `intent.hints` 保持关闭，等待意图停在只观测与自报，等待方式的选择规则仍由平台 MCP 服务器的 `instructions` 与工具描述承载。 |
+| 平台 MCP 服务器初始化时提供的 `instructions` 在 `-p` 下是否进入系统提示（[REF-mcp](references.md)） | 等待方式选择规则的常驻载体 | 通过——本地代理观察到的模型请求的系统提示中含该 `instructions` 原文。不通过——不含；此时同一规则由托管 `SessionStart` hook 的 `additionalContext` 注入，工具描述照常承载等待方式的选择规则。 |
+| `SubagentStart` hook 返回的 `additionalContext` 对子代理是否可见（[REF-claude-code-hooks](references.md)） | 子代理的等待方式契约 | 通过——本地代理观察到的子代理首个模型请求中含该 `additionalContext`。不通过——不含；此时不注册 `SubagentStart` hook，子代理只经平台 MCP 工具描述获得契约，子代理内的等待由机械层兜住。 |
+| `-p` 下 `Stop` hook 输入的 `last_assistant_message` 是否可用（[REF-claude-code-hooks](references.md)） | 回合意图的规则分类，以及回合完成时的宽限期 `G_turn_grace_done` 与「回合完成」先验 | 通过——每个回合结束时，`Stop` hook 输入含该回合最后一条助手消息的完整文本。不通过——字段缺失或为空；此时驱动器从 stream-json 输出中该回合最后一条 assistant 消息取文本，仍取不到时回合意图恒为 `unknown`，宽限期与先验保持默认。 |
+| 托管 hook 二进制同步返回的时延：从 Claude Code 启动 hook 到收到输出，含经本地 IPC 向驱动器查询 | 情境提示能否同步返回而不拉长工具结果的交付 | 通过——目标镜像中 p95 不超过 10 ms，并行工具批次下同样成立，hook 失败时工具结果不变。不通过——p95 超过 10 ms；此时驱动器在 `tool_started` 时预先算好该调用的提示并缓存，hook 只读缓存；仍超过时 `intent.hints` 保持关闭。 |
 | CLI 以 stream-json 输出时 `background_tasks_changed` 与 `task_started`、`task_updated`、`task_notification` 消息的输出；workflow 内各 agent 是否作为独立任务出现；`ambient` 的取值（[REF-claude-agent-sdk-typescript](references.md)） | 后台作业登记，即 `bg_jobs_changed` 的来源 | 通过——CLI 的 stream-json 输出包含这些消息，`background_tasks_changed` 推送完整的存活任务集合；workflow 内的 agent 各自作为任务出现，或其存活期被 workflow 任务覆盖；`ambient` 的取值与任务种类的对应关系可重复观察。不通过——CLI 不输出这些消息，或 workflow 内 agent 的存活不反映在任务集合中；此时以 Stop 与 SubagentStop hook 输入的 `background_tasks` 在每个回合结束时对账，仍无法覆盖时不设置 `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0`，改由其默认行为判定后台子代理与 workflow 的存活（二者存活时回合结束后仍报 running）；`ambient` 的取值无法判定时 `ambient` 任务一律计入后台作业。 |
 | `--resume` 对 `CronCreate` 与 `ScheduleWakeup` 作业的恢复；错过触发时刻后是否补跑；Stop hook 输入的 `session_crons` 是否包含 `ScheduleWakeup` 安排的唤醒（[REF-claude-agent-sdk-typescript](references.md)） | 自唤醒条目的 `survives_resume` 与 `L_self_wake` | 通过——`--resume` 后未过期的 `CronCreate` 作业按原计划触发；错过触发时刻时补跑一次或跳过，行为可重复观察；`session_crons` 是否包含 `ScheduleWakeup` 可确定。不通过——`--resume` 不恢复 `CronCreate` 作业，或恢复行为不可重复；此时 `cron` 条目的 `survives_resume` 取假，存在自唤醒条目时不以挂起为目的销毁，`L_self_wake` 只取冻结与快照两档；`session_crons` 不包含 `ScheduleWakeup` 时，`wakeup` 条目只按工具调用维护，不参与 `session_crons` 对账。 |
 | `--resume` 之后此前的后台任务（后台 shell、后台子代理、workflow）与 `Monitor` 的去留，以及续接后收到的 `task_notification`（[REF-claude-agent-sdk-typescript](references.md)） | I9 中「无后台作业」与「自唤醒条目都随续接恢复」的判定，以及「回合被中断」通知的内容 | 通过——续接后此前的后台任务与 `Monitor` 都已终止，续接后的后台任务集合从空集起算；此前任务的结局以可识别的方式呈现（带终止状态的 `task_notification`，或会话记录中的中断标记），且不重复通知已在进程退出前结束的任务。不通过——续接后旧任务仍出现在任务集合中而没有对应的执行体，或旧任务的结局不可识别；此时驱动器把续接前已存在的任务标识排除出后台作业，并在「回合被中断」通知中列出中断时存活的后台任务。 |
@@ -139,6 +144,70 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 - 控制面循环驱动器在不修改协议的前提下，在回合语义、挂起机制与投递确认上与进程驱动器一致。
 - 多租户配额与优先级对单组织默认配置无可观察影响，跨租户抢占按配置生效。
+
+### 等待意图的分步落地
+
+等待意图按下列意图阶段逐步启用。前提是阶段 1 的 Claude Code 驱动器、平台 MCP 服务器与 GitHub 连接器已交付；意图阶段与阶段 2～4 并行，不改变这些阶段的门槛。进入下一意图阶段的条件以下列指标表达：
+
+- 可转订阅的前台等待占比：分类为 `waiting` 且命中等待签名的前台工具调用时长，在全部前台工具调用时长中的占比，按外部系统与签名分组。
+- 自报误差：Agent 自报的 `agent_expected_ms` 与实际等待时长的相对误差分布，以及实际等待落在自报值 ±50% 以内的命中率。
+- 提示转化率：情境提示之后 `N_adopt` 个回合内出现同一关联对象的 `subscribe_event` 或 `sleep_until` 的提示，在全部情境提示中的比例。
+- 挂起收益：情境提示开启组与关闭组之间 `idle_while_scheduled_ratio`、回合边界销毁占比与冻结总时长的差异。
+- 误提示率：情境提示所依据的签名匹配经抽样复核并非该签名对应等待的比例。
+
+#### 意图阶段 A：只观测
+
+交付物：
+
+- Claude Code 驱动器的意图解析：Bash、Agent、Workflow 与 `Monitor` 工具的输入，`Stop` hook 的 `last_assistant_message`，本地代理观察到的对同一主机的周期性连接。
+- `connectorhub` 装载并校验外部系统定义中的等待签名，随沙箱侧配置下发；驱动器按命令签名匹配。
+- `intent_observed` 上报与 `run.intents`；意图分类分布与签名命中的指标。
+- `intent.hints` 关闭，意图不进入等待时长预测与宽限期选择，Agent 看不到任何意图相关内容。
+
+进入意图阶段 B 的条件：
+
+- 真实负载上，可转订阅的前台等待占比可按外部系统与签名度量；占比为零的外部系统不进入情境提示。
+- 误提示率可按抽样复核度量，并低于为进入情境提示设定的阈值。
+- 同一负载下，单一条件门控、静止证据与 I9 前置检查的判定结果与关闭意图解析时一致。
+
+#### 意图阶段 B：契约与自报
+
+交付物：
+
+- 平台 MCP 服务器的 `instructions` 与 `SubagentStart` 契约注入，载体按技术验证清单的结论选定。
+- `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`agent_expected_ms` 的上报。
+- 意图接入 `suspendpolicy`：等待时长预测纳入 Agent 自报与签名先验，`policy_state` 记录自报的历史命中情况用于置信度校准；回合意图为 `completed` 时宽限期取 `G_turn_grace_done`，等待预测取「回合完成」先验行。
+
+进入意图阶段 C 的条件：
+
+- 自报误差按运行实例与等待种类可度量；纳入自报与签名先验之后，实际等待落在预测区间 `[p25, p90]` 内的比例不低于只用历史直方图时。
+- 回合意图为 `completed` 而取 `G_turn_grace_done` 的回合边界中，宽限期满后销毁、又在 `G_turn_grace` 以内被下一条输入唤醒的比例不高于设定阈值。
+- 技术验证清单中 `PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 一项通过；不通过时意图层停在本阶段。
+
+#### 意图阶段 C：情境提示
+
+交付物：
+
+- `PostToolUse` 与 `PostToolBatch` 的情境提示：托管 hook 二进制经本地 IPC 向驱动器查询并同步返回；分类为 `waiting` 且命中签名的后台 `local_bash` 在下一次 `PostToolUse` 提示一次。
+- 频率控制与采纳判定：同一签名在每个运行实例首次命中时提示，未采纳时按 2^k 个回合退避，连续两次未采纳后本运行实例停止提示该签名；提示之后 `N_adopt` 个回合内出现同一关联对象的 `subscribe_event` 或 `sleep_until` 计为采纳。
+- 提示开与关的 A/B 对比：按运行实例随机分组，`intent.hints` 只对实验组开启。
+
+进入意图阶段 D 的条件：
+
+- 提示转化率与挂起收益可度量；实验组相对对照组的 `idle_while_scheduled_ratio` 下降，回合边界销毁占比上升，误提示率不高于阈值。转化率长期过低或挂起收益没有改善时，按 [ADR-wait-intent-as-soft-input](adr/adr-wait-intent-as-soft-input.md) 的失效条件处理，`intent.hints` 保持关闭。
+- 规则与签名判为 `unknown` 的前台与后台调用时长占比可度量，其中经抽样复核为等待的部分足以抵偿分类请求的成本。
+
+#### 意图阶段 D：宿主侧分类与出口流量形态识别（可选）
+
+交付物：
+
+- 宿主侧分类模型，开关为 `intent.classifier`，默认关闭：规则判不了的命令、描述与最后一条消息由看守进程经本地代理发往 `llmgateway` 分类，不经 Agent 进程，不进入 Agent 上下文，按运行实例计费。
+- 出口流量形态识别：等待签名的 `request{host, method, path_regex}` 匹配，依赖出口代理对请求方法与路径的可见性；出口代理只在终止 TLS 的主机上看得到路径，以 `tls_passthrough` 透传的主机不启用路径级签名。
+
+阶段完成的观察结果：
+
+- 分类结果经抽样复核的准确率与其置信度 0.6 相符；开启分类后可转订阅的前台等待占比上升，误提示率不高于阈值；分类请求的成本可按运行实例审计。
+- 路径级签名只在出口代理可见路径的主机上生效，命令签名的匹配不受影响。
 
 ## 与设计文档的边界
 

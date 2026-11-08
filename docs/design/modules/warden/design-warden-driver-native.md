@@ -13,7 +13,7 @@
 控制面循环驱动器的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体接口、字段与算法见后续章节。
 
 - **定义 Agent 驱动器接口**：规定启动、喂入、挂起准备、恢复、终止、快照恢复衔接、事件流与状态查询操作，以及每个操作的输入、输出与前置条件；结果是两种循环共用同一套翻译层，`runcontroller` 不按循环位置分支。
-- **规定事件集合与顺序**：要求两种驱动器使用同一套 `AgentEvent` 种类与字段，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序，自唤醒条目事件只由存在自唤醒源的驱动器发出；结果是收件箱、游标与唤醒谓词不依赖循环位置。
+- **规定事件集合与顺序**：要求两种驱动器使用同一套 `AgentEvent` 种类与字段，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序，自唤醒条目事件只由存在自唤醒源的驱动器发出，[等待意图](../../../glossary.md)事件只由解析等待意图的驱动器发出；结果是收件箱、游标与唤醒谓词不依赖循环位置。
 - **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致。
 - **规定挂起与恢复语义**：定义回合边界、恢复点、以挂起为目的的退出、恢复句柄与快照恢复后的衔接；结果是两种循环的挂起决策与恢复准入使用同一套规则。
 - **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、帧关联、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
@@ -108,7 +108,7 @@ type DriverState struct {
 
 ### 对 `runcontroller` 的事件
 
-两种驱动器使用同一套 `AgentEvent` 种类与字段，由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。`self_wake_changed{entries, crons_synced}` 只由存在[自唤醒源](../../../glossary.md)的驱动器发出（[Claude Code 驱动器](design-warden-driver-claude-code.md)）；控制面循环没有会话内定时等自唤醒源，定时只经 `timer_requested` 登记，控制面循环驱动器不产生该事件，运行实例的自唤醒集合因而为空，`runcontroller` 不为其发出 `StartAgent`。
+两种驱动器使用同一套 `AgentEvent` 种类与字段，由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。`self_wake_changed{entries, crons_synced}` 只由存在[自唤醒源](../../../glossary.md)的驱动器发出（[Claude Code 驱动器](design-warden-driver-claude-code.md)）；控制面循环没有会话内定时等自唤醒源，定时只经 `timer_requested` 登记，控制面循环驱动器不产生该事件，运行实例的自唤醒集合因而为空，`runcontroller` 不为其发出 `StartAgent`。`intent_observed` 只由解析等待意图的驱动器发出（Claude Code 驱动器）；控制面循环的阻塞点由 `WaitDeclared` 显式声明，控制面循环驱动器不产生该事件。`subscription_created` 与 `wait_started` 的 `agent_expected_ms` 只取 Agent 经工具参数 `expected_wait` 自报的预计等待时长，没有自报时为空，与 `predicted_ms` 分开上报。
 
 | 事件 | 触发点 | 约束 |
 | --- | --- | --- |
@@ -117,14 +117,15 @@ type DriverState struct {
 | `tool_started{call_id}` | 开始一次工具调用，或发出一次 `ToolExec` 调用之前 | `call_id` 由驱动器分配，同一回合唯一 |
 | `tool_ended{call_id}` | 工具调用结束或失败 | 与 `tool_started` 配对；未配对的调用在 `turn_ended` 时清理 |
 | `permission_requested{id, call_id, blocking}` | 循环需要审批 | `blocking` 表示是否在回合中阻塞等待 |
-| `wait_started{call_id, kind, ref, fire_at, predicted_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer` |
-| `subscription_created{sub_id, since_cursor}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记 |
+| `wait_started{call_id, kind, ref, fire_at, predicted_ms, agent_expected_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer`；`agent_expected_ms` 没有自报时为空 |
+| `subscription_created{sub_id, since_cursor, agent_expected_ms}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记；`agent_expected_ms` 没有自报时为空 |
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
 | `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 携带完整集合；未结束的作业使回合边界不构成安全点；回合结束之后集合变化时作为回合外事件发出 |
 | `self_wake_changed{entries, crons_synced}` | 控制面循环驱动器不发出 | 由存在自唤醒源的驱动器发出；可作为回合外事件发出 |
+| `intent_observed{ref_kind, ref, class, target, expected_ms, source, confidence}` | 控制面循环驱动器不发出 | 由解析等待意图的驱动器发出；同一 `(ref_kind, ref)` 后到的覆盖先到的；可作为回合外事件发出 |
 | `state_changed{idle\|requires_action}` | 驱动器有对应的原生状态时；控制面循环没有原生状态时在回合结束发出 `state_changed{idle}` | 不替代 `turn_ended`；进程驱动器在没有进行中回合时发出的为回合外事件 |
 
-回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，重复与乱序不改变结果。
+回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，`intent_observed` 按 `(ref_kind, ref)` 以后到者覆盖先到者，重复与乱序不改变结果。
 
 `WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经宿主 `runcontroller` 注入的事件入口提交声明，由宿主调用 `RunService.DeclareWait`，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等；条件种类与 `runcontroller` 的 `declared_kind` 闭集一致（`llm`、`timer`、`approval`、`wait_for`），`scope=run` 时只取 `approval`、`wait_for`、`timer`；`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
 
@@ -179,7 +180,7 @@ type DriverState struct {
 
 ### 稳定性承诺
 
-- 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集与挂起/恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
+- 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出，`intent_observed` 只由解析等待意图的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集与挂起/恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
 - `ToolExec` 的操作集合对控制面循环稳定；新增操作须同时修改看守进程主文档、本模块与 `agentprotocol`。
 - 接口变更须同时覆盖进程驱动器与控制面循环驱动器，并以同一套契约测试约束；事件种类变化另须提升协议版本。
 
@@ -354,7 +355,7 @@ sequenceDiagram
 
 事件按外部接口契约中的触发点发出，顺序约束为：`turn_started` 先于本回合全部工具、等待与状态事件，`turn_ended` 最后；回合内事件的 `event_seq` 在同一回合内单调，按 `event_seq` 丢弃重复或乱序事件的规则只适用于回合内事件。`tool_started` 与 `tool_ended` 按 `call_id` 配对；`bg_jobs_changed` 在集合变化时以完整集合发出，未结束的作业使回合边界不构成安全点。回合结束之后 `ToolExec` 后台作业结束时，`bg_jobs_changed` 作为回合外事件发出，`turn_id` 与 `event_seq` 为空，接收方按替换语义处理。
 
-控制面循环没有 `requires_action` 概念；此时以回合结束作为等价信号发出 `state_changed{idle}`，由 `turn_ended` 表达回合边界。事件种类由 `agentprotocol` 定义，不因实现而增加；控制面循环驱动器不产生 `self_wake_changed`。
+控制面循环没有 `requires_action` 概念；此时以回合结束作为等价信号发出 `state_changed{idle}`，由 `turn_ended` 表达回合边界。事件种类由 `agentprotocol` 定义，不因实现而增加；控制面循环驱动器不产生 `self_wake_changed` 与 `intent_observed`，循环的阻塞点经 `WaitDeclared` 显式声明，不需要宿主推断等待意图。
 
 ### 挂起与恢复
 

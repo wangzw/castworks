@@ -1,6 +1,6 @@
 # 看守进程
 
-看守进程（`warden`）是沙箱容器的 PID 1，位于 Agent 子 cgroup 之外，以管道驱动 Agent 主进程。它同时是沙箱内唯一持有[运行实例令牌](../../../glossary.md)的进程、与控制面之间唯一的协议端点，以及活动度、Agent 后台任务与[自唤醒源](../../../glossary.md)、工作区租约、投递状态与冻结动作在沙箱侧的观察点和执行点。它不拥有运行实例的状态机、挂起决策、沙箱生命周期与工作区租约表，这些分别归 `runcontroller`、`suspendpolicy`、`sandboxprovider` 与 `workspace`。心智模型：Agent 进程树在它下面运行并可被冻结，而它留在冻结边界之外继续服务控制面（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）。
+看守进程（`warden`）是沙箱容器的 PID 1，位于 Agent 子 cgroup 之外，以管道驱动 Agent 主进程。它同时是沙箱内唯一持有[运行实例令牌](../../../glossary.md)的进程、与控制面之间唯一的协议端点，以及活动度、Agent 后台任务与[自唤醒源](../../../glossary.md)、[等待意图](../../../glossary.md)、工作区租约、投递状态与冻结动作在沙箱侧的观察点和执行点。它不拥有运行实例的状态机、挂起决策、沙箱生命周期与工作区租约表，这些分别归 `runcontroller`、`suspendpolicy`、`sandboxprovider` 与 `workspace`。心智模型：Agent 进程树在它下面运行并可被冻结，而它留在冻结边界之外继续服务控制面（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）。
 
 文档较长，按顺序阅读：先读核心概念、职责与子模块分工，用来建立边界；再读外部接口契约与依赖，用来核对本模块向谁承诺什么；然后读 UML 图、核心数据结构与核心算法与流程，其中走查给出领取、启动、投递与重连的落盘轨迹，以及 `Freeze{signal}` 降级路径与冻结期间入站数据唤醒的状态轨迹，其余小节按能力逐项展开；最后读错误与失败语义、并发与事务边界与扩展点，作为对前述流程的完备性自测。
 
@@ -18,7 +18,9 @@
 - **活动度采集**：按固定周期采集 `Activity` 的字段，包括 PSI 累计停滞时间、CPU 累计用量 `cpu_usage_usec`、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态与 `freeze_id`。结果是控制面获得不依赖 Agent 配合的忙闲证据，`suspendpolicy` 与 `runcontroller` 据此判断能否挂起，包括后台作业存活或回合中多循环并发时的[静止冻结](../../../glossary.md)。
 - **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
 - **投递意图日志**：`Deliver` 到达后先在 `.platform/deliveries.jsonl` 追加 `accepted{seq}` 并同步写入，按日志去重后把事件喂给 Agent；观察到回合开始后追加 `consumed{seq, turn_id}` 并同步写入，再发出 `Consumed`。结果是至少一次投递在跨代重建后仍可由日志去重，重建后不重复处理已消费事件（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
-- **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的带令牌调用，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
+- **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的带令牌调用，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。初始化时以 `instructions` 提供[等待方式的选择](#等待方式的选择)规则；解析 `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`expected_wait` 换算为毫秒后经 Agent 驱动器随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1），Agent 自报的等待时长与平台的预测分开进入控制面。
+- **托管 hook**：随镜像在工作区之外提供 Claude Code 托管 hook 的二进制，注册在托管策略设置中；二进制经本地 IPC 把 hook 输入交给 Agent 驱动器并同步返回驱动器的应答：`PostToolUse` 与 `PostToolBatch` 返回等待意图的情境提示，`SubagentStart` 向子代理注入等待方式的选择规则，审批所用的 `PreToolUse` 与旁证所用的其余 hook 共用同一机制。结果是提示只搭载在 Agent 下一次本来就要发出的模型请求上，与等待意图相关的 hook 输出只有 `additionalContext`，不拒绝、不阻塞工具调用，也不让对话继续（[REF-claude-code-hooks](../../../references.md)、[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
+- **等待意图配置应用**：按沙箱侧配置中的 `wait_signatures`、`intent.hints` 与 `intent.classifier` 设置 Agent 驱动器的签名匹配、情境提示开关与宿主侧分类开关；宿主侧分类请求经本地代理发往 `llmgateway`，不经 Agent 进程、不进入 Agent 上下文。结果是[等待签名](../../../glossary.md)随外部系统定义下发，提示与宿主侧分类可按运行实例关闭，意图解析与 `intent_observed` 始终进行。
 - **工具接入声明执行**：按[沙箱侧配置](../../../glossary.md)（`SandboxConfig`，接收与应用见[沙箱侧配置](#沙箱侧配置)）中的[工具接入声明](../../../glossary.md)向 Agent 进程与 `ToolExec.exec` 注入凭据占位符环境变量与非秘密配置，合并已批准的第三方 MCP 服务器配置；只注入字面占位符，不解析、不换取、不缓存真实凭据。结果是第三方工具经同一组环境变量使用平台的出口凭据通道，平台不需要知道哪个工具使用了哪条通道。
 - **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 exec、文件读写、流式输出与后台作业帧，按代校验；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，且驱动器无需持有运行实例令牌。
 - **出站流与状态对账**：始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，发送 `Hello`、`AgentEvent`、`Activity`、`Accepted`、`Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`Busy`、`Thawed`、`LeaseLost`、`conn.inbound`、本地代理与平台 MCP 服务器的请求事件与 `ToolExec` 响应/数据帧，处理 `HelloAck`、`Deliver`、`StartAgent`、`PrepareSuspend`、`CancelSuspend`、`Thaw`、`Resumed`、`LiveState`、`Shutdown`、`Fenced`、`TokenRotate`、`SandboxConfig` 与 `ToolExec` 请求/取消帧；断连后退避重连、重放未确认消息并以 `Hello` 做状态对账。结果是控制面以持久化状态而非事件历史恢复一致（I10）。
@@ -31,9 +33,9 @@
 
 各子模块有独立文档，模块文档只固定边界。
 
-- **本地代理**：看守进程内不被冻结的 HTTP 代理，终止 Agent 使用代理变量发出的 LLM 与外部系统 HTTP 连接，附加运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)，由透明拦截器接收这些连接并以出口代理为上游。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
-- **Claude Code 驱动器**：以无头 `stream-json` 协议驱动 Claude Code，把回合、工具、权限询问与等待翻译为协议事件，按 Claude Code 的后台任务集合维护后台作业，镜像会话内定时、工具超时与 `Monitor` 截止等自唤醒条目，把投递翻译为原生输入，并管理会话续接、`StartAgent` 启动与退出。细节见 [design-warden-driver-claude-code.md](design-warden-driver-claude-code.md)（[REF-claude-code-headless](../../../references.md)）。
-- **控制面循环驱动器**：控制面循环驱动器使用 `ToolExec` 的接口与语义，不假定沙箱内存在 Agent 进程，不产生自唤醒条目事件。细节见 [design-warden-driver-native.md](design-warden-driver-native.md)（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
+- **本地代理**：看守进程内不被冻结的 HTTP 代理，终止 Agent 使用代理变量发出的 LLM 与外部系统 HTTP 连接，附加运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)，由透明拦截器接收这些连接并以出口代理为上游。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。本地代理另按主机与归属对象识别周期性连接供意图解析使用，并把 Agent 驱动器的宿主侧分类请求转发到 `llmgateway`。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- **Claude Code 驱动器**：以无头 `stream-json` 协议驱动 Claude Code，把回合、工具、权限询问与等待翻译为协议事件，按 Claude Code 的后台任务集合维护后台作业，镜像会话内定时、工具超时与 `Monitor` 截止等自唤醒条目，解析等待意图并发出 `intent_observed`、决定情境提示，把投递翻译为原生输入，并管理会话续接、`StartAgent` 启动与退出。细节见 [design-warden-driver-claude-code.md](design-warden-driver-claude-code.md)（[REF-claude-code-headless](../../../references.md)）。
+- **控制面循环驱动器**：控制面循环驱动器使用 `ToolExec` 的接口与语义，不假定沙箱内存在 Agent 进程，不产生自唤醒条目事件，也不产生 `intent_observed`：它的阻塞点由 `WaitDeclared` 显式声明。细节见 [design-warden-driver-native.md](design-warden-driver-native.md)（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
 ### 非职责
 
@@ -43,6 +45,7 @@
 - 挂起决策与策略参数归 `suspendpolicy`：何时挂起、选择冻结或快照或销毁、冻结上限、冻结中升级、恢复准入、静止证据与活动度阈值都不由看守进程判断；看守进程只提供活动度样本与执行结果。
 - 运行实例状态机、收件箱、唤醒信号、等待、定时器、自唤醒集合的保存与到期唤醒、投递游标、代递增、纠正性对账，以及沙箱侧配置的按运行实例保存与发送归 `runcontroller`；看守进程只实现协议消息在沙箱侧的效果。
 - 自唤醒源的触发归 Agent 自身：会话内定时、`sleep` 进程、工具超时与 `Monitor` 截止由 Agent 触发，看守进程只观测并上报。看守进程不禁用、不拦截、不终止 Agent 的会话内定时、后台 Bash、`Monitor`、后台子代理、workflow 与长 MCP 调用的自动转后台，也不设置关闭这些功能的环境变量（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
+- 等待意图的使用归 `suspendpolicy` 与 `runcontroller`：等待时长预测、宽限期选择与 `run.intents` 的保存都不在看守进程；意图不进入看守进程的冻结前置核对、入站数据唤醒与安全点复核。等待签名的定义与装载校验归 `connectorhub`。看守进程不向 Agent 定期提问，不以拒绝或阻塞工具调用、`Stop` 与 `SubagentStop` 的 `additionalContext`、强制转后台或终止进程的方式索取意图，提示可以被 Agent 忽略（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 - 工作区租约表、绑定、接管与[持久化确认](../../../glossary.md)归 `workspace`；看守进程只续约并上报 `LeaseLost`。
 - 运行实例令牌的签发、签名与轮换签名归 `secrets`；看守进程只领取、持有、使用并替换令牌。
 - 协议信封、序列化、重放与按 `(generation, msg_seq)` 去重的规则归 `agentprotocol`；看守进程只声明每条消息的沙箱侧效果。
@@ -63,7 +66,7 @@
 
 ## 外部接口契约
 
-看守进程对外的可调用面为：与控制面的协议消息、平台 MCP 工具、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
+看守进程对外的可调用面为：与控制面的协议消息、平台 MCP 工具、托管 hook、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；托管 hook 的输出形态受 Claude Code hook 契约约束，对 Claude Code 驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
 
 ### 与控制面的协议
 
@@ -72,7 +75,7 @@
 | 方向 | 消息 | 沙箱侧效果 |
 | --- | --- | --- |
 | 发出 | `Hello` | 建立或重建出站流时携带代、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`last_received_msg_seq` 与 `sandbox_config_revision`（已应用的沙箱侧配置版本，尚未应用为 0）；领取成功且首次续约成功之后才发出 |
-| 发出 | `AgentEvent` | 回合开始与结束、工具开始与结束、权限询问、订阅创建、定时请求、等待开始、后台作业变化与自唤醒条目变化；`bg_jobs_changed{job_ids}` 每次携带完整集合，`self_wake_changed{entries, crons_synced}` 每次携带驱动器当前掌握的全部条目，`crons_synced` 标明其中的 cron 条目是否已按本进程的 `session_crons` 对账，为假时 cron 条目可能不完整；没有进行中回合时发出的事件（例如 `bg_jobs_changed`、`self_wake_changed` 与 `state_changed`）`turn_id` 与 `event_seq` 为空 |
+| 发出 | `AgentEvent` | 回合开始与结束、工具开始与结束、权限询问、订阅创建、定时请求、等待开始、后台作业变化、自唤醒条目变化与等待意图；`subscription_created` 与 `wait_started` 携带 `agent_expected_ms`，取 Agent 经 `expected_wait` 自报的预计等待时长，未自报时为空，与 `predicted_ms` 分开；`bg_jobs_changed{job_ids}` 每次携带完整集合，`self_wake_changed{entries, crons_synced}` 每次携带驱动器当前掌握的全部条目，`crons_synced` 标明其中的 cron 条目是否已按本进程的 `session_crons` 对账，为假时 cron 条目可能不完整；`intent_observed{ref_kind, ref, class, target, expected_ms, source, confidence}` 由 Claude Code 驱动器发出，同一 `(ref_kind, ref)` 后到的覆盖先到的；没有进行中回合时发出的事件（例如 `bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed`）`turn_id` 与 `event_seq` 为空 |
 | 发出 | `Activity` | 固定周期的活动度样本与冻结状态 |
 | 发出 | `Accepted`、`Consumed`、`DeliveryFailed` | 投递接受、常规投递的消费与投递失败；接受与消费记录的同步写入先于对应消息 |
 | 发出 | `ReadyToSuspend`、`Busy`、`Thawed` | 挂起就绪、挂起前置不满足或取消确认、解冻完成；均以 `suspend_id` 或 `freeze_id` 幂等 |
@@ -88,7 +91,7 @@
 | 接收 | `Shutdown`、`Fenced`、`TokenRotate` | 关闭、代过期与令牌替换 |
 | 接收 | `SandboxConfig` | `revision` 与 `config`；按 `revision` 幂等应用，首次应用之前不启动 Agent 主进程；应用规则见[沙箱侧配置](#沙箱侧配置) |
 
-稳定性承诺按类别给出：协议消息受协议版本约束，看守进程不自行增删字段；`Hello` 与 `HelloAck` 的状态摘要字段是状态对账的唯一依据，字段变化须同时修改 `runcontroller` 的进入规则与本模块文档；`Shutdown`、`Fenced` 与不可重试认证失败关闭是三种不同的终止语义，不得合并。`runcontroller` 的唤醒与进入规则依赖看守进程的下列承诺：`conn.inbound` 对每个 `freeze_id` 至多发出一次；`bg_jobs_changed` 每次携带完整集合，接收方按替换语义处理；`self_wake_changed` 每次携带驱动器当前掌握的全部条目与 `crons_synced`，接收方在 `crons_synced` 为真时整体替换，为假时整体替换 cron 之外的条目、cron 条目按 `entry_id` 合并，规则见 [runcontroller](../design-runcontroller.md)；回合外事件不带 `event_seq`，其顺序由出站流的 `msg_seq` 保证，重复与乱序不改变接收方的结果；`StartAgent` 幂等，重复到达不启动第二个 Agent 进程。
+稳定性承诺按类别给出：协议消息受协议版本约束，看守进程不自行增删字段；`Hello` 与 `HelloAck` 的状态摘要字段是状态对账的唯一依据，字段变化须同时修改 `runcontroller` 的进入规则与本模块文档；`Shutdown`、`Fenced` 与不可重试认证失败关闭是三种不同的终止语义，不得合并。`runcontroller` 的唤醒与进入规则依赖看守进程的下列承诺：`conn.inbound` 对每个 `freeze_id` 至多发出一次；`bg_jobs_changed` 每次携带完整集合，接收方按替换语义处理；`self_wake_changed` 每次携带驱动器当前掌握的全部条目与 `crons_synced`，接收方在 `crons_synced` 为真时整体替换，为假时整体替换 cron 之外的条目、cron 条目按 `entry_id` 合并，规则见 [runcontroller](../design-runcontroller.md)；`intent_observed` 只作软输入，接收方对同一 `(ref_kind, ref)` 以后到者覆盖先到者；回合外事件不带 `event_seq`，其顺序由出站流的 `msg_seq` 保证，重复与乱序不改变接收方的结果；`StartAgent` 幂等，重复到达不启动第二个 Agent 进程。
 
 ### ToolExec API
 
@@ -117,16 +120,18 @@
 | 工具 | 结果 |
 | --- | --- |
 | `list_events` | 列出当前运行实例可订阅的外部系统事件：事件类型、可匹配字段、[关联键身份键](../../../glossary.md)、[终态取值](../../../glossary.md)与订阅参数；只读，不产生阻塞等待 |
-| `subscribe_event` | 在 `connectorhub` 登记订阅并返回 `sub_id`；登记事务对已到达事件回溯匹配，已终态的外部对象合成完成事件 |
-| `wait_for` | 阻塞等待指定条件；临近冻结上限或被 Agent 自动转到后台时返回已转为订阅与 `sub_id` 的结果，要求 Agent 结束回合 |
-| `sleep_until` | 登记定时；阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器并返回已转为定时的结果 |
+| `subscribe_event` | 在 `connectorhub` 登记订阅并返回 `sub_id`；登记事务对已到达事件回溯匹配，已终态的外部对象合成完成事件；接受可选参数 `expected_wait` 与 `reason` |
+| `wait_for` | 阻塞等待指定条件；临近冻结上限或被 Agent 自动转到后台时返回已转为订阅与 `sub_id` 的结果，要求 Agent 结束回合；接受可选参数 `expected_wait` 与 `reason` |
+| `sleep_until` | 登记定时；阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器并返回已转为定时的结果；接受可选参数 `expected_wait` 与 `reason` |
 | 附件取回 | 附运行实例令牌向存放方取回附件引用中的内容 |
 
-`list_events`、`subscribe_event` 与 `wait_for` 的 MCP 描述向 Agent 说明：先用 `list_events` 查看可用事件；`wait_for` 是短等待，临近冻结上限时自动转为订阅；`subscribe_event` 登记后事件作为下一回合输入。
+`list_events`、`subscribe_event` 与 `wait_for` 的 MCP 描述向 Agent 说明：先用 `list_events` 查看可用事件；`wait_for` 是短等待，临近冻结上限时自动转为订阅；`subscribe_event` 登记后事件作为下一回合输入。平台 MCP 服务器在初始化应答中提供 `instructions`，内容为[等待方式的选择](#等待方式的选择)中的规则，与各工具的 MCP 描述一致；工具描述独立承载同一组规则，不依赖 `instructions` 进入 Agent 的系统提示。子代理经 `SubagentStart` hook 得到同一组规则，见[托管 hook](#托管-hook)。
+
+`expected_wait` 是 Agent 预计的等待时长，取时长字符串（数值加 `s`、`m`、`h` 或 `d` 后缀）；`reason` 是等待原因的短文本，不超过 200 字符，超出部分截断。两者都不改变调用语义，缺省、为空或无法解析时按未填写处理，调用照常执行。`expected_wait` 换算为毫秒后交给 Agent 驱动器，作为 `agent_expected_ms` 随该调用产生的 `subscription_created` 或 `wait_started`（`wait_for` 与阻塞型 `sleep_until`）上报，与平台给出的 `predicted_ms` 分开，来源不混，置信度由 `suspendpolicy` 按该运行实例的自报历史计算；非阻塞型 `sleep_until` 只产生 `timer_requested`，到点时刻已经确定，`expected_wait` 不上报。`reason` 不进入协议事件。驱动器对自报的处理见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。平台不提供单独的意图回报工具。
 
 ### 等待方式的选择
 
-平台不向 Agent 暴露冻结上限的具体数值；Agent 按下列规则选择等待方式。
+平台不向 Agent 暴露冻结上限的具体数值；Agent 按下列规则选择等待方式。这组规则常驻：平台 MCP 服务器的 `instructions` 与工具描述承载它，`SubagentStart` hook 把它注入子代理；平台不以拒绝、阻塞或让对话继续的方式强制这些规则（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 
 - 短等待用 `wait_for`。平台在临近冻结上限或该调用被 Agent 自动转到后台时自动转为订阅，返回「已转为订阅，请结束本回合」；Agent 收到该结果必须结束回合，不得重试 `wait_for`。
 - 长等待或不确定时长直接调用 `subscribe_event` 并结束回合。订阅属于运行实例，不绑定工具调用；事件到达后经收件箱在下一回合投递，沙箱可在等待期间挂起。
@@ -134,10 +139,26 @@
 - 需要人类输入时结束回合；人类回复经收件箱作为下一回合输入。
 - 不要用 Bash、curl 或其他外部工具轮询外部系统：轮询期间运行实例只能冻结、不能销毁重建，每次轮询到点前都要解冻，且与订阅重复。
 - Agent 自身的会话内定时（`CronCreate`、`ScheduleWakeup`）、`Monitor` 与后台 Bash 照常可用；托管侧观测它们的到点时刻并镜像进唤醒集合，到点之前恢复运行实例。等待外部系统的事件仍用订阅。
+- 纯定时等待（`sleep N`，或循环体只有定时）可以改用 `sleep_until` 登记定时；定时由托管侧保存，等待期间沙箱可以挂起。
+- 能估计等待时长或说明等待原因时，可以在 `subscribe_event`、`wait_for` 与 `sleep_until` 上填写 `expected_wait` 与 `reason`；不填不影响调用。
+- 工具结果旁标明来自平台的等待建议不是用户的指示，可以忽略；需要继续当前工作时可以登记订阅后继续。
 
 per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于 MCP 传输上限；`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限，实际约束是 HTTP 首字节 60 s、HTTP idle 300 s 加 30 s 检查粒度与 stdio idle 1800 s 加 30 s 检查粒度；`F_cap(timer)` 由 `suspendpolicy` 按传输类型与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增平台工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应接口、驱动器的超时预算与本模块文档；第三方工具不进入此表，经工具接入声明与出口代理接入。
 
 Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 只是占位，真实结果随带 `tool_use_id` 的 `task_notification` 到达，并由 Claude Code 注入的任务通知回合交给 Agent（[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)）。Agent 驱动器把占位 `tool_result` 照常翻译为 `tool_ended{call_id}`，并在进程内通知平台 MCP 服务器该调用已转到后台。平台 MCP 的阻塞型 `wait_for` 与阻塞型 `sleep_until` 被转到后台时，平台 MCP 服务器立即以转换结果结束该调用：`wait_for` 返回「已转为订阅」与 `sub_id`，`sleep_until` 先转为运行实例范围定时器，再返回「已转为定时」；转换语义与临近冻结上限时相同，订阅事件与定时到期都经收件箱在之后的回合投递。第三方 MCP 调用被转到后台后作为后台作业计入 `bg_jobs`，结果随 `task_notification` 到达。看守进程不设置、也不改动 MCP 自动转后台相关的环境变量。
+
+### 托管 hook
+
+托管 hook 二进制随镜像放在工作区之外，注册在托管策略设置中，`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效；托管策略设置的内容、hook 事件的完整集合与审批、旁证等用途见 [Claude Code 驱动器](design-warden-driver-claude-code.md)（[REF-claude-code-settings](../../../references.md)）。Claude Code 在 hook 事件发生时执行二进制并把 hook 输入写入其标准输入；二进制把输入原样经本地 IPC 交给 Agent 驱动器，按驱动器的应答写出 hook 输出后退出，执行过程见[托管 hook 的执行](#托管-hook-的执行)。与等待意图相关的 hook 及其输出穷举如下：
+
+| hook 事件 | 驱动器对输入的用途 | hook 输出 |
+| --- | --- | --- |
+| `PostToolUse`、`PostToolBatch` | 工具调用与后台作业的意图解析，以及情境提示的判定 | 驱动器给出情境提示时为 `hookSpecificOutput.additionalContext`，否则为空输出；`intent.hints` 关闭时恒为空输出 |
+| `SubagentStart` | 无 | `hookSpecificOutput.additionalContext`，内容为[等待方式的选择](#等待方式的选择)中的规则 |
+| `Stop` | `last_assistant_message` 用于回合意图分类；其余输入的用途见 Claude Code 驱动器 | 空输出 |
+| `SubagentStop` | 见 Claude Code 驱动器 | 空输出 |
+
+输出约束：这些 hook 的输出只含 `hookSpecificOutput.additionalContext` 或为空，不含 `decision`、`continue` 与权限决定字段，退出码恒为 0。`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，`PostToolUse` 的退出码 2 会把标准错误作为反馈交给模型，两者都不使用；`PreToolUse` 的拒绝与询问只用于审批，不用于等待意图，`UserPromptSubmit` 不输出等待相关内容。`PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 出现在工具结果旁，模型在下一次模型请求时读到，情境提示因而只影响下一次等待，当下这一次等待由静止冻结、入站数据唤醒与 `sleep` 到期时刻兜住；`SubagentStart` 的 `additionalContext` 在子代理开始时出现。`additionalContext` 上限为 10000 字符：情境提示不超过 600 字符，`SubagentStart` 注入的规则不超过该上限。情境提示的触发条件、内容与频率归 [Claude Code 驱动器](design-warden-driver-claude-code.md)，本模块只承诺上述输出形态。
 
 ### 入站端点
 
@@ -156,8 +177,11 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 
 - `modes`（按主机通道模式）：本地 DNS 与透明拦截器重新加载主机表，此后的解析与拦截按新表进行；通道语义见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 - `tool_profile`（工具接入声明）：只对此后启动的 Agent 进程、第三方 MCP 服务器与 `ToolExec.exec` 命令生效，已运行进程的环境变量不变。
+- `wait_signatures`（该运行实例可用外部系统的等待签名列表，每项为 `{system, id, match, event_type, correlation, prior}`，字段语义见 [connectorhub](../connectorhub/design-connectorhub.md#等待签名)）：交给 Claude Code 驱动器的签名匹配，此后开始的工具调用与后台作业按新列表匹配，已发出的 `intent_observed` 不重算。`match.command` 的正则在应用时编译，无法编译的项跳过并计数，其余项照常生效；`match.request` 的方法与路径只在终止 TLS 或解析明文请求的出口路径上可见，沙箱内不按出口流量匹配它，只由驱动器对 `Monitor` 工具输入中的 URL 按主机与路径匹配。
+- `intent.hints`（情境提示开关）：只控制 `PostToolUse` 与 `PostToolBatch` 的情境提示，此后的 hook 查询按新值应答；关闭时这两个 hook 以空输出返回。`instructions`、工具描述与 `SubagentStart` 注入的规则不受它控制。
+- `intent.classifier`（宿主侧分类开关）：开启时，规则判不了的命令、描述与最后一条消息由 Claude Code 驱动器经本地代理向 `llmgateway` 发出分类请求，请求的转发见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求)；关闭时这些对象的意图保持规则分类结果。更新只影响此后的分类决定，在途的分类请求照常完成。
 
-`modes` 为空时本地 DNS 不把任何主机指向透明拦截器，`tool_profile` 为空时看守进程不注入工具接入声明；内容无法解析时保留上一次成功应用的配置并计数，从未成功应用时按 `modes` 与 `tool_profile` 均为空处理，并启动 Agent 主进程。看守进程不校验工具接入声明与出口策略的一致性，该校验归 `connectorhub`。
+`modes` 为空时本地 DNS 不把任何主机指向透明拦截器，`tool_profile` 为空时看守进程不注入工具接入声明，`wait_signatures` 为空时不做签名匹配，`intent` 或其中任一开关缺省时该开关按关闭处理；意图解析与 `intent_observed` 不受任何一项控制，始终进行。内容无法解析时保留上一次成功应用的配置并计数，从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的两个开关均关闭处理，并启动 Agent 主进程。看守进程不校验工具接入声明与出口策略的一致性，也不校验 `wait_signatures` 的 `event_type` 是否属于外部系统的事件目录，这些校验归 `connectorhub`。
 
 ## 依赖
 
@@ -165,14 +189,14 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 
 - `agentprotocol`：信封、消息类型、出站流客户端、未确认消息重放、按 `(generation, msg_seq)` 去重与协议版本。看守进程只实现每条消息的沙箱侧效果。
 - `workspace`：`RenewLease(lease_id, generation, sandbox_id)` 的 CAS 语义与首次续约绑定持有者；租约到期前无法续约时由本模块执行本地保护动作并上报 `LeaseLost`。租约的建立、接管与释放不在本模块。
-- `llmgateway`：本地代理转发的 LLM 请求以运行实例令牌鉴权；在途请求与回放存储归 `llmgateway`，恢复后按 `request_id` 取回（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
-- `connectorhub` 与 `humanchannel`：平台 MCP 服务器转发的事件目录查询、订阅与附件取回请求以运行实例令牌鉴权；订阅匹配与连接器事件日志归 `connectorhub`。
+- `llmgateway`：本地代理转发的 LLM 请求与宿主侧分类请求以运行实例令牌鉴权，按运行实例计费；在途请求与回放存储归 `llmgateway`，恢复后按 `request_id` 取回（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- `connectorhub` 与 `humanchannel`：平台 MCP 服务器转发的事件目录查询、订阅与附件取回请求以运行实例令牌鉴权；订阅匹配与连接器事件日志归 `connectorhub`。沙箱侧配置中的 `wait_signatures` 由 `connectorhub` 从外部系统定义生成，`event_type` 与事件目录的一致性在装载时由它校验。
 - `sandboxprovider`：提供引导接口，看守进程经运行时 HTTPS 调用领取运行实例令牌与 `lease_id`；请求与响应、错误码与一次性领取语义见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)。k8s 路径的预热认领经 wake-router 调用 `/wake` 通知看守进程领取。
 - Kubernetes 投射 ServiceAccount 令牌（k8s 路径）与 Substrate 的 `systemInfo` 卷及出口网关的 actor JWT 注入（Substrate 路径）：领取所用的沙箱实例身份凭据、`actor-name` 与出口网关 CA 的来源。
 - Substrate 出口网关（Substrate 路径）：actor 除发往 53 端口的 DNS 之外的全部 TCP 出站都经出口网关，出口网关只接受运行态 actor 的出口连接。看守进程到控制面的连接，包括出站流、`RenewLease`、本地代理发往 `llmgateway` 的请求与平台 MCP 服务器发往 `connectorhub`、`humanchannel` 的请求，经出口网关以 `tls_passthrough` 按 SNI 透传，出口网关不终止其 TLS、不替换其请求头；这些连接所用的控制面主机名不得与引导接口主机名相同，否则会落入引导接口主机的 MITM 规则，`Authorization` 头被替换为 actor JWT。放行规则由 [substrate 子模块](../sandboxprovider/design-sandboxprovider-substrate.md)在落地 EgressPolicy 时追加。
 - Linux cgroup v2、PSI 与 procfs：`Freeze{cgroup}` 的冻结状态观察、活动度采集（PSI 累计停滞时间、`cpu.stat`、进程态、`wchan` 与进程启动时刻）与接收队列检查（`/proc/net/tcp`、`/proc/net/tcp6`）的内核接口（[REF-linux-cgroup-v2](../../../references.md)、[REF-linux-psi](../../../references.md)）。
-- Claude Code：无头模式、hooks、托管策略设置、环境变量、网络看门狗、stream-json 消息，以及后台任务消息与会话内定时工具的契约（[REF-claude-code-settings](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)、[REF-claude-code-network-config](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)）。
-- MCP：平台 MCP 服务器的工具与传输。
+- Claude Code：无头模式、hooks、托管策略设置、环境变量、网络看门狗、stream-json 消息，以及后台任务消息与会话内定时工具的契约；hooks 中本模块依赖 `PostToolUse`、`PostToolBatch` 与 `SubagentStart` 的 `hookSpecificOutput.additionalContext`（出现位置与 10000 字符上限）、`Stop` 输入的 `last_assistant_message` 与各 hook 的退出码语义（[REF-claude-code-settings](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)、[REF-claude-code-network-config](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-hooks](../../../references.md)）。
+- MCP：平台 MCP 服务器的工具、传输与初始化应答中的 `instructions`（[REF-mcp](../../../references.md)）。
 
 方向约束：看守进程的代码依赖只指向基础层的 `agentprotocol` 与 `workspace` 沙箱侧部分，不依赖 `runcontroller`、`sandboxprovider` 与事件源模块，因此可独立于它们演进，新增一个事件源不改变本模块。
 
@@ -193,6 +217,7 @@ flowchart TB
         subgraph agentcg["agent 子 cgroup"]
             agent["Agent 主进程，Claude Code"]
             bash["Bash 进程树"]
+            hook["托管 hook 二进制"]
         end
         warden -->|"以管道驱动与监督"| agent
         warden --> proxy
@@ -200,8 +225,11 @@ flowchart TB
         warden --> driver
         driver -->|"原生输入与事件"| agent
         driver -->|"accepted 与 consumed"| intent
+        driver -->|"宿主侧分类请求"| proxy
         agent -->|"回环 HTTP"| proxy
         agent -->|"MCP 工具调用"| mcp
+        agent -->|"hook 事件时执行"| hook
+        hook -->|"本地 IPC 查询"| driver
     end
     nfa["节点冻结代理，特权 DaemonSet"]
     router["入站路由"]
@@ -221,7 +249,7 @@ flowchart TB
     mcp -->|"附运行实例令牌"| hc
 ```
 
-看守进程、本地代理、平台 MCP 服务器与 Agent 驱动器位于同一个进程，本地代理与平台 MCP 服务器不是独立进程；节点冻结代理只对 `agent` 子 cgroup 写入，看守进程留在父 cgroup，因此冻结期间探针、租约续约、出站流与本地代理的上游连接继续工作，本地代理在非 LLM 上游连接上读到载荷字节时由看守进程经出站流发出 `conn.inbound`。Agent 的 `bash` 子进程与后续 fork 继承 `agent` 子 cgroup，进程树因而整体冻结。投递意图日志位于工作区，不在容器 rootfs。对引导接口的领取不经出站流；领取成功之前，看守进程不以运行实例 uid 启动任何进程。
+看守进程、本地代理、平台 MCP 服务器与 Agent 驱动器位于同一个进程，本地代理与平台 MCP 服务器不是独立进程；节点冻结代理只对 `agent` 子 cgroup 写入，看守进程留在父 cgroup，因此冻结期间探针、租约续约、出站流与本地代理的上游连接继续工作，本地代理在非 LLM 上游连接上读到载荷字节时由看守进程经出站流发出 `conn.inbound`。Agent 的 `bash` 子进程与后续 fork 继承 `agent` 子 cgroup，进程树因而整体冻结。托管 hook 二进制由 Claude Code 作为子进程执行，同样位于 `agent` 子 cgroup、以运行实例 uid 运行、随进程树冻结；它只经本地 IPC 向驱动器查询，不持有令牌。驱动器的宿主侧分类请求经本地代理发往 LLM 网关，不经 Agent 进程。投递意图日志位于工作区，不在容器 rootfs。对引导接口的领取不经出站流；领取成功之前，看守进程不以运行实例 uid 启动任何进程。
 
 ### 启动与重连时序
 
@@ -316,7 +344,7 @@ sequenceDiagram
 | `agent_pgid` | Agent 主进程所在进程组，用于终止 Bash 进程树 |
 | `exit_code` | 最近一次退出码；`SIGTERM` 终止为 143 |
 | `session_id` | 最近一次观察到的会话标识，用于 `ReadyToSuspend` 的恢复句柄 |
-| `bg_jobs` | Agent 驱动器登记的后台作业标识集合：Claude Code 后台任务集合中 `ambient` 为假的任务，加上孤儿进程，即 Agent 进程树中不是 Agent 主进程、不属于任何任务、也不是已声明第三方 MCP 服务器的进程（作业标识为 `proc:<pid>`）；Claude Code 进程启动或重启时从空集起算，登记规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
+| `bg_jobs` | Agent 驱动器登记的后台作业标识集合：Claude Code 后台任务集合中 `ambient` 为假的任务，加上孤儿进程，即 Agent 进程树中不是 Agent 主进程、不属于任何任务、也不是已声明第三方 MCP 服务器或托管 hook 二进制的进程（作业标识为 `proc:<pid>`）；Claude Code 进程启动或重启时从空集起算，登记规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
 | `self_wake` | Agent 驱动器镜像的自唤醒条目集合，每项为 `{entry_id, kind, fire_at, survives_resume}`，`fire_at` 为空表示触发时刻未知；本代 Agent 进程启动后即可上报，镜像规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
 | `crons_synced` | `self_wake` 中的 cron 条目是否已按本进程的 `session_crons` 对账；Agent 进程每次启动（含同代重启）时为假，驱动器首次取得本进程的 `session_crons` 后为真，随 `self_wake_changed` 上报 |
 | `running_tools` | 未配对的 `tool_started` 调用集合 |
@@ -527,7 +555,21 @@ sequenceDiagram
 
 平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的带令牌调用，并向 Agent 驱动器提供事件。`list_events` 从 `connectorhub` 的事件目录取得当前运行实例可订阅的事件；`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对连接器事件日志回溯匹配；`wait_for` 阻塞到条件满足、临近冻结上限或被 Agent 自动转到后台，后两种情形返回已转为订阅与 `sub_id` 的结果；`sleep_until` 登记定时，阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器；附件取回附运行实例令牌向存放方请求。第三方工具不经过平台 MCP 服务器，它们经本地代理或透明拦截器到出口代理执行。
 
+平台 MCP 服务器在初始化应答中返回 `instructions`，并在每次调用时解析可选参数 `expected_wait` 与 `reason`：解析成功的 `expected_wait` 换算为毫秒，连同调用的 `call_id` 交给 Agent 驱动器，由驱动器写入本次调用的 `subscription_created` 或 `wait_started` 的 `agent_expected_ms`；`reason` 不进入协议事件。解析失败时只计数，不向 Agent 返回错误。
+
 工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，`wait_for` 的 `ref` 只取 `lifetime: once` 的订阅，`sleep_until` 以 `scope=run` 发出定时请求。per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于 MCP 传输上限；工具超时返回错误结果，不无限占用回合。调用被 Claude Code 自动转到后台时，Agent 驱动器把占位 `tool_result` 照常翻译为 `tool_ended{call_id}` 并在进程内通知平台 MCP 服务器，阻塞型调用随即按[平台 MCP 工具](#平台-mcp-工具)中的转换规则结束。
+
+### 托管 hook 的执行
+
+看守进程在工作区之外的 Unix 域套接字上提供本地 IPC 端点，运行实例 uid 可以连接；端点只接受 hook 查询，应答中不含运行实例令牌与沙箱侧配置原文。托管 hook 二进制每次执行按以下步骤处理，审批所用的 `PreToolUse` 共用同一端点，其等待与决定的规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md)：
+
+1. 读取标准输入中的 hook 输入，连同 hook 事件名经 IPC 端点发给 Agent 驱动器；二进制不解析输入内容。
+2. 驱动器按当前生效的沙箱侧配置与意图状态应答：`PostToolUse` 与 `PostToolBatch` 的应答为一条情境提示或空，`SubagentStart` 的应答为等待方式的选择规则，`Stop` 与 `SubagentStop` 的应答恒为空。驱动器在应答之前把 hook 输入计入意图解析，例如 `Stop` 的 `last_assistant_message` 计入回合意图分类。
+3. 二进制把应答写为[托管 hook](#托管-hook)规定的输出并以退出码 0 退出。
+
+查询的耗时目标为 10 ms 以内。二进制对查询设截止时间，截止时间小于托管策略设置中为该 hook 配置的 `timeout`；IPC 端点不可达、查询超过截止时间或应答无法解析时，二进制以空输出、退出码 0 退出并计数，不提示、不拒绝、不阻塞工具调用。hook 二进制随 Agent 进程树冻结，冻结期间未完成的查询在解冻后继续，驱动器对迟到的查询按当时的状态应答。运行实例 uid 下的其他进程同样能连接 IPC 端点；伪造的 `PostToolUse`、`PostToolBatch` 与 `SubagentStart` 查询至多改变作为软输入的意图与提示，不改变门控、静止证据与唤醒集合。
+
+复杂度：每次查询为一次 IPC 往返，驱动器的应答为 O(1) 次意图表与提示状态的读写。
 
 ### ToolExec 与文件访问
 
@@ -560,6 +602,10 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | `PrepareSuspend` 前置不满足 | 回 `Busy{reason, retry_after}`；看守进程不为满足前置条件终止后台作业、残留进程或孤儿进程；控制面回到 `Active`，由策略在 `retry_after` 之后复评 |
 | 以挂起为目的的销毁时进程树中存在 Agent 主进程与已声明的第三方 MCP 服务器进程之外的进程 | 回 `Busy`；不终止这些进程，由控制面在 `retry_after` 之后复评 |
 | `conn.inbound` 发出时出站流不可用 | 消息留在重放缓冲，重连后随重放送达；同一 `freeze_id` 不另生成第二条 |
+| 托管 hook 的 IPC 端点不可达、查询超过截止时间或应答无法解析 | 二进制以空输出、退出码 0 退出并计数；不提示、不拒绝、不阻塞工具调用，`SubagentStart` 未注入规则时子代理仍可从工具描述读到同一组规则 |
+| `expected_wait` 无法解析 | 按未填写处理，`agent_expected_ms` 为空并计数；调用照常执行，不向 Agent 返回错误 |
+| `wait_signatures` 中某项的 `match.command` 正则无法编译 | 跳过该项并计数，其余项照常生效 |
+| 宿主侧分类请求失败或超时 | 驱动器保持规则分类结果，不重试；不上报 `llm.request.failed`，转发侧的处置见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求) |
 | 平台 MCP 阻塞型调用被 Agent 自动转到后台 | 立即以转换结果结束该调用：`wait_for` 返回「已转为订阅」与 `sub_id`，`sleep_until` 先转为运行实例范围定时器再返回「已转为定时」；结果随 `task_notification` 到达 Agent |
 | `SIGSTOP` 扫描超限或截止到期 | 对已停止 PID 发送 `SIGCONT`，记录已解冻，回 `Busy`；不留下部分冻结的进程树 |
 | `CancelSuspend` | 未越过不可撤销点时回 `Busy{reason=cancelled}`；已越过时回 `ReadyToSuspend`，由控制面按迟到应答处理 |
@@ -578,7 +624,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 领取返回 503（`secrets` 或存储不可达，或 Substrate 出口网关因 Substrate 控制面暂时不可达取不到 actor JWT） | 退避重试 |
 | 领取请求没有到达引导接口（DNS 解析得到 NXDOMAIN、出口默认拒绝、出口网关拒绝非运行态 actor、连接失败或超时），或得到引导接口错误码之外的状态码（例如 Substrate 出口网关返回的 403、500） | 退避重试，与 404 相同；Substrate 构建模板快照的 actor 停在等待领取的状态 |
 | 预热认领的 `/wake` 通知未送达 | 由退避领取兜底，领取延迟不超过退避上限 30 s |
-| `SandboxConfig` 内容无法解析 | 保留上一次成功应用的配置并计数；从未成功应用时按 `modes` 与 `tool_profile` 均为空处理，并启动 Agent 主进程 |
+| `SandboxConfig` 内容无法解析 | 保留上一次成功应用的配置并计数；从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的两个开关均关闭处理，并启动 Agent 主进程 |
 | 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递「回合被中断」；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径下 kubelet 在同一 Pod 内重启容器时，新的看守进程领取得到 409，停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建 |
 | 快照恢复后时钟跳变 | 以 `Resumed.wall_clock_now` 校时，再通知驱动器；恢复期间的超时以校时后的时钟计算 |
 | MCP 传输定时器（首字节、idle）或 per-server timeout 到期 | 工具返回错误结果，不无限占用回合；阻塞型等待已转为订阅或定时时按转换结果返回 |
@@ -595,6 +641,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 - **投递串行**：同一时刻只有一个投递批被喂入 Agent；追加 `accepted`、喂入、追加 `consumed` 与发送确认按固定顺序执行，日志写入串行化。不同批的 `Deliver` 在流上按到达顺序处理。
 - **租约续约独立**：续约周期任务独立于投递与冻结；续约失败只触发一次本地保护动作与一次 `LeaseLost`，后续由控制面的重建路径接管。
 - **本地代理不被冻结**：本地代理、平台 MCP 服务器与活动度采集在看守进程内继续运行；被冻结的只有 `agent` 子 cgroup 中的进程树。本地代理在冻结期间持有上游连接并缓冲或直通响应，并在非 LLM 上游连接上观察入站载荷（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- **托管 hook 查询**：IPC 端点并发接受查询，各查询由驱动器按当前生效的沙箱侧配置快照与意图状态应答；同一情境提示只交付一次，`PostToolUse` 与 `PostToolBatch` 的查询并发到达时只有先完成标记的一方得到该提示。`SandboxConfig` 的应用以原子替换生效，与查询并发时查询读取替换前或替换后的完整配置，不读取部分更新。查询不持有进程监督锁，不与投递、冻结和出站流发送串行。
 - **DRAIN 标志**：DRAIN 按 `suspend_id` 幂等设置；设置之后到达的阻塞型调用按 DRAIN 规则返回，设置之前已进入等待的调用同样被唤醒并按规则返回。
 - **入站与出站协调**：`/wake` 在出站流建立或重建之后才返回，并发调用合并为同一次处理；`/readyz` 在领取之前反映看守进程可服务；领取之后，k8s 路径上反映出站流与关键组件的就绪状态，Substrate 路径上只反映关键组件的就绪状态。入站请求与出站消息并发时，以运行实例令牌与代的校验结果为准。
 - **领取串行**：同一时刻至多一个领取请求在途。退避到期与 `/wake` 触发的领取在已有请求在途时并入该请求，不另发请求；`actor-name` 变化触发的领取先放弃在途请求及其连接，再在新连接上发出：在途请求可能随模板快照进入新 actor，Substrate 的内存快照恢复不保证旧 TCP 连接可被及时察觉为失效，而构建模板快照的 actor 没有引导记录，被放弃的请求不会领取成功。看守进程自身的并发领取因而不会得到 409。
@@ -603,13 +650,17 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 
 ### 新增 Agent 驱动器
 
-新增驱动器（例如 Codex、OpenHands 或 Gemini CLI）实现同一套 Agent 驱动器接口：把该 Agent 的原生回合、工具、权限询问、等待、后台作业与自唤醒源翻译为协议事件，后台作业以完整集合上报，自唤醒条目以完整集合连同 `crons_synced` 上报，没有自唤醒源的 Agent 不发出 `self_wake_changed`，没有进行中回合时发出的事件 `turn_id` 与 `event_seq` 为空；把 `Deliver` 的 `target` 翻译为原生输入；定义以挂起为目的的退出路径与恢复句柄。新增驱动器不修改 `runcontroller`、`suspendpolicy` 或本模块文档的协议消息；接口变更须同时覆盖进程驱动器与控制面循环驱动器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
+新增驱动器（例如 Codex、OpenHands 或 Gemini CLI）实现同一套 Agent 驱动器接口：把该 Agent 的原生回合、工具、权限询问、等待、后台作业与自唤醒源翻译为协议事件，后台作业以完整集合上报，自唤醒条目以完整集合连同 `crons_synced` 上报，没有自唤醒源的 Agent 不发出 `self_wake_changed`，不解析等待意图的驱动器不发出 `intent_observed`，解析时只把意图作软输入、不以拒绝或阻塞工具调用、让对话继续的方式索取，没有进行中回合时发出的事件 `turn_id` 与 `event_seq` 为空；把 `Deliver` 的 `target` 翻译为原生输入；定义以挂起为目的的退出路径与恢复句柄。新增驱动器不修改 `runcontroller`、`suspendpolicy` 或本模块文档的协议消息；接口变更须同时覆盖进程驱动器与控制面循环驱动器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
 ### 新增平台工具与第三方工具接入
 
-新增平台工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限、DRAIN 行为与被 Agent 自动转到后台时的转换结果；运行实例令牌的鉴权方式；超时预算。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的接口、Agent 驱动器的超时配置与本模块文档。
+新增平台工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限、DRAIN 行为与被 Agent 自动转到后台时的转换结果；运行实例令牌的鉴权方式；超时预算；产生等待的工具是否接受 `expected_wait` 与 `reason`，以及 `agent_expected_ms` 随哪条事件上报。工具的 MCP 描述与 `instructions` 中的等待方式的选择规则保持一致。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的接口、Agent 驱动器的超时配置与本模块文档。
 
 第三方工具不进入平台 MCP 闭集。新增第三方工具只改项目作用域的工具接入声明：声明凭据占位符环境变量、第三方 MCP 服务器与允许主机；平台不为其增加工具、不识别其操作，也不改变本地代理与出口代理的实现。
+
+### 新增托管 hook
+
+新增托管 hook 须给出：hook 事件与 matcher；驱动器对输入的用途；输出字段及其在模型上下文中出现的位置；查询截止时间与失败时的输出。用于等待意图的 hook 只输出 `additionalContext` 或空输出，不输出 `decision`、`continue` 与权限决定，退出码恒为 0，且不在 `Stop`、`SubagentStop` 等会让对话继续的 hook 上输出 `additionalContext`；托管策略设置、本模块的[托管 hook](#托管-hook)表与 Claude Code 驱动器同步修改。
 
 ### 新增冻结变体
 
@@ -632,6 +683,8 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 工作区租约续约 | 未实现 | — |
 | 投递意图日志 | 未实现 | — |
 | 平台 MCP 服务器 | 未实现 | — |
+| 平台 MCP 的 `instructions` 与自报参数 | 未实现 | — |
+| 托管 hook 二进制与本地 IPC 端点 | 未实现 | — |
 | `ToolExec` API | 未实现 | — |
 | 文件 API | 未实现 | — |
 | 出站流与重连 | 未实现 | — |
