@@ -12,28 +12,28 @@
 
 看守进程的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体消息字段、表结构与算法见后续章节。
 
-- **进程监督**：作为 PID 1 以停止态启动 Agent 主进程，协调节点冻结代理把它移入 `agent` 子 cgroup 后继续执行；启动由需要喂入事件的投递或 `StartAgent` 触发，`StartAgent` 只以恢复句柄启动、不写入任何输入；回收子进程、转发信号、维护进程组，并把 Agent 驱动器报告的后台作业、工具调用与自唤醒条目登记到进程监督记录。Agent 退出时上报 `turn_ended{agent_exited=true}` 并保持监督；收到 `SIGTERM` 时以退出码 143 终止、杀死 Bash 进程树并执行 `SessionEnd` hook；以挂起为目的的销毁路径上，Agent 主进程正常退出之后终止已声明的第三方 MCP 服务器进程（含其子进程），这是看守进程在挂起路径中唯一终止的进程，除此之外任何挂起路径都不终止进程，后台作业、残留进程与孤儿进程存在时回 `Busy`。结果是 Agent 进程树始终有唯一监督者，退出与信号处理、僵尸回收都由本进程完成（[REF-claude-code-hooks](../../../references.md)）。
+- **进程监督**：作为 PID 1 以停止态启动以运行实例 uid 直接运行的进程（例如 Agent 主进程与 `/terminal` 的 shell），k8s 路径上经本 Pod 的节点冻结代理套接字 `/run/castworks/freeze/agent.sock` 以 `AdoptAgent` 只提交容器内 pid，由节点冻结代理移入 `agent` 子 cgroup 后再让它继续执行；`AdoptAgent` 被拒绝或不可达时不让该进程执行，按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报；Agent 主进程的启动由需要喂入事件的投递或 `StartAgent` 触发，`StartAgent` 只以恢复句柄启动、不写入任何输入；回收子进程、转发信号、维护进程组，并把 Agent 驱动器报告的后台作业、工具调用与自唤醒条目登记到进程监督记录。Agent 退出时上报 `turn_ended{agent_exited=true}` 并保持监督；收到 `SIGTERM` 时以退出码 143 终止、杀死 Bash 进程树并执行 `SessionEnd` hook；以挂起为目的的销毁路径上，Agent 主进程正常退出之后终止已声明的第三方 MCP 服务器进程（含其子进程），这是看守进程在挂起路径中唯一终止的进程，除此之外任何挂起路径都不终止进程，后台作业、残留进程与孤儿进程存在时回 `Busy`。结果是 Agent 进程树始终有唯一监督者，退出与信号处理、僵尸回收都由本进程完成（[REF-claude-code-hooks](../../../references.md)）。
 - **冻结与解冻执行**：按 `PrepareSuspend.variant` 执行 `Freeze{cgroup}` 的沙箱侧协调或 `Freeze{signal}` 的降级路径；以 `freeze_id` 幂等，向控制面上报 `ReadyToSuspend`、`Thawed` 或 `Busy`；收到 `Thaw` 后解冻进程树或观察 `agent` 子 cgroup 已解冻。结果是冻结只作用于 Agent 进程树，看守进程自身继续应答探针、续约租约并维持出站流（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
 - **入站数据唤醒**：Agent 进程树处于冻结状态时，由本地代理与透明拦截器在 Agent 持有的非 LLM 上游连接上观察载荷字节，并在冻结确认时检查 Agent 进程树套接字的接收队列，承载 LLM 请求与平台 MCP 交互的回环连接、两端都在 Agent 进程树内的回环连接不在检查之列；任一成立即向控制面发出 `conn.inbound{freeze_id}`，每个 `freeze_id` 至多一次。结果是冻结期间到达 Agent 自持连接的外部数据不被搁置到冻结上限，控制面据此唤醒运行实例；`conn.inbound` 只表达外部输入，Agent 进程树内部的进展由活动度判据负责。
 - **活动度采集**：按固定周期采集 `Activity` 的字段，包括 PSI 累计停滞时间、CPU 累计用量 `cpu_usage_usec`、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态与 `freeze_id`。结果是控制面获得不依赖 Agent 配合的忙闲证据，`suspendpolicy` 与 `runcontroller` 据此判断能否挂起，包括后台作业存活或回合中多循环并发时的[静止冻结](../../../glossary.md)。
-- **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
+- **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代、附以[实例密钥](../../../glossary.md)签名的[持有证明](../../../glossary.md)周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
 - **投递意图日志**：`Deliver` 到达后先在 `.platform/deliveries.jsonl` 追加 `accepted{seq}` 并同步写入，按日志去重后把事件喂给 Agent；观察到回合开始后追加 `consumed{seq, turn_id}` 并同步写入，再发出 `Consumed`。结果是至少一次投递在跨代重建后仍可由日志去重，重建后不重复处理已消费事件（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
-- **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的带令牌调用，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。初始化时以 `instructions` 提供[等待方式的选择](#等待方式的选择)规则；解析 `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`expected_wait` 换算为毫秒后经 Agent 驱动器随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报，`reason` 连同 `run_id`、`call_id`、工具名与 `expected_wait` 写入结构化日志，供诊断与抽检。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1），Agent 自报的等待时长与平台的预测分开进入控制面，`reason` 不进入协议事件。
+- **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的调用，各附对方受众的运行实例令牌，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。初始化时以 `instructions` 提供[等待方式的选择](#等待方式的选择)规则；解析 `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`expected_wait` 换算为毫秒后经 Agent 驱动器随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报，`reason` 连同 `run_id`、`call_id`、工具名与 `expected_wait` 写入结构化日志，供诊断与抽检。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1），Agent 自报的等待时长与平台的预测分开进入控制面，`reason` 不进入协议事件。
 - **托管 hook**：随镜像在工作区之外提供 Claude Code 托管 hook 的二进制，按使其父进程为 Agent 主进程的方式注册在托管策略设置中（经 shell 执行时写成 `exec <托管 hook 二进制路径>`）；二进制经本地 IPC 把 hook 输入交给 Agent 驱动器并同步返回驱动器的应答，IPC 端点以 `SO_PEERCRED` 认证对端，并按 Agent 驱动器观察到的 stream-json 事件对查询做一次性核对，只应答由 Agent 主进程执行的托管 hook 二进制针对已存在、尚未应答事件的查询：`PostToolUse` 与 `PostToolBatch` 返回等待意图的情境提示，`SubagentStart` 向子代理注入等待方式的选择规则，审批所用的 `PreToolUse` 与旁证所用的其余 hook 共用同一机制；查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果。结果是提示只搭载在 Agent 下一次本来就要发出的模型请求上，与等待意图相关的 hook 输出只有 `additionalContext`，不拒绝、不阻塞工具调用，也不让对话继续，审批在平台不可用时不放行（[REF-claude-code-hooks](../../../references.md)、[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 - **等待意图配置应用**：按沙箱侧配置中的 `wait_signatures`、`intent.hints` 与 `intent.classifier` 设置 Agent 驱动器的签名匹配、情境提示开关与宿主侧分类开关；宿主侧分类请求经本地代理附分类标记发往 `llmgateway`，不经 Agent 进程、不进入 Agent 上下文，也不计入在途请求与 LLM 等待信号，不参与事件源实例租约。结果是[等待签名](../../../glossary.md)随外部系统定义下发，提示与宿主侧分类可按运行实例关闭，意图解析与 `intent_observed` 始终进行。
 - **工具接入声明执行**：按[沙箱侧配置](../../../glossary.md)（`SandboxConfig`，接收与应用见[沙箱侧配置](#沙箱侧配置)）中的[工具接入声明](../../../glossary.md)向 Agent 进程与 `ToolExec.exec` 注入凭据占位符环境变量与非秘密配置，合并已批准的第三方 MCP 服务器配置；只注入字面占位符，不解析、不换取、不缓存真实凭据。结果是第三方工具经同一组环境变量使用平台的出口凭据通道，平台不需要知道哪个工具使用了哪条通道。
 - **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 exec、文件读写、流式输出与后台作业帧，按代校验；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，且驱动器无需持有运行实例令牌。
 - **出站流与状态对账**：始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，发送 `Hello`、`AgentEvent`、`Activity`、`Accepted`、`Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`Busy`、`Thawed`、`LeaseLost`、`conn.inbound`、本地代理与平台 MCP 服务器的请求事件与 `ToolExec` 响应/数据帧，处理 `HelloAck`、`Deliver`、`StartAgent`、`PrepareSuspend`、`CancelSuspend`、`Thaw`、`Resumed`、`LiveState`、`Shutdown`、`Fenced`、`TokenRotate`、`SandboxConfig` 与 `ToolExec` 请求/取消帧；断连后退避重连、重放未确认消息并以 `Hello` 做状态对账。结果是控制面以持久化状态而非事件历史恢复一致（I10）。
-- **令牌持有与轮换**：启动后经引导接口领取运行实例令牌与 `lease_id`，两者只保存在进程内存，领取成功之前不以运行实例 uid 启动任何进程；持有沙箱内唯一的运行实例令牌，按 `TokenRotate` 替换；令牌过期且未收到新令牌之前，不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求。结果是同一沙箱实例至多领取成功一次，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，沙箱内不出现长期凭据或 LLM 密钥，运行实例令牌只由看守进程持有（I6）。
+- **令牌持有与轮换**：领取之前生成实例密钥，经引导接口领取按受众划分的运行实例令牌组、`lease_id` 与[接入票据](../../../glossary.md)公钥集合，实例私钥、令牌组与 `lease_id` 只保存在进程内存，领取成功之前不以运行实例 uid 启动任何进程；按受众使用令牌：`Hello.resume_token` 取 `runcontroller` 令牌，本地代理发往 `llmgateway` 的请求取 `llmgateway` 令牌、发往 k8s 路径平台出口代理的请求取 `egress` 令牌，平台 MCP 服务器对 `connectorhub` 与 `humanchannel` 分别取各自受众的令牌；以实例私钥为 `Hello` 与 `RenewLease` 签持有证明；按 `TokenRotate` 整体替换令牌组与接入票据公钥集合；令牌过期且未收到新令牌之前，不向 `llmgateway`、`connectorhub`、`humanchannel` 与平台出口代理发请求。结果是同一沙箱实例至多领取成功一次，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，任一接收方收到的令牌只能用于它自身的受众，不持有实例私钥的一方即使取得令牌与 `lease_id` 也不能建立出站流或续约租约，沙箱内不出现长期凭据或 LLM 密钥，运行实例令牌只由看守进程持有（I6，[ADR-run-token-audience-and-holder-binding](../../../adr/adr-run-token-audience-and-holder-binding.md)）。
 - **快照恢复后的清理**：恢复后先校时、主动断开 Agent 进程的旧 TCP 连接，再通知 Agent 驱动器；本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。结果是半死连接不会把恢复拖到读超时。
 - **DRAIN 处置**：收到 `Resumed{drain=true}` 后按 `suspend_id` 幂等，把已等待与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即按终止等待的结果返回，使当前回合能够结束。结果是控制面能在回合边界执行以挂起为目的的销毁（[ADR-turn-boundary-destroy](../../../adr/adr-turn-boundary-destroy.md)）。
-- **入站服务**：在沙箱内监听 80 端口，提供 `/readyz`、`/wake`、`/terminal` 与文件访问；入站端点不承载事件内容。结果是提供者恢复与预热认领通知、探针与人类接入有稳定入口，事件投递仍只走出站流。
+- **入站服务**：只在 Pod 地址上监听 80 端口，拒绝来源为回环地址或本 Pod 地址的连接，提供 `/readyz`、`/wake`、`/terminal` 与 `/files`；`/terminal` 与 `/files` 只在接入票据校验通过后建立终端或读取文件；入站端点不承载事件内容。结果是提供者恢复与预热认领通知、探针与人类接入有稳定入口，人类接入经端到端认证，沙箱内的进程不能经回环调用入站端点，事件投递仍只走出站流。
 
 ### 子模块分工
 
 各子模块有独立文档，模块文档只固定边界。
 
-- **本地代理**：看守进程内不被冻结的 HTTP 代理，终止 Agent 使用代理变量发出的 LLM 与外部系统 HTTP 连接，附加运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)，由透明拦截器接收这些连接并以出口代理为上游。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。本地代理另按主机与归属对象识别周期性连接供意图解析使用，并把 Agent 驱动器的宿主侧分类请求附分类标记转发到 `llmgateway`，对来自 Agent 进程的请求剥离该标记。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- **本地代理**：看守进程内不被冻结的 HTTP 代理，终止 Agent 使用代理变量发出的 LLM 与外部系统 HTTP 连接，附加对应受众的运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)，由透明拦截器接收这些连接并以出口代理为上游。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。本地代理另按主机与归属对象识别周期性连接供意图解析使用，并把 Agent 驱动器的宿主侧分类请求附分类标记转发到 `llmgateway`，对来自 Agent 进程的请求剥离该标记。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - **Claude Code 驱动器**：以无头 `stream-json` 协议驱动 Claude Code，把回合、工具、权限询问与等待翻译为协议事件，按 Claude Code 的后台任务集合维护后台作业，镜像会话内定时、工具超时与 `Monitor` 截止等自唤醒条目，解析等待意图并发出 `intent_observed`、决定情境提示，把投递翻译为原生输入，并管理会话续接、`StartAgent` 启动与退出。细节见 [design-warden-driver-claude-code.md](design-warden-driver-claude-code.md)（[REF-claude-code-headless](../../../references.md)）。
 - **控制面循环驱动器**：控制面循环驱动器使用 `ToolExec` 的接口与语义，不假定沙箱内存在 Agent 进程，不产生自唤醒条目事件，也不产生 `intent_observed`：它的阻塞点由 `WaitDeclared` 显式声明。细节见 [design-warden-driver-native.md](design-warden-driver-native.md)（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
@@ -41,13 +41,13 @@
 
 非职责的判定标准是职责清单之外、由其他模块拥有的事实与机制。
 
-- 沙箱的预配、挂起、恢复、销毁、预热池、原地缩放、出口策略落地与引导接口归 `sandboxprovider`；看守进程只执行沙箱内的冻结与进程动作，以 `ReadyToSuspend`、`Busy`、`Thawed` 应答，并作为调用方经引导接口领取。
+- 沙箱的预配、挂起、恢复、销毁、预热池、原地缩放、出口策略落地与引导接口归 `sandboxprovider`，沙箱 Pod 的安全基线、NetworkPolicy、init 容器 `uid-egress-filter` 与节点冻结代理对 `AdoptAgent` 的核验归其 k8s 子模块；看守进程只执行沙箱内的冻结与进程动作，以 `ReadyToSuspend`、`Busy`、`Thawed` 应答，作为调用方经引导接口领取，并作为调用方请求 `AdoptAgent`。
 - 挂起决策与策略参数归 `suspendpolicy`：何时挂起、选择冻结或快照或销毁、冻结上限、冻结中升级、恢复准入、静止证据与活动度阈值都不由看守进程判断；看守进程只提供活动度样本与执行结果。
 - 运行实例状态机、收件箱、唤醒信号、等待、定时器、自唤醒集合的保存与到期唤醒、投递游标、代递增、纠正性对账，以及沙箱侧配置的按运行实例保存与发送归 `runcontroller`；看守进程只实现协议消息在沙箱侧的效果。
 - 自唤醒源的触发归 Agent 自身：会话内定时、`sleep` 进程、工具超时与 `Monitor` 截止由 Agent 触发，看守进程只观测并上报。看守进程不禁用、不拦截、不终止 Agent 的会话内定时、后台 Bash、`Monitor`、后台子代理、workflow 与长 MCP 调用的自动转后台，也不设置关闭这些功能的环境变量（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 - 等待意图的使用归 `suspendpolicy` 与 `runcontroller`：等待时长预测、宽限期选择与 `run.intents` 的保存都不在看守进程；意图不进入看守进程的冻结前置核对、入站数据唤醒与安全点复核。等待签名的定义与装载校验归 `connectorhub`。看守进程不向 Agent 定期提问，不以拒绝或阻塞工具调用、`Stop` 与 `SubagentStop` 的 `additionalContext`、强制转后台或终止进程的方式索取意图，提示可以被 Agent 忽略（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
-- 工作区租约表、绑定、接管与[持久化确认](../../../glossary.md)归 `workspace`；看守进程只续约并上报 `LeaseLost`。
-- 运行实例令牌的签发、签名与轮换签名归 `secrets`；看守进程只领取、持有、使用并替换令牌。
+- 工作区租约表、租约绑定、接管与[持久化确认](../../../glossary.md)归 `workspace`；工作区在节点上的挂载与运行实例子目录的绑定挂载归 `sandboxprovider` 的 k8s 子模块与[节点挂载代理](../../../glossary.md)（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）；看守进程只在已挂载的本运行实例子目录内读写，不管理挂载。
+- 运行实例令牌的签发、签名与轮换签名，以及接入票据的签发与签名密钥归 `secrets`；看守进程只领取、持有、使用并替换令牌，只校验接入票据。
 - 协议信封、序列化、重放与按 `(generation, msg_seq)` 去重的规则归 `agentprotocol`；看守进程只声明每条消息的沙箱侧效果。
 - LLM 凭据换取、在途请求与回放存储归 `llmgateway`；外部系统定义、订阅、[连接器事件日志](../../../glossary.md)、出口策略与沙箱侧配置的生成、工具接入声明的装载与校验归 `connectorhub`；人类会话、身份与审批决定归 `humanchannel`。看守进程只发起附运行实例令牌的运行时 HTTP 调用。
 - Agent 会话记录的内容归 Agent 自身；看守进程只保证状态目录位于工作区内，并在[安全点](../../../glossary.md)要求持久化完成。
@@ -58,7 +58,7 @@
 | 术语 | 英文对照 | 适用范围 | 定义 |
 | --- | --- | --- | --- |
 | 冻结变体 | freeze variant | warden | `Freeze{cgroup}` 与 `Freeze{signal}` 的统称：`Freeze{cgroup}` 由节点冻结代理写 `agent/cgroup.freeze`，`Freeze{signal}` 由看守进程按运行实例 uid 扫描 `/proc` 并迭代 `SIGSTOP`。 |
-| 停止态启动 | stopped-state spawn | warden | 看守进程先让 Agent 主进程以停止态出现，待节点冻结代理把它移入 `agent` 子 cgroup 后再继续执行；其后的 fork 自动继承该子 cgroup。 |
+| 停止态启动 | stopped-state spawn | warden | 看守进程先让以运行实例 uid 直接启动的进程（例如 Agent 主进程）以停止态出现，待节点冻结代理经 `AdoptAgent` 把它移入 `agent` 子 cgroup 后再继续执行；其后的 fork 自动继承该子 cgroup。 |
 | 投递意图日志条目 | delivery intent log entry | warden | 工作区 `.platform/deliveries.jsonl` 中的一行，取值为 `accepted{seq}` 或 `consumed{seq, turn_id}`；`accepted{seq}` 在喂给 Agent 之前同步写入，`consumed{seq, turn_id}` 在观察到回合开始后同步写入。 |
 | DRAIN 处置 | DRAIN disposition | warden | 收到 `Resumed{drain=true}` 后，把阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即按终止等待的结果返回，使当前回合能够结束并转入回合边界。 |
 | 活动度样本 | activity sample | warden | 固定周期采集并随 `Activity` 上报的一组观测值，含 PSI 累计停滞时间、CPU 累计用量、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态与 `freeze_id`。 |
@@ -74,7 +74,7 @@
 
 | 方向 | 消息 | 沙箱侧效果 |
 | --- | --- | --- |
-| 发出 | `Hello` | 建立或重建出站流时携带代、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`last_received_msg_seq` 与 `sandbox_config_revision`（已应用的沙箱侧配置版本，尚未应用为 0）；领取成功且首次续约成功之后才发出 |
+| 发出 | `Hello` | 建立或重建出站流时携带代、`session_epoch`、`resume_token`（令牌组中的 `runcontroller` 令牌）、`workspace_lease_id`、`sandbox_id`、`instance_key`（实例公钥 JWK）、`holder_proof`（用途为 `hello` 的持有证明）、`agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`last_received_msg_seq` 与 `sandbox_config_revision`（已应用的沙箱侧配置版本，尚未应用为 0）；领取成功且首次续约成功之后才发出 |
 | 发出 | `AgentEvent` | 回合开始与结束、工具开始与结束、权限询问、订阅创建、定时请求、等待开始、后台作业变化、自唤醒条目变化与等待意图；`subscription_created` 与 `wait_started` 携带 `agent_expected_ms`，取 Agent 经 `expected_wait` 自报的预计等待时长，未自报时为空，与 `predicted_ms` 分开；`bg_jobs_changed{job_ids}` 每次携带完整集合，`self_wake_changed{entries, crons_synced}` 每次携带驱动器当前掌握的全部条目，`crons_synced` 标明其中的 cron 条目是否已按本进程的 `session_crons` 对账，为假时 cron 条目可能不完整；`intent_observed{ref_kind, ref, class, target, expected_ms, prior, source, confidence}` 由 Claude Code 驱动器发出，`prior{p25, p50, p90}` 在 `source=signature` 时取等待签名的时长先验，其余来源为空，同一 `(ref_kind, ref)` 后到的覆盖先到的；没有进行中回合时发出的事件（例如 `bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed`）`turn_id` 与 `event_seq` 为空 |
 | 发出 | `Activity` | 固定周期的活动度样本与冻结状态 |
 | 发出 | `Accepted`、`Consumed`、`DeliveryFailed` | 投递接受、常规投递的消费与投递失败；接受与消费记录的同步写入先于对应消息 |
@@ -88,7 +88,8 @@
 | 接收 | `PrepareSuspend`、`CancelSuspend`、`Thaw` | 挂起前置、冻结变体、截止时间与 `mode=destroy` 时的自唤醒截止时刻 `self_wake_cutoff`；取消与解冻 |
 | 接收 | `Resumed` | 解冻或恢复完成、冻结时长与 `drain` 标志 |
 | 接收 | `LiveState` | 实时接入状态，按 `as_of` 取最新 |
-| 接收 | `Shutdown`、`Fenced`、`TokenRotate` | 关闭、代过期与令牌替换 |
+| 接收 | `Shutdown`、`Fenced` | 关闭与代过期 |
+| 接收 | `TokenRotate` | `tokens`（按受众为键的令牌组，形态与领取响应相同，`cnf.jkt` 不变）、`token_expires_at` 与 `access_ticket_keys`；整体替换进程内存中的令牌组与接入票据公钥集合 |
 | 接收 | `SandboxConfig` | `revision` 与 `config`；按 `revision` 幂等应用，首次应用之前不启动 Agent 主进程；应用规则见[沙箱侧配置](#沙箱侧配置) |
 
 稳定性承诺按类别给出：协议消息受协议版本约束，看守进程不自行增删字段；`Hello` 与 `HelloAck` 的状态摘要字段是状态对账的唯一依据，字段变化须同时修改 `runcontroller` 的进入规则与本模块文档；`Shutdown`、`Fenced` 与不可重试认证失败关闭是三种不同的终止语义，不得合并。`runcontroller` 的唤醒与进入规则依赖看守进程的下列承诺：`conn.inbound` 对每个 `freeze_id` 至多发出一次；`bg_jobs_changed` 每次携带完整集合，接收方按替换语义处理；`self_wake_changed` 每次携带驱动器当前掌握的全部条目与 `crons_synced`，接收方在 `crons_synced` 为真时整体替换，为假时整体替换 cron 之外的条目、cron 条目按 `entry_id` 合并，规则见 [runcontroller](../design-runcontroller.md)；`intent_observed` 只作软输入，接收方对同一 `(ref_kind, ref)` 以后到者覆盖先到者，`ref_kind`、`class`、`source` 越出闭集或 `class` 不属于 `ref_kind` 对应的闭集时丢弃该事件并计数，不终止传输；回合外事件不带 `event_seq`，其顺序由出站流的 `msg_seq` 保证，重复与乱序不改变接收方的结果；`StartAgent` 幂等，重复到达不启动第二个 Agent 进程。
@@ -109,9 +110,9 @@
 
 ### 文件 API 与回环代理端点
 
-文件 API 为界面提供工作区文件的读取，包括列目录与读文件；路径限定在运行实例子目录内，请求经入站路由到达，按入站路由的调用方身份（`humanchannel` 完成用户身份与项目归属校验）与实时接入状态鉴权。看守进程以自身持有的运行实例令牌核对请求携带的代，并校验当前租约的持有者为自身；请求本身不携带令牌。文件 API 不提供事件通道。
+文件 API 为界面提供工作区文件的读取，包括列目录与读文件，入站路径为 `/files`（agentprotocol 常量 `PathFiles`）；路径限定在运行实例子目录内，请求由 `workspace` 经入站路由转发到达，按[接入票据](../../../glossary.md)（`channel=file`）与实时接入状态鉴权。看守进程核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。票据的校验规则见[入站端点](#入站端点)。文件 API 不提供事件通道。
 
-本地代理监听回环地址，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器。Agent 不持有令牌，本地代理在转发时附加运行实例令牌；LLM 请求转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理。本地代理与透明拦截器都不做 MITM，不替换凭据，TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
+本地代理监听回环地址，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器。Agent 不持有令牌，本地代理在转发时附加对应受众的运行实例令牌：LLM 请求附 `llmgateway` 令牌转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理，k8s 路径上两者对平台出口代理都附 `egress` 令牌。本地代理与透明拦截器都不做 MITM，不替换凭据，TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
 ### 平台 MCP 工具
 
@@ -123,7 +124,7 @@
 | `subscribe_event` | 在 `connectorhub` 登记订阅并返回 `sub_id`；登记事务对已到达事件回溯匹配，已终态的外部对象合成完成事件；接受可选参数 `expected_wait` 与 `reason` |
 | `wait_for` | 阻塞等待指定条件；临近冻结上限或被 Agent 自动转到后台时返回已转为订阅与 `sub_id` 的结果，要求 Agent 结束回合；接受可选参数 `expected_wait` 与 `reason` |
 | `sleep_until` | 登记定时；阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器并返回已转为定时的结果；接受可选参数 `expected_wait` 与 `reason` |
-| 附件取回 | 附运行实例令牌向存放方取回附件引用中的内容 |
+| 附件取回 | 附存放方受众的运行实例令牌（`connectorhub` 或 `humanchannel`）向存放方取回附件引用中的内容 |
 
 `list_events`、`subscribe_event` 与 `wait_for` 的 MCP 描述向 Agent 说明：先用 `list_events` 查看可用事件；`wait_for` 是短等待，临近冻结上限时自动转为订阅；`subscribe_event` 登记后事件作为下一回合输入。平台 MCP 服务器在初始化应答中提供 `instructions`，内容为[等待方式的选择](#等待方式的选择)中的规则，与各工具的 MCP 描述一致；工具描述独立承载同一组规则，不依赖 `instructions` 进入 Agent 的系统提示。子代理经 `SubagentStart` hook 得到同一组规则，见[托管 hook](#托管-hook)。
 
@@ -167,8 +168,18 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 | --- | --- | --- |
 | `/readyz` | kubelet 就绪探针、Substrate 的 `wakeupProbe`（[REF-substrate](../../../references.md)） | 不以领取为条件：看守进程尚未领取时，可服务即返回就绪；领取之后，k8s 路径上出站流已建立且看守进程可服务时返回就绪，否则返回未就绪；Substrate 路径上可服务即返回就绪，不以出站流为条件：`wakeupProbe` 在 `ResumeActor` 把 actor 置为运行态之前探测，出口网关此时拒绝看守进程到控制面的连接，快照恢复的出站流在路由器转发 `/wake` 之后重建，`/wake` 在重建完成后返回。Substrate 路径下看守进程尚未领取时，每次被探测都读取 `actor-name`，与上次读取不同即立即领取一次；已领取的看守进程不再领取；快照恢复的是同一 actor，`actor-name` 不变，看守进程不重新领取 |
 | `/wake` | `sandboxprovider`：Substrate 路由器（快照恢复）、k8s 的 wake-router（预热认领后的领取通知） | 已领取时为恢复触发入口，看守进程立即重建出站流，不等重连退避到期，返回即表示出站流已重建；Substrate 路由器把请求停泊到 `/readyz` 就绪之后才转发给看守进程；尚未领取时为领取通知，看守进程立即经引导接口领取，再首次 `RenewLease` 并发送 `Hello`，出站流建立之后返回。并发调用合并为同一次处理 |
-| `/terminal` | `humanchannel` 经入站路由 | 人类 shell 终端接入；只在用户身份校验完成后建立；领取成功之前返回 503，不启动 shell |
-| 文件访问 | `workspace` 与平台界面经入站路由 | 到达文件 API，读取工作区文件 |
+| `/terminal` | `humanchannel` 经入站路由 | 人类 shell 终端接入；校验接入票据（`channel=terminal`）后建立；shell 以停止态启动并经 `AdoptAgent` 进入 `agent` 子 cgroup，与 Agent 进程树一同受冻结约束；票据中的用户写入终端审计；领取成功之前返回 503，不启动 shell |
+| `/files` | `workspace` 经入站路由 | 校验接入票据（`channel=file`）后到达文件 API，读取工作区文件；领取成功之前返回 503 |
+
+`/terminal` 与 `/files` 的请求以请求头 `x-castworks-access-ticket` 携带接入票据，每个入站请求一张，入站路由原样转发；票据的签发与形态归 `secrets`，端点契约见 [agentprotocol](../design-agentprotocol.md#入站端点契约)（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。看守进程逐项校验，校验所用的公钥集合是随领取响应与 `TokenRotate` 下发的 `access_ticket_keys`：
+
+- JOSE 头部的 `alg` 为 `EdDSA`、`typ` 为 `castworks-access-ticket`；`kid` 属于 `access_ticket_keys`，且签名有效。
+- `aud` 为 `warden`；`run_id` 与 `generation` 等于本沙箱的运行实例与代。
+- `channel` 与端点相符：`/terminal` 要求 `terminal`，`/files` 要求 `file`。
+- 未过期，且 `exp − iat ≤ T_access_ticket`（60 s）。
+- `jti` 未出现过；看守进程在内存中记录已接受的 `jti`，保留到该票据的 `exp`。
+
+任一项不通过时返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；通过时票据的 `sub`（平台用户标识）写入终端审计，`/files` 另照常执行租约持有者核对与 `file` 通道的实时接入要求。入站服务只监听 Pod 地址，拒绝来源为回环地址或本 Pod 地址的连接：沙箱内的进程不能经回环或 Pod 地址调用 `/wake`、`/terminal` 与 `/files`，探针与入站路由的请求来自 Pod 之外。
 
 入站端点不承载事件内容，`Deliver` 只在出站流上进行；`/readyz` 只配置在看守进程上，不配置在被冻结的 Agent 进程上；尚未领取的沙箱实例（k8s 的预热 Pod、Substrate 构建[模板快照](../../../glossary.md)的 actor）因 `/readyz` 不以领取为条件而通过探针。k8s 提供者的事件驱动恢复不经入站端点，由节点冻结代理解冻或把 Sandbox CR 改回运行态后，看守进程自行重连；k8s 预热 Pod 被认领时，`sandboxprovider` 经 wake-router 调用 `/wake` 作为领取通知，不等待其返回，通知未送达时由看守进程的退避领取兜底。Substrate 提供者的快照恢复经路由器调用 `/wake`。
 
@@ -186,15 +197,16 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 
 ## 依赖
 
-代码依赖为 `agentprotocol` 与 `workspace` 的沙箱侧部分（文件 API、持久化确认与租约续约），与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway`、`connectorhub` 与 `humanchannel` 的调用是附运行实例令牌的运行时 HTTP 调用，对 `sandboxprovider` 的[引导接口](../../../glossary.md)的调用是以沙箱实例身份凭据认证的运行时 HTTPS 调用，都不是代码依赖。`runcontroller` 是唯一依赖本模块的模块：本模块的控制面循环驱动器子模块以库的形式链接进 `runcontroller` 进程，`runcontroller` 调用其 Agent 驱动器接口；看守进程的其余部分不被任何模块依赖。
+代码依赖为 `agentprotocol` 与 `workspace` 的沙箱侧部分（文件 API、持久化确认与租约续约），与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway`、`connectorhub` 与 `humanchannel` 的调用是附对方受众运行实例令牌的运行时 HTTP 调用，对 `sandboxprovider` 的[引导接口](../../../glossary.md)的调用是以沙箱实例身份凭据认证的运行时 HTTPS 调用，都不是代码依赖。`runcontroller` 是唯一依赖本模块的模块：本模块的控制面循环驱动器子模块以库的形式链接进 `runcontroller` 进程，`runcontroller` 调用其 Agent 驱动器接口；看守进程的其余部分不被任何模块依赖。
 
 - `agentprotocol`：信封、消息类型、出站流客户端、未确认消息重放、按 `(generation, msg_seq)` 去重与协议版本。看守进程只实现每条消息的沙箱侧效果。
-- `workspace`：`RenewLease(lease_id, generation, sandbox_id)` 的 CAS 语义与首次续约绑定持有者；租约到期前无法续约时由本模块执行本地保护动作并上报 `LeaseLost`。租约的建立、接管与释放不在本模块。
-- `llmgateway`：本地代理转发的 LLM 请求与宿主侧分类请求以运行实例令牌鉴权，按运行实例计费；在途请求与回放存储归 `llmgateway`，恢复后按 `request_id` 取回（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。宿主侧分类请求带分类标记，`llmgateway` 不为它登记在途请求事实、不写 `llm_completed` 或 `llm_failed`，它也不参与事件源实例租约，标记的约定见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求)。
-- `connectorhub` 与 `humanchannel`：平台 MCP 服务器转发的事件目录查询、订阅与附件取回请求以运行实例令牌鉴权；订阅匹配与连接器事件日志归 `connectorhub`。沙箱侧配置中的 `wait_signatures` 由 `connectorhub` 从外部系统定义生成，`event_type` 与事件目录的一致性在装载时由它校验。
-- `sandboxprovider`：提供引导接口，看守进程经运行时 HTTPS 调用领取运行实例令牌与 `lease_id`；请求与响应、错误码与一次性领取语义见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)。k8s 路径的预热认领经 wake-router 调用 `/wake` 通知看守进程领取。
+- `workspace`：`RenewLease(lease_id, generation, sandbox_id, proof)` 的 CAS 语义与首次续约绑定持有者；`proof` 为用途是 `renew` 的持有证明，`workspace` 要求其中实例公钥的指纹等于租约的 `holder_jkt`（由 `sandboxprovider` 在领取时以 `SetHolderKey` 登记）、签名与时窗有效，否则以不可重试错误拒绝；租约到期前无法续约时由本模块执行本地保护动作并上报 `LeaseLost`。租约的建立、接管与释放不在本模块。
+- `llmgateway`：本地代理转发的 LLM 请求与宿主侧分类请求以 `llmgateway` 受众的运行实例令牌鉴权，只发往[面向沙箱的端点](../../../glossary.md) `llm`，按运行实例计费；在途请求与回放存储归 `llmgateway`，恢复后按 `request_id` 取回（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。宿主侧分类请求带分类标记，`llmgateway` 不为它登记在途请求事实、不写 `llm_completed` 或 `llm_failed`，它也不参与事件源实例租约，标记的约定见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求)。
+- `connectorhub` 与 `humanchannel`：平台 MCP 服务器发往 `connectorhub` 的事件目录查询、订阅登记与附件取回请求以 `connectorhub` 受众的运行实例令牌鉴权，只发往面向沙箱的端点 `connector`；发往 `humanchannel` 的附件取回请求以 `humanchannel` 受众的运行实例令牌鉴权，只发往面向沙箱的端点 `human`；订阅匹配与连接器事件日志归 `connectorhub`。沙箱侧配置中的 `wait_signatures` 由 `connectorhub` 从外部系统定义生成，`event_type` 与事件目录的一致性在装载时由它校验。
+- `sandboxprovider`：提供引导接口，看守进程以请求体 `{instance_key}` 经运行时 HTTPS 调用领取按受众划分的令牌组、`lease_id` 与接入票据公钥集合；`sandboxprovider` 在返回领取响应之前以 `SetHolderKey` 把实例公钥指纹登记为租约的 `holder_jkt`，并以同一指纹签发令牌组；请求与响应、错误码与一次性领取语义见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)。k8s 路径的预热认领经 wake-router 调用 `/wake` 通知看守进程领取。k8s 路径的节点冻结代理在本 Pod 的套接字上提供 `AdoptAgent`，核验规则见 [k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md)。
+- 面向沙箱的端点：看守进程连接的控制面端点都是面向沙箱的端点，穷举为 `stream`（出站流）、`bootstrap`（领取）、`lease`（`RenewLease`）、`llm`（本地代理）、`connector` 与 `human`（平台 MCP 服务器）、`egress`（k8s 路径的本地代理与透明拦截器）。地址取自部署配置 `sandbox_facing_endpoints` 中各条目的 `{host, port, addr}`，k8s 路径写入 Pod 的 `hostAliases`，Substrate 路径写入 actor 模板的启动参数；看守进程按配置的地址直连，不经 DNS 解析控制面主机名。这些端点与只接受 SPIFFE（[REF-spiffe](../../../references.md)）对端的内部监听器使用不同的主机名与端口，每个都要求 Agent 进程不持有的凭据（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。k8s 路径上 init 容器 `uid-egress-filter` 使 uid 非 0 的进程发出的报文只能到达回环地址，Substrate 路径以同样的限制为部署前提；以运行实例 uid 运行的进程因而到达不了这些端点，只有看守进程（uid 0）连接它们（I6）。
 - Kubernetes 投射 ServiceAccount 令牌（k8s 路径）与 Substrate 的 `systemInfo` 卷及出口网关的 actor JWT 注入（Substrate 路径）：领取所用的沙箱实例身份凭据、`actor-name` 与出口网关 CA 的来源。
-- Substrate 出口网关（Substrate 路径）：actor 除发往 53 端口的 DNS 之外的全部 TCP 出站都经出口网关，出口网关只接受运行态 actor 的出口连接。看守进程到控制面的连接，包括出站流、`RenewLease`、本地代理发往 `llmgateway` 的请求与平台 MCP 服务器发往 `connectorhub`、`humanchannel` 的请求，经出口网关以 `tls_passthrough` 按 SNI 透传，出口网关不终止其 TLS、不替换其请求头；这些连接所用的控制面主机名不得与引导接口主机名相同，否则会落入引导接口主机的 MITM 规则，`Authorization` 头被替换为 actor JWT。放行规则由 [substrate 子模块](../sandboxprovider/design-sandboxprovider-substrate.md)在落地 EgressPolicy 时追加。
+- Substrate 出口网关（Substrate 路径）：actor 除发往 53 端口的 DNS 之外的全部 TCP 出站都经出口网关，出口网关只接受运行态 actor 的出口连接；actor 的非 TCP 出站（UDP 含 QUIC、ICMP）除发往 DNS 中继的查询外一律拒绝，DNS 中继对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机、其余返回 NXDOMAIN、不递归解析，这两项与 actor 内 uid 非 0 的出站只到回环同为 Substrate 路径的部署前提，列入[实施路线与技术验证](../../../roadmap.md)。看守进程到控制面的连接，包括出站流、`RenewLease`、本地代理发往 `llmgateway` 的请求与平台 MCP 服务器发往 `connectorhub`、`humanchannel` 的请求，只到面向沙箱的端点主机名，经出口网关以 `tls_passthrough` 按 SNI 透传，出口网关不终止其 TLS、不替换其请求头；这些连接所用的控制面主机名不得与引导接口主机名相同，否则会落入引导接口主机的 MITM 规则，`Authorization` 头被替换为 actor JWT。放行规则由 [substrate 子模块](../sandboxprovider/design-sandboxprovider-substrate.md)在落地 EgressPolicy 时追加。沙箱的 `resolv.conf` 只指向看守进程的本地 DNS，本地 DNS 的应答规则见 [design-warden-llmproxy.md](design-warden-llmproxy.md#本地-dns-与透明拦截)。
 - Linux cgroup v2、PSI 与 procfs：`Freeze{cgroup}` 的冻结状态观察、活动度采集（PSI 累计停滞时间、`cpu.stat`、进程态、`wchan` 与进程启动时刻）、接收队列检查（`/proc/net/tcp`、`/proc/net/tcp6`）与托管 hook IPC 端点的对端认证（`SO_PEERCRED`、`/proc/<pid>/exe`、`/proc/<pid>/stat`）的内核接口（[REF-linux-cgroup-v2](../../../references.md)、[REF-linux-psi](../../../references.md)）。
 - Claude Code：无头模式、hooks、托管策略设置、环境变量、网络看门狗、stream-json 消息，以及后台任务消息与会话内定时工具的契约；hooks 中本模块依赖 command hook 的执行方式（是否经 shell 执行，以及据此选定的注册方式能否使 hook 二进制的父进程为 Agent 主进程）、`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 的 `hookSpecificOutput.additionalContext`（出现位置与 10000 字符上限）、`PreToolUse` 输出的 `permissionDecision`、`Stop` 输入的 `last_assistant_message` 与各 hook 的退出码语义；stream-json 消息（例如 Assistant 消息中的 `tool_use`、`tool_result` 与后台任务消息）另作托管 hook 查询一次性核对的依据（[REF-claude-code-settings](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)、[REF-claude-code-network-config](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-hooks](../../../references.md)）。
 - MCP：平台 MCP 服务器的工具、传输与初始化应答中的 `instructions`（[REF-mcp](../../../references.md)）。
@@ -241,16 +253,17 @@ flowchart TB
     hc["humanchannel"]
     boot["sandboxprovider 引导接口"]
     nfa -->|"写 agent/cgroup.freeze"| agentcg
-    router -->|"/readyz /wake /terminal 与文件访问"| warden
-    warden -->|"HTTPS 领取令牌与 lease_id"| boot
-    warden -->|"出站 gRPC 流"| rc
-    proxy -->|"附运行实例令牌"| gw
-    proxy -->|"CONNECT 或 HTTP 前置"| egress
-    mcp -->|"附运行实例令牌"| hub
-    mcp -->|"附运行实例令牌"| hc
+    warden -->|"AdoptAgent，经按 Pod 套接字"| nfa
+    router -->|"/readyz /wake；/terminal /files 携带接入票据"| warden
+    warden -->|"HTTPS 领取令牌组与 lease_id，请求体 instance_key"| boot
+    warden -->|"出站 gRPC 流，Hello 附持有证明"| rc
+    proxy -->|"附 llmgateway 受众令牌"| gw
+    proxy -->|"CONNECT 或 HTTP 前置，k8s 路径附 egress 受众令牌"| egress
+    mcp -->|"附 connectorhub 受众令牌"| hub
+    mcp -->|"附 humanchannel 受众令牌"| hc
 ```
 
-看守进程、本地代理、平台 MCP 服务器与 Agent 驱动器位于同一个进程，本地代理与平台 MCP 服务器不是独立进程；节点冻结代理只对 `agent` 子 cgroup 写入，看守进程留在父 cgroup，因此冻结期间探针、租约续约、出站流与本地代理的上游连接继续工作，本地代理在非 LLM 上游连接上读到载荷字节时由看守进程经出站流发出 `conn.inbound`。Agent 的 `bash` 子进程与后续 fork 继承 `agent` 子 cgroup，进程树因而整体冻结。托管 hook 二进制由 Claude Code 经 shell 执行注册的 `exec` 命令启动，shell 以 `exec` 让位，二进制的父进程因而是 Agent 主进程；它同样位于 `agent` 子 cgroup、以运行实例 uid 运行、随进程树冻结，只经本地 IPC 向驱动器查询，不持有令牌。IPC 端点以 `SO_PEERCRED` 核对对端是 Agent 主进程执行的该二进制，并以驱动器从 Agent 的 stream-json 输出观察到的事件对查询做一次性核对。驱动器的宿主侧分类请求经本地代理发往 LLM 网关，不经 Agent 进程。投递意图日志位于工作区，不在容器 rootfs。对引导接口的领取不经出站流；领取成功之前，看守进程不以运行实例 uid 启动任何进程。
+看守进程、本地代理、平台 MCP 服务器与 Agent 驱动器位于同一个进程，本地代理与平台 MCP 服务器不是独立进程；节点冻结代理只对 `agent` 子 cgroup 写入，看守进程留在父 cgroup，因此冻结期间探针、租约续约、出站流与本地代理的上游连接继续工作，本地代理在非 LLM 上游连接上读到载荷字节时由看守进程经出站流发出 `conn.inbound`。Agent 的 `bash` 子进程与后续 fork 继承 `agent` 子 cgroup，进程树因而整体冻结。托管 hook 二进制由 Claude Code 经 shell 执行注册的 `exec` 命令启动，shell 以 `exec` 让位，二进制的父进程因而是 Agent 主进程；它同样位于 `agent` 子 cgroup、以运行实例 uid 运行、随进程树冻结，只经本地 IPC 向驱动器查询，不持有令牌。IPC 端点以 `SO_PEERCRED` 核对对端是 Agent 主进程执行的该二进制，并以驱动器从 Agent 的 stream-json 输出观察到的事件对查询做一次性核对。驱动器的宿主侧分类请求经本地代理发往 LLM 网关，不经 Agent 进程。投递意图日志位于工作区，不在容器 rootfs。对引导接口的领取不经出站流；领取成功之前，看守进程不以运行实例 uid 启动任何进程。看守进程到节点冻结代理的 `AdoptAgent` 只经本 Pod 的 Unix 域套接字，该套接字不承载 `Freeze` 与 `Thaw`，节点冻结代理的地址不在沙箱 Pod 的 NetworkPolicy 放行列表中。图中看守进程到控制面与出口代理的边都只到面向沙箱的端点，各附对方受众的令牌；入站路由到看守进程的边上，`/terminal` 与 `/files` 由接入票据端到端认证。
 
 ### 启动与重连时序
 
@@ -264,11 +277,12 @@ sequenceDiagram
     participant S as workspace
     participant R as runcontroller
     W->>W: 监听入站端点，/readyz 照常应答
-    W->>B: POST /v1/bootstrap/claim，Authorization 携带沙箱实例身份凭据
-    B-->>W: run_id, generation, sandbox_id, lease_id, token, token_expires_at
-    W->>S: RenewLease(lease_id, generation, sandbox_id)
+    W->>W: 生成实例密钥，私钥只在进程内存
+    W->>B: POST /v1/bootstrap/claim，请求体 {instance_key}，Authorization 携带沙箱实例身份凭据
+    B-->>W: run_id, generation, sandbox_id, lease_id, tokens, token_expires_at, access_ticket_keys
+    W->>S: RenewLease(lease_id, generation, sandbox_id, holder_proof)
     S-->>W: 成功，绑定租约持有者
-    W->>R: Hello{generation, session_epoch, resume_token, workspace_lease_id, sandbox_id, agent_state, 游标, pending_intents, last_received_msg_seq, sandbox_config_revision=0}
+    W->>R: Hello{generation, session_epoch, resume_token, workspace_lease_id, sandbox_id, instance_key, holder_proof, agent_state, 游标, pending_intents, last_received_msg_seq, sandbox_config_revision=0}
     R-->>W: HelloAck{accepted, desired_state, last_received_msg_seq, owner_epoch, cursor_accepted, live_attached}
     R->>W: SandboxConfig{revision, config}
     W->>W: 按 revision 应用沙箱侧配置
@@ -276,8 +290,8 @@ sequenceDiagram
     W->>W: 追加 accepted{seq} 并同步写入
     W-->>R: Accepted{delivery_id, through_seq, fed=true}
     W->>A: 以停止态 spawn，携带运行实例 uid 与 resume_session_id
-    W->>N: 提交 Agent 主进程 PID 与容器 cgroup 路径
-    N->>N: 在容器 cgroup 下创建 agent 子 cgroup 并移入 PID
+    W->>N: AdoptAgent(pid)，经按 Pod 套接字
+    N->>N: 经容器运行时解析容器 cgroup，核验 pid 后移入 agent 子 cgroup
     N-->>W: 移入完成
     W->>A: 继续执行，按 target 翻译为原生输入
     A-->>W: turn_started{turn_id, delivery_id}
@@ -285,11 +299,11 @@ sequenceDiagram
     W-->>R: Consumed{through_seq, turn_id}
     Note over W,R: 出站流断开
     W->>R: 退避后重连，重放未确认消息
-    W->>R: Hello{last_received_msg_seq, 游标, pending_intents, sandbox_config_revision}
+    W->>R: Hello{instance_key, holder_proof, last_received_msg_seq, 游标, pending_intents, sandbox_config_revision}
     R-->>W: HelloAck 状态对账结果
 ```
 
-启动顺序的约束：领取成功之后才调用 `RenewLease`，首次 `RenewLease` 成功之后才发 `Hello`，首次应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，图中为投递触发的路径，领取不经过出站流。`Hello` 的 `generation`、令牌与租约持有者必须一致，否则控制面回 `HelloAck.fenced` 或关闭流。`HelloAck.desired_state=frozen` 时看守进程不恢复 Agent 执行，直到收到 `Thaw` 或新的恢复消息。重连不重新执行 `PrepareSuspend`，未确认消息由发送方重放，接收方按 `(generation, msg_seq)` 去重。`Hello` 的 `pending_intents` 使控制面在新代推进 `cursor_accepted`，再按对账后的 `cursor_consumed` 决定重投起点。
+启动顺序的约束：实例密钥在领取之前生成，领取成功之后才调用 `RenewLease`，首次 `RenewLease` 成功之后才发 `Hello`，首次应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，图中为 k8s 路径上投递触发的路径，领取不经过出站流。`RenewLease` 与 `Hello` 都附以实例私钥签名的持有证明，每次调用重新签名；`Hello` 的 `generation`、令牌与租约持有者必须一致，令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 必须相同，否则控制面回 `HelloAck.fenced` 或以不可重试认证失败关闭流。图中 `AdoptAgent` 只提交容器内 pid，cgroup 路径由节点冻结代理经容器运行时解析，看守进程收到移入完成之后才让 Agent 主进程继续执行。`HelloAck.desired_state=frozen` 时看守进程不恢复 Agent 执行，直到收到 `Thaw` 或新的恢复消息。重连不重新执行 `PrepareSuspend`，未确认消息由发送方重放，接收方按 `(generation, msg_seq)` 去重。`Hello` 的 `pending_intents` 使控制面在新代推进 `cursor_accepted`，再按对账后的 `cursor_consumed` 决定重投起点。
 
 ### 冻结与解冻时序
 
@@ -406,12 +420,12 @@ sequenceDiagram
 
 | 步骤 | 事件或调用 | 沙箱侧状态与持久写入 |
 | --- | --- | --- |
-| 1 | 看守进程启动并监听入站端点，经引导接口领取 | 响应携带 `generation=6`、`sandbox_id=sb-6`、`lease_id=L6` 与令牌；令牌与 `lease_id` 只保存在进程内存 |
-| 2 | `RenewLease(lease_id=L6, generation=6, sandbox_id=sb-6)` | 租约持有者绑定为 `sb-6`；续约成功之前不发 `Hello` |
-| 3 | 发出 `Hello{generation=6, session_epoch=e6, workspace_lease_id=L6, sandbox_id=sb-6, cursor_accepted=10, cursor_consumed=10, pending_intents=[], sandbox_config_revision=0}` | 出站流建立；控制面回 `HelloAck{accepted, desired_state=running}` |
+| 1 | 看守进程启动并监听入站端点，生成实例密钥（公钥指纹 `J6`），以请求体 `{instance_key}` 经引导接口领取 | 响应携带 `generation=6`、`sandbox_id=sb-6`、`lease_id=L6`、按受众划分的令牌组（各令牌 `cnf.jkt=J6`）与 `access_ticket_keys`；实例私钥、令牌组、`lease_id` 与公钥集合只保存在进程内存 |
+| 2 | `RenewLease(lease_id=L6, generation=6, sandbox_id=sb-6, proof)`，`proof` 为用途 `renew` 的持有证明 | `workspace` 核对实例公钥指纹等于租约的 `holder_jkt=J6`；租约持有者绑定为 `sb-6`；续约成功之前不发 `Hello` |
+| 3 | 发出 `Hello{generation=6, session_epoch=e6, resume_token=<runcontroller 令牌>, workspace_lease_id=L6, sandbox_id=sb-6, instance_key, holder_proof, cursor_accepted=10, cursor_consumed=10, pending_intents=[], sandbox_config_revision=0}` | 控制面核对令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 都为 `J6`；出站流建立；控制面回 `HelloAck{accepted, desired_state=running}` |
 | 4 | 收到 `SandboxConfig{revision=3, config}` | 本地 DNS 与透明拦截器加载主机表；已应用版本为 3，此后才允许启动 Agent 主进程 |
 | 5 | 收到 `Deliver{delivery_id=d-4, batch=[11], through_seq=11, target=next_user_message, resume_session_id=ses-1}` | 追加 `accepted{11}` 并同步写入；日志成为跨代去重依据 |
-| 6 | 按日志去重：`11` 未被消费；先发出 `Accepted{d-4, 11, fed=true}`，再以 `--resume ses-1` 按停止态启动 Claude Code，节点冻结代理把 PID 移入 `agent` 子 cgroup 后继续，喂入事件 | 进程监督记录 `agent_pid=4101`、`agent_pgid=4101`；`agent_state.phase=starting`，随后转为 `in_turn` |
+| 6 | 按日志去重：`11` 未被消费；先发出 `Accepted{d-4, 11, fed=true}`，再以 `--resume ses-1` 按停止态启动 Claude Code，经本 Pod 套接字以 `AdoptAgent(pid)` 请求节点冻结代理把它移入 `agent` 子 cgroup，收到移入完成后让它继续，喂入事件 | 进程监督记录 `agent_pid=4101`、`agent_pgid=4101`；`agent_state.phase=starting`，随后转为 `in_turn` |
 | 7 | Agent 发出 `turn_started{turn_id=turn-9, delivery_id=d-4}` | 追加 `consumed{11, turn-9}` 并同步写入；随后发出 `Consumed{11, turn-9}` |
 | 8 | 出站流在 `Consumed` 送达前断开，随后重连 | `Hello.pending_intents` 携带 `accepted{11}`、`Hello.cursor_consumed=11`、`Hello.sandbox_config_revision=3`；控制面先推进 `cursor_accepted` 到 11，再按 `Hello.cursor_consumed` 对齐 `cursor_consumed=11`，不重投 11，也不重发 `SandboxConfig` |
 
@@ -449,21 +463,41 @@ sequenceDiagram
 看守进程的启动顺序对 k8s 与 Substrate 两条提供者路径相同：
 
 1. 启动并监听入站端点；`/readyz` 照常应答，不以领取为条件。
-2. 调用[引导接口](../../../glossary.md)的 `POST /v1/bootstrap/claim` 领取，请求体为空，调用方身份只来自 `Authorization` 头。领取未成功时按退避重试，退避从 1 s 起翻倍，上限 30 s；k8s 路径收到 `/wake`、Substrate 路径读到的 `actor-name` 发生变化时，尚未领取的看守进程立即领取一次，不受此前 401 或 404 的影响。Substrate 路径由 `actor-name` 变化触发的领取同时把退避重置为从 1 s 起：这次领取发生在 `wakeupProbe` 探测期间，`ResumeActor` 尚未把 actor 置为运行态，出口网关拒绝非运行态 actor 的出口连接，领取可能在网络层失败；重置后的退避使下一次重试约 1 s 后发出，不沿用随模板快照带入的退避间隔。401 停止退避重试，409 停止领取，410 使看守进程退出，处置见[错误与失败语义](#错误与失败语义)。
-3. 领取成功后，令牌与 `lease_id` 只保存在进程内存；响应中的 `generation` 与 `sandbox_id` 用于续约与 `Hello`。
-4. 首次 `RenewLease` 成功后发送 `Hello`，其中 `sandbox_config_revision=0`。
-5. 收到并应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，启动步骤见[进程监督](#进程监督)。
+2. 生成 Ed25519 [实例密钥](../../../glossary.md)，私钥只在进程内存，不写入任何文件或日志，快照恢复沿用同一密钥对；公钥指纹 `instance_jkt` 按 [ADR-run-token-audience-and-holder-binding](../../../adr/adr-run-token-audience-and-holder-binding.md) 的规则对公钥 JWK 计算。Substrate 路径上尚未领取的看守进程读到的 `actor-name` 与生成密钥时读到的不同时，先重新生成实例密钥再领取：随模板快照进入新 actor 的密钥只属于构建快照的 actor，不用于任何领取。
+3. 调用[引导接口](../../../glossary.md)的 `POST /v1/bootstrap/claim` 领取，请求体为 `{instance_key}`（实例公钥 JWK，不是凭据），调用方身份只来自 `Authorization` 头。领取未成功时按退避重试，退避从 1 s 起翻倍，上限 30 s；k8s 路径收到 `/wake`、Substrate 路径读到的 `actor-name` 发生变化时，尚未领取的看守进程立即领取一次，不受此前 401 或 404 的影响。Substrate 路径由 `actor-name` 变化触发的领取同时把退避重置为从 1 s 起：这次领取发生在 `wakeupProbe` 探测期间，`ResumeActor` 尚未把 actor 置为运行态，出口网关拒绝非运行态 actor 的出口连接，领取可能在网络层失败；重置后的退避使下一次重试约 1 s 后发出，不沿用随模板快照带入的退避间隔。401 停止退避重试，409 停止领取，410 使看守进程退出，处置见[错误与失败语义](#错误与失败语义)。
+4. 领取成功后，响应中按受众为键的令牌组 `tokens`（`runcontroller`、`llmgateway`、`connectorhub`、`humanchannel`、`egress`）、`lease_id` 与接入票据公钥集合 `access_ticket_keys` 只保存在进程内存，令牌组中各令牌的 `cnf.jkt` 等于本实例的 `instance_jkt`；响应中的 `generation` 与 `sandbox_id` 用于续约与 `Hello`。
+5. 首次 `RenewLease` 附用途为 `renew` 的持有证明，成功后发送附 `instance_key` 与用途为 `hello` 的持有证明的 `Hello`，其中 `sandbox_config_revision=0`。
+6. 收到并应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，启动步骤见[进程监督](#进程监督)。
 
 `Authorization` 头按提供者路径取值，两条路径的领取语义相同：
 
 - k8s 路径：`Bearer <投射令牌>`。投射令牌是沙箱 Pod 专用 ServiceAccount 的令牌，audience 为 `castworks-bootstrap`、有效期 600 s，kubelet 在到期前替换令牌文件；看守进程每次领取前重新读取令牌文件，不缓存启动时读到的令牌：预热 Pod 在池中停留超过 600 s 时，启动时读到的令牌已过期，携带它领取会得到 401。令牌文件只允许看守进程读取，Agent 进程树以运行实例 uid 运行，读不到该文件。
-- Substrate 路径：占位符，出口网关把它替换为 audience 为 `castworks-bootstrap`、有效期 300 s 的 actor JWT。领取请求在出口网关处以 MITM 终止 TLS，看守进程以 `systemInfo` 卷 `trustBundle` 数据源投射的出口网关 CA（`egress-mitm.ate.dev`）校验网关出示的证书，并在每次领取时读取该文件：进程内存随模板快照进入新 actor，启动时加载的信任库会把构建快照时的 CA 带入所有新 actor。看守进程启动时读取 `systemInfo` 卷投射的 `actor-name` 作为初值；尚未领取时，每次 `/readyz` 被探测都重新读取，与上次读取不同即立即领取一次，不受此前领取失败（含 401）的影响；已领取的看守进程不再领取；快照恢复的是同一 actor，`actor-name` 不变，看守进程不重新领取。构建模板快照的 actor 没有引导记录，也没有 `sandboxprovider` 落地的 EgressPolicy，领取不会成功：Substrate 沙箱的 DNS 中继对没有出口策略的 actor 返回 NXDOMAIN，领取在网络层失败，或在请求到达引导接口时因 `Authorization` 仍是占位符而得到 401。看守进程停在等待领取的状态，该状态随模板快照进入从它恢复的新 actor，新 actor 被探测时读到自己的 `actor-name` 并立即领取一次，未成功时按从 1 s 起的退避重试。
+- Substrate 路径：占位符，出口网关把它替换为 audience 为 `castworks-bootstrap`、有效期 300 s 的 actor JWT。领取请求在出口网关处以 MITM 终止 TLS，看守进程以 `systemInfo` 卷 `trustBundle` 数据源投射的出口网关 CA（`egress-mitm.ate.dev`）校验网关出示的证书，并在每次领取时读取该文件：进程内存随模板快照进入新 actor，启动时加载的信任库会把构建快照时的 CA 带入所有新 actor。看守进程启动时读取 `systemInfo` 卷投射的 `actor-name` 作为初值；尚未领取时，每次 `/readyz` 被探测都重新读取，与上次读取不同即立即领取一次，不受此前领取失败（含 401）的影响；已领取的看守进程不再领取；快照恢复的是同一 actor，`actor-name` 不变，看守进程不重新领取。看守进程按 `sandbox_facing_endpoints` 中 `bootstrap` 条目的地址连接引导接口主机，不经 DNS 解析。构建模板快照的 actor 没有引导记录，也没有 `sandboxprovider` 落地的 EgressPolicy，领取不会成功：没有出口策略的 actor 发往引导接口主机的连接不被出口网关放行，领取在网络层失败，或在请求到达引导接口时因 `Authorization` 仍是占位符而得到 401。看守进程停在等待领取的状态，该状态随模板快照进入从它恢复的新 actor，新 actor 被探测时读到自己的 `actor-name`，先重新生成实例密钥，再立即领取一次，未成功时按从 1 s 起的退避重试。
 
-同一沙箱实例至多领取成功一次。领取成功之前，看守进程不以运行实例 uid 启动任何进程：Agent 主进程、`/terminal` 的 shell、第三方 MCP 服务器与 `ToolExec.exec` 命令都在领取成功之后才启动，`/terminal` 在此之前返回 503。Substrate 路径的出口网关为 actor 内任何进程携带占位符头的请求注入 actor JWT，领取之前存在的运行实例 uid 进程都可能抢先领取；领取成功之后，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，运行实例令牌因而只由看守进程持有（I6）。领取的契约见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)，各响应的处置见[错误与失败语义](#错误与失败语义)。
+[持有证明](../../../glossary.md) `holder_proof{iat, sig}` 由看守进程在每次 `Hello` 与 `RenewLease` 时重新生成：`iat` 为当前 Unix 秒，`sig` 为实例私钥对 UTF-8 文本 `castworks-holder-proof\n<用途>\n<标识>\n<generation>\n<sandbox_id>\n<iat>` 的 Ed25519 签名（base64url），用途为 `hello` 时标识取 `run_id`，为 `renew` 时取 `lease_id`。接收方要求 `|now − iat| ≤ T_proof_skew`（60 s）；看守进程在快照恢复后先校时，再发 `Hello` 与 `RenewLease`。取得令牌组或 `lease_id` 而不持有实例私钥的一方，签不出被接受的持有证明。
+
+同一沙箱实例至多领取成功一次。领取成功之前，看守进程不以运行实例 uid 启动任何进程：Agent 主进程、`/terminal` 的 shell、第三方 MCP 服务器与 `ToolExec.exec` 命令都在领取成功之后才启动，`/terminal` 与 `/files` 在此之前返回 503。Substrate 路径的出口网关为 actor 内任何进程携带占位符头的请求注入 actor JWT，领取之前存在的运行实例 uid 进程都可能抢先领取；领取成功之后，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，运行实例令牌因而只由看守进程持有（I6）。领取的契约见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)，各响应的处置见[错误与失败语义](#错误与失败语义)。
+
+### 出口 CA 信任
+
+`mitm` 主机的连接由出口代理以出口 CA 签发的证书终止 TLS，Agent 进程树中的工具必须信任该 CA。出口 CA 的来源按提供者路径区分：k8s 路径的平台 CA 经镜像预置或运行时注入（只读投射卷）；Substrate 路径的出口网关 CA 取自 `systemInfo` 卷 `trustBundle` 数据源的运行时投射，不预置进镜像（[ADR-platform-does-not-execute-external-operations](../../../adr/adr-platform-does-not-execute-external-operations.md)）。
+
+看守进程在工作区之外生成合并信任库 `/run/castworks/trust/ca-bundle.pem`，内容为公共根证书加出口 CA，属主为 root，Agent 只读；生成以写临时文件再原子替换的方式完成，读取方不会读到部分内容。生成时机为领取成功之后、快照恢复之后与投射文件变化时；Agent 主进程、`/terminal` 的 shell 与 `ToolExec.exec` 命令都在首次生成之后启动。看守进程对 Agent 进程树、`ToolExec.exec` 命令与 `/terminal` 的 shell 设置下列环境变量，取值都是该路径：`SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`、`GIT_SSL_CAINFO`、`REQUESTS_CA_BUNDLE`、`CURL_CA_BUNDLE`。工具接入声明中的同名变量覆盖这些值。
+
+CA 轮换按重叠期 `T_ca_overlap` 进行：新 CA 加入信任库不少于 `T_ca_overlap` 之后出口代理才用它签发，旧 CA 在信任库中保留不少于 `T_ca_overlap`；`T_ca_overlap` 不短于快照保留期上限，快照恢复后仍持有旧信任库的进程在重叠期内可以重建连接。轮换之后仍持有不含新 CA 的旧信任库的进程，连接 `mitm` 主机时证书校验失败，按上游 TLS 失败处理。领取时校验 Substrate 出口网关证书所用的 CA 仍按[启动与领取](#启动与领取)的规则在每次领取时读取 `trustBundle`。
 
 ### 进程监督
 
-看守进程是沙箱容器的 PID 1，Agent 主进程是它直接 spawn 的子进程。Agent 主进程只在领取成功且首次应用沙箱侧配置之后启动，启动步骤固定为：以运行实例 uid 创建 Agent 主进程并使其处于停止态；把 PID 与容器 cgroup 路径交给节点冻结代理；节点冻结代理在容器 cgroup 下创建 `agent` 子 cgroup 并移入 PID；看守进程继续执行，其后的 fork 自动继承子 cgroup。Agent 进程启动时设置 `no_new_privs` 并清空 capability bounding set，镜像内没有 sudo 与 setuid 二进制。
+看守进程是沙箱容器的 PID 1，Agent 主进程是它直接 spawn 的子进程。Agent 主进程只在领取成功且首次应用沙箱侧配置之后启动。看守进程以运行实例 uid 直接启动的进程（例如 Agent 主进程、`/terminal` 的 shell 与 `ToolExec.exec` 命令）在 k8s 路径上按同一组步骤启动：
+
+1. 以运行实例 uid 创建进程并使其处于停止态。
+2. 经本 Pod 的节点冻结代理套接字 `/run/castworks/freeze/agent.sock` 调用 `AdoptAgent(AdoptRequest{PID})`；请求只携带容器 PID 命名空间内的 pid，不携带 cgroup 路径。
+3. 节点冻结代理以 `SO_PEERCRED` 认定调用方是本 Pod 容器的 PID 1 且 uid 为 0，经容器运行时解析容器 cgroup，核验该 pid 是看守进程的直接子进程、uid 等于运行实例 uid、处于停止态且尚不在 `agent` 子 cgroup，然后把它移入同一容器的 `agent` 子 cgroup；核验规则与套接字的发布方式见 [k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md)。
+4. 看守进程收到移入完成后让该进程继续执行，其后的 fork 自动继承 `agent` 子 cgroup。
+
+`AdoptAgent` 被拒绝或不可达时，看守进程不让该进程继续执行，按退避重试；重试耗尽时回收这个尚未开始执行的进程并按启动失败上报，各进程的上报方式见[错误与失败语义](#错误与失败语义)。k8s 路径上以运行实例 uid 运行的进程因而都在冻结边界之内，`/terminal` 的 shell 与 Agent 进程树一同受冻结约束，不能留在父 cgroup 中逃离冻结与活动度统计（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。Substrate 路径没有节点冻结代理，这些进程不经 `AdoptAgent`。以运行实例 uid 启动的进程都设置 `no_new_privs` 并清空 capability bounding set，镜像内没有 sudo 与 setuid 二进制。
+
+k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添加看守进程所需的集合：`SETUID`、`SETGID`（切换到运行实例 uid 与 gid）、`KILL`（向运行实例 uid 的进程发信号）、`CHOWN`、`FOWNER`、`DAC_OVERRIDE`（工作区内的持久化确认与沙箱侧 `Ensure`）、`SYS_PTRACE`（读取其他 uid 进程的 `/proc/<pid>/exe` 等，用于托管 hook IPC 端点的对端校验与活动度采集）、`NET_BIND_SERVICE`（监听 80 端口）。以运行实例 uid 启动的进程的 capability bounding set 照旧清空，不继承这一集合。沙箱 Pod 安全基线（seccomp、AppArmor 或 SELinux、securityContext、准入策略与启动自检）与 init 容器 `uid-egress-filter` 见 [k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md)。
 
 监督职责包括：回收全部子进程并处理 `SIGCHLD`；维护 Agent 主进程的进程组，使 `SIGTERM` 能覆盖 Bash 进程树；在 Agent 退出时记录退出码并上报 `turn_ended{agent_exited=true}`，不就地重启同名进程，下一次投递或 `StartAgent` 以恢复句柄重新启动；登记 Agent 驱动器报告的后台作业与自唤醒条目，后台作业未结束时回合边界不构成安全点，冻结只在静止证据成立时发生；收到 `SIGTERM` 时以退出码 143 终止，杀死 Bash 进程树并执行 `SessionEnd` hook，该路径只用于失效判定与超时。
 
@@ -485,11 +519,11 @@ sequenceDiagram
 
 ### 出站流建立、重连与状态对账
 
-看守进程运行时始终维持一条主动外连 `runcontroller` 的 gRPC 双向流。流建立顺序为：领取成功；首次 `RenewLease` 成功；发送 `Hello`；处理 `HelloAck`；按 `desired_state` 决定是否恢复 Agent 执行。`HelloAck{accepted}` 之后，控制面保存的沙箱侧配置版本大于 `Hello.sandbox_config_revision` 时在该流上发送 `SandboxConfig`；运行实例的沙箱侧配置在流已接受期间更新时，控制面立即在该流上发送。`HelloAck` 的 `accepted` 表示接管成功，`fenced{current_generation}` 表示本代已过期，`Shutdown` 表示运行实例已终态或本代作废；令牌签名、`run_id` 或代不符时控制面以不可重试认证失败关闭流，不回 `HelloAck`，看守进程停止重连并上报。
+看守进程运行时始终维持一条主动外连 `runcontroller` 的 gRPC 双向流。流建立顺序为：领取成功；首次 `RenewLease` 成功；发送 `Hello`；处理 `HelloAck`；按 `desired_state` 决定是否恢复 Agent 执行。`HelloAck{accepted}` 之后，控制面保存的沙箱侧配置版本大于 `Hello.sandbox_config_revision` 时在该流上发送 `SandboxConfig`；运行实例的沙箱侧配置在流已接受期间更新时，控制面立即在该流上发送。`HelloAck` 的 `accepted` 表示接管成功，`fenced{current_generation}` 表示本代已过期，`Shutdown` 表示运行实例已终态或本代作废；令牌签名、受众、`run_id` 或代不符，`instance_key` 的指纹与令牌的 `cnf.jkt` 或租约的 `holder_jkt` 不符，持有证明的签名或时窗无效，或令牌到期时刻低于控制面记录的可接受下界时，控制面以不可重试认证失败关闭流，不回 `HelloAck`，看守进程停止重连并上报。
 
-断连后的重连：按退避重试；重连后重放未确认的发出消息；接收方按 `(generation, msg_seq)` 去重；`Hello` 携带 `last_received_msg_seq`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`agent_state` 与 `sandbox_config_revision`，`HelloAck` 返回控制面的 `last_received_msg_seq`、游标与实时接入状态；双方以对方的 `last_received_msg_seq` 裁剪重放缓冲，并据此对账。可重试关闭（例如依赖调用失败）不终止 Agent 进程树；`Fenced` 与 `Shutdown{graceful=false}` 要求停止投递与副作用，并对 Agent 进程树执行强制终止。
+断连后的重连：按退避重试；重连后重放未确认的发出消息；接收方按 `(generation, msg_seq)` 去重；`Hello` 携带重新签名的持有证明、`last_received_msg_seq`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`agent_state` 与 `sandbox_config_revision`，`HelloAck` 返回控制面的 `last_received_msg_seq`、游标与实时接入状态；双方以对方的 `last_received_msg_seq` 裁剪重放缓冲，并据此对账。可重试关闭（例如依赖调用失败）不终止 Agent 进程树；`Fenced` 与 `Shutdown{graceful=false}` 要求停止投递与副作用，并对 Agent 进程树执行强制终止。
 
-令牌轮换：首个令牌来自领取，此后的令牌来自 `TokenRotate`。`Hello` 中令牌已过期或临近到期而签名、代与租约校验通过时，控制面在同一事务写 `TokenRotate`；看守进程收到后替换本地令牌。替换之前，看守进程不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求，以免使用过期令牌。
+令牌轮换：首个令牌组来自领取，此后的令牌组来自 `TokenRotate`。`Hello` 中令牌已过期或临近到期而签名、代、租约与持有证明校验通过时，控制面在同一事务写 `TokenRotate`；已过期的令牌只在同一沙箱实例延续或快照恢复的状态下被接受，接受条件归 [runcontroller](../design-runcontroller.md)。看守进程收到 `TokenRotate` 后整体替换本地令牌组与接入票据公钥集合，新令牌组的 `cnf.jkt` 不变。替换之前，看守进程不向 `llmgateway`、`connectorhub`、`humanchannel` 与平台出口代理发请求，以免使用过期令牌。
 
 `Activity` 按固定周期发送，与流是否刚重连无关；控制面以样本判断忙闲与冻结状态。`Shutdown{graceful=true}` 时看守进程停止接受新的 `Deliver`，按正常退出路径关闭 Agent，并在 `deadline` 之前结束；`Shutdown{graceful=false}` 时直接终止进程树。
 
@@ -500,7 +534,7 @@ sequenceDiagram
 1. 校验信封的代与当前代一致；不一致时丢弃并计入旧代拒绝。
 2. 对批次中的每个 `inbox_seq`，若日志中已有 `consumed` 条目则跳过；否则追加 `accepted{seq}` 并同步写入。同步写入失败时不回 `Accepted`、不喂事件，回 `DeliveryFailed{retryable=true}`。
 3. 按日志去重后若没有需要喂入的事件，回 `Accepted{delivery_id, through_seq, fed=false}`，不为本批启动 Agent。
-4. 若存在需要喂入的事件，先回 `Accepted{delivery_id, through_seq, fed=true}`，再按 `target` 翻译为 Agent 原生输入：`next_user_message` 作为下一条用户消息，`tool_result{call_id}` 作为工具结果，`permission_decision{id}` 作为权限决定。
+4. 若存在需要喂入的事件，先回 `Accepted{delivery_id, through_seq, fed=true}`，再按 `target` 翻译为 Agent 原生输入：`next_user_message` 作为下一条用户消息，`tool_result{call_id}` 作为工具结果，`permission_decision{id, input_hash}` 作为权限决定，`input_hash` 为[审批内容摘要](../../../glossary.md)，驱动器在交付决定前按当前工具输入重算并比对。
 5. 对 `target=next_user_message` 的常规投递，观察到 `turn_started` 后追加 `consumed{seq, turn_id}` 并同步写入，写入成功后才发 `Consumed{through_seq, turn_id}`。定向投递与回合边界续接的消费只写日志，不发 `Consumed`。Agent 自行开始的回合（会话内定时触发的回合、任务通知回合）不对应投递，`turn_started.delivery_id` 为空，不写 `consumed` 条目。
 6. 目标等待点在沙箱内已失效（调用的 `tool_ended` 已发出、hook 已返回）时，回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递。
 
@@ -548,13 +582,13 @@ sequenceDiagram
 
 ### 工作区租约续约与 LeaseLost
 
-看守进程持有 `lease_id` 与代，按小于租约有效期的周期调用 `workspace.RenewLease(lease_id, generation, sandbox_id)`。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at` 未过，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。首次续约成功之后才发 `Hello`。
+看守进程持有 `lease_id` 与代，按小于租约有效期的周期调用 `workspace.RenewLease(lease_id, generation, sandbox_id, proof)`，每次以实例私钥重新签名用途为 `renew` 的持有证明。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at` 未过，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。`workspace` 另要求持有证明中实例公钥的指纹等于租约的 `holder_jkt`、签名有效且 `iat` 在 `T_proof_skew` 之内，不满足时以不可重试错误拒绝，看守进程不重试该次拒绝，按无法续约处理。首次续约成功之后才发 `Hello`。
 
 在租约到期前无法续约时，看守进程停止向工作区写入，冻结或杀死 Agent 进程树，并通过出站流上报 `LeaseLost{lease_id, expires_at}`；流不可用时继续重连，恢复后补发。租约的接管、释放与新代接管不属于本模块；看守进程不自行删除或改写租约记录。
 
 ### 平台 MCP 服务器
 
-平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的带令牌调用，并向 Agent 驱动器提供事件。`list_events` 从 `connectorhub` 的事件目录取得当前运行实例可订阅的事件；`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对连接器事件日志回溯匹配；`wait_for` 阻塞到条件满足、临近冻结上限或被 Agent 自动转到后台，后两种情形返回已转为订阅与 `sub_id` 的结果；`sleep_until` 登记定时，阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器；附件取回附运行实例令牌向存放方请求。第三方工具不经过平台 MCP 服务器，它们经本地代理或透明拦截器到出口代理执行。
+平台 MCP 服务器把 Agent 的工具调用翻译为对托管侧的调用，对 `connectorhub` 附 `connectorhub` 受众令牌、对 `humanchannel` 附 `humanchannel` 受众令牌，并向 Agent 驱动器提供事件。`list_events` 从 `connectorhub` 的事件目录取得当前运行实例可订阅的事件；`subscribe_event` 在 `connectorhub` 登记订阅，登记事务对连接器事件日志回溯匹配；`wait_for` 阻塞到条件满足、临近冻结上限或被 Agent 自动转到后台，后两种情形返回已转为订阅与 `sub_id` 的结果；`sleep_until` 登记定时，阻塞型在 DRAIN、临近上限或被 Agent 自动转到后台时转为运行实例范围定时器；附件取回附存放方受众的令牌向存放方请求。第三方工具不经过平台 MCP 服务器，它们经本地代理或透明拦截器到出口代理执行。
 
 平台 MCP 服务器在初始化应答中返回 `instructions`，并在每次调用时解析可选参数 `expected_wait` 与 `reason`：解析成功的 `expected_wait` 换算为毫秒，连同调用的 `call_id` 交给 Agent 驱动器，由驱动器写入本次调用的 `subscription_created` 或 `wait_started` 的 `agent_expected_ms`；`reason` 不进入协议事件，平台 MCP 服务器把截断后的 `reason` 连同 `run_id`、`call_id`、工具名与 `expected_wait` 写入结构化日志，供诊断与抽检。`expected_wait` 解析失败时只计数，不向 Agent 返回错误。
 
@@ -591,13 +625,13 @@ hook 二进制随 Agent 进程树冻结，冻结期间未完成的查询在解�
 
 控制面循环驱动器没有沙箱内 Agent 进程，通过 `ToolExec` 使用沙箱：`exec` 在运行实例 uid 下启动命令并返回退出码与输出流；文件读与文件写在运行实例子目录内进行；流式输出按偏移续传，支持断线后从上次偏移继续；后台作业可列出、查询与终止，未结束的作业计入后台作业集合，使回合边界不构成安全点。帧经该运行实例的出站流往返，由 `runcontroller` 从进程内驱动器转发；驱动器不持有运行实例令牌，帧的代按当前代校验；`Shutdown` 与 `Fenced` 到达后终止在途执行并拒绝新请求。
 
-文件 API 经入站路由提供界面对工作区文件的读取，路径限定在运行实例子目录内，按入站路由的调用方身份与实时接入状态鉴权；看守进程以自身持有的运行实例令牌核对请求携带的代，并校验当前租约的持有者为自身，请求本身不携带令牌。文件访问会唤醒快照态与销毁态的沙箱，接入状态由 `runcontroller` 记录。
+文件 API 以 `/files` 经入站路由提供界面对工作区文件的读取，请求由 `workspace` 原样转发，路径限定在运行实例子目录内，按接入票据（`channel=file`）与实时接入状态鉴权；看守进程按[入站端点](#入站端点)的规则校验票据，核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。文件访问会唤醒快照态与销毁态的沙箱，接入状态由 `runcontroller` 记录。
 
 ### 快照恢复后的校时与连接清理
 
 快照恢复后，看守进程先按 `Resumed.wall_clock_now` 校准本地时钟，再主动断开 Agent 进程的旧 TCP 连接，最后通知 Agent 驱动器恢复。`Resumed` 只经重建后的出站流到达，校时因此在出站流重建之后进行，`/readyz` 不等待校时。旧连接可能处于半死状态，等待读超时会拖长恢复；主动断开使 Agent 重新建立连接。在途 LLM 请求的上游连接在快照时已断开，本地代理在恢复后按 `request_id` 向 `llmgateway` 取回已完成响应；取回完成之前不向 Agent 交付该请求的结果。
 
-快照恢复不重新领取：令牌与 `lease_id` 随进程内存进入快照；令牌在挂起期间过期时，由 `runcontroller` 的 `rotate_token` 效果经 `TokenRotate` 替换，替换之前按令牌过期的规则不发请求。
+快照恢复不重新领取：实例私钥、令牌组、`lease_id` 与接入票据公钥集合随进程内存进入快照，快照对象静态加密、读取权限只授予 Substrate 控制面，这是 Substrate 路径的部署前提；看守进程在快照恢复后重新生成[合并信任库](#出口-ca-信任)；令牌在挂起期间过期时，由 `runcontroller` 的 `rotate_token` 效果经 `TokenRotate` 替换，替换之前按令牌过期的规则不发请求。
 
 ### DRAIN 处置
 
@@ -627,22 +661,26 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | `wait_signatures` 中某项的 `match.command` 正则无法编译 | 跳过该项并计数，其余项照常生效 |
 | 宿主侧分类请求失败或超时 | 驱动器保持规则分类结果，不重试；不上报 `llm.request.failed`，转发侧的处置见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求) |
 | 平台 MCP 阻塞型调用被 Agent 自动转到后台 | 立即以转换结果结束该调用：`wait_for` 返回「已转为订阅」与 `sub_id`，`sleep_until` 先转为运行实例范围定时器再返回「已转为定时」；结果随 `task_notification` 到达 Agent |
+| `AdoptAgent` 被拒绝或不可达（节点冻结代理核验不通过、套接字不可连接或调用超时） | 该进程保持停止态，不继续执行；按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报：Agent 主进程按启动失败上报 `turn_ended{agent_exited=true}`，控制面计入 `start_failures`；`/terminal` 返回 503，不建立 shell；`ToolExec.exec` 以执行启动失败应答；计数并告警 |
+| `/terminal` 或 `/files` 的接入票据缺失或校验不通过（`alg`、`typ`、`kid`、签名、`aud`、`run_id`、`generation`、`channel`、有效期或 `jti` 任一项） | 返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；已接受过的 `jti` 再次出现时同样拒绝 |
+| 入站连接的来源为回环地址或本 Pod 地址 | 拒绝该连接，不进入任何端点的处理 |
+| 合并信任库生成失败（出口 CA 的投射文件缺失或无法解析） | 保留上一次成功生成的信任库并计数告警；首次生成即失败时只以公共根证书生成信任库，不推迟进程启动，`mitm` 主机的连接按上游 TLS 失败处理；投射文件恢复后重新生成 |
 | `SIGSTOP` 扫描超限或截止到期 | 对已停止 PID 发送 `SIGCONT`，记录已解冻，回 `Busy`；不留下部分冻结的进程树 |
 | `CancelSuspend` | 未越过不可撤销点时回 `Busy{reason=cancelled}`；已越过时回 `ReadyToSuspend`，由控制面按迟到应答处理 |
-| 工作区租约无法续约 | 停止工作区写入，冻结或杀死 Agent 进程树，上报 `LeaseLost`；流不可用时重连后补发 |
+| 工作区租约无法续约，含 `workspace` 以持有证明不符不可重试地拒绝续约 | 停止工作区写入，冻结或杀死 Agent 进程树，上报 `LeaseLost`；流不可用时重连后补发；持有证明被拒时不重试该次续约 |
 | 出站流断开 | 退避重连，重放未确认消息；不终止 Agent 进程树；控制面以 `Hello` 对账恢复一致 |
 | 可重试关闭 | 不终止 Agent 进程树；退避重连后重放未确认消息 |
 | `Fenced` | 停止投递与副作用，对 Agent 进程树执行强制终止；不再接受本代消息 |
 | `Shutdown{graceful=false}` | 停止投递，强制终止 Agent 进程树并关闭流；不再接受本代消息 |
 | `Shutdown{graceful=true}` | 停止接受新 `Deliver`，关闭 stdin，按正常退出路径结束，在 `deadline` 之前完成 |
-| 不可重试认证失败 | 停止重连并上报；不回 `HelloAck`，不携带当前代 |
+| 不可重试认证失败（令牌签名、受众、`run_id` 或代不符，实例公钥指纹与令牌 `cnf.jkt` 或租约 `holder_jkt` 不符，持有证明无效，或令牌到期时刻低于可接受下界） | 停止重连并上报；不回 `HelloAck`，不携带当前代 |
 | 令牌过期且未收到 `TokenRotate` | 不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求；等待轮换后恢复 |
 | 领取返回 401（凭据无效或 audience 不符） | 停止退避重试；此后 k8s 路径收到 `/wake`、Substrate 路径尚未领取时读到 `actor-name` 变化，仍立即领取一次，Substrate 路径的这次领取同时恢复从 1 s 起的退避重试（这次领取发生在 `wakeupProbe` 探测期间，可能被出口网关以非运行态拒绝，见[启动与领取](#启动与领取)）；领取成功之前不发送 `Hello`，不启动 Agent 主进程；Substrate 构建模板快照的 actor 停在这一状态，并随模板快照进入新 actor |
 | 领取返回 404（没有对应记录） | 退避重试；k8s 的预热 Pod 在认领之前停在等待领取的状态 |
 | 领取返回 409（已领取） | 停止领取，不启动 Agent 主进程；`runcontroller` 按沙箱丢失以新代重建 |
 | 领取返回 410（该代已销毁或运行实例已释放） | 看守进程退出 |
 | 领取返回 503（`secrets` 或存储不可达，或 Substrate 出口网关因 Substrate 控制面暂时不可达取不到 actor JWT） | 退避重试 |
-| 领取请求没有到达引导接口（DNS 解析得到 NXDOMAIN、出口默认拒绝、出口网关拒绝非运行态 actor、连接失败或超时），或得到引导接口错误码之外的状态码（例如 Substrate 出口网关返回的 403、500） | 退避重试，与 404 相同；Substrate 构建模板快照的 actor 停在等待领取的状态 |
+| 领取请求没有到达引导接口（出口默认拒绝、出口网关拒绝非运行态 actor 或没有出口策略的 actor、连接失败或超时），或得到引导接口错误码之外的状态码（例如 Substrate 出口网关返回的 403、500） | 退避重试，与 404 相同；Substrate 构建模板快照的 actor 停在等待领取的状态 |
 | 预热认领的 `/wake` 通知未送达 | 由退避领取兜底，领取延迟不超过退避上限 30 s |
 | `SandboxConfig` 内容无法解析 | 保留上一次成功应用的配置并计数；从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的两个开关均关闭处理，并启动 Agent 主进程 |
 | 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递「回合被中断」；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径下 kubelet 在同一 Pod 内重启容器时，新的看守进程领取得到 409，停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建 |
@@ -656,14 +694,14 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 看守进程不参与控制面数据库事务。它的持久化边界是工作区内的投递意图日志同步写入、Agent 自身的会话记录，以及 `workspace` 的租约 CAS；控制面 PostgreSQL 是运行实例状态的唯一事实源，但看守进程不读写它。
 
 - **出站流单写者**：同一时刻只有一条出站流被处理；`msg_seq` 单调递增，未确认消息在重连后重放。`Hello` 与 `HelloAck` 的交换不与普通消息并发。
-- **进程监督串行**：Agent 的启动（含 `StartAgent` 触发的启动）、正常退出、强制终止与冻结共用进程监督锁；持有该锁时不执行网络调用与日志同步写入。`StartAgent` 在持锁时核对 Agent 进程是否运行，运行中即返回，重复到达的 `StartAgent` 因而不启动第二个进程。冻结与解冻按 `freeze_id` 串行，`Thaw` 只作用于已记录的冻结。
+- **进程监督串行**：Agent 的启动（含 `StartAgent` 触发的启动）、正常退出、强制终止与冻结共用进程监督锁；持有该锁时不执行网络调用与日志同步写入。`StartAgent` 在持锁时核对 Agent 进程是否运行，运行中即返回，重复到达的 `StartAgent` 因而不启动第二个进程。停止态的进程在锁内登记为启动中，`AdoptAgent` 调用与其退避在锁外进行，收到移入完成或重试耗尽后再取锁让进程继续或回收它；登记为启动中的 Agent 主进程按运行中处理，期间到达的 `StartAgent` 与 `Deliver` 不再启动进程。冻结与解冻按 `freeze_id` 串行，`Thaw` 只作用于已记录的冻结。
 - **入站数据唤醒至多一次**：`inbound_reported` 按 `freeze_id` 以原子比较交换置位；接收队列检查、本地代理与透明拦截器的各连接并发触发时，只有置位成功者发出 `conn.inbound`。上游载荷检测的开启与关闭由冻结执行记录驱动，连接协程只读取当前生效的 `freeze_id`。接收队列检查读取本地代理连接用途记录的当前值：Agent 进程树已冻结，检查期间不产生新的请求，尚未完成分类的连接没有记录，按外部连接照常检查。进程树内部连接的判定使用同一次读取的 inode 集合与 `/proc/net/tcp`、`/proc/net/tcp6` 内容，Agent 进程树已冻结，两端套接字在检查期间不由 Agent 侧新建或关闭。
 - **投递串行**：同一时刻只有一个投递批被喂入 Agent；追加 `accepted`、喂入、追加 `consumed` 与发送确认按固定顺序执行，日志写入串行化。不同批的 `Deliver` 在流上按到达顺序处理。
 - **租约续约独立**：续约周期任务独立于投递与冻结；续约失败只触发一次本地保护动作与一次 `LeaseLost`，后续由控制面的重建路径接管。
 - **本地代理不被冻结**：本地代理、平台 MCP 服务器与活动度采集在看守进程内继续运行；被冻结的只有 `agent` 子 cgroup 中的进程树。本地代理在冻结期间持有上游连接并缓冲或直通响应，并在非 LLM 上游连接上观察入站载荷（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - **托管 hook 查询**：IPC 端点并发接受查询，每个连接在读取查询之前完成对端认证，父进程按当时的 `agent_pid` 核对；一次性核对在驱动器锁内执行，同一事件标识的查询并发到达时只有先完成标记的一方通过，其余按核对不通过处理；各查询由驱动器按当前生效的沙箱侧配置快照与意图状态应答；同一情境提示只交付一次，`PostToolUse` 与 `PostToolBatch` 的查询并发到达时只有先完成标记的一方得到该提示。`SandboxConfig` 的应用以原子替换生效，与查询并发时查询读取替换前或替换后的完整配置，不读取部分更新。查询不持有进程监督锁，不与投递、冻结和出站流发送串行。
 - **DRAIN 标志**：DRAIN 按 `suspend_id` 幂等设置；设置之后到达的阻塞型调用按 DRAIN 规则返回，设置之前已进入等待的调用同样被唤醒并按规则返回。
-- **入站与出站协调**：`/wake` 在出站流建立或重建之后才返回，并发调用合并为同一次处理；`/readyz` 在领取之前反映看守进程可服务；领取之后，k8s 路径上反映出站流与关键组件的就绪状态，Substrate 路径上只反映关键组件的就绪状态。入站请求与出站消息并发时，以运行实例令牌与代的校验结果为准。
+- **入站与出站协调**：`/wake` 在出站流建立或重建之后才返回，并发调用合并为同一次处理；`/readyz` 在领取之前反映看守进程可服务；领取之后，k8s 路径上反映出站流与关键组件的就绪状态，Substrate 路径上只反映关键组件的就绪状态。入站请求与出站消息并发时，`/terminal` 与 `/files` 以接入票据、代与租约持有者的校验结果为准；`jti` 记录以原子插入判重，同一 `jti` 的并发请求只有一个通过。`TokenRotate` 对接入票据公钥集合的替换以原子引用生效，校验读取替换前或替换后的完整集合。
 - **领取串行**：同一时刻至多一个领取请求在途。退避到期与 `/wake` 触发的领取在已有请求在途时并入该请求，不另发请求；`actor-name` 变化触发的领取先放弃在途请求及其连接，再在新连接上发出：在途请求可能随模板快照进入新 actor，Substrate 的内存快照恢复不保证旧 TCP 连接可被及时察觉为失效，而构建模板快照的 actor 没有引导记录，被放弃的请求不会领取成功。看守进程自身的并发领取因而不会得到 409。
 
 ## 扩展点
@@ -674,7 +712,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 
 ### 新增平台工具与第三方工具接入
 
-新增平台工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限、DRAIN 行为与被 Agent 自动转到后台时的转换结果；运行实例令牌的鉴权方式；超时预算；产生等待的工具是否接受 `expected_wait` 与 `reason`，以及 `agent_expected_ms` 随哪条事件上报。工具的 MCP 描述与 `instructions` 中的等待方式的选择规则保持一致。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的接口、Agent 驱动器的超时配置与本模块文档。
+新增平台工具须给出：工具名与参数闭集；对应的唤醒源（`connectorhub`、`humanchannel` 或定时器）；阻塞型调用的冻结上限、DRAIN 行为与被 Agent 自动转到后台时的转换结果；所用运行实例令牌的受众与鉴权方式；超时预算；产生等待的工具是否接受 `expected_wait` 与 `reason`，以及 `agent_expected_ms` 随哪条事件上报。工具的 MCP 描述与 `instructions` 中的等待方式的选择规则保持一致。工具名属于对外闭集，新增须同步修改 `connectorhub` 或 `humanchannel` 的接口、Agent 驱动器的超时配置与本模块文档。
 
 第三方工具不进入平台 MCP 闭集。新增第三方工具只改项目作用域的工具接入声明：声明凭据占位符环境变量、第三方 MCP 服务器与允许主机；平台不为其增加工具、不识别其操作，也不改变本地代理与出口代理的实现。
 
@@ -712,5 +750,9 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 快照恢复后的校时与连接清理 | 未实现 | — |
 | DRAIN 处置 | 未实现 | — |
 | 入站端点 | 未实现 | — |
+| 接入票据校验 | 未实现 | — |
 | 经引导接口领取 | 未实现 | — |
+| 实例密钥与持有证明 | 未实现 | — |
+| `AdoptAgent` 停止态启动 | 未实现 | — |
+| 出口 CA 合并信任库 | 未实现 | — |
 | 沙箱侧配置应用与重新加载 | 未实现 | — |

@@ -38,7 +38,7 @@ Substrate 处于 v1.0.0-rc.1，能力与稳定性尚未验证；k8s 路径依赖
 - 同一套看守进程镜像、协议与控制面代码必须能在两个提供者上运行；提供者特有行为留在各自子模块。
 - 能力差异与退化路径按 [ADR-capability-tiered-suspension](adr-capability-tiered-suspension.md) 处置。
 - 每个提供者必须有独立的集成测试。
-- 提供者特有的安全机制必须各自落地：k8s 的节点冻结代理为特权 DaemonSet，Substrate 的出口策略与凭据提供者按 actor 落地。
+- 提供者特有的安全机制必须各自落地：k8s 的节点冻结代理与[节点挂载代理](../glossary.md)为特权 DaemonSet，沙箱 Pod 以安全基线与按 uid 的出站规则约束；Substrate 的出口策略与凭据提供者按 actor 落地。
 
 承担的代价穷举如下：
 

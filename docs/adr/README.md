@@ -23,6 +23,8 @@
 | [外部唤醒源与外部流量由托管侧持有，Agent 自唤醒源由托管侧镜像](adr-host-owns-external-wake-sources.md) |
 | [平台不执行第三方操作，只提供出口凭据替换、连接器事件日志与订阅](adr-platform-does-not-execute-external-operations.md) |
 | [LLM 流量经沙箱内本地代理与 LLM 网关两级](adr-two-tier-llm-proxy.md) |
+| [连接器事件与订阅按项目归属键隔离](adr-connector-events-project-scoped.md) |
+| [LLM 上游服务端代发的外联与出口策略同级约束](adr-llm-server-capability-egress-alignment.md) |
 
 ## 并发与所有权
 
@@ -67,12 +69,22 @@
 | 决策 |
 | --- |
 | [工作区持久化按沙箱提供者选择](adr-workspace-persistence-per-provider.md) |
+| [沙箱容器内只挂载本运行实例的工作区子目录](adr-per-run-workspace-mount.md) |
 
 ## 失效判定
 
 | 决策 |
 | --- |
 | [按代拒绝旧沙箱的消息与副作用](adr-generation-fencing.md) |
+
+## 认证与授权
+
+| 决策 |
+| --- |
+| [控制面调用以 SPIFFE mTLS 认证并按方法授权，Agent 的网络出站收敛到回环](adr-control-plane-call-authentication.md) |
+| [运行实例令牌按受众签发并绑定沙箱实例密钥](adr-run-token-audience-and-holder-binding.md) |
+| [humanchannel 作为唯一面向用户的入口执行用户授权](adr-user-facing-authorization.md) |
+| [审批决定绑定工具调用内容摘要](adr-approval-bound-to-tool-input.md) |
 
 ## 租户
 

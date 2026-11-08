@@ -1,27 +1,29 @@
 # 平台出口代理（k8s 路径）
 
-`connectorhub` 的平台出口代理是 k8s 路径的出口网关进程，部署在控制面命名空间之外。它监听本地代理发起的 CONNECT 与 HTTP 前置请求以及[透明拦截器](../../../glossary.md)发起的 CONNECT 隧道，按[运行实例](../../../glossary.md)令牌与出口策略逐请求鉴权，在请求头中替换凭据占位符，再把请求转发到允许主机。它不生成出口策略，不落地 NetworkPolicy，不处理 LLM 流量，也不代理 Substrate 路径的出口。文档围绕凭据占位符替换这一机制组织。心智模型：出口策略是一张按运行实例给出的允许主机与请求头改写表，每个请求只有在该运行实例的当前代上通过一次新查询才被放行（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。
+`connectorhub` 的平台出口代理是 k8s 路径的出口网关进程，部署在控制面命名空间之外。它在[面向沙箱的端点](../../../glossary.md) `egress` 上监听本地代理发起的 CONNECT 与 HTTP 前置请求以及[透明拦截器](../../../glossary.md)发起的 CONNECT 隧道，按 `egress` 受众的[运行实例](../../../glossary.md)令牌与出口策略逐请求鉴权，确定授权主机并核对请求的目的地与之一致，在请求头中替换凭据占位符，再把请求转发到授权主机。它不生成出口策略，不落地 NetworkPolicy，不处理 LLM 流量，也不代理 Substrate 路径的出口。文档围绕凭据占位符替换这一机制组织。心智模型：出口策略是一张按运行实例给出的允许主机与请求头改写表，每个请求只有在该运行实例的当前代上通过一次新查询才被放行（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。
 
-文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、规则档位、状态一览、走查、请求鉴权与规则选择、占位符替换、按代撤销与残余窗口；术语表、外部接口契约、依赖、UML 图与数据结构作为参考，在核对字段、状态码或配置调用时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文规则判断每个交错序列的结果，再与表中结论核对。
+文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、规则档位、状态一览、走查、请求鉴权与规则选择、目的地一致性、占位符替换、按代撤销与残余窗口；术语表、外部接口契约、依赖、UML 图与数据结构作为参考，在核对字段、状态码或配置调用时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文规则判断每个交错序列的结果，再与表中结论核对。
 
 ## 核心概念
 
-凭据占位符替换是本子模块的核心机制。需要凭据的请求头在沙箱内只携带占位符，例如 `Authorization: Bearer {{github.token}}`；代理在逐请求鉴权通过之后，按该运行实例的[出口策略](../../../glossary.md)匹配注入规则，以[运行实例令牌](../../../glossary.md)向 `secrets` 换取真实凭据，只替换请求中已存在的头里的占位符，再把请求发往上游。占位符也可以由看守进程作为环境变量注入第三方工具，例如 `GH_TOKEN={{github.token}}`；工具把它放进请求头，代理不感知工具身份，只按主机、头名与占位符匹配。
+凭据占位符替换是本子模块的核心机制。需要凭据的请求头在沙箱内只携带占位符，例如 `Authorization: Bearer {{github.token}}`；代理在逐请求鉴权通过之后，按该运行实例的[出口策略](../../../glossary.md)匹配注入规则，以 `egress` 受众的[运行实例令牌](../../../glossary.md)向 `secrets` 换取真实凭据，只替换请求中已存在的头里的占位符，再把请求发往上游。占位符也可以由看守进程作为环境变量注入第三方工具，例如 `GH_TOKEN={{github.token}}`；工具把它放进请求头，代理不感知工具身份，只按主机、头名与占位符匹配。
 
-系统需要它，是因为[沙箱](../../../glossary.md)内不存放真实凭据（[架构不变量](../../architecture.md#架构不变量) I6），而沙箱内的调用方只接触占位符；代理在最后一跳完成占位符到真实凭据的转换，调用方无需持有真实凭据，真实凭据只出现在代理进程内存中。替换要求代理看到请求头，因此有注入规则的 CONNECT 目标使用 `https` 档终止 TLS 后处理，没有注入规则的 CONNECT 目标使用 `tls_passthrough` 档按端到端 TLS 直通；证书固定目标不能接受 TLS 终止，故不为其声明注入规则。`https` 档是唯一的 TLS 终止点，向客户端出示由平台 CA 签发的目标主机证书；平台 CA 私钥只在出口代理侧持有，沙箱只注入信任锚。`mitm` 与 `passthrough` 通道由沙箱内本地 DNS 把目标域名解析到透明拦截器，透明拦截器不终止 TLS，只把原始 TLS 字节以 CONNECT 隧道转给出口代理；出口代理按注入规则选 `https` 或 `tls_passthrough`，不感知通道来源，不使用 CNI、eBPF 或 sidecar。
+系统需要它，是因为[沙箱](../../../glossary.md)内不存放真实凭据（[架构不变量](../../architecture.md#架构不变量) I6），而沙箱内的调用方只接触占位符；代理在最后一跳完成占位符到真实凭据的转换，调用方无需持有真实凭据，真实凭据只出现在代理进程内存中。替换要求代理看到请求头，因此有注入规则的 CONNECT 目标使用 `https` 档终止 TLS 后处理，没有注入规则的 CONNECT 目标使用 `tls_passthrough` 档按端到端 TLS 直通；证书固定目标不能接受 TLS 终止，故不为其声明注入规则。`https` 档是唯一的 TLS 终止点，向客户端出示由平台 CA 为授权主机签发的证书；平台 CA 私钥只在出口代理侧持有，沙箱只注入信任锚。k8s 路径的平台 CA 经镜像预置或运行时注入（只读投射卷），看守进程把它与公共根证书合并为工作区之外的信任库 `/run/castworks/trust/ca-bundle.pem`，在投射文件变化时重新生成（见 [warden](../warden/design-warden.md)）。CA 轮换时，新 CA 加入信任库不少于 `T_ca_overlap` 后才开始签发，旧 CA 在信任库中保留不少于 `T_ca_overlap`，`T_ca_overlap` 不短于快照保留期上限；轮换后仍持有旧信任库的进程连接 `mitm` 主机失败，按上游 TLS 失败处理。`mitm` 与 `passthrough` 通道由沙箱内本地 DNS 把目标域名解析到透明拦截器，透明拦截器不终止 TLS，只把原始 TLS 字节以 CONNECT 隧道转给出口代理；出口代理按注入规则选 `https` 或 `tls_passthrough`，不感知通道来源，不使用 CNI、eBPF 或 sidecar。
+
+替换只在目的地唯一时成立：鉴权确定的授权主机（CONNECT 目标，或绝对形式请求的 URI 主机）是请求唯一的目的地，客户端 SNI、内层 `Host`/`:authority` 与之不一致的请求被拒绝，注入规则只按授权主机查找，上游的域名解析、连接目标、SNI 与证书校验也只取授权主机。没有这条约束，Agent 可以对允许主机发起 CONNECT，再以内层请求头把注入了真实凭据的请求导向共享前端后的另一个主机。真实凭据只在 TLS 连接上注入，外部系统定义显式声明的明文主机（`PlaintextHosts`）除外。
 
 ## 职责
 
 本子模块的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体算法、字段与调用细节见后续章节。
 
-- **CONNECT 终止与 HTTP 前置终止**：在单一监听端口上接受本地代理的 CONNECT 与绝对形式 HTTP 请求以及透明拦截器的 CONNECT 隧道，解析目标主机与请求形态，把请求交给鉴权与替换阶段；无法解析目标主机的请求立即拒绝，不建立上游连接。
-- **按运行实例白名单鉴权**：从代理认证头取运行实例令牌，经 `secrets` 校验签名、过期时间与 `run_id`，逐请求经 `runcontroller` 的 `Generations.Current` 校验代、终态与本代作废状态，并检查目标主机属于该运行实例出口策略的 `AllowedHosts`；任一条件不通过即拒绝，不向上游发送任何字节。
-- **凭据占位符替换**：对命中的注入规则，只在请求已存在的头中把占位符替换为真实凭据；缺少该头时不注入，请求体、请求行与其他头保持不变；代理自身的认证头在转发前移除。真实凭据由 `secrets.ExchangeCredential` 以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取，调用携带本进程的调用方身份，`Usage.UsageID` 取本次请求的 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；换取结果按 `(run_id, generation, system, auth_method, scopes)` 缓存在进程内直到 `ExpiresAt`；策略缺 `project_id`、凭据对象未配置或认证方式不匹配时返回 `503`，请求的授权范围超出凭据对象的授权范围时返回 `403`，均审计。
-- **规则档位选择**：按目标主机、请求形态与出口策略，把请求归入 `https`、`tls_passthrough`、`http` 档位；`https` 档终止客户端 TLS，`http` 档解析明文请求，两者都检查请求头；`tls_passthrough` 档保留端到端 TLS 并按目标主机放行。
-- **上游 TLS 发起**：对 `https` 档，以目标主机名作为 SNI 发起向上游的 TLS 并校验证书；对 `http` 档以明文转发；对 `tls_passthrough` 档原样转发 TLS 记录，不改写 SNI。
+- **CONNECT 终止与 HTTP 前置终止**：在面向沙箱的端点 `egress` 的单一监听端口上接受本地代理的 CONNECT 与绝对形式 HTTP 请求以及透明拦截器的 CONNECT 隧道，解析目标主机与请求形态，把请求交给鉴权与替换阶段；无法解析目标主机的请求立即拒绝，不建立上游连接。目的地一致性：鉴权确定的授权主机（CONNECT 目标，或绝对形式请求的 URI 主机）是请求唯一的目的地；绝对形式请求的 `Host` 头、`https` 档的客户端 SNI 与内层 `Host`/`:authority`、`tls_passthrough` 档 ClientHello 的 SNI 都必须与之一致，带 ECH 扩展的 ClientHello 无法核对、按不一致处理，不一致的请求被拒绝，不向上游发送任何字节。
+- **按运行实例白名单鉴权**：从代理认证头取 `egress` 受众的运行实例令牌，以 `secrets.VerifyRunToken(token, egress)` 校验签名、过期时间、`run_id` 与受众，逐请求经 `runcontroller` 的 `Generations.Current` 校验代、终态与本代作废状态，并检查授权主机属于该运行实例出口策略的 `AllowedHosts`；任一条件不通过即拒绝，不向上游发送任何字节。鉴权通过后把授权主机与选定的策略修订号一起写入动态元数据，后续阶段只按元数据中的授权主机查找注入规则与选路。
+- **凭据占位符替换**：对命中的注入规则，只在请求已存在的头中把占位符替换为真实凭据；缺少该头时不注入，请求体、请求行与其他头保持不变；代理自身的认证头在转发前移除。真实凭据由 `secrets.ExchangeCredential` 以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取，调用携带本进程的调用方身份，`Usage.UsageID` 取本次请求的 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；换取结果按 `(run_id, generation, system, auth_method, scopes)` 缓存在进程内直到 `min(ExpiresAt, RecheckAt)`，之后重新调用 `ExchangeCredential`；策略缺 `project_id`、凭据对象未配置或认证方式不匹配时返回 `503`，请求的授权范围超出凭据对象的授权范围时返回 `403`，均审计。
+- **规则档位选择**：按授权主机、请求形态与出口策略，把请求归入 `https`、`tls_passthrough`、`http` 档位；`https` 档终止客户端 TLS，`http` 档解析明文请求，两者都检查请求头；`http` 档只对 `PlaintextHosts` 中的主机注入凭据，对其他主机拒绝携带占位符的明文请求；`tls_passthrough` 档保留端到端 TLS，核对 SNI 后按授权主机放行。
+- **上游 TLS 发起**：上游的域名解析、连接目标、SNI 与证书校验一律取授权主机，dynamic forward proxy 按元数据中的授权主机选路，不按 `:authority` 选路；对 `https` 档，以授权主机名作为 SNI 发起向上游的 TLS 并校验证书；对 `http` 档以明文转发到授权主机；对 `tls_passthrough` 档，要求 ClientHello 的 SNI 存在且等于授权主机并拒绝带 ECH 的握手，通过后原样转发 TLS 记录。
 - **在途请求事件上报**：在请求头阶段与响应头阶段各上报一次在途信号，携带运行实例、代、请求标识、目标主机与方法；该信号不进入收件箱、不形成持久化请求记录。
 - **策略落地与版本治理**：按运行实例接收出口策略修订，校验字段与闭集，保持修订号单调，原子替换当前快照；更低或相同修订、已终态运行实例的落地被拒绝。
-- **审计与计数**：记录凭据替换、未授权主机、旧代拒绝、占位符无法解析、上游 TLS 失败与配置拒绝；审计记录不包含凭据值。
+- **审计与计数**：记录凭据替换、未授权主机、目的地不一致（计数 `egress_destination_mismatch`）、非明文主机的明文请求携带占位符、旧代拒绝、占位符无法解析、上游 TLS 失败与配置拒绝；审计记录不包含凭据值。
 - **默认拒绝与失败关闭**：未列入 `AllowedHosts` 的主机一律拒绝；令牌校验、代查询、凭据取得或配置不可用时拒绝请求，不放行也不降级为直连。
 
 ### 非职责
@@ -66,7 +68,7 @@
 
 出口策略由 `connectorhub` 生成，字段与语义以主文档的「对沙箱提供者的出口策略推送」为准（[design-connectorhub](design-connectorhub.md)）。k8s 路径上，策略内容经 `sandboxprovider` 的 k8s 子模块落地为本进程的配置副本；本进程不直接接受业务模块推送，只按字段语义消费。
 
-本子模块消费的字段为 `RunID`、`ProjectID`、`Revision`、`AllowedHosts`、`Inject` 与 `Git`；`Inject` 的每条规则携带 `Host`、`Header`、`Placeholder`、`System`、`AuthMethod` 与 `Scopes`，用于向 `secrets` 换取凭据。稳定承诺：修订号按运行实例单调递增；同一修订重复落地幂等；更低或相同修订不覆盖当前快照；`AllowedHosts` 之外的主机默认拒绝；`Inject` 的每条规则只在请求已有对应头时生效。
+本子模块消费的字段为 `RunID`、`ProjectID`、`Revision`、`AllowedHosts`、`Inject`、`PlaintextHosts` 与 `Git`；`Inject` 的每条规则携带 `Host`、`Header`、`Placeholder`、`System`、`AuthMethod` 与 `Scopes`，用于向 `secrets` 换取凭据；`PlaintextHosts` 是 `AllowedHosts` 中允许以明文 HTTP 注入凭据的主机子集。稳定承诺：修订号按运行实例单调递增；同一修订重复落地幂等；更低或相同修订不覆盖当前快照；`AllowedHosts` 之外的主机默认拒绝；`Inject` 的每条规则只在请求已有对应头时生效。
 
 ### 对 `runcontroller` 的代查询
 
@@ -91,8 +93,8 @@ type CurrentGeneration struct {
 
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本子模块依赖 `runcontroller`、`secrets`、`sandboxprovider` 的 k8s 子模块与 Envoy 数据面（[REF-envoy](../../../references.md)）；本地代理与透明拦截器是运行时调用方，不是代码依赖，不出现在模块依赖图中。
 
-- `runcontroller`：代查询接口 `Generations.Current`，逐请求调用，不使用缓存。本子模块不读 `run` 表，不参与状态转移；`runcontroller` 不反向调用本子模块。
-- `secrets`：运行实例令牌的签名、过期时间与 `run_id` 校验，以及占位符对应凭据的取得。凭据换取以策略中的 `project_id` 为项目范围、以 `(run_id, generation)` 定位运行实例与代、以 `system` 与 `auth_method` 选择凭据对象、以 `scopes` 约束授权；调用 `ExchangeCredential` 时以调用方身份认证，`Target` 取 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则，`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；代理不使用缓存之外的代。真实凭据只在本进程内存中出现，不写入策略副本、审计记录或请求头事件。
+- `runcontroller`：代查询接口 `Generations.Current`，逐请求调用，不使用缓存；本子模块以 `egress-proxy` 的 SPIFFE 身份经 mTLS 调用，`runcontroller` 按对端身份授权。本子模块不读 `run` 表，不参与状态转移；`runcontroller` 不反向调用本子模块。
+- `secrets`：运行实例令牌的签名、过期时间与 `run_id` 校验，以及占位符对应凭据的取得；本子模块以 `egress-proxy` 的 SPIFFE 身份经 mTLS 调用 `VerifyRunToken` 与 `ExchangeCredential`。凭据换取以策略中的 `project_id` 为项目范围、以 `(run_id, generation)` 定位运行实例与代、以 `system` 与 `auth_method` 选择凭据对象、以 `scopes` 约束授权；调用 `ExchangeCredential` 时 `Target` 取 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则，`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；代理不使用缓存之外的代。真实凭据只在本进程内存中出现，不写入策略副本、审计记录或请求头事件。
 - `sandboxprovider` 的 k8s 子模块：平台出口代理配置与 NetworkPolicy 的落地，出口策略副本的保存与按运行实例推送。k8s 路径的 `RevokeEgressPolicy` 为空操作，本子模块不依赖撤销墓碑；NetworkPolicy 默认拒绝沙箱出口，只放行控制面地址、LLM 网关与平台出口代理。
 - `connectorhub` 主文档：出口策略的内容来源，包括 `AllowedHosts` 的并集、`Inject` 规则与 `GitRule`。本子模块与连接器同属 `connectorhub`，不构成跨模块依赖。
 - Envoy：数据面。CONNECT 终止、TLS 终止与发起、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 由 Envoy 提供；本子模块实现 `ext_authz` 与 `ext_proc` 的策略逻辑。
@@ -112,7 +114,9 @@ flowchart LR
     listener --> parse["解析目标主机与请求形态"]
     parse --> authz["ext_authz：令牌校验、代查询、白名单"]
     authz -->|"不通过"| deny["407 / 403 / 503<br/>审计与计数"]
-    authz -->|"通过"| mode{"规则档位"}
+    authz -->|"通过"| dest["核对目的地一致性<br/>Host、SNI、:authority"]
+    dest -->|"不一致"| deny
+    dest -->|"一致"| mode{"规则档位"}
     mode -->|"https"| tls["终止客户端 TLS<br/>进入内部监听器"]
     mode -->|"http"| plain["解析明文 HTTP"]
     mode -->|"tls_passthrough"| tunnel["原样转发 TLS 记录<br/>不改写 SNI"]
@@ -125,7 +129,7 @@ flowchart LR
     resp --> lp
 ```
 
-流水线的顺序约束是：鉴权在解析目标主机之后、任何上游字节发出之前完成；占位符替换在鉴权通过之后、上游连接建立之前完成；`tls_passthrough` 档跳过替换，只按 CONNECT 目标主机放行。任一鉴权或替换失败都走向拒绝，不存在绕过鉴权直接转发的分支。默认拒绝使未列入 `AllowedHosts` 的主机在 `ext_authz` 阶段即被拦截，不会到达上游。
+流水线的顺序约束是：鉴权在解析目标主机之后、任何上游字节发出之前完成；目的地一致性核对在鉴权通过之后、TLS 终止与请求头处理之前完成，不一致的请求不向上游发送任何字节；占位符替换在鉴权与一致性核对通过之后、上游连接建立之前完成；`tls_passthrough` 档跳过替换，只按核对过的 CONNECT 目标主机放行。任一鉴权、一致性核对或替换失败都走向拒绝，不存在绕过鉴权直接转发的分支。默认拒绝使未列入 `AllowedHosts` 的主机在 `ext_authz` 阶段即被拦截，不会到达上游。
 
 ### CONNECT 与 HTTP 前置时序图
 
@@ -145,6 +149,7 @@ sequenceDiagram
         R-->>E: generation=3、Terminal=false、Fenced=false
         E->>E: 白名单命中，选择 https 档与策略快照
         E->>E: 终止客户端 TLS，进入内部监听器
+        E->>E: 核对客户端 SNI 与内层 Host/:authority 等于授权主机
         E->>E: ext_proc 替换已有头中的占位符，上报请求头事件
         E->>U: 以 SNI=api.github.com 发起 TLS 并转发
         U-->>E: 响应头与响应体
@@ -156,17 +161,17 @@ sequenceDiagram
         S-->>E: run_id=R、generation=3
         E->>R: Generations.Current(R)
         R-->>E: generation=3、Terminal=false、Fenced=false
-        E->>E: 白名单命中，选择 http 档与策略快照
+        E->>E: 白名单命中，核对 Host 与 URI 主机一致，选择 http 档与策略快照
         E->>E: ext_proc 替换已有头中的占位符，上报请求头事件
         E->>U: 明文转发
         U-->>E: 响应头与响应体
         E->>E: 上报响应头事件
         E-->>LP: 响应
     end
-    Note over E: tls_passthrough 档只校验令牌、代与 CONNECT 目标主机，不终止 TLS，不执行 ext_proc
+    Note over E: tls_passthrough 档只校验令牌、代与 CONNECT 目标主机，核对 ClientHello 的 SNI 等于目标并拒绝带 ECH 的握手；不终止 TLS，不执行 ext_proc
 ```
 
-CONNECT 分支与 HTTP 前置分支共享同一套鉴权与策略选择：令牌校验、代查询、白名单检查相同，差别只在 TLS 终止与请求头可见性。CONNECT 分支终止客户端 TLS 后才能看到请求头并执行替换；HTTP 前置分支天然可见请求头。`tls_passthrough` 档没有 HTTP 头可检查，只在 CONNECT 目标主机上做一次鉴权，因此也不产生请求头与响应头事件。
+CONNECT 分支与 HTTP 前置分支共享同一套鉴权与策略选择：令牌校验、代查询、白名单检查相同，差别只在 TLS 终止与请求头可见性。CONNECT 分支终止客户端 TLS 后才能看到请求头并执行替换，终止前后分别核对客户端 SNI 与内层 `Host`/`:authority`；HTTP 前置分支天然可见请求头，`Host` 必须等于 URI 主机。`tls_passthrough` 档没有 HTTP 头可检查，只核对 ClientHello 的 SNI 并拒绝带 ECH 的握手，因此也不产生请求头与响应头事件。图中的 `biz.internal` 在外部系统定义中声明于 `access.plaintext_hosts`，因而 `http` 档对它执行注入；未列入 `PlaintextHosts` 的主机不接受携带占位符的明文请求。
 
 ### 策略与撤销状态图
 
@@ -190,9 +195,9 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `https` | CONNECT | 终止客户端 TLS，进入内部监听器，向上游重新发起 TLS | 是，只替换已有请求头 |
 | `tls_passthrough` | CONNECT | 不终止 TLS，按 CONNECT 目标主机放行，原样转发字节流 | 否 |
-| `http` | 绝对形式 HTTP 前置 | 解析明文请求，明文转发 | 是，只替换已有请求头 |
+| `http` | 绝对形式 HTTP 前置 | 解析明文请求，明文转发；只对 `PlaintextHosts` 中的主机注入 | 是，仅 `PlaintextHosts`；其他主机携带占位符的请求拒绝 |
 
-档位选择规则穷举如下：绝对形式 HTTP 请求使用 `http` 档；CONNECT 目标主机在该运行实例的策略中有注入规则时使用 `https` 档；CONNECT 目标主机没有注入规则时使用 `tls_passthrough` 档。
+档位选择规则穷举如下：绝对形式 HTTP 请求使用 `http` 档；CONNECT 目标主机在该运行实例的策略中有注入规则时使用 `https` 档；CONNECT 目标主机没有注入规则时使用 `tls_passthrough` 档。`http` 档的注入范围由 `PlaintextHosts` 决定：授权主机在 `PlaintextHosts` 中时按注入规则替换；不在其中时，携带占位符的绝对形式请求返回 `403` 并审计，不向明文链路发送真实凭据；不携带占位符的明文请求照常放行。真实凭据只在 TLS 连接上注入，`PlaintextHosts` 是这一规则的显式例外。
 
 外部系统定义的 `access.mode` 与 `access.host_modes` 决定沙箱侧通道，不改变本子模块的档位选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由本地 DNS 把域名指向透明拦截器，透明拦截器以附带运行实例令牌的 CONNECT 把原始 TLS 字节交给出口代理，不终止 TLS。出口代理只按请求形态与注入规则选择档位，不感知通道来源。证书固定的目标不能接受平台出口代理的 TLS 终止，因此不得为其声明注入规则；需要凭据的证书固定目标不受支持（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 
@@ -201,7 +206,7 @@ stateDiagram-v2
 | 结构 | 字段 | 约束与含义 |
 | --- | --- | --- |
 | `EgressRule` | `Host`、`Mode`、`Inject` | `Host` 必须属于 `AllowedHosts`；`Inject` 来自出口策略的 `Inject` 规则；`Mode` 是本次请求按档位选择规则确定的档位，不属于快照字段 |
-| `PolicySnapshot` | `ProjectID`、`Revision`、`AllowedHosts`、`Rules`、`Git` | 不可变；`ProjectID` 用于凭据换取的项范围；`Revision` 单调递增；`Rules` 按 `Host` 索引；`Git` 保存 `ProxyHost` 与凭据引用 |
+| `PolicySnapshot` | `ProjectID`、`Revision`、`AllowedHosts`、`PlaintextHosts`、`Rules`、`Git` | 不可变；`ProjectID` 用于凭据换取的项目范围；`Revision` 单调递增；`Rules` 按 `Host` 索引；`PlaintextHosts` 决定 `http` 档的注入范围；`Git` 保存 `ProxyHost` 与凭据引用 |
 | `AuthDecision` | `RunID`、`Generation`、`Revision`、`Mode`、`Allowed`、`Reason` | 一次请求的鉴权结果；`Revision` 写入动态元数据，供 `ext_proc` 选择同一快照 |
 | `RequestEvent` | `RunID`、`Generation`、`RequestID`、`Host`、`Method`、`Phase`、`OccurredAt` | `Phase` 闭集为 `request_headers`、`response_headers`；不持久化 |
 | `InjectRule` | `Host`、`Header`、`Placeholder`、`System`、`AuthMethod`、`Scopes` | 与出口策略同名字段一致；`Header` 大小写不敏感匹配；只在请求已有该头时替换；后三项用于向 `secrets` 换取凭据 |
@@ -220,7 +225,7 @@ stateDiagram-v2
 
 ### 走查
 
-初始状态：运行实例 `R` 的当前代为 3；出口策略修订 7 已落地，`AllowedHosts` 含 `api.github.com` 与 `pinned.example`；`api.github.com` 有注入规则 `Authorization: {{github.token}}`，`pinned.example` 没有注入规则；策略仓库中 `R` 的快照为 `active`，修订 7。代理没有持久化的请求状态。
+初始状态：运行实例 `R` 的当前代为 3；出口策略修订 7 已落地，`AllowedHosts` 含 `api.github.com`、`biz.internal` 与 `pinned.example`，`PlaintextHosts` 含 `biz.internal`；`api.github.com` 有注入规则 `Authorization: {{github.token}}`，`biz.internal` 有注入规则，`pinned.example` 没有注入规则；策略仓库中 `R` 的快照为 `active`，修订 7。代理没有持久化的请求状态。
 
 1. 本地代理向平台出口代理发送 `CONNECT api.github.com:443`，携带 `Proxy-Authorization: Bearer T3`，`T3` 的 `run_id=R`、代 3。代理解析目标主机，尚未连接上游。状态不变。
 2. `ext_authz` 调用 `secrets` 校验 `T3` 的签名、过期时间与 `run_id`，通过；调用 `Generations.Current(R)`，返回 `generation=3`、`Terminal=false`、`Fenced=false`。目标主机属于 `AllowedHosts`，选择 `https` 档与修订 7 的快照，把修订 7 写入动态元数据。状态不变。
@@ -233,7 +238,7 @@ stateDiagram-v2
 
 ### 请求鉴权与规则选择
 
-1. 解析目标主机：CONNECT 取 `host:port` 的主机部分，绝对形式 HTTP 取请求 URI 的主机或 `Host` 头。解析失败返回 `400`。
+1. 解析授权主机：CONNECT 取 `host:port` 的主机部分；绝对形式 HTTP 取请求 URI 的主机，请求的 `Host` 头必须与 URI 主机相同（大小写不敏感，端口规范化后比较），不一致返回 `403` 并计数 `egress_destination_mismatch`。解析失败返回 `400`。
 2. 从 `Proxy-Authorization` 取运行实例令牌。缺失或格式不符返回 `407`。
 3. 调用 `secrets` 校验令牌签名、过期时间与 `run_id`。校验失败返回 `407`，不查询代。
 4. 调用 `runcontroller` 的 `Generations.Current`。查询失败返回 `503`；`Generation` 与令牌中的代不符、`Terminal=true` 或 `Fenced=true` 返回 `403` 并计入旧代拒绝计数。
@@ -242,18 +247,31 @@ stateDiagram-v2
 
 鉴权复杂度为按运行实例与主机的常数次哈希查找，加上一次令牌校验调用与一次代查询调用；不随运行实例数或允许主机数线性增长。策略快照的读取不加锁，读取到的是某一个完整修订。
 
+### 目的地一致性
+
+鉴权确定的授权主机是请求唯一的目的地：CONNECT 取 CONNECT 目标主机，绝对形式 HTTP 取请求 URI 的主机。授权主机与选定的策略修订号一起写入动态元数据，注入规则查找、上游选路与证书校验都只按它进行。
+
+目的地一致性的要求穷举如下。
+
+- **绝对形式请求**：`Host` 头必须等于 URI 主机，比较前统一大小写并规范化端口；不一致返回 `403`，不转发。
+- **`https` 档**：终止客户端 TLS 之后、`ext_proc` 之前，客户端 ClientHello 的 SNI（若有）与内层请求的 `Host`/`:authority` 都必须等于授权主机。平台 CA 只为授权主机签发证书，因而不一致的请求无法完成与授权主机的 TLS 会话。不一致返回 `403`，不向上游发送任何字节。
+- **`tls_passthrough` 档**：解析 ClientHello，要求 SNI 存在且等于 CONNECT 目标主机；携带 ECH 扩展的 ClientHello 无法核对内层目的地，按不一致处理，关闭隧道。SNI 缺失、与 CONNECT 目标不同或带 ECH 时关闭隧道，不转发任何字节。
+- **上游发起**：上游的域名解析、连接目标、SNI 与证书校验一律取授权主机；dynamic forward proxy 按元数据中的授权主机选路，不按 `:authority` 选路。
+
+不一致的请求计数 `egress_destination_mismatch` 并审计；`https` 与 `http` 档返回 `403`，`tls_passthrough` 档关闭隧道。没有这条约束时，Agent 可以对允许主机发起 CONNECT，再以内层请求头把注入了真实凭据的请求导向共享前端之后的另一个主机。
+
 ### 占位符替换
 
-1. 只处理 `https` 与 `http` 档；`tls_passthrough` 档不进入该流程。
-2. 遍历该主机在选定修订中的注入规则。头名按大小写不敏感匹配请求头。git 的 Basic 或 Bearer 头按同一规则处理：头已存在时替换占位符，头不存在时不注入。
+1. 只处理 `https` 与 `http` 档；`tls_passthrough` 档不进入该流程。`http` 档只对 `PlaintextHosts` 中的授权主机执行注入；不在其中的主机在步骤 6 拒绝携带占位符的请求。
+2. 遍历授权主机在选定修订中的注入规则。头名按大小写不敏感匹配请求头。git 的 Basic 或 Bearer 头按同一规则处理：头已存在时替换占位符，头不存在时不注入。
 3. 请求没有该头时跳过该规则，不新增头，不把占位符写入新头。
-4. 请求有该头且值包含占位符时，调用 `secrets.ExchangeCredential` 取得真实凭据：`Target` 取 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则；`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；调用以本进程的调用方身份认证。同一请求命中多条注入规则时，各次换取因 `UsageID` 不同而在审计中各自成条。取得凭据后把占位符替换为该凭据，替换该头中出现的全部占位符；同一凭据在 `ExpiresAt` 之前复用于同一运行实例、同一代与同一凭据对象。
+4. 请求有该头且值包含占位符时，调用 `secrets.ExchangeCredential` 取得真实凭据：`Target` 取 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则；`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；调用以本进程的调用方身份认证。同一请求命中多条注入规则时，各次换取因 `UsageID` 不同而在审计中各自成条。取得凭据后把占位符替换为该凭据，替换该头中出现的全部占位符；同一凭据在 `min(ExpiresAt, RecheckAt)` 之前复用于同一运行实例、同一代与同一凭据对象，之后重新调用 `ExchangeCredential`。
 5. 请求有该头但值不含占位符时保持不变。
-6. `https` 与 `http` 档中，请求头出现形如 `{{...}}` 的占位符，但没有匹配的注入规则时，返回 `403` 并审计；不把未解析的占位符发往上游。匹配规则但凭据换取失败时按错误分类处理：`ErrInvalidToken` 与 `ErrTokenExpired` 返回 `407`，与鉴权阶段一致；`ErrScopeDenied` 返回 `403`；`ErrCredentialNotConfigured` 与 `ErrTargetNotAuthorized` 返回 `503` 并告警；`ErrInvalidArgument` 由本代理构造的请求非法引起，返回 `503` 并告警；密钥库、审计存储与铸造的暂时性失败返回 `503`。不发送未替换的占位符。
+6. `https` 与 `http` 档中，请求头出现形如 `{{...}}` 的占位符，但没有匹配的注入规则时，返回 `403` 并审计；`http` 档中，授权主机不在 `PlaintextHosts` 中且请求头携带占位符时同样返回 `403` 并审计，不执行替换；不把未解析的占位符发往上游。匹配规则但凭据换取失败时按错误分类处理：`ErrInvalidToken` 与 `ErrTokenExpired` 返回 `407`，与鉴权阶段一致；`ErrScopeDenied` 返回 `403`；`ErrCredentialNotConfigured` 与 `ErrTargetNotAuthorized` 返回 `503` 并告警；`ErrInvalidArgument` 由本代理构造的请求非法引起，返回 `503` 并告警；密钥库、审计存储与铸造的暂时性失败返回 `503`。不发送未替换的占位符。
 7. 规则匹配但凭据不可取得时返回 `503`，不转发请求，审计记录包含运行实例、代、主机与头名；本步骤只覆盖密钥库、审计存储与铸造的暂时性失败，凭据对象未配置或认证方式不匹配按步骤 6 处理。
 8. 替换完成后移除 `Proxy-Authorization`；请求行、请求体与其他头保持不变。
 
-替换只作用于请求头，不作用于响应头、URL、查询参数与请求体。审计只记录头名与是否替换，不记录凭据值或替换前后的完整头值。工具不发送认证头时不会被注入，上游按自身规则返回 401；平台不为了让工具工作而补头。`tls_passthrough` 档不终止 TLS、不解析请求头，代理无法检测其中的占位符，因此该档不保证拦截未解析的占位符；证书固定目标需要凭据时不受支持。
+替换只作用于请求头，不作用于响应头、URL、查询参数与请求体。审计只记录头名与是否替换，不记录凭据值或替换前后的完整头值。工具不发送认证头时不会被注入，上游按自身规则返回 401；平台不为了让工具工作而补头。`http` 档的注入范围限于 `PlaintextHosts`，其他主机即使定义了注入规则也不在明文链路上注入。`tls_passthrough` 档不终止 TLS、不解析请求头，代理无法检测其中的占位符，因此该档不保证拦截未解析的占位符；证书固定目标需要凭据时不受支持。
 
 ### 规则档位与 Substrate 映射
 
@@ -261,13 +279,13 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `https` | CONNECT | 终止客户端 TLS，替换已有请求头，向上游重新发起 TLS | MITM 加 `replaceHeaders` |
 | `tls_passthrough` | CONNECT | 不终止 TLS，按目标主机放行，原样转发 | 直通规则，无头替换 |
-| `http` | 绝对形式 HTTP 前置 | 解析明文请求，替换已有请求头，明文转发 | 明文代理加 `replaceHeaders` |
+| `http` | 绝对形式 HTTP 前置 | 解析明文请求，只对 `PlaintextHosts` 中的主机替换已有请求头，明文转发 | `PlaintextHosts` 对应 `http` 规则加 `replaceHeaders`；其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` |
 
-k8s 路径与 Substrate 路径的语义一致：默认拒绝未列入的主机；只替换已有头，缺头不注入；`replaceHeaders` 与 `Inject` 都只作用于请求头。差异在凭据来源与失效判定：Substrate 路径的凭据来自凭据提供者，k8s 路径来自 `secrets`；Substrate 路径按（运行实例，代）落地并在代作废时撤销策略，k8s 路径逐请求查询代。映射只描述语义，不要求共用配置格式。
+k8s 路径与 Substrate 路径的语义一致：默认拒绝未列入的主机；只替换已有头，缺头不注入；真实凭据只在 TLS 连接上注入，`PlaintextHosts` 是显式例外；`replaceHeaders` 与 `Inject` 都只作用于请求头。差异在凭据来源与失效判定：Substrate 路径的凭据来自凭据提供者，k8s 路径来自 `secrets`；Substrate 路径按（运行实例，代）落地并在代作废时撤销策略，k8s 路径逐请求查询代。映射只描述语义，不要求共用配置格式。
 
 ### 策略落地与原子替换
 
-1. 接收一个运行实例的策略修订，校验 `ProjectID`、`Revision`、`AllowedHosts`、`Inject` 与 `Git`：`ProjectID` 非空、主机非空、注入规则的 `Host` 属于 `AllowedHosts`、`Header` 是合法头名、`Placeholder` 非空、`System` 与 `AuthMethod` 非空；`Scopes` 可为空，空表示使用凭据对象的授权范围。
+1. 接收一个运行实例的策略修订，校验 `ProjectID`、`Revision`、`AllowedHosts`、`Inject`、`PlaintextHosts` 与 `Git`：`ProjectID` 非空、主机非空、注入规则的 `Host` 属于 `AllowedHosts`、`PlaintextHosts` 是 `AllowedHosts` 的子集、`Header` 是合法头名、`Placeholder` 非空、`System` 与 `AuthMethod` 非空；`Scopes` 可为空，空表示使用凭据对象的授权范围。
 2. 读取当前快照的修订。新修订不大于当前修订时丢弃并计数，不改变当前快照。
 3. 构建新的 `PolicySnapshot`，按主机建立索引，保存各主机的注入规则与 `Git` 规则；规则档位在请求到达时按请求形态选择，不在落地时固定。
 4. 原子替换该运行实例的快照指针。替换之前开始的请求继续使用旧快照；替换之后开始的请求使用新快照。不存在部分字段来自新修订、部分来自旧修订的请求。
@@ -304,6 +322,7 @@ k8s 路径的放行不依赖按代策略副本，也不依赖撤销墓碑（[ADR
 | 代不符 | 令牌中的代与 `Generations.Current.Generation` 不同 | 返回 `403`，旧代拒绝计数加一，审计 | 请求被拒绝，不产生外部副作用 |
 | 运行实例终态或本代作废 | `Terminal=true` 或 `Fenced=true` | 返回 `403`，计数并审计；观察到 `Terminal=true` 时把该运行实例策略置 `revoked` | 请求被拒绝，新请求继续被拒 |
 | 未授权主机 | 目标主机不在 `AllowedHosts` | 返回 `403`，审计并计数，不查询上游 | 请求被拒绝 |
+| 目的地不一致 | 绝对形式请求的 `Host` 与 URI 主机不同，`https` 档的客户端 SNI 或内层 `Host`/`:authority` 与授权主机不同，或 `tls_passthrough` 档的 SNI 缺失、与 CONNECT 目标不同或带 ECH 扩展 | `https` 与 `http` 档返回 `403`，`tls_passthrough` 档关闭隧道；计数 `egress_destination_mismatch`，审计，不向上游发送任何字节 | 请求被拒绝；授权主机边界不被绕过 |
 | 占位符无法解析 | `https` 或 `http` 档的请求头含 `{{...}}`，但没有匹配的注入规则 | `https` 与 `http` 档返回 `403`，审计并计数，不转发 | `https` 与 `http` 档的占位符不会到达上游；`tls_passthrough` 档不检查请求头，占位符可能原样到达上游 |
 | 凭据对象未配置或认证方式不匹配 | 注入规则匹配，但凭据对象未配置或认证方式不匹配 | 返回 `503`，错误为 `ErrCredentialNotConfigured`，告警并审计，不转发 | 请求失败 |
 | 本代理构造的请求非法 | `UsageID` 为空、`Operation` 为空或令牌与 `Usage` 不一致 | 返回 `503`，错误为 `ErrInvalidArgument`，告警并审计，不转发 | 请求失败，属本代理错误 |
@@ -369,4 +388,5 @@ k8s 路径的放行不依赖按代策略副本，也不依赖撤销墓碑（[ADR
 | dynamic forward proxy 发起上游 TLS | 未实现 | — |
 | 在途请求事件上报 | 未实现 | — |
 | 策略修订落地与原子替换 | 未实现 | — |
+| 目的地一致性与明文主机注入范围 | 未实现 | — |
 | 审计与失败计数 | 未实现 | — |

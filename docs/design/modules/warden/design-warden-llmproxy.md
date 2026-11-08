@@ -1,6 +1,6 @@
 # 本地代理
 
-[本地代理](../../../glossary.md)是[看守进程](../../../glossary.md)内不被[冻结](../../../glossary.md)的 HTTP 代理，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由[本地 DNS](../../../glossary.md)指向同一看守进程内的[透明拦截器](../../../glossary.md)。它终止 Agent 的连接，把 LLM 请求附[运行实例令牌](../../../glossary.md)转发到 [LLM 网关](../../../glossary.md)，把外部系统请求以 CONNECT 或 HTTP 前置转发到[出口代理](../../../glossary.md)；透明拦截器把 `mitm` 与 `passthrough` 主机的原始 TLS 字节以 CONNECT 隧道转给出口代理。两者都不终止 TLS，TLS 终止与凭据替换由出口代理承担。每个 LLM 请求在开始时一次性选定[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，整个请求期间不再改变；[快照](../../../glossary.md)恢复后按 `request_id` 取回已完成响应。它还为看守进程记录最近一次 LLM 请求与最近一次可重试失败的时刻，按连接记录用途，在 Agent 进程树冻结期间观察非 LLM 上游连接上的入站载荷，按主机与归属对象识别周期性连接供 Agent 驱动器解析[等待意图](../../../glossary.md)，并把 Agent 驱动器的宿主侧分类请求转发到 `llmgateway`。它不拥有凭据换取、代校验、在途请求表与回放存储，这些归 `llmgateway`；也不拥有[出口策略](../../../glossary.md)与凭据替换，这些归 `connectorhub` 与出口代理；它不做 MITM，也不解释等待意图。心智模型：本地代理是 Agent 在[沙箱](../../../glossary.md)内按代理变量出站时经过的门，Agent 在门内，门在看守进程继续运行时保持开启（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+[本地代理](../../../glossary.md)是[看守进程](../../../glossary.md)内不被[冻结](../../../glossary.md)的 HTTP 代理，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由[本地 DNS](../../../glossary.md)指向同一看守进程内的[透明拦截器](../../../glossary.md)。它终止 Agent 的连接，把 LLM 请求附 `llmgateway` 受众的[运行实例令牌](../../../glossary.md)转发到 [LLM 网关](../../../glossary.md)，把外部系统请求以 CONNECT 或 HTTP 前置转发到[出口代理](../../../glossary.md)；透明拦截器把 `mitm` 与 `passthrough` 主机的原始 TLS 字节以 CONNECT 隧道转给出口代理。两者都不终止 TLS，TLS 终止与凭据替换由出口代理承担。每个 LLM 请求在开始时一次性选定[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，整个请求期间不再改变；[快照](../../../glossary.md)恢复后按 `request_id` 取回已完成响应。它还为看守进程记录最近一次 LLM 请求与最近一次可重试失败的时刻，按连接记录用途，在 Agent 进程树冻结期间观察非 LLM 上游连接上的入站载荷，按主机与归属对象识别周期性连接供 Agent 驱动器解析[等待意图](../../../glossary.md)，并把 Agent 驱动器的宿主侧分类请求转发到 `llmgateway`。它不拥有凭据换取、代校验、在途请求表与回放存储，这些归 `llmgateway`；也不拥有[出口策略](../../../glossary.md)与凭据替换，这些归 `connectorhub` 与出口代理；它不做 MITM，也不解释等待意图。心智模型：本地代理是 Agent 在[沙箱](../../../glossary.md)内按代理变量出站时经过的门，Agent 在门内，门在看守进程继续运行时保持开启（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 
 文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、请求接入与分类、模式选择、上游转发与流式处理、冻结与解冻期间的交付、客户端中止与重发、令牌轮换、恢复后取回、冻结期间的入站数据唤醒、周期性连接观测、宿主侧分类请求；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对字段、事件顺序或失败路径时查阅。
 
@@ -14,9 +14,9 @@
 
 本地代理的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体字段、状态与算法见后续章节。
 
-- **终止 Agent 的出站连接**：在回环地址监听，接受 Agent 进程的 LLM 请求与外部系统请求，按请求形态分类；结果是 Agent 不需要、也不能直接到达回环地址之外的网络端点（I6）。
-- **附加运行实例令牌**：为每个转发到 `llmgateway` 的 LLM 请求附加看守进程持有的运行实例令牌与请求元数据，并剥离 Agent 请求中的分类标记请求头 `x-castworks-purpose`；结果是 Agent 进程不持有任何令牌，凭据换取与代校验在网关完成，Agent 的请求不能以宿主侧分类请求的身份到达网关。
-- **前置外部系统请求**：以 CONNECT 或 HTTP 前置把外部系统请求转发到出口代理，保持方法、路径、请求头与请求体不变，不替换凭据占位符；结果是出口策略与凭据替换只在托管侧执行，本地代理不做 MITM。
+- **终止 Agent 的出站连接**：在回环地址监听，接受 Agent 进程的 LLM 请求与外部系统请求，按请求形态分类；结果是 Agent 不需要、也不能直接到达回环地址之外的网络端点（I6），后者在 k8s 路径由 init 容器 `uid-egress-filter` 强制，在 Substrate 路径为部署前提。
+- **附加运行实例令牌**：为每个转发到 `llmgateway` 的 LLM 请求附加看守进程令牌组中的 `llmgateway` 受众令牌与请求元数据，并剥离 Agent 请求中的分类标记请求头 `x-castworks-purpose`；k8s 路径上为发往平台出口代理的请求附加 `egress` 受众令牌；结果是 Agent 进程不持有任何令牌，凭据换取与代校验在网关完成，任一上游收到的令牌只能用于它自身的受众，Agent 的请求不能以宿主侧分类请求的身份到达网关。
+- **前置外部系统请求**：以 CONNECT 或 HTTP 前置把外部系统请求转发到出口代理，保持方法、路径、请求头与请求体不变，不替换凭据占位符；绝对 URI 请求的 `Host` 头与 URI 主机不一致时返回 403，不转发；结果是出口策略与凭据替换只在托管侧执行，本地代理不做 MITM，转发出去的请求只有一个目的地。
 - **一次性选定请求模式**：在请求开始时选定 `passthrough` 或 `hold`，整个请求期间不再改变；结果是同一请求不会在直刷与缓冲之间切换，冻结上限由模式唯一决定。
 - **直通转发**：在 `passthrough` 下按原顺序把 SSE 事件直刷给 Agent，冻结期间继续写入，写入受阻时对上游施加背压；结果是已向 Agent 转发内容的请求不进入缓冲，冻结不超过 `F_stream`，且一旦转发内容就不再延长。
 - **缓存与保活**：在 `hold` 下缓冲全部内容事件，只向 Agent 转发 `ping` 保活事件，持有上游连接；结果是冻结期间客户端连接由保活事件维持，内容事件在解冻后一次性交付。
@@ -27,16 +27,17 @@
 - **记录连接用途**：每次请求分类时按 Agent 侧连接端点记录该连接的用途，取 `llm` 或 `external`，并向看守进程提供按端点的查询；结果是冻结确认时的接收队列检查能排除承载 LLM 请求的连接，LLM 响应与保活事件在 Agent 侧未读的字节不触发入站数据唤醒，外部转发连接照常检查。
 - **观察冻结期间的入站载荷**：Agent 进程树处于冻结状态时，在 CONNECT 隧道、HTTP 前置请求与透明拦截器的拦截连接的上游一侧读到载荷字节，即通知看守进程发出 `conn.inbound{freeze_id}`，字节照常转发；结果是冻结期间到达 Agent 外部连接的数据触发唤醒，不被搁置到冻结上限。
 - **识别周期性连接**：按主机与归属对象（发起连接的工具调用或后台作业）记录外部系统连接的建立时刻，同一主机、同一归属对象的连接在窗口内以近似固定间隔重复出现时，向 Claude Code 驱动器提供周期性连接观测；结果是 Agent 以 Bash、curl 或脚本轮询外部系统而命令文本看不出等待时，驱动器仍能识别轮询型等待，观测只作等待意图的软输入，不进入 `conn.inbound`、安全点复核与 `Activity`。
-- **转发宿主侧分类请求**：沙箱侧配置的 `intent.classifier` 开启时，接受 Claude Code 驱动器的进程内分类请求，附运行实例令牌与分类标记 `x-castworks-purpose: classifier` 转发到 `llmgateway`；结果是分类不经 Agent 进程、不进入 Agent 上下文，按运行实例计费；它不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，也不让它参与事件源实例租约，分类请求因而不进入在途请求、阻塞条件、静止证据与 `Activity.llm_last_request_at`，不改变 Agent 的 LLM 等待信号与活动度观测。
+- **转发宿主侧分类请求**：沙箱侧配置的 `intent.classifier` 开启时，接受 Claude Code 驱动器的进程内分类请求，附 `llmgateway` 受众令牌与分类标记 `x-castworks-purpose: classifier` 转发到 `llmgateway`；结果是分类不经 Agent 进程、不进入 Agent 上下文，按运行实例计费；它不产生 `llm.request.*` 事件，`llmgateway` 按分类标记不为它登记在途请求事实、不写唤醒信号，也不让它参与事件源实例租约，分类请求因而不进入在途请求、阻塞条件、静止证据与 `Activity.llm_last_request_at`，不改变 Agent 的 LLM 等待信号与活动度观测。
 - **令牌轮换期间暂停转发**：令牌过期或临近到期且未收到 `TokenRotate` 时，不向上游发起新请求，已准入的请求继续；结果是沙箱内不出现长期凭据，也不使用过期令牌。
 - **快照恢复后取回**：恢复后按 `request_id` 向 `llmgateway` 取回已完成响应，按已转发的事件序号续传；结果是半死的上游连接不会把恢复拖到读超时，已到达的内容不重复交付。
 - **拒绝未放行目标**：对出口策略未放行的外部目标立即返回错误，不建立上游连接，不黑洞；结果是 Agent 的失败可见且可自行处理。
+- **本地 DNS 只应答通道主机**：本地 DNS 只为 `mitm`、`passthrough` 与 `proxy` 主机应答，其余名字返回 NXDOMAIN，不向任何上游递归转发；结果是查询名不出沙箱，DNS 不能用作外联通道。
 
 ### 非职责
 
 非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
 
-- LLM 凭据换取、代校验、在途请求表、回放存储与限流计费归 `llmgateway`；本地代理只生成 `request_id` 与 `request_hash`，持有本地回放条目，并按 `request_id` 取回。
+- LLM 凭据换取、代校验、在途请求表、回放存储、限流计费与服务端能力治理（请求体顶层 `tools`、`mcp_servers`、`container` 与 `anthropic-beta` 请求头的约束）归 `llmgateway`；本地代理只生成 `request_id` 与 `request_hash`，持有本地回放条目，并按 `request_id` 取回，不解析请求体。
 - 出口策略的生成归 `connectorhub`，策略落地、凭据占位符替换与默认拒绝归出口代理；本地代理不读取或生成策略内容，只按放行结果转发或拒绝。
 - TLS 终止、MITM、证书固定与请求头凭据注入不在本地代理，也不在透明拦截器；两者只把字节流转给出口代理。Substrate 路径的出口策略以出口网关的 EgressPolicy 落地，k8s 路径由平台出口代理落地。
 - 挂起决策、冻结上限取值、冻结中复评与静止证据（含可重试失败后的重试窗）归 `suspendpolicy`；`F_stream` 与 `F_cap(llm)` 的定义与取值由该模块给出，本地代理只按模式决定直刷或缓冲，只记录请求与失败时刻。
@@ -67,26 +68,28 @@
 
 | 请求形态 | 目标 | 本地代理行为 |
 | --- | --- | --- |
-| `CONNECT host:port` | 外部系统 | 向出口代理建立隧道，双向转发字节流 |
-| 绝对 URI 的 HTTP 请求 | 外部系统 | 以 HTTP 前置把完整请求转发到出口代理 |
-| 其余 HTTP 请求 | LLM | 附运行实例令牌后转发到 `llmgateway` |
+| `CONNECT host:port` | 外部系统 | 向出口代理建立隧道，双向转发字节流；k8s 路径附 `egress` 受众令牌 |
+| 绝对 URI 的 HTTP 请求 | 外部系统 | 核对 `Host` 头等于 URI 主机，不一致返回 403；一致时以 HTTP 前置把完整请求转发到出口代理，k8s 路径附 `egress` 受众令牌 |
+| 其余 HTTP 请求 | LLM | 附 `llmgateway` 受众令牌后转发到 `llmgateway` |
 
 回环地址不暴露到沙箱之外。外部系统请求的放行集合由出口策略决定；本地代理对未放行的目标立即返回错误，不建立上游连接。
 
 ### 网关与出口代理的上游契约
 
-**对 `llmgateway`。** LLM 请求沿用 Anthropic Messages API 的请求体格式，平台元数据放在请求头中，认证头由网关以换取的凭据替换。请求头与状态码的稳定承诺由 [llmgateway](../design-llmgateway.md) 定义，本地代理按其契约调用。
+**对 `llmgateway`。** LLM 请求沿用 Anthropic Messages API 的请求体格式，平台元数据放在请求头中，认证头由网关以换取的凭据替换。两种请求都只发往[面向沙箱的端点](../../../glossary.md) `llm`，`x-castworks-run-token` 取令牌组中的 `llmgateway` 受众令牌（[ADR-run-token-audience-and-holder-binding](../../../adr/adr-run-token-audience-and-holder-binding.md)）。请求头与状态码的稳定承诺由 [llmgateway](../design-llmgateway.md) 定义，本地代理按其契约调用。
 
 | 请求 | 携带 | 响应与处置 |
 | --- | --- | --- |
-| `POST /v1/messages` | `x-castworks-run-token`、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头（剥离其中的 `x-castworks-purpose`）；宿主侧分类请求另带 `x-castworks-purpose: classifier` | 终态条目直接返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；`request_id` 跨代复用返回 `422`；上游流为 SSE |
-| `GET /v1/requests/{request_id}` | 同一运行实例令牌 | `200` 返回终态条目；`202` 仍在途；`403` 归属不符；`404` 条目缺失或已过保留期；`409` 由另一实例持有 |
+| `POST /v1/messages` | `x-castworks-run-token`（`llmgateway` 受众令牌）、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头（剥离其中的 `x-castworks-purpose`）；宿主侧分类请求另带 `x-castworks-purpose: classifier` | 终态条目直接返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；`request_id` 跨代复用返回 `422`；服务端能力越界返回 `400` 或 `403`；上游流为 SSE |
+| `GET /v1/requests/{request_id}` | 同一运行实例的 `llmgateway` 受众令牌 | `200` 返回终态条目；`202` 仍在途；`403` 归属不符；`404` 条目缺失或已过保留期；`409` 由另一实例持有 |
 
 `202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。`422` 只表示 `request_id` 与运行实例内已有行冲突，本地代理重新生成 `request_id`、保持同一 `request_hash` 与模式后重发，不执行取回；`request_hash` 与唯一索引使重发仍命中同一逻辑请求。
 
-宿主侧分类请求沿用同一请求契约：以 `POST /v1/messages` 发往 `llmgateway`，携带运行实例令牌、本地代理新生成的 `request_id`、`request_hash` 与分类标记 `x-castworks-purpose: classifier`，`x-castworks-mode` 取 `passthrough`，请求体为 `stream=false` 的 Messages API 请求。网关照常校验令牌、计费并写回放条目，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，也不写 `llm_completed` 或 `llm_failed` 唤醒信号；分类请求不参与事件源实例租约，网关只在本实例存在 Agent 请求（`purpose=agent`）的在途事实时调用 `RenewSourceLease`，分类请求在网关内的跟踪按网关自身的超时处理；本地代理不为它上报 `llm.request.*`。分类请求因此不影响 I9 预检中的「本代无在途请求」，也不进入阻塞条件与静止证据。分类标记只出现在看守进程自身发起的分类请求上：本地代理转发 Agent 进程的 LLM 请求之前剥离其中的 `x-castworks-purpose`，Agent 无法让网关把自己的请求按分类请求处理。处置规则见[宿主侧分类请求](#宿主侧分类请求)。
+本地代理不解析 LLM 请求体，透传 Agent 的 Anthropic 请求头（剥离分类标记）；请求体顶层 `tools`、`mcp_servers`、`container` 字段与 `anthropic-beta` 请求头的服务端能力治理统一由 `llmgateway` 执行，规则见 [llmgateway](../design-llmgateway.md#服务端能力治理)（[ADR-llm-server-capability-egress-alignment](../../../adr/adr-llm-server-capability-egress-alignment.md)）。网关因服务端能力越界返回的 `400` 或 `403` 不访问上游、不写 `llm_failed`，本地代理按客户端错误把响应交还 Agent，上报 `llm.request.failed{reason=admission_failed}`，不重发、不建立本地回放条目。
 
-**对出口代理。** 外部系统请求保持方法、路径、请求头与请求体不变，本地代理附加运行实例身份并转发；`Authorization` 等头中的凭据占位符原样保留，由出口代理在发往允许主机时替换。占位符可以来自 Agent 的命令参数，也可以来自看守进程注入的工具环境变量；本地代理不区分来源。CONNECT 隧道建立后，本地代理只转发字节流，不解析隧道内的 TLS。k8s 路径的出口代理对每个请求按运行实例令牌校验代、终态与作废状态；Substrate 路径按以运行实例与代为键的出口策略放行（[REF-substrate](../../../references.md)）。出口代理的校验与撤销归 `connectorhub` 与 `sandboxprovider`，本地代理不缓存放行结果。
+宿主侧分类请求沿用同一请求契约：以 `POST /v1/messages` 发往 `llmgateway`，携带 `llmgateway` 受众令牌、本地代理新生成的 `request_id`、`request_hash` 与分类标记 `x-castworks-purpose: classifier`，`x-castworks-mode` 取 `passthrough`，请求体为 `stream=false` 的 Messages API 请求。网关照常校验令牌、计费并写回放条目，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，也不写 `llm_completed` 或 `llm_failed` 唤醒信号；分类请求不参与事件源实例租约，网关只在本实例存在 Agent 请求（`purpose=agent`）的在途事实时调用 `RenewSourceLease`，分类请求在网关内的跟踪按网关自身的超时处理；本地代理不为它上报 `llm.request.*`。分类请求因此不影响 I9 预检中的「本代无在途请求」，也不进入阻塞条件与静止证据。分类标记只出现在看守进程自身发起的分类请求上：本地代理转发 Agent 进程的 LLM 请求之前剥离其中的 `x-castworks-purpose`，Agent 无法让网关把自己的请求按分类请求处理。处置规则见[宿主侧分类请求](#宿主侧分类请求)。
+
+**对出口代理。** 外部系统请求保持方法、路径、请求头与请求体不变，本地代理附加运行实例身份并转发：k8s 路径上本地代理以 `Proxy-Authorization: Bearer` 附令牌组中的 `egress` 受众令牌，透明拦截器的 CONNECT 同样附该令牌，连接只到面向沙箱的端点 `egress`；Substrate 路径不附令牌，连接经出口网关；`Authorization` 等头中的凭据占位符原样保留，由出口代理在发往允许主机时替换。占位符可以来自 Agent 的命令参数，也可以来自看守进程注入的工具环境变量；本地代理不区分来源。CONNECT 隧道建立后，本地代理只转发字节流，不解析隧道内的 TLS。k8s 路径的出口代理对每个请求按 `egress` 受众令牌校验代、终态与作废状态；Substrate 路径按以运行实例与代为键的出口策略放行（[REF-substrate](../../../references.md)）。绝对 URI 的 HTTP 请求在转发之前核对 `Host` 头等于 URI 主机，不一致时返回 403，规则见[请求接入与分类](#请求接入与分类)；透明拦截器按 SNI 发起 CONNECT，CONNECT 目标即为 SNI 中的主机；出口代理对授权主机与内层 `Host`、SNI 的一致性核对归 `connectorhub` 的出口代理。出口代理的校验与撤销归 `connectorhub` 与 `sandboxprovider`，本地代理不缓存放行结果。
 
 ### 向驱动器上报的事件
 
@@ -121,8 +124,8 @@
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway` 与出口代理的调用是运行时 HTTP 调用，不是代码依赖。
 
 - `agentprotocol`：请求事件的信封、消息类型、发送顺序与重放；本地代理只实现事件内容与时序。
-- `llmgateway`：`POST /v1/messages` 与 `GET /v1/requests/{request_id}` 的请求头、状态码与回放取回语义，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号，也不为它续租事件源实例租约；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
-- 出口代理：CONNECT 与 HTTP 前置的目标、运行实例身份与凭据占位符语义；k8s 路径为 `connectorhub` 的平台出口代理，Substrate 路径为 Substrate 出口网关。
+- `llmgateway`：面向沙箱的端点 `llm` 上 `POST /v1/messages` 与 `GET /v1/requests/{request_id}` 的请求头（`x-castworks-run-token` 取 `llmgateway` 受众令牌）、状态码与回放取回语义，服务端能力治理及其 `400`、`403` 拒绝，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号，也不为它续租事件源实例租约；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- 出口代理：CONNECT 与 HTTP 前置的目标、运行实例身份与凭据占位符语义，以及授权主机与内层 `Host`、SNI 的一致性核对；k8s 路径为 `connectorhub` 的平台出口代理（面向沙箱的端点 `egress`，以 `egress` 受众令牌鉴权），Substrate 路径为 Substrate 出口网关。
 - Claude Code 的网络行为：流式空闲看门狗在未收到内容时中止并重发一次，已收到部分内容时保留截断结果（[REF-claude-code-network-config](../../../references.md)）。
 - Anthropic Messages API 的 SSE 格式：内容事件与 `ping` 保活事件的区分（[REF-anthropic-streaming](../../../references.md)）。
 
@@ -180,7 +183,7 @@ sequenceDiagram
     participant E as 出口代理
     A->>P: LLM 请求，回环地址
     P->>P: 计算 request_hash，选定 mode，生成 request_id
-    P->>G: POST /v1/messages，附令牌与请求元数据
+    P->>G: POST /v1/messages，附 llmgateway 受众令牌与请求元数据
     G-->>P: 响应头与 SSE 流
     P->>D: llm.request.started
     alt mode=passthrough
@@ -196,7 +199,7 @@ sequenceDiagram
     Note over P,A: hold 在解冻后一次性交付缓冲内容
     A->>P: CONNECT api.github.com:443
     P->>P: 按主机与归属对象记录连接建立时刻
-    P->>E: CONNECT，附运行实例身份
+    P->>E: CONNECT，k8s 路径附 egress 受众令牌
     E-->>P: 隧道建立
     P-->>A: 双向字节流
     opt 同一主机、同一归属对象的连接在窗口内以近似固定间隔重复出现
@@ -301,7 +304,9 @@ sequenceDiagram
 
 分类结果同时以该连接的 Agent 侧端点（即本地代理所接受连接的对端地址与端口，等于 Agent 套接字的本地地址与端口）为键写入观测记录的 `conn_purpose`：CONNECT 与绝对 URI 请求记为 `external`，其余记为 `llm`。同一连接上的后续请求重新分类时覆盖该记录，记录因而反映最近一次请求的用途，Agent 侧未读的响应字节属于这一请求；CONNECT 建立隧道后该连接只转发隧道字节，记录保持 `external`。连接关闭时删除记录。看守进程只在冻结确认时的接收队列检查中按端点查询该记录。
 
-LLM 请求的请求体原样转发，不解析模型、消息或工具字段。`request_hash` 对影响上游结果的请求体计算，同一逻辑请求的重发得到相同值；具体摘要算法不属于跨模块契约，网关只要求同一请求得到同一值。外部系统请求的请求体与请求头原样转发，本地代理不解析协议内容。
+LLM 请求的请求体原样转发，不解析模型、消息或工具字段；服务端工具、`mcp_servers`、`container` 与 `anthropic-beta` 的治理由 `llmgateway` 执行，见[网关与出口代理的上游契约](#网关与出口代理的上游契约)。`request_hash` 对影响上游结果的请求体计算，同一逻辑请求的重发得到相同值；具体摘要算法不属于跨模块契约，网关只要求同一请求得到同一值。外部系统请求的请求体与请求头原样转发，本地代理不解析协议内容。
+
+绝对 URI 的 HTTP 请求在分类之后、建立上游连接之前做目的地一致性核对：`Host` 头必须等于 URI 中的主机，比较时主机名大小写不敏感，端口按 scheme 的默认端口规范化（`http` 省略端口即 80）。不一致时立即返回 403，计数 `egress_destination_mismatch`，不转发、不建立上游连接；出口代理只按 URI 主机鉴权，这一核对使转发出去的请求不能借 `Host` 头指向另一个目的地。CONNECT 请求不携带内层请求，隧道内 TLS 的 SNI 与 `Host` 由出口代理核对。
 
 复杂度：分类、请求记录创建与连接用途记录的写入和查询为 O(1)，请求体摘要为 O(B)，B 为请求体字节数；外部系统的 CONNECT 隧道建立后按字节转发，为 O(N)。
 
@@ -310,10 +315,17 @@ LLM 请求的请求体原样转发，不解析模型、消息或工具字段。`
 外部系统定义的 `access.mode` 与 `access.host_modes` 决定该主机的[网络通道](../../../glossary.md)：
 
 - `proxy`：只设置 `HTTP_PROXY` 与 `HTTPS_PROXY`，由工具主动使用本地代理。
-- `mitm`：设置代理变量，并由看守进程在沙箱内提供本地 DNS，把该主机解析到回环地址上的拦截器；拦截器按 SNI 识别目标，把原始 TLS 字节作为 CONNECT 隧道转给出口代理，不终止 TLS。出口代理按注入规则终止客户端 TLS、替换凭据，再向上游重新发起 TLS。客户端信任平台 CA，信任来源由镜像预置或运行时注入信任库；平台 CA 私钥只在出口代理侧。
+- `mitm`：设置代理变量，并由看守进程在沙箱内提供本地 DNS，把该主机解析到回环地址上的拦截器；拦截器按 SNI 识别目标，把原始 TLS 字节作为 CONNECT 隧道转给出口代理，不终止 TLS。出口代理按注入规则终止客户端 TLS、替换凭据，再向上游重新发起 TLS。客户端信任出口 CA，信任来源按提供者路径区分：k8s 路径的平台 CA 经镜像预置或运行时注入（只读投射卷），Substrate 路径的出口网关 CA 经 `systemInfo` 卷 `trustBundle` 数据源运行时投射，不预置进镜像；看守进程生成的合并信任库与 CA 环境变量见[看守进程](design-warden.md#出口-ca-信任)。CA 私钥只在出口代理侧。
 - `passthrough`：同样由本地 DNS 指向拦截器，拦截器按主机白名单把原始字节流转给出口代理；出口代理按无注入规则使用 `tls_passthrough` 档，不终止 TLS，因而不能注入 HTTPS 请求头。
 
-平台不按工具绑定通道：同一组环境变量与同一个本地 DNS 可被多个工具共用。NetworkPolicy 默认拒绝沙箱访问外部 DNS（53/853），防止 DoH 与 DoT 绕过本地解析；经 443 的 DoH 按出口策略的允许主机判定。本地 DNS 与透明拦截器是看守进程内与本地代理并列的组件，两者都以出口代理为上游，随看守进程在冻结期间继续运行。
+平台不按工具绑定通道：同一组环境变量与同一个本地 DNS 可被多个工具共用。本地 DNS 的应答规则如下：
+
+- 沙箱的 `resolv.conf` 只指向本地 DNS。
+- `mitm` 与 `passthrough` 主机解析到回环地址上的透明拦截器；`proxy` 主机解析为 `127.0.0.1`，代理变量路径由本地代理按请求中的主机名转发，不依赖真实解析。
+- 其余名字一律返回 NXDOMAIN，不向任何上游递归转发，查询名不出沙箱；出口策略之外的主机经出口代理同样不可达，NXDOMAIN 不改变工具可到达的主机集合。
+- 看守进程连接控制面时按部署配置 `sandbox_facing_endpoints` 的地址直连，控制面主机名不经本地 DNS 解析。
+
+出口强制拒绝全部 DNS 出口，包括集群 DNS：k8s 路径的 NetworkPolicy 不放行 53 端口，init 容器 `uid-egress-filter` 另使运行实例 uid 的报文只能到达回环地址；Substrate 路径以 actor 的非 TCP 出站只到 DNS 中继、DNS 中继不递归解析为部署前提，规则见[看守进程](design-warden.md#依赖)。DoT 与直连外部解析器因此不可达，经 443 的 DoH 按出口策略的允许主机判定。本地 DNS 与透明拦截器是看守进程内与本地代理并列的组件，两者都以出口代理为上游，随看守进程在冻结期间继续运行。
 
 ### 模式选择
 
@@ -327,7 +339,7 @@ LLM 请求的请求体原样转发，不解析模型、消息或工具字段。`
 
 ### 上游转发与流式处理
 
-LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-castworks-run-token`、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`），剥离 Agent 请求中的分类标记 `x-castworks-purpose`，并透传 Agent 的 Anthropic 请求头；认证头由网关替换，本地代理不读取、不记录凭据。响应为 SSE 时，本地代理按到达顺序解析事件，`ping` 归保活事件，其余归内容事件，按模式处理：
+LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-castworks-run-token` 取 `llmgateway` 受众令牌，另有 `x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`），剥离 Agent 请求中的分类标记 `x-castworks-purpose`，并透传 Agent 的 Anthropic 请求头；认证头由网关替换，本地代理不读取、不记录凭据。本地代理不解析请求体，服务端能力治理统一由 `llmgateway` 执行（[llmgateway](../design-llmgateway.md#服务端能力治理)、[ADR-llm-server-capability-egress-alignment](../../../adr/adr-llm-server-capability-egress-alignment.md)）；网关因服务端能力越界返回的 `400` 或 `403` 按客户端错误交还 Agent，本地代理上报 `llm.request.failed{reason=admission_failed}`，不重发。响应为 SSE 时，本地代理按到达顺序解析事件，`ping` 归保活事件，其余归内容事件，按模式处理：
 
 - `passthrough`：每个事件立即写入 Agent 连接；写入返回阻塞时暂停读取上游，形成背压，不把该请求转为缓冲。
 - `hold`：内容事件追加到请求记录的 `buffer`，`ping` 立即写入 Agent 连接；`buffer` 的顺序与上游一致。
@@ -366,7 +378,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 
 ### 令牌轮换
 
-本地代理为每个新上游请求读取当前运行实例令牌。令牌过期或临近到期且未收到 `TokenRotate` 时，本地代理不向上游发起新请求，把它们按到达顺序排队；排队期间不建立到网关的连接，也不向 Agent 返回成功。收到 `TokenRotate` 后，本地代理原子替换令牌并按队列顺序转发。
+本地代理为每个新上游请求读取当前令牌组中对应受众的令牌：发往 `llmgateway` 的请求取 `llmgateway` 令牌，k8s 路径上发往平台出口代理的请求与透明拦截器的 CONNECT 取 `egress` 令牌。令牌过期或临近到期且未收到 `TokenRotate` 时，本地代理不向上游发起新请求，把它们按到达顺序排队；排队期间不建立到上游的连接，也不向 Agent 返回成功。收到 `TokenRotate` 后，本地代理以原子引用替换令牌组，各受众的令牌随之替换为新令牌组中的对应令牌，再按队列顺序转发。
 
 已准入的请求不因令牌轮换中断：令牌在准入时校验，已换取的凭据由网关按其到期时间使用。排队请求在客户端请求超时之前仍未获得新令牌时，本地代理返回可重试错误并上报 `llm.request.failed`；`Shutdown` 或 `Fenced` 到达时，排队请求按失败返回，不再转发。
 
@@ -374,7 +386,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 
 快照恢复保留看守进程内存，请求记录与 `forwarded_seq` 随快照恢复；到网关的上游连接在快照时已断开。恢复后看守进程先校时、断开 Agent 进程的旧 TCP 连接，再通知本地代理与驱动器。本地代理对每个非终态请求执行：
 
-1. 以运行实例令牌调用 `GET /v1/requests/{request_id}`。
+1. 以 `llmgateway` 受众令牌调用 `GET /v1/requests/{request_id}`。
 2. `200` 返回终态条目：按请求记录中的 `mode` 与 `forwarded_seq` 续传。`passthrough` 从 `forwarded_seq` 之后继续直刷；`hold` 把尚未交付的内容事件一次性交付，`ping` 可重复转发。
 3. `202` 表示条目仍在途：本地代理不重发上游，退避后再次取回。
 4. `403`、`404` 或超过保留期的条目：本地代理上报 `llm.request.failed`，按失败释放请求。
@@ -419,7 +431,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 `intent.classifier` 开启时，Claude Code 驱动器把规则判不了的命令、描述或最后一条消息构造成分类请求体，连同截止时间经进程内入口交给本地代理，截止时间短于 `llmgateway` 的 `T_classifier_timeout` 减时钟余量，网关因超时中止之前本地代理已按截止时间结束该请求；请求体的内容与模型由驱动器决定，见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。本地代理按以下步骤处理：
 
 1. 令牌过期或临近到期且未收到 `TokenRotate` 时不排队，直接按失败返回。
-2. 生成新的 `request_id` 与 `request_hash`，附运行实例令牌与平台请求头，`x-castworks-mode` 取 `passthrough`，`x-castworks-purpose` 取 `classifier`，以 `POST /v1/messages` 发往 `llmgateway`；同一代内请求体相同的分类请求命中网关的回放条目，不产生第二次上游调用。
+2. 生成新的 `request_id` 与 `request_hash`，附 `llmgateway` 受众令牌与平台请求头，`x-castworks-mode` 取 `passthrough`，`x-castworks-purpose` 取 `classifier`，以 `POST /v1/messages` 发往 `llmgateway`；同一代内请求体相同的分类请求命中网关的回放条目，不产生第二次上游调用。
 3. 终态条目直接返回驱动器；`202` 与 `409` 在截止时间内退避后以 `GET /v1/requests/{request_id}` 取回；`422` 重新生成 `request_id` 后重发；截止时间到期或其余失败按失败返回，不重试。
 4. 全程不上报 `llm.request.*`，不更新 `llm_last_request_at` 与 `llm_last_retryable_failure_at`，不写 `conn_purpose`、`ext_conns`、请求记录与本地回放缓存。
 
@@ -436,10 +448,13 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | 失败 | 处置 |
 | --- | --- |
 | 工具未发送认证头 | 出口代理按头名匹配规则，缺头不注入；上游返回 401，作为工具结果返回 Agent |
-| 工具忽略代理变量 | 未启用透明拦截的主机在 NetworkPolicy 默认拒绝下连接失败；启用 `mitm` 或 `passthrough` 的主机由本地 DNS 指向拦截器 |
+| 工具忽略代理变量 | `proxy` 主机由本地 DNS 解析为 `127.0.0.1`，直连该地址的目标端口失败；运行实例 uid 发往回环之外地址的连接立即被拒（k8s 路径的 init 容器 `uid-egress-filter`，Substrate 路径的部署前提）；启用 `mitm` 或 `passthrough` 的主机由本地 DNS 指向拦截器 |
+| 查询 `mitm`、`passthrough`、`proxy` 之外的名字 | 本地 DNS 返回 NXDOMAIN，不向上游递归转发 |
+| 绝对 URI 请求的 `Host` 头与 URI 主机不一致 | 立即返回 403，计数 `egress_destination_mismatch`；不转发、不建立上游连接 |
 | 占位符未被替换 | 请求头含占位符但没有匹配规则时出口代理返回 403；`tls_passthrough` 档不解析请求头，占位符可能原样到达上游 |
 | 网关不可达或连接被拒 | 上报 `llm.request.failed`；向 Agent 返回错误；不建立本地回放条目 |
-| 网关返回 `401`、`403` 或 `503` | 按不可重试或暂时性错误分类：`401` 与 `403` 失败并上报；`503` 按退避重试，重试耗尽后失败 |
+| 网关返回 `400` 或 `403`，含服务端能力越界（服务端工具或 `anthropic-beta` 不在允许清单、外联域与允许主机的交集为空、`mcp_servers` 主机不在允许主机内、`container` 不属于本运行实例） | 按客户端错误把响应交还 Agent，上报 `llm.request.failed{reason=admission_failed}`；不重发、不建立本地回放条目 |
+| 网关返回 `401` 或 `503` | `401` 失败并上报；`503`（含允许主机查询失败）按退避重试，重试耗尽后失败 |
 | 上游返回错误或流中断 | 网关提交失败回放条目并写 `llm_failed`；本地代理上报 `llm.request.failed`；已到达的内容按模式交付或丢弃 |
 | 网关返回 `202` | 不新建上游调用；挂接已有本地上游流，或退避后取回 |
 | 网关返回 `409` | 不重发上游；退避后取回条目 |
@@ -470,10 +485,10 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 - **上游连接归属**：每个请求持有自己的上游连接；冻结期间连接保持打开，解冻与重发不重建已存在的连接。请求之间不共享上游连接。
 - **事件顺序**：同一逻辑请求的 `started`、`first_token`、`completed` 或 `failed` 按该顺序至多各一次；事件写入看守进程的出站流是串行的，跨请求的相对顺序不做保证。
 - **本地回放缓存**：按 `replay_key` 加锁；同一键的创建、追加与交付串行；不同键之间并发。缓存条目在请求关闭或保留期到期后释放。
-- **令牌快照**：令牌替换以原子引用完成；每个新请求读取一次当前令牌，已有请求不重新读取。替换与排队队列的操作串行。
+- **令牌快照**：令牌组替换以原子引用完成；每个新请求读取一次当前令牌组中对应受众的令牌，已有请求不重新读取。替换与排队队列的操作串行。
 - **观测记录**：两个时刻以原子写更新，看守进程采样时读取最新值；`inbound_freeze_id` 由看守进程以原子引用设置与清空，各连接协程读取其快照后通知，连接协程之间不加锁，`conn.inbound` 的至多一次由看守进程的冻结执行记录保证。`conn_purpose` 的每个键只由接受该连接的协程写入与删除，看守进程以并发安全的读取查询；冻结确认时 Agent 进程树已冻结，不会发出新请求，查询期间记录不因 Agent 的新请求而改变。
 - **周期性连接记录**：`conn_starts` 与 `periodic_conns` 按 `(host, 归属对象)` 加锁；归属解析在独立协程中进行，完成后于锁内追加时刻并判定，对驱动器的通知在锁外发出，按同一键的判定顺序发出；不同键之间并发。归属解析与连接转发并发，解析未完成或失败不影响转发。
-- **宿主侧分类请求**：每个分类请求由独立协程处理，按新请求的规则读取一次当前令牌；不与 Agent 的请求共享上游连接、请求记录或本地回放缓存，不影响 Agent 请求的模式、缓冲与事件顺序。
+- **宿主侧分类请求**：每个分类请求由独立协程处理，按新请求的规则读取一次当前的 `llmgateway` 受众令牌；不与 Agent 的请求共享上游连接、请求记录或本地回放缓存，不影响 Agent 请求的模式、缓冲与事件顺序。
 - **快照与恢复**：快照保留请求记录与 `forwarded_seq`；恢复期间的取回与交付在看守进程完成校时和旧连接清理之后开始，之前不产生新事件。
 - **销毁边界**：I9 检查通过前不得销毁；本地代理的在途请求由看守进程的投递与安全点检查纳入，销毁后不保留请求记录。
 
@@ -509,3 +524,4 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | 连接用途记录 | 未实现 | — |
 | 周期性连接观测 | 未实现 | — |
 | 宿主侧分类请求转发 | 未实现 | — |
+| 绝对 URI 目的地一致性核对 | 未实现 | — |

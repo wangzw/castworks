@@ -29,9 +29,12 @@
 | 非特权沙箱中 `/proc/<pid>/wchan`、`/proc/<pid>/stat`、`/proc/net/tcp` 与 `/proc/net/tcp6` 的可读性；`wchan` 的符号名是否可见 | 静止证据中定时睡眠的识别（`timed_sleepers`）；入站数据唤醒中冻结确认时的接收队列检查，含两端都在 Agent 进程树内的回环连接的排除 | 通过——看守进程能读取 Agent 进程的 `wchan` 并得到 `nanosleep`、`hrtimer` 一类符号名，能读取 `starttime`，能读取 `rx_queue` 并按套接字 inode 关联到 Agent 进程，能按回环连接的对端地址找到对端套接字并按其 inode 判定持有者是否属于 Agent 进程树。不通过——任一文件不可读，或 `wchan` 只返回 0；此时定时睡眠一律视为忙，冻结确认时不做接收队列检查，改为解冻后短暂观察。 |
 | PSI 的 `cpu.pressure` 与 `io.pressure` 中 `some` 行 `total` 累计值的更新粒度，及其与活动度采样间隔、`Q_quiet` 的匹配（[REF-linux-psi](references.md)）；Claude Code 空闲（回合边界、无后台作业）时 `agent` 子 cgroup 的 `cpu.stat` 中 `usage_usec` 的增长基线，及其与 `U_quiet` 的匹配（[REF-linux-cgroup-v2](references.md)） | 静止证据中的 PSI 静默判定与 CPU 用量判据，`Q_quiet` 与 `U_quiet` 的取值 | 通过——Agent 进程树静止期间相邻样本差为零；Agent 进程树出现 CPU 或 I/O 停滞时，差值在一个采样间隔内变为非零；`total` 的更新粒度不粗于采样间隔；Claude Code 空闲期间任一静止窗内 `usage_usec` 的增量不超过 `U_quiet` 乘以窗口时长。不通过——静止期间出现非零差值，或停滞发生后差值滞后多个采样间隔才出现；此时把采样间隔上调到实测更新粒度以上，按实测滞后上调 `Q_quiet`；静止期间的非零差值来自可识别的固定噪声时，PSI 静默判定改为样本差不超过实测噪声上限。Claude Code 空闲期间静止窗内 `usage_usec` 的增量超过 `U_quiet` 乘以窗口时长时，按实测基线上调 `U_quiet`，或静止证据改以连续多个窗口判定 CPU 用量。 |
 | 原地缩小 CPU request 的生效时延；节点 CPU 分配 80% 时放大进入 `Deferred` 的比例与持续时间；agent-sandbox 控制器是否回滚 Pod 的 `resources`（[REF-k8s-in-place-pod-resize](references.md)） | `InPlaceResize` 能力，以及冻结是否真正释放调度额度 | 通过——缩小立即生效且不触发重建；节点 CPU 分配 80% 时 `Deferred` 的比例与持续时间可度量并落在设计可接受范围；控制器不回滚 `resources`。不通过——控制器回滚，或缩小不释放调度额度；此时从能力集中移除 `InPlaceResize`，冻结只释放用量、不释放 request。 |
+| 定制 seccomp profile（Localhost，以 RuntimeDefault 为起点）与 AppArmor 或 SELinux profile 下，Claude Code 负载与已声明第三方 MCP 服务器的兼容性，含 Claude Code 自带 Bash 沙箱所需的 user namespace | 沙箱 Pod 安全基线的 seccomp 白名单与 LSM 规则；不以移除系统调用换取约束 | 通过——一个完整回合的启动、LLM 请求、Bash 沙箱、文件读写、子代理、workflow 与第三方 MCP 调用在 profile 下完成，无 `EPERM` 或被 LSM 拒绝，Agent 功能所需系统调用可逐项列出。不通过——某项系统调用或 LSM 规则阻断 Agent 功能；此时把该系统调用保留进白名单，并由 AppArmor 或 SELinux 收窄其可达的高危子系统，不降低 Agent 能力。 |
 | `claude -p --resume` 冷启动分布：会话记录文件为 1、10、50 MB，CPU request 为 250m 与 2 核，二进制在镜像内与共享文件系统上，外联黑洞与 RST，MCP 初始化耗时（无头模式文档） | 销毁重建 p95 < 10 s 与 p95 < 20 s 的目标、`T_nofreeze` 与预热池容量 | 通过——预热池认领 p95 < 10 s，共享文件系统冷启动 p95 < 20 s，分布可按会话记录文件大小与 CPU 规格解释。不通过——启动期外联或 MCP 初始化使 p95 超出目标；此时把对应耗时计入 `T_nofreeze` 与抖动预算，并按实测补充前置时间重算预热池容量。 |
 | agent-sandbox 认领时延（单个与 100 并发）与池补充前置时间 L；共享文件系统的 `mkdir`、`chown`、`fsync` 时延与 `root_squash` 行为；块存储 `attach` 在 50 与 200 并发下的时延（[REF-agent-sandbox](references.md)） | 预热池容量公式、冷启动目标与工作区隔离实现 | 通过——100 并发认领满足 p95 < 10 s，池补充前置时间 L 可测；共享文件系统的 `mkdir`、`chown`、`fsync` 支持 I9 的持久化确认，`root_squash` 行为与工作区设计一致；块存储 `attach` 时延与目标一致。不通过——并发认领显著劣化，或 `root_squash` 阻止目录创建；此时池按分片扩容，或改由看守进程 `seteuid` 后创建目录。 |
 | Substrate 试点：看守进程作 PID 1 在 gVisor 下驱动 Claude Code；约 500 MB actor 的 Suspend 与 Resume 时延与快照大小；经路由器 `/wake` 唤醒；EgressPolicy 占位符注入；S3 插件；`parked-request-budget`；编译测试类负载；MEMORY 快照恢复后的时钟与旧连接；外部 CSI 卷；`durableDir` 退化配置；经出口网关注入 actor JWT 的[引导接口](glossary.md)领取，以及从[模板快照](glossary.md)恢复的 actor 以 `actor-name` 变化触发领取（[REF-substrate](references.md)） | Substrate 提供者的 go 与 no-go | 通过——阶段 0 的 go 判定全部满足。不通过——任一阻断项无法成立且无补偿路径；此时第一版只交付 k8s 提供者，Substrate 提供者顺延。 |
+| Substrate actor 的网络前提：uid 非 0 的出站是否只到回环；非 TCP 出站（UDP 含 QUIC、ICMP）能否除 DNS 中继查询外全部拒绝；DNS 中继能否对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机、其余返回 NXDOMAIN 且不递归解析（[REF-substrate](references.md)） | Substrate 路径的出口边界；任一项不成立时 Substrate 路径不上线 | 通过——在 actor 内以 UDP 探测、ICMP 探测与 DNS 查询实测，非策略目标不可达或立即失败，DNS 查询名不出沙箱，NXDOMAIN 可观察且中继无上游递归。不通过——任一约束无法由 Substrate 或部署实施；此时 Substrate 路径不上线，第一版只交付 k8s 提供者。 |
+| Substrate 出口网关的目的地一致性与 CA 轮换：`https` 规则下客户端 SNI 与内层 `Host`/`:authority` 是否都等于规则主机；`tls_passthrough` 规则是否要求 SNI 等于规则主机并拒绝带 ECH 的 ClientHello；CA 轮换能否保留不短于快照保留期上限的新旧 CA 同时受信重叠期（[REF-substrate](references.md)） | 出口目的地一致性与 CA 运行时投射；不通过时 Substrate 路径不上线 | 通过——构造 SNI 与 `Host` 不一致、ECH ClientHello 与轮换期旧 CA 连接，网关分别返回 403、关闭隧道、接受旧 CA，且计数 `egress_destination_mismatch`；`T_ca_overlap` 可配置且不短于快照保留期上限。不通过——任一情形无法核对；此时 Substrate 路径不上线，或按实测缩小 Substrate 的适用范围。 |
 
 ## 当前验证结论
 
@@ -61,7 +64,7 @@
 
 交付物：
 
-- k8s 冻结路径：节点冻结代理与 Agent 子 cgroup、PSI、CPU 用量与进程态采集、原地缩小 CPU request、agent-sandbox 认领，以及共享文件系统上的工作区操作。
+- k8s 冻结路径：节点冻结代理与 Agent 子 cgroup、PSI、CPU 用量与进程态采集、原地缩小 CPU request、agent-sandbox 认领、沙箱 Pod 安全基线的定制 seccomp 与 LSM profile 兼容性，以及共享文件系统上的工作区操作。
 - Substrate 试点：看守进程作 PID 1、Suspend 与 Resume、路由器唤醒、出口策略、引导领取、工作区持久化与恢复后状态清理。
 
 Substrate 试点的 go 判定如下，全部满足为 go：
@@ -71,6 +74,8 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 | 驱动 Claude Code | 看守进程以 PID 1 在 gVisor 下驱动 Claude Code 完成一个回合：启动、LLM 请求、工具调用与回合结束均可观察，进程树受看守进程监督 |
 | 快照恢复 | 约 500 MB actor 的 Suspend 与 Resume 时延与快照大小可重复测量；快照恢复 p95 < 5 s，或偏差可归因于已知项并触发目标调整 |
 | 入站唤醒 | 经带 `ate-target-actor` 头的路由器调用 `/wake` 成功唤醒；控制面以 SPIFFE 身份（[REF-spiffe](references.md)）通过白名单；调大 `parked-request-budget` 后停泊请求不被提前切断 |
+| 网络前提 | actor 内 uid 非 0 的出站只到回环；非 TCP 出站（UDP 含 QUIC、ICMP）除 DNS 中继查询外被拒绝；DNS 中继只应答 EgressPolicy 所列主机与控制面主机，其余返回 NXDOMAIN 且不递归，查询名不出沙箱 |
+| 出口网关目的地一致性与 CA 轮换 | `https` 规则核对客户端 SNI 与内层 `Host` 等于规则主机；`tls_passthrough` 规则要求 SNI 等于规则主机并拒绝带 ECH 的 ClientHello；目的地不一致按规则返回 403 或关闭隧道并计数 `egress_destination_mismatch`；CA 轮换重叠期不短于快照保留期上限 |
 | 出口策略 | EgressPolicy 对 `api.github.com` 与 git 的占位符注入生效，缺头不注入，未列主机默认拒绝；S3 插件可用 |
 | 引导领取 | 出口网关为看守进程发往引导接口、携带 `Authorization` 占位符的请求注入 audience 为 `castworks-bootstrap` 的 actor JWT，引导接口经 Substrate 签发方的 OIDC 发现验签、核对 actor 名与 actor UID 后返回运行实例令牌与 `lease_id`；从模板快照恢复的新 actor 在 `wakeupProbe` 探测时读到新的 `actor-name` 并立即领取，在 `ResumeActor` 成功之后的首次退避重试内领取成功；同一 actor 内的再次领取返回 409 |
 | 工作区持久化 | 外部 CSI 卷（NFS CSI 驱动）在 actor 内可挂载、可读写，且沙箱外可经同一导出访问；不可用时 `durableDir` 同步挂起的耗时与崩溃丢失窗口可测并落在可接受范围 |
@@ -83,6 +88,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 - Substrate 的 go 或 no-go 结论已确定，并反映为第一版交付的提供者范围。
 - k8s 冻结路径的 cgroup 挂载属性与 PSI 可读性、原地缩放、认领与工作区时延均得到通过结论或明确的回退路径。
+- 沙箱 Pod 安全基线的定制 seccomp 与 LSM profile 在 Claude Code 负载与已声明第三方 MCP 服务器上通过，或已按实测调整白名单且不降低 Agent 能力。
 - Claude Code 的冻结与续接行为、MCP 超时、托管设置生效均得到通过结论或明确的回退路径：MCP 超时一项已判定不通过，回退路径为按 MCP 传输类型重算 `F_cap`，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果；`F_stream`、`F_cap` 与 `T_nofreeze` 的取值已确定或已触发设计更新。
 
 ### 阶段 1：最小挂起恢复闭环

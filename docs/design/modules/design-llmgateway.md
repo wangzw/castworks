@@ -1,8 +1,8 @@
 # llmgateway
 
-`llmgateway` 是控制面中的 [LLM 网关](../../glossary.md)，位于[沙箱](../../glossary.md)内 [本地代理](../../glossary.md) 与 Anthropic API 之间。它拥有以 [运行实例令牌](../../glossary.md) 换取真实 LLM 凭据、按 [代](../../glossary.md) 校验请求、登记在途请求与实例租约、流式转发、单次回放、限流、计费、审计与时延直方图；它不拥有 Agent 进程、沙箱、本地代理的缓冲与模式选择、[挂起](../../glossary.md)决策与外部系统连接器。两级结构见 [ADR-two-tier-llm-proxy](../../adr/adr-two-tier-llm-proxy.md)。本模块围绕单次回放组织：网关把一次 LLM 请求变成一条控制面可持有、沙箱消失后仍可取回的回执。
+`llmgateway` 是控制面中的 [LLM 网关](../../glossary.md)，位于[沙箱](../../glossary.md)内 [本地代理](../../glossary.md) 与 Anthropic API 之间。它拥有以 [运行实例令牌](../../glossary.md) 换取真实 LLM 凭据、按 [代](../../glossary.md) 校验请求、约束上游服务端代发的外联、登记在途请求与实例租约、流式转发、单次回放、限流、计费、审计与时延直方图；它不拥有 Agent 进程、沙箱、本地代理的缓冲与模式选择、[挂起](../../glossary.md)决策与外部系统连接器。两级结构见 [ADR-two-tier-llm-proxy](../../adr/adr-two-tier-llm-proxy.md)。本模块围绕单次回放组织：网关把一次 LLM 请求变成一条控制面可持有、沙箱消失后仍可取回的回执。
 
-文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、请求准入与代校验、凭据换取与在途登记、上游转发与流式保活、终态持久化与信号、回放取回、宿主侧分类请求；术语表、依赖、UML 图、核心数据结构、时延直方图、限流、计费与审计、错误与失败语义、并发与事务边界作为参考，在核对字段、失败路径或事务顺序时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文的顺序与幂等键判断每个交错序列的结果，再与表中处置核对。
+文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、请求准入与代校验、服务端能力治理、凭据换取与在途登记、上游转发与流式保活、终态持久化与信号、回放取回、宿主侧分类请求；术语表、依赖、UML 图、核心数据结构、时延直方图、限流、计费与审计、错误与失败语义、并发与事务边界作为参考，在核对字段、失败路径或事务顺序时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文的顺序与幂等键判断每个交错序列的结果，再与表中处置核对。
 
 ## 核心概念
 
@@ -12,8 +12,9 @@
 
 `llmgateway` 是控制面中唯一以真实 LLM 凭据访问 Anthropic API 的模块。职责穷举如下，每条先写本模块执行的动作，再写产生的结果或边界；具体算法、表结构与顺序见后续章节。
 
-- **请求准入与代校验**：校验运行实例令牌的签名、过期时间与 `run_id`，再经 `runcontroller` 的 `Generations.Current` 比较令牌中的代与当前代；令牌无效、[运行实例](../../glossary.md)已终态或本代已作废时拒绝请求。被拒绝的请求不换取凭据、不产生上游调用，并计入旧代拒绝计数。
-- **凭据换取**：以运行实例令牌与调用方身份向 `secrets` 换取真实 LLM 凭据，目标为本模块部署配置中的 LLM 提供方与认证方式；凭据只在网关进程内存中持有至到期；凭据不写入数据库、回放条目，也不返回本地代理。
+- **请求准入与代校验**：以期望受众 `llmgateway` 校验运行实例令牌的签名、过期时间、`run_id` 与受众，再经 `runcontroller` 的 `Generations.Current` 比较令牌中的代与当前代；令牌无效、受众不符、[运行实例](../../glossary.md)已终态或本代已作废时拒绝请求。被拒绝的请求不换取凭据、不产生上游调用，并计入旧代拒绝计数。
+- **服务端能力与出口策略对齐**：对 Agent 的 LLM 请求与宿主侧分类请求解析请求体顶层的 `tools`、`mcp_servers`、`container` 与请求头 `anthropic-beta`，把外联类服务端工具的可达域收敛到该运行实例当前的允许主机，核对远程 MCP 服务器的主机，并按允许清单约束服务端工具类型与 beta 取值；结果是上游服务端以平台凭据代发的外联与沙箱自身的出站受同一出口策略约束，越界请求不访问上游（[ADR-llm-server-capability-egress-alignment](../../adr/adr-llm-server-capability-egress-alignment.md)）。
+- **凭据换取**：以 `llmgateway` 受众的运行实例令牌与调用方身份向 `secrets` 换取真实 LLM 凭据，目标为本模块部署配置中的 LLM 提供方与认证方式；凭据只在网关进程内存中持有至 `min(ExpiresAt, RecheckAt)`；凭据不写入数据库、回放条目，也不返回本地代理。
 - **在途登记与实例续租**：转发上游前在 `llm_request` 表登记请求，并对 Agent 的 LLM 请求经 [汇入契约](../../glossary.md) `SetRunFact{inflight_request}` 写入在途请求事实与实例租约；只在本实例存在 `purpose=agent` 的在途请求事实时以 `RenewSourceLease` 周期续租，使实例失联可由 `runcontroller` 判定。
 - **流式转发**：按原顺序转发 Anthropic Messages 的 SSE 事件与 ping 保活事件，不合并、不重排、不改写内容事件；同时把事件写入该请求的回放缓冲。
 - **终态持久化与信号**：上游正常结束、返回错误、超时、流中断或流内 `error` 事件时，在同一事务提交回放条目与 `llm_request.status`；提交后对 Agent 的 LLM 请求经汇入契约写入 `llm_completed` 或 `llm_failed` [唤醒信号](../../glossary.md)。
@@ -27,6 +28,7 @@
 非职责举例如下，判定标准为职责清单之外、由其他模块拥有的事实与机制。
 
 - **不做 MITM**：不拦截 Agent 的其他出站 TLS 流量；外部系统的凭据占位符替换归 `connectorhub` 的出口代理。
+- **不生成出口策略**：允许主机由 `connectorhub` 生成与落地；本模块只经其出口策略查询接口读取允许主机，用于服务端能力治理。
 - **不决定何时冻结、快照或销毁**：[挂起](../../glossary.md)决策归 `suspendpolicy`，状态转移与执行归 `runcontroller` 与 `sandboxprovider`。
 - **不持有沙箱**：不创建、销毁、[冻结](../../glossary.md)或恢复沙箱，不读取沙箱内进程状态。
 - **不直接接 Agent**：只接受本地代理的请求；Agent 进程能到达的网络端点见[架构不变量](../architecture.md#架构不变量) I6，Agent 不持有网关凭据。
@@ -45,15 +47,15 @@
 
 ## 外部接口契约
 
-稳定性承诺按接口类别给出：对本地代理的 HTTP 接口在请求元数据字段、错误状态与回放取回语义上稳定，新增模型或上游事件类型不构成接口变更；对 `runcontroller` 的汇入调用遵循其汇入契约；对 `secrets` 的调用遵循其 `ExchangeCredential` 换取契约；上游 Anthropic API 的版本由请求头 `anthropic-version` 决定，不由本模块承诺。
+稳定性承诺按接口类别给出：对本地代理的 HTTP 接口在请求元数据字段、错误状态与回放取回语义上稳定，新增模型或上游事件类型不构成接口变更；对 `runcontroller` 的汇入调用遵循其汇入契约；对 `secrets` 的调用遵循其 `ExchangeCredential` 换取契约；对 `connectorhub` 的调用遵循其出口策略查询接口；上游 Anthropic API 的版本由请求头 `anthropic-version` 决定，不由本模块承诺。
 
 ### 对本地代理的 HTTP 接口
 
-本地代理向网关发起的请求沿用 Anthropic Messages API 的请求体格式，平台元数据放在下列请求头中；`anthropic-version`、`content-type` 等 Anthropic 请求头由本地代理透传，网关以换取的凭据替换认证头。
+下列端点部署在[面向沙箱的端点](../../glossary.md) `llm` 上：使用独立的主机名与端口，只供看守进程的本地代理调用，不在本模块的内部监听器上提供。本地代理向网关发起的请求沿用 Anthropic Messages API 的请求体格式，平台元数据放在下列请求头中；`anthropic-version`、`anthropic-beta`、`content-type` 等 Anthropic 请求头由本地代理透传，网关按[服务端能力治理](#服务端能力治理)核对 `anthropic-beta`，以换取的凭据替换认证头。
 
 | 请求头 | 含义 |
 | --- | --- |
-| `x-castworks-run-token` | [看守进程](../../glossary.md)持有的运行实例令牌 |
+| `x-castworks-run-token` | [看守进程](../../glossary.md)持有的 `llmgateway` 受众运行实例令牌 |
 | `x-castworks-request-id` | 本地代理为逻辑请求生成的标识，在运行实例内跨代唯一（因而在 `(run_id, generation)` 内唯一），不从 `request_hash` 派生；网关在响应头 `x-castworks-request-id` 返回归一后的规范标识 |
 | `x-castworks-request-hash` | 本地代理对影响上游结果的请求体计算的稳定摘要；同一逻辑请求重发时保持一致 |
 | `x-castworks-mode` | `passthrough` 或 `hold`，由本地代理在请求开始时一次性选定 |
@@ -64,11 +66,12 @@ POST /v1/messages
 GET  /v1/requests/{request_id}
 ```
 
+- 网关不暴露 `/v1/messages` 与 `/v1/requests/{request_id}` 之外的任何上游端点，例如 Files 与 Batches；其他路径返回 `404`，不访问上游。
 - `POST /v1/messages` 的响应体为 Anthropic Messages API 的响应；请求 `stream=true` 时为 SSE 流。网关在响应头 `x-castworks-request-id` 返回归一后的 `request_id`（首次登记行的标识），本地代理以它取回回放，并把它作为 `llm.request.started`、`llm.request.completed`、`llm.request.failed` 与 `blocked_on.ref` 的 `request_id`；网关的唤醒信号 `Ref` 也取该规范标识。同一逻辑请求的重发若携带不同标识而 `request_hash` 相同，网关仍返回首次登记行的标识。
 - 同一 `(run_id, generation, request_hash)` 已有终态行时，`POST` 直接返回该回放条目，不再请求上游；已有 `in_flight` 行且由同一网关实例持有时返回 `202`，由另一存活网关实例持有时返回 `409`，租约已到期的行先按回收规则删除再登记，都不新建上游调用。
-- `GET /v1/requests/{request_id}` 携带同一运行实例令牌。网关按 `(run_id, request_id)` 定位行，校验令牌有效且运行实例未终态，并要求令牌的 `run_id` 等于行的 `run_id`；行的 `generation` 只作记录，取回不要求与令牌的代相同，因而销毁重建后的新代本地代理仍可取回旧代已完成的响应。行处于终态时返回 `200` 与原始响应内容；仍在途且由同一网关实例持有时返回 `202`，由另一存活网关实例持有时返回 `409`；持有实例的租约已到期时按回收规则删除该行并返回 `404`；条目缺失或已过保留期时返回 `404`；行属于其他运行实例时返回 `403`。
+- `GET /v1/requests/{request_id}` 携带同一运行实例的 `llmgateway` 受众令牌。网关按 `(run_id, request_id)` 定位行，以期望受众 `llmgateway` 校验令牌有效且运行实例未终态，受众不符按令牌无效返回 `401`，并要求令牌的 `run_id` 等于行的 `run_id`；行的 `generation` 只作记录，取回不要求与令牌的代相同，因而销毁重建后的新代本地代理仍可取回旧代已完成的响应。行处于终态时返回 `200` 与原始响应内容；仍在途且由同一网关实例持有时返回 `202`，由另一存活网关实例持有时返回 `409`；持有实例的租约已到期时按回收规则删除该行并返回 `404`；条目缺失或已过保留期时返回 `404`；行属于其他运行实例时返回 `403`。
 - 带 `x-castworks-purpose: classifier` 的请求是宿主侧分类请求，要求 `x-castworks-mode=passthrough` 且请求体 `stream` 不为真，否则返回 `400`；它与 Agent 的 LLM 请求共用上述两个端点、状态码与取回语义，网关不为它调用 `SetRunFact{inflight_request}`，不写 `llm_completed` 或 `llm_failed`。处置规则见[宿主侧分类请求](#宿主侧分类请求)。
-- 认证失败、代不匹配、终态与作废、参数非法与限流以 HTTP 客户端错误返回；上游 `401` 与 `403` 以 `502` 返回；`secrets`、`runcontroller`、回放存储不可用以 `503` 返回。错误体字段不是稳定契约，调用方按状态码处置。
+- 认证失败（含令牌受众不是 `llmgateway`）、代不匹配、终态与作废、参数非法、服务端能力越界与限流以 HTTP 客户端错误返回：服务端工具类型或 `anthropic-beta` 取值不在允许清单内与未知 `container` 返回 `400`，外联类服务端工具的允许域交集为空或 `mcp_servers` 主机不在允许主机内返回 `403`；上游 `401` 与 `403` 以 `502` 返回；`secrets`、`runcontroller`、回放存储不可用以 `503` 返回，含外联类服务端工具或 `mcp_servers` 的请求在出口策略查询不可用时同样返回 `503`。错误体字段不是稳定契约，调用方按状态码处置；本地代理把服务端能力越界的 `400` 与 `403` 按客户端错误交还 Agent，不重发。
 - 稳定承诺覆盖请求头名称、响应头 `x-castworks-request-id`、`mode` 与 `purpose` 闭集、宿主侧分类请求不登记在途请求事实与不写唤醒信号的语义、`GET` 的取回语义与 `200`、`202`、`403`、`404`、`409`、`422`、`502`、`503` 的区分；上游模型清单与事件类型的变化不改变本地代理的调用方式。
 
 ### 对 runcontroller 的汇入调用
@@ -86,8 +89,10 @@ AppendWakeSignal(ctx, WakeSignal{
     RunID: runID, Generation: g, Kind: llm_completed, Ref: requestID, OccurredAt: now,
 })
 current, err := Generations.Current(ctx, runID) // {Generation, Terminal, Fenced}
+view, err := RunService.Get(ctx, runID)         // 取 RunView.project_id
 ```
 
+- 本模块以 `llmgateway` SPIFFE 身份经 mTLS 调用上述方法：汇入契约的 `AppendWakeSignal`（`llm_completed`、`llm_failed`）、`SetRunFact{inflight_request}` 与 `RenewSourceLease`，以及 `Generations.Current` 与 `RunService.Get`；它们是 `runcontroller` 按方法授权表允许 `llmgateway` 调用的全部方法（[认证与授权边界](../architecture.md#认证与授权边界)）。`RunFact.Source` 与 `SourceLease.Module` 由 `runcontroller` 按对端身份写入，代码中的同名值被忽略。
 - `SetRunFact{inflight_request}` 在转发上游之前调用，只用于 `llm_request.purpose=agent` 的行，宿主侧分类请求不调用；`InFlightRequest.Instance` 取网关实例标识，`InitialTTL` 取本次登记的租约有效期。调用失败时按错误类别处置：不可重试错误使请求失败，已插入的行按登记失败规则处置，暂时性错误返回 `503`；都不转发上游。
 - `RenewSourceLease` 只延长租约，不改变在途请求事实，只在本实例存在 `purpose=agent` 的在途请求事实时调用。本实例的一个在途请求事实在该请求的 `SetRunFact{inflight_request}` 成功时成立，在其唤醒信号写入成功、因不可重试错误被丢弃或终态提交的 CAS 失败时关闭；在途请求事实全部关闭后本实例停止续租，`source_lease` 随其 `expires_at` 过期，下一次 `SetRunFact{inflight_request}` 在同一事务以 `InitialTTL` 重新延长或建立租约。宿主侧分类请求不登记在途请求事实，也不参与实例租约：它不触发续租，其行不随续租刷新，在网关内按 `T_classifier_timeout` 跟踪（见[宿主侧分类请求](#宿主侧分类请求)）。`runcontroller` 对不存在的 `source_lease` 行按成功返回且不写入、不创建行（幂等的空操作），租约只由 `SetRunFact{inflight_request}` 建立；续租成功因而不证明租约行存在，网关按续租结果只刷新本实例尚未到期的 `purpose=agent` 在途行。续租周期小于 `InitialTTL` 减去时钟余量；续租返回暂时性错误或 `runcontroller` 不可达时网关按退避重试续租，期间暂停接收新请求（返回 `503`），续租成功后恢复准入；续租的不可重试错误属于部署或实现缺陷，告警并同样按续租失败处置。连续失败至本实例 `purpose=agent` 在途行的 `lease_expires_at` 到期时，本实例停止准入，这些行的终态提交随之失败并按回收规则处置；已有上游请求在租约有效期内继续完成并提交回放。
 - `AppendWakeSignal` 只为 `purpose=agent` 的行调用；`Kind` 闭集为 `llm_completed` 与 `llm_failed`；`Ref` 取规范 `request_id`（首次登记行上的标识）；`Reason` 只在 `llm_failed` 时写入，取值闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`。`gateway_lost` 只由 `runcontroller` 的「事件源实例失联」守卫合成。
@@ -97,7 +102,7 @@ current, err := Generations.Current(ctx, runID) // {Generation, Terminal, Fenced
 ### 对 secrets 的调用
 
 ```go
-info, err := VerifyRunToken(token) // {RunID, Generation, ExpiresAt, Expired} | invalid
+info, err := VerifyRunToken(token, llmgateway) // {RunID, Generation, ExpiresAt, Expired, InstanceJKT} | invalid
 cred, err := ExchangeCredential(ctx, ExchangeRequest{
     Token:     token,
     ProjectID: projectID,
@@ -112,30 +117,42 @@ cred, err := ExchangeCredential(ctx, ExchangeRequest{
         Operation:  "llm.request",
         UsageID:    requestID,
     },
-}) // MintedCredential{Value, Scopes, ExpiresAt, SourceVersion}
+}) // MintedCredential{Value, Scopes, ExpiresAt, RecheckAt, SourceVersion}
 ```
 
-- `VerifyRunToken` 校验签名与 `run_id`，过期单独返回而不作为签名无效。令牌无效时拒绝请求；`secrets` 不可达或超时按暂时性错误处置，不据此判定令牌失效。
-- `ExchangeCredential` 以运行实例令牌与调用方身份换取真实 LLM 凭据。本模块以 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)）作为 mTLS 客户端证书调用，`secrets` 按部署白名单校验该身份并映射到允许的 `(Kind, System, AuthMethod)` 集合，本模块被允许的 `Kind` 为 `llm`，`System` 与 `AuthMethod` 取部署配置中登记的 LLM 提供方与认证方式；身份缺失时 mTLS 握手失败，身份不在白名单时 `secrets` 返回未认证错误。
+- `VerifyRunToken` 以期望受众 `llmgateway` 校验签名、`run_id` 与受众，过期单独返回而不作为签名无效。令牌无效或受众不是 `llmgateway` 时按令牌无效拒绝请求并返回 `401`，`POST /v1/messages` 与 `GET /v1/requests/{request_id}` 都只接受 `llmgateway` 受众；`secrets` 不可达或超时按暂时性错误处置，不据此判定令牌失效。
+- `ExchangeCredential` 以 `llmgateway` 受众的运行实例令牌与调用方身份换取真实 LLM 凭据，`secrets` 按同一受众校验令牌。本模块以 `llmgateway` SPIFFE 工作负载身份（[REF-spiffe](../../references.md)）作为 mTLS 客户端证书调用，`secrets` 按部署白名单校验该身份并映射到允许的 `(Kind, System, AuthMethod)` 集合，本模块被允许的 `Kind` 为 `llm`，`System` 与 `AuthMethod` 取部署配置中登记的 LLM 提供方与认证方式；身份缺失时 mTLS 握手失败，身份不在白名单时 `secrets` 返回未授权错误。
 - `Target.Kind` 固定为 `llm`；`Target.System` 与 `Target.AuthMethod` 取部署配置中该模型对应的 LLM 提供方（`llmProvider`）与认证方式（`llmAuthMethod`）。请求模型不在部署映射中时，网关在换取前返回 `400` 并告警，不调用 `ExchangeCredential`，不设隐式默认提供方。新增兼容 Anthropic Messages API 的提供方只改变部署配置，不改变调用方式；其他协议需要新的转发适配。
 - `Target.Scopes` 留空表示不额外收窄范围，`secrets` 以凭据对象的授权范围为准；返回的 `Scopes` 与 `SourceVersion` 只用于审计，不改变网关的转发行为。
 - `ProjectID` 取运行实例所属项目（`RunView.project_id`），`Usage` 的 `RunID` 与 `Generation` 取已验证令牌中的值，`Usage.Operation` 固定为 `llm.request`（宿主侧分类请求相同），`UsageID` 取本次请求的 `request_id`。
-- 凭据为不透明值，只在网关进程内存中持有至 `ExpiresAt`，不写入数据库或回放条目。
-- 换取失败的处置按 `secrets` 的错误分类：`ErrInvalidToken` 与 `ErrTokenExpired` 返回 `401`；`ErrTargetNotAuthorized` 是部署或身份配置错误，返回 `503` 并告警，`secrets` 不读取凭据对象、不暴露其存在性并写 `denied` 审计；mTLS 握手失败或 `secrets` 返回未认证错误（身份不在白名单）同为部署或身份配置错误，网关返回 `503` 并告警，身份不在白名单时 `secrets` 写 `denied` 审计；密钥库不可达、审计存储不可用与铸造的暂时性失败返回 `503` 并按退避重试；`ErrCredentialNotConfigured` 与 `ErrInvalidArgument` 是部署配置错误，返回 `503` 并告警，不随客户端重试恢复。
+- 凭据为不透明值，只在网关进程内存中持有至 `min(ExpiresAt, RecheckAt)`，不写入数据库或回放条目；之后的请求重新调用 `ExchangeCredential`，凭据对象的撤销因而在 `T_cred_recheck` 内对网关生效。
+- 换取失败的处置按 `secrets` 的错误分类：`ErrInvalidToken` 与 `ErrTokenExpired` 返回 `401`；`ErrTargetNotAuthorized` 是部署或身份配置错误，返回 `503` 并告警，`secrets` 不读取凭据对象、不暴露其存在性并写 `denied` 审计；mTLS 握手失败或 `secrets` 返回未授权错误（身份不在白名单）同为部署或身份配置错误，网关返回 `503` 并告警，身份不在白名单时 `secrets` 写 `denied` 审计；密钥库不可达、审计存储不可用与铸造的暂时性失败返回 `503` 并按退避重试；`ErrCredentialNotConfigured` 与 `ErrInvalidArgument` 是部署配置错误，返回 `503` 并告警，不随客户端重试恢复。
 - `secrets` 在换取与使用审计中关联 `run_id`、`generation` 与操作；本模块的审计记录同一组标识与 `request_id`。
 - 稳定承诺覆盖调用的输入标识、`Target` 的 `Kind`、`System` 与 `AuthMethod` 字段以及返回凭据的有效期；凭据格式由 `secrets` 定义，本模块不解析。
 
+### 对 connectorhub 的出口策略查询
+
+```go
+view, err := EgressPolicyQuery.AllowedHosts(ctx, runID) // AllowedHostsView{Revision, AllowedHosts}
+```
+
+- 本模块以 `llmgateway` SPIFFE 身份经 mTLS 调用，`llmgateway` 是该查询唯一允许的调用方；返回该运行实例当前出口策略的修订号与允许主机，与沙箱出口代理执行的是同一份出口策略。
+- 网关按 `run_id` 缓存查询结果不超过 `T_egress_view_cache`；只有含外联类服务端工具或 `mcp_servers` 的请求读取它，其余请求不调用该查询。
+- 查询失败（不可达、超时或暂时性错误）时，依赖它的请求返回 `503` 并按暂时性错误处置，不改用过期超过 `T_egress_view_cache` 的缓存，不放宽为不加限制；其余请求不受影响。允许主机为空时，外联类服务端工具的交集为空，`mcp_servers` 的任何主机都不在允许主机内，按服务端能力越界拒绝。
+- 稳定承诺覆盖 `AllowedHostsView` 的 `Revision` 与 `AllowedHosts` 字段；出口策略的生成与落地不经本模块。
+
 ## 依赖
 
-依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖 `runcontroller` 与 `secrets`，存储为 PostgreSQL，上游为 Anthropic API；`runcontroller` 不反向调用本模块。
+依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖 `runcontroller`、`secrets` 与 `connectorhub`，存储为 PostgreSQL，上游为 Anthropic API；`runcontroller` 与 `connectorhub` 不反向调用本模块。
 
 - `runcontroller`：[汇入契约](../../glossary.md)与代查询接口。在途请求事实、实例租约、完成与失败信号按[运行实例](../../glossary.md)写入，宿主侧分类请求不写在途请求事实与信号，也不参与实例租约；代查询用于请求准入，对宿主侧分类请求同样执行。这些调用都由本模块发起，`runcontroller` 不感知本模块。
 - `secrets`：运行实例令牌校验与 LLM 凭据换取；调用 `ExchangeCredential` 时以调用方身份认证，`Target.Kind=llm`。真实凭据只在本模块与上游之间使用，不跨越沙箱边界（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.ReportDenial` 写 `denied` 记录。
+- `connectorhub`：出口策略查询 `EgressPolicyQuery.AllowedHosts`，本模块以 `llmgateway` SPIFFE 身份经 mTLS 调用，`llmgateway` 是该查询唯一允许的调用方；只用于[服务端能力治理](#服务端能力治理)，返回该运行实例当前出口策略的 `Revision` 与 `AllowedHosts`。这是事件源模块之间的依赖，方向为 `llmgateway → connectorhub`，`connectorhub` 不依赖本模块。
 - PostgreSQL：`llm_request` 表与回放条目的持久化，提供唯一索引、行锁与状态 CAS。
 - Anthropic API：上游 LLM 服务。流式响应的 SSE 事件与 ping 保活事件按 Anthropic Messages API 的格式处理（[REF-anthropic-streaming](../../references.md)）；网关不定义上游协议。
 - OpenTelemetry：追踪与指标遵循 `gen_ai` 语义约定（[REF-otel-genai-semconv](../../references.md)），使一次请求在本地代理、网关与上游之间按同一条追踪关联。
 
-**边界**：本模块不依赖 `warden`、`connectorhub` 或 `sandboxprovider`。本地代理与网关之间是运行时 HTTP 调用，不是代码依赖；网关不读看守进程的工作区或投递意图日志。本模块不写 `runcontroller` 的表，所有控制面事实经汇入契约写入。
+**边界**：本模块不依赖 `warden` 或 `sandboxprovider`。本地代理与网关之间是运行时 HTTP 调用，不是代码依赖；网关不读看守进程的工作区或投递意图日志。本模块不写 `runcontroller` 的表，所有控制面事实经汇入契约写入。
 
 ## UML 图
 
@@ -151,12 +168,17 @@ sequenceDiagram
     participant G as LLM 网关
     participant S as secrets
     participant R as runcontroller
+    participant H as connectorhub
     participant U as Anthropic API
     A->>P: POST /v1/messages
     P->>P: 选定 mode，生成 request_id 与 request_hash
     P->>G: POST /v1/messages（令牌、request_id、request_hash、mode）
     G->>S: VerifyRunToken
     G->>R: Generations.Current
+    opt 含外联类服务端工具或 mcp_servers
+        G->>H: EgressPolicyQuery.AllowedHosts(run_id)
+        H-->>G: {Revision, AllowedHosts}
+    end
     G->>S: ExchangeCredential
     opt purpose=agent
         G->>R: SetRunFact{inflight_request}
@@ -174,7 +196,7 @@ sequenceDiagram
     G-->>P: 回放条目
 ```
 
-时序图固定下列顺序约束：`SetRunFact{inflight_request}` 在转发上游之前完成；同一上游事件先写入回放缓冲、再转发给本地代理，缓冲写入成功前不转发该事件；回放条目与 `llm_request.status` 在同一事务提交；唤醒信号在提交之后写入；取回只读取已提交的终态条目。图中省略本地代理向 `runcontroller` 发送 `llm.request.completed` 的出站流消息；它与网关的 `AppendWakeSignal` 命中同一阻塞条件，后到者在条件 UPDATE 中无效果。`ExchangeCredential` 与 `VerifyRunToken` 都经 `secrets`；`ExchangeCredential` 依赖 `VerifyRunToken` 已确认的 `run_id` 与代。图中以 Agent 进程发起的请求为例；看守进程经本地代理发起的宿主侧分类请求（`purpose=classifier`）走同一序列，省略两个 `opt` 片段中的汇入调用，本地代理也不为它发送 `llm.request.*`。
+时序图固定下列顺序约束：`SetRunFact{inflight_request}` 在转发上游之前完成；同一上游事件先写入回放缓冲、再转发给本地代理，缓冲写入成功前不转发该事件；回放条目与 `llm_request.status` 在同一事务提交；唤醒信号在提交之后写入；取回只读取已提交的终态条目。含外联类服务端工具或 `mcp_servers` 的请求在换取凭据之前经 `connectorhub` 读取允许主机，查询结果按 `run_id` 缓存不超过 `T_egress_view_cache`，其余请求不调用该查询。图中省略本地代理向 `runcontroller` 发送 `llm.request.completed` 的出站流消息；它与网关的 `AppendWakeSignal` 命中同一阻塞条件，后到者在条件 UPDATE 中无效果。`ExchangeCredential` 与 `VerifyRunToken` 都经 `secrets`；`ExchangeCredential` 依赖 `VerifyRunToken` 已确认的 `run_id` 与代。图中以 Agent 进程发起的请求为例；看守进程经本地代理发起的宿主侧分类请求（`purpose=classifier`）走同一序列，省略两个 `opt` 片段中的汇入调用，本地代理也不为它发送 `llm.request.*`。
 
 ### 在途请求与回放状态图
 
@@ -316,14 +338,26 @@ flowchart TD
 3. 令牌中的代不等于 `Current.Generation`、`Terminal` 为真或 `Fenced` 为真时拒绝：返回 `403`，计入旧代拒绝计数，不换取凭据、不写 `llm_request`、不写唤醒信号。
 4. 校验请求元数据：`request_id`、`request_hash` 与 `mode` 必填，`mode` 属于 `passthrough`、`hold` 闭集。缺失或越界返回 `400`。`x-castworks-purpose` 出现时取值必须为 `classifier`，`mode` 必须为 `passthrough`，请求体 `stream` 不得为真；不满足返回 `400` 并计入分类标记拒绝计数，规则见[宿主侧分类请求](#宿主侧分类请求)。
 
-令牌有效的条件与 `runcontroller` 的定义一致：`secrets` 的签名、过期时间与 `run_id` 校验通过；令牌中的代等于当前代；运行实例未进入终态；本代未被判定作废。令牌在请求准入之后过期不中断已准入的请求，已换取的凭据按其自身的 `ExpiresAt` 使用；新请求重新执行准入。代在请求期间递增时，已完成的上游调用不回滚，完成信号按请求登记时的代写入，由 `runcontroller` 按旧代拒绝并计数；旧代回放可由同一运行实例按 `request_id` 取回，新代同一 `request_hash` 按新请求登记。
+令牌有效的条件与 `runcontroller` 的定义一致：`secrets` 的签名、过期时间与 `run_id` 校验通过；令牌中的代等于当前代；运行实例未进入终态；本代未被判定作废。令牌在请求准入之后过期不中断已准入的请求，已换取的凭据在其 `min(ExpiresAt, RecheckAt)` 之内使用；新请求重新执行准入。代在请求期间递增时，已完成的上游调用不回滚，完成信号按请求登记时的代写入，由 `runcontroller` 按旧代拒绝并计数；旧代回放可由同一运行实例按 `request_id` 取回，新代同一 `request_hash` 按新请求登记。
+
+### 服务端能力治理
+
+本模块只解析 `purpose=agent` 与 `purpose=classifier` 请求体顶层的 `tools`、`mcp_servers`、`container` 字段与请求头 `anthropic-beta`，其余字段与请求头原样转发。允许主机取自 `connectorhub` 的 `EgressPolicyQuery.AllowedHosts(run_id)`（见[对 connectorhub 的出口策略查询](#对-connectorhub-的出口策略查询)），返回的 `AllowedHostsView{Revision, AllowedHosts}` 与沙箱出口代理执行的是同一份出口策略。规则穷举如下：
+
+- 外联类服务端工具（`web_fetch` 的各版本）：`allowed_domains` 改写为请求原值与该运行实例当前 `AllowedHosts` 的交集；请求未给 `allowed_domains` 时取 `AllowedHosts`；交集为空返回 `403` 并审计，不访问上游。
+- `mcp_servers`：每个服务器 URL 的主机必须属于 `AllowedHosts`，否则返回 `403` 并审计，不访问上游。
+- `web_search`：放行并审计其使用；部署配置 `llm_web_search_domain_filter` 可选施加域过滤，未配置时不限制检索域。
+- 服务端工具类型与 `anthropic-beta` 取值：各按部署配置的允许清单 `llm_server_tool_allowlist` 与 `llm_beta_allowlist` 放行，缺省清单包含所固定 Claude Code 版本实际使用的取值；清单外返回 `400` 并审计。上游新增的服务端能力须评估后加入清单。
+- `container`：只接受本运行实例此前响应中出现过的容器标识，网关按 `run_id` 记录；未知标识返回 `400` 并审计。
+
+这些拒绝不访问上游、不写 `llm_failed`，计数 `server_capability_denied` 并写审计。只有含外联类服务端工具或 `mcp_servers` 的请求读取允许主机查询；查询结果按 `run_id` 缓存不超过 `T_egress_view_cache`，查询失败时这类请求返回 `503`，其余请求不受影响。网关不暴露 `POST /v1/messages` 与 `GET /v1/requests/{request_id}` 之外的任何上游端点，Files、Batches 等路径返回 `404`。本地代理仍不解析请求体，网关的 `400` 与 `403` 由本地代理按客户端错误交还 Agent，不重发。
 
 ### 凭据换取与在途登记
 
 准入通过后，网关按以下顺序建立控制面可见的在途请求：
 
 1. 按运行实例限流。超限返回 `429`，不换取凭据、不登记、不产生上游调用。
-2. 以运行实例令牌与调用方身份调用 `ExchangeCredential`。换取失败按 `secrets` 的错误分类返回 `401` 或 `503`，不登记。凭据在 `ExpiresAt` 之前可复用于同一运行实例的后续请求；换取与复用都记审计。
+2. 以运行实例令牌与调用方身份调用 `ExchangeCredential`。换取失败按 `secrets` 的错误分类返回 `401` 或 `503`，不登记。凭据在 `min(ExpiresAt, RecheckAt)` 之前可复用于同一运行实例的后续请求；换取与复用都记审计。
 3. 插入 `llm_request` 行，`status=in_flight`，`gateway_instance` 取当前实例标识，`purpose` 取请求头 `x-castworks-purpose`，缺省为 `agent`；`lease_expires_at` 在 `purpose=agent` 时取登记时刻加 `InitialTTL`，在 `purpose=classifier` 时取登记时刻加 `T_classifier_timeout`。唯一索引 `(run_id, generation, request_hash)` 冲突时按已有行处置：已有行为 `completed`、`replayed` 或 `failed` 且 `reason≠registration_failed` 时直接返回回放条目；已有行为 `failed` 且 `reason=registration_failed` 时以 CAS 置回 `in_flight`（`gateway_instance` 与 `lease_expires_at` 按本次登记重写）并重新执行登记；已有行为 `in_flight` 且 `gateway_instance` 为当前实例时返回 `202` 与规范 `request_id`；属于另一存活网关实例时返回 `409`；`lease_expires_at < now()` 时先按回收规则删除该行再登记。唯一索引 `(run_id, request_id)` 冲突时返回 `422`，由本地代理重新生成标识后重发；该状态与 `409`（同一逻辑请求由另一存活网关实例持有）语义不同，本地代理不得对 `422` 执行取回或退避。上述情形都不新建上游调用。冲突处置与本次请求是否带分类标记无关；置回 `in_flight` 后是否写在途请求事实、是否参与实例租约、终态后是否写唤醒信号，都按已有行的 `purpose` 判定。
 4. `purpose=agent` 的行调用 `SetRunFact{inflight_request}`；`purpose=classifier` 的行跳过本步，直接进入步骤 5。`InFlightRequest` 的 `Kind` 为 `llm`，`Instance` 取当前网关实例标识，`InitialTTL` 取本次租约有效期。`runcontroller` 在同一事务写入 `source_request` 与 `source_lease`。调用失败时以 CAS 把刚插入的 `in_flight` 行置为 `failed`、写入 `reason=registration_failed` 与失败回放条目，返回 `503`，不转发上游，不写唤醒信号；已并发拿到 `202` 的调用方取回该失败条目，不会看到行被删除。回放存储不可用时行保持 `in_flight`，由回收规则删除。
 5. 开始向上游转发。`purpose=agent` 的请求自步骤 4 成功起计入本实例的在途请求事实，本实例存在在途请求事实期间周期调用 `RenewSourceLease`，最后一个在途请求事实关闭后停止调用（关闭条件见对 `runcontroller` 的汇入调用）。续租周期小于 `InitialTTL` 减去时钟余量；每次续租成功后以 `gateway_instance` 等于本实例、`status=in_flight`、`purpose=agent` 且 `lease_expires_at > now()` 为条件刷新 `lease_expires_at`，`lease_expires_at` 与 `source_lease.expires_at` 按同一 `InitialTTL` 与续租周期推进；已到期的行不因续租成功复活。`purpose=classifier` 的行不计入在途请求事实，不触发续租，也不随续租刷新，`lease_expires_at` 保持登记时的取值。`Instance` 对每次进程启动唯一，进程重启后不使用旧标识续租。
@@ -332,7 +366,7 @@ flowchart TD
 
 ### 上游转发与流式保活
 
-网关把请求体原样转发给 Anthropic API，只替换认证头为换取的真实凭据。响应按 Anthropic Messages API 的 SSE 格式处理：每个事件的 `event` 与 `data` 字段按原顺序转发，不合并事件、不重排事件、不改写内容事件。`ping` 事件按原顺序转发，用于维持本地代理与网关之间的连接；`ping` 不参与首 token 计时与用量统计。
+网关把请求转发给 Anthropic API：仅按[服务端能力治理](#服务端能力治理)解析并约束请求体顶层的 `tools`、`mcp_servers`、`container` 与请求头 `anthropic-beta`，其余字段与请求头原样转发，并把认证头替换为换取的真实凭据。响应按 Anthropic Messages API 的 SSE 格式处理：每个事件的 `event` 与 `data` 字段按原顺序转发，不合并事件、不重排事件、不改写内容事件。`ping` 事件按原顺序转发，用于维持本地代理与网关之间的连接；`ping` 不参与首 token 计时与用量统计。
 
 直通模式与缓存模式的差异只在本地代理；网关对两种模式执行相同的转发与回放写入，`mode` 只记录在 `llm_request` 与指标标签中。
 
@@ -388,6 +422,7 @@ flowchart TD
 - **限流**：在凭据换取与上游转发之前，按运行实例施加并发与速率限制，宿主侧分类请求与 Agent 的 LLM 请求计入同一限额。阈值由部署配置给出，本模块不定义默认值。超限返回 `429`，不换取凭据、不登记在途请求、不写唤醒信号。
 - **计费**：按上游响应的 `usage` 记录输入与输出 token，关联 `run_id`、`generation`、`request_id`、`model`、`mode` 与 `purpose`；宿主侧分类请求同样计入所属运行实例。用量随指标与审计记录导出；单价与结算规则不在本模块定义。
 - **审计**：记录凭据换取、代校验结果、分类标记拒绝、请求终态与失败原因，关联调用方身份、`run_id`、`generation`、`request_id`、`purpose` 与网关实例标识。审计记录不复制请求与响应正文；正文只在回放条目中按保留期保存。`secrets` 侧的凭据使用审计与网关的请求审计以 `run_id`、`generation`、操作与调用方身份关联；LLM 请求的操作固定为 `llm.request`，由本模块在 `Usage.Operation` 中传入。
+- **服务端能力拒绝计数**：服务端工具类型或 `anthropic-beta` 取值越界、`container` 标识未知、外联类服务端工具允许域交集为空与 `mcp_servers` 主机越界的拒绝按 `server_capability_denied` 计数，随同一 OpenTelemetry 指标周期导出。
 
 ## 错误与失败语义
 
@@ -400,6 +435,7 @@ flowchart TD
 | `request_id`、`request_hash` 或 `mode` 缺失或越界 | 客户端错误 | `400` | 无上游调用 | 不重试 |
 | `x-castworks-purpose` 取值不是 `classifier`，或带该标记的请求的 `mode` 不是 `passthrough`，或其请求体 `stream` 为真 | 客户端错误 | `400` | 无凭据换取、无上游调用；计入分类标记拒绝计数并审计 | 不重试 |
 | 请求模型不在部署映射中 | 客户端或部署配置错误 | `400` | 无凭据换取、无上游调用；告警 | 不重试 |
+| 服务端能力越界：服务端工具类型或 `anthropic-beta` 取值不在允许清单内、`container` 标识未知、外联类服务端工具的允许域交集为空、`mcp_servers` 主机不在允许主机内 | 客户端错误 | 清单外取值与未知容器 `400`；允许域交集为空或主机不在允许主机内 `403` | 无凭据换取、无上游调用；不写 `llm_failed`；计数 `server_capability_denied` 并审计 | 不重试 |
 | 同一 `request_hash` 在另一存活网关实例上处于 `in_flight` | 客户端错误 | `409` | 不新建上游调用；持有实例的租约已到期时先按回收规则删除再登记 | 不重试 |
 | `request_id` 已在运行实例内登记（跨代复用） | 客户端错误 | `422` | 无上游调用；由本地代理重新生成 `request_id` 后重发，不得按 `409` 取回 | 不重试 |
 | 限流 | 客户端错误 | `429` | 无凭据换取、无上游调用 | 不重试 |
@@ -478,3 +514,4 @@ flowchart TD
 | 限流、计费与审计 | 未实现 | — |
 | 时延直方图 | 未实现 | — |
 | 宿主侧分类请求的区别处置 | 未实现 | — |
+| 服务端能力治理与出口策略查询 | 未实现 | — |

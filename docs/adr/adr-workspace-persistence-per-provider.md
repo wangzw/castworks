@@ -4,7 +4,7 @@
 
 工作区必须在沙箱销毁与重建之间保留，各代沙箱以逐字一致的路径挂载，并承载 Agent 的会话状态（`CLAUDE_CONFIG_DIR`，[REF-claude-code-env-vars](../references.md)）与投递意图日志。会话状态与投递意图日志都需要同步写入的持久化语义：接受记录同步写入完成后才回 `Accepted` 并交给 Agent，消费记录同步写入完成后才发 `Consumed`；投递确认的级序见 [ADR-delivery-intent-log](adr-delivery-intent-log.md)。`durableDir` 配置下，工作区回退会连同会话记录一起回退。
 
-k8s 提供者的沙箱 Pod 由 agent-sandbox 的 Sandbox CR 管理（[REF-agent-sandbox](../references.md)）。共享文件系统（RWX）无挂接步骤、无节点亲和，预热 Pod 在创建时即可挂载项目根；块存储（RWO）有节点或可用区亲和，不能预绑定预热池，并发挂接与强制分离存在等待。共享文件系统没有 RWO 的单节点挂接限制；但 RWO 只限制挂接节点，不阻止同节点多个 Pod 或旧代沙箱写入，不能替代工作区租约；共享文件系统与块存储都由工作区租约串行化写者。
+k8s 提供者的沙箱 Pod 由 agent-sandbox 的 Sandbox CR 管理（[REF-agent-sandbox](../references.md)）。共享文件系统（RWX）无挂接步骤、无节点亲和，预热 Pod 在创建时即可获得工作区挂载点，认领时由节点侧组件绑定运行实例子目录，无需卷挂接；块存储（RWO）有节点或可用区亲和，不能预绑定预热池，并发挂接与强制分离存在等待。共享文件系统没有 RWO 的单节点挂接限制；但 RWO 只限制挂接节点，不阻止同节点多个 Pod 或旧代沙箱写入，不能替代工作区租约；共享文件系统与块存储都由工作区租约串行化写者。
 
 Substrate 提供者的 actor 只支持 `durableDir`、`external`（CSI 动态供给）、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷（[REF-substrate](../references.md)）。外部 CSI 卷写穿持久、崩溃不丢、沙箱外可经同一导出访问；`durableDir` 只在挂起时上传对象存储，actor 崩溃会丢失上次快照之后的全部写入，沙箱外没有读取接口。
 
@@ -30,16 +30,16 @@ Substrate 提供者的 actor 只支持 `durableDir`、`external`（CSI 动态供
 
 本决策使项目承担以下义务（穷举）：
 
-- k8s 提供者必须在每个沙箱与预热 Pod 上以逐字一致的路径挂载共享文件系统；块存储退化配置必须遵守节点或可用区亲和、挂接上限与强制分离等待。
+- k8s 提供者必须在每个沙箱与预热 Pod 内以逐字一致的路径挂载本运行实例的工作区子目录，挂载根不进入 Pod，挂载方式见 [ADR-per-run-workspace-mount](adr-per-run-workspace-mount.md)；块存储退化配置必须遵守节点或可用区亲和、挂接上限与强制分离等待。
 - 工作区写者必须以工作区租约串行化，与持久化方式无关（k8s 的共享文件系统与块存储、Substrate 的外部 CSI 卷与 `durableDir` 皆同）；租约续约失败时看守进程必须冻结或终止 Agent 进程树并上报。
 - Substrate 提供者必须优先使用外部 CSI 卷；`durableDir` 退化配置下，回合边界的销毁必须使用同步挂起，上传完成后才返回；回合中崩溃必须重投事件，已接受的事件带 `redelivery=true`。
 - 工作区必须承载 Agent 的会话状态与投递意图日志，会话状态与投递意图日志不得放在 rootfs；同步写入必须在 `Accepted`、`Consumed` 之前完成。
 - 沙箱外文件访问必须经入站路由到达看守进程的文件 API；它可能唤醒快照态或销毁态的 actor。
-- 共享文件系统必须满足目录权限、uid、配额与 `no_root_squash` 或等效的创建方式；Agent 二进制与依赖缓存放在镜像内，不放工作区。
+- 共享文件系统必须满足目录权限、uid 与配额；`no_root_squash` 只为[节点挂载代理](../glossary.md)以 root 创建运行实例子目录所需；Agent 二进制与依赖缓存放在镜像内，不放工作区。
 
 承担的代价穷举如下：
 
-- 共享文件系统是共享失败域，需要 RWX 存储；性能、配额与 `no_root_squash` 的安全约束由部署承担。
+- 共享文件系统是共享失败域，需要 RWX 存储；性能、配额与 `no_root_squash`（只对节点侧组件生效）的安全约束由部署承担。
 - 块存储退化配置有挂接与亲和限制，重建时延高于共享文件系统。
 - Substrate 的 `durableDir` 退化配置在崩溃时丢失上次快照之后的写入；同步挂起增加回合边界销毁的时延；沙箱外读取需要唤醒 actor。
 - Substrate 的外部 CSI 卷处于预览阶段，可用性、性能与沙箱外访问需要验证。

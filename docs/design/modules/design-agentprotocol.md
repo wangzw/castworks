@@ -20,7 +20,7 @@
 - **定义消息闭集与字段语义**：按方向穷举应用消息种类、字段与语义，定义共用的确认帧，约束字段取值闭集；消息种类不在当前协议版本闭集内的帧按协议违规处理。
 - **定义关闭状态闭集**：`Fenced`、可重试关闭、不可重试认证失败与 `Shutdown`；规定每种状态的触发、确认推进与看守进程动作，并与协议违规造成的传输终止相区分。
 - **协商协议版本**：按双方支持的连续版本区间选择版本，版本在协商完成后不变；版本决定信封字段、消息闭集与字段语义。
-- **定义出站流与入站端点契约**：出站流的服务端与客户端行为、两个方向的消息尺寸上限与附件引用；看守进程在 80 端口提供的 `/readyz`、`/wake` 与 `/terminal` 的路径与语义。
+- **定义出站流与入站端点契约**：出站流的服务端与客户端行为、两个方向的消息尺寸上限与附件引用；看守进程在 80 端口提供的 `/readyz`、`/wake`、`/terminal` 与 `/files` 的路径与语义，以及 `/terminal` 与 `/files` 的[接入票据](../../glossary.md)请求头与校验规则。
 - **提供共享库 API**：编码与解码、信封校验、重放缓冲、去重表、版本协商与会话抽象；链接方只经这些 API 收发协议消息，不自行解析信封。
 
 ### 非职责
@@ -29,8 +29,8 @@
 
 - 每条消息对运行实例状态机的作用、持久化点与效果记录归 `runcontroller`。本模块只把消息按序、去重后交给它。
 - 投递批的选择、`delivery_id`、`Accepted` 与 `Consumed` 的游标语义归 `runcontroller`。协议层的 `ack_msg_seq` 只确认消息已处理，不是投递确认（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
-- 沙箱的预配、挂起、解冻、快照、销毁与恢复触发归 `sandboxprovider`；`/readyz`、`/wake` 与 `/terminal` 的 HTTP 服务归看守进程，入站路由归 `sandboxprovider` 的提供者子模块。
-- 运行实例令牌的签发、签名校验、轮换与有效期归 `secrets`。本模块只承载 `resume_token` 与 `TokenRotate`，并定义认证失败的关闭状态。首个令牌与工作区租约的 `lease_id` 由看守进程经 `sandboxprovider` 的[引导接口](../../glossary.md)领取，不经过出站流。
+- 沙箱的预配、挂起、解冻、快照、销毁与恢复触发归 `sandboxprovider`；`/readyz`、`/wake`、`/terminal` 与 `/files` 的 HTTP 服务归看守进程，入站路由归 `sandboxprovider` 的提供者子模块。
+- 运行实例令牌的签发、签名校验、轮换与有效期归 `secrets`；接入票据的签发与公钥集合同样归 `secrets`。本模块只承载 `resume_token`、`TokenRotate` 的按受众令牌组、接入票据公钥集合与请求头常量，并定义认证失败的关闭状态。首个令牌组与工作区租约的 `lease_id` 由看守进程经 `sandboxprovider` 的[引导接口](../../glossary.md)领取，不经过出站流。
 - [沙箱侧配置](../../glossary.md)的生成归 `connectorhub`，按运行实例保存与发送时机归 `runcontroller`，应用归看守进程。本模块只承载 `SandboxConfig` 消息与 `Hello.sandbox_config_revision`，不解析配置内容。
 - [收件箱](../../glossary.md)、[唤醒信号](../../glossary.md)、[等待](../../glossary.md)、定时器、[订阅](../../glossary.md)、在途请求与自唤醒条目的持久化归 `runcontroller` 与事件源模块。本模块只承载 `Hello` 中的状态摘要、`Deliver` 中的投递批与 `self_wake_changed` 中的条目集合及其 `crons_synced`。
 - 本地代理与 LLM 网关之间的 HTTP、连接器与外部系统之间的 HTTP、MCP 工具调用都不归本模块；它们与出站流是并行的运行时调用。
@@ -99,10 +99,27 @@ type Session interface {
 
 func Negotiate(local VersionRange, peer int) (int, error)
 
+type HolderProof struct {
+    InstanceKey json.RawMessage // 实例公钥 JWK；RenewLease 的持有证明携带它
+    IAt         int64           // 签名时刻，Unix 秒
+    Sig         string          // 实例私钥对规范签名文本的 Ed25519 签名，base64url
+}
+
+func InstanceJKT(instanceKey json.RawMessage) (string, error)
+func HolderProofMessage(purpose string, id string, generation Generation, sandboxID string, iat int64) []byte
+func CanonicalJSON(v any) ([]byte, error)
+func ApprovalInputHash(toolInput json.RawMessage) (string, error)
+
 const (
     PathReadyz   = "/readyz"
     PathWake     = "/wake"
     PathTerminal = "/terminal"
+    PathFiles    = "/files"
+
+    HeaderAccessTicket = "x-castworks-access-ticket"
+
+    S_tool_input   = 1 << 20  // 1 MiB
+    S_tool_preview = 64 << 10 // 64 KiB
 )
 ```
 
@@ -111,8 +128,10 @@ const (
 - **去重表**：`SeenOrAdd` 以 `(generation, msg_seq)` 为键，区分已提交与已接收未提交：序号不高于已提交前缀时返回真，调用方只重发确认、不再派发；未提交的序号返回假，调用方派发，重放时重新派发，重复效果由应用层幂等吸收。`AckTo` 在消息处理事务提交后推进已提交前缀并删除不高于它的条目。去重表只保留未确认窗口内的条目，旧代条目随代变化丢弃。
 - **会话**：`Send` 在窗口未满时分配序号、写入重放缓冲并交给传输；`Receive` 完成信封校验、按序与去重后返回消息；`AckCommitted` 由链接方在处理事务提交后调用，库据此生成确认，有应用消息可搭载时搭载、没有时按周期发送确认帧；`Reconcile` 处理 `Hello` 与 `HelloAck`；`Close` 产生语义化关闭状态。
 - **版本协商**：`Negotiate` 以本地的连续支持区间与对端声明的版本计算共同版本；没有公共版本时返回错误，调用方终止连接。
+- **实例公钥指纹与[持有证明](../../glossary.md)**：`InstanceJKT` 对公钥 JWK 的成员 `crv`、`kty`、`x` 按键名排序、无空白序列化后求 SHA-256，再做 base64url 编码。[持有证明](../../glossary.md)的签名文本为 UTF-8 的 `castworks-holder-proof\n<用途>\n<标识>\n<generation>\n<sandbox_id>\n<iat>`：用途为 `hello` 时标识取 `run_id`，为 `renew` 时取 `lease_id`；`iat` 为 Unix 秒；`sig` 为实例私钥对该文本的 Ed25519 签名，base64url 编码；接收方要求 `|now − iat| ≤ T_proof_skew`（60 s）。`HolderProofMessage` 生成该文本，`InstanceJKT` 计算指纹。`Hello.holder_proof` 只携带 `{iat, sig}`，公钥由同帧的 `instance_key` 给出；`workspace.RenewLease` 的 `HolderProof` 另携带 `InstanceKey`，因为 `workspace` 只保存指纹 `holder_jkt`。
+- **规范 JSON 编码与[审批内容摘要](../../glossary.md)**：`CanonicalJSON` 对对象成员按键名的 Unicode 码点序排序，不输出空白，字符串只转义 JSON 要求转义的字符，数字解析为双精度后以最短往返十进制表示输出，数组保持顺序，结果按 UTF-8 编码。`ApprovalInputHash` 返回 `tool_input` 规范 JSON 编码的 SHA-256 小写十六进制，即[审批内容摘要](../../glossary.md)（协议字段 `input_hash`）；看守进程在首次 `PreToolUse` 与交付决定前使用同一函数，保证摘要可比（[ADR-approval-bound-to-tool-input](../../adr/adr-approval-bound-to-tool-input.md)）。
 
-稳定性承诺按接口类别给出。信封字段、消息名称、字段名称与取值闭集在同一个 `protocol_version` 内稳定；新增消息种类或改变既有字段语义必须递增协议版本。同一版本内可以新增可选字段，接收方忽略不认识的字段，不得据其改变既有语义。入站端点的路径与语义稳定；新增端点按扩展点的条件处理。库的公开签名稳定，链接方不依赖未导出的实现细节。库不引入任何业务模块的类型，`Message`、`HelloSummary` 与 `Frame` 以本模块定义的类型或字节载荷表达。
+稳定性承诺按接口类别给出。信封字段、消息名称、字段名称与取值闭集在同一个 `protocol_version` 内稳定；新增消息种类或改变既有字段语义必须递增协议版本。同一版本内可以新增可选字段，接收方忽略不认识的字段，不得据其改变既有语义。入站端点的路径与语义稳定，接入票据的请求头名称与校验规则随端点契约稳定；新增端点按扩展点的条件处理。库的公开签名稳定，链接方不依赖未导出的实现细节。库不引入任何业务模块的类型，`Message`、`HelloSummary` 与 `Frame` 以本模块定义的类型或字节载荷表达。
 
 ## 依赖
 
@@ -231,8 +250,8 @@ stateDiagram-v2
 
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
-| `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq`、`sandbox_config_revision` | 出站流首帧。以 `resume_token` 认证并声明代与工作区租约，提交状态摘要。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放；`sandbox_config_revision` 是看守进程已应用的[沙箱侧配置](../../glossary.md)版本，尚未应用为 0。 |
-| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor, agent_expected_ms}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms, agent_expected_ms}`、`bg_jobs_changed{job_ids}`、`self_wake_changed{entries, crons_synced}`、`intent_observed{ref_kind, ref, class, target, expected_ms, prior{p25, p50, p90}, source, confidence}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为事件；回合内事件的 `event_seq` 在同一回合内单调，用于丢弃重复与乱序事件；没有进行中回合时发出的事件，其 `turn_id` 与 `event_seq` 为空，见表后说明。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合（任务通知回合、会话内定时触发的回合）为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。`bg_jobs_changed` 与 `self_wake_changed` 携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换或合并 `cron` 条目，条目与发送时机见表后说明。`intent_observed` 报告驱动器观察到的[等待意图](../../glossary.md)，同一 `(ref_kind, ref)` 后到的覆盖先到的，字段越出闭集时由接收方丢弃并计数；`subscription_created` 与 `wait_started` 的 `agent_expected_ms` 是 Agent 自报的预计等待时长，与 `predicted_ms` 分开承载；字段、取值闭集与处理规则见表后说明。 |
+| `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`instance_key`、`holder_proof{iat, sig}`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq`、`sandbox_config_revision` | 出站流首帧。`resume_token` 取 `runcontroller` 受众的令牌；`instance_key` 为看守进程[实例密钥](../../glossary.md)的公钥 JWK；`holder_proof` 为以实例私钥对用途 `hello`、`run_id`、信封 `generation`、`sandbox_id` 与 `iat` 所作的[持有证明](../../glossary.md)。控制面要求 `instance_jkt(instance_key)` 等于令牌 `cnf.jkt`，`run.instance_jkt` 非空时三者相等，`lease.holder_jkt` 等于它，且签名与时窗有效，任一不满足以不可重试认证失败关闭。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放；`sandbox_config_revision` 是看守进程已应用的[沙箱侧配置](../../glossary.md)版本，尚未应用为 0。 |
+| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking, tool{name, input, input_preview, input_hash, input_size}}`、`subscription_created{sub_id, since_cursor, agent_expected_ms}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms, agent_expected_ms}`、`bg_jobs_changed{job_ids}`、`self_wake_changed{entries, crons_synced}`、`intent_observed{ref_kind, ref, class, target, expected_ms, prior{p25, p50, p90}, source, confidence}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为事件；回合内事件的 `event_seq` 在同一回合内单调，用于丢弃重复与乱序事件；没有进行中回合时发出的事件，其 `turn_id` 与 `event_seq` 为空，见表后说明。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合（任务通知回合、会话内定时触发的回合）为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。`bg_jobs_changed` 与 `self_wake_changed` 携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换或合并 `cron` 条目，条目与发送时机见表后说明。`intent_observed` 报告驱动器观察到的[等待意图](../../glossary.md)，同一 `(ref_kind, ref)` 后到的覆盖先到的，字段越出闭集时由接收方丢弃并计数；`subscription_created` 与 `wait_started` 的 `agent_expected_ms` 是 Agent 自报的预计等待时长，与 `predicted_ms` 分开承载；字段、取值闭集与处理规则见表后说明。 |
 | `WaitDeclared` | `wait_id`、`scope: run\|generation`、`conditions[{cond_id, kind, ref}]`、`deadline`、`safe_to` | 仅 L2 协作式 Agent 使用；沙箱内的 L2 进程驱动器经出站流发送，控制面循环驱动器经宿主 `runcontroller` 注入的事件入口提交同一组字段，由宿主调用 `RunService.DeclareWait`。向控制面追加显式等待条件。`kind=timer` 的条件必须引用已存在且同范围的 `timer` 行，否则整条声明被拒绝并计数；带 `deadline` 时登记同范围的 `declared_deadline` 定时器。 |
 | `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`timed_sleepers{known_earliest_expiry, unknown}`、`mcp_procs`、`throttled_usec`、`cpu_usage_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`llm_last_request_at`、`llm_last_retryable_failure_at`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`procs` 计 Agent 进程树的全部进程；`mcp_procs` 为其中已声明的第三方 MCP 服务器进程及其子进程的数量；`procs` 各态计数之和减 `mcp_procs` 为 Agent 主进程与其他进程的数量，控制面据此判定进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外是否还有其他进程。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。`psi`、`cpu_usage_usec`、`timed_sleepers` 与两个 LLM 时刻字段的取值见表后说明，它们作为忙信号的解释归 [suspendpolicy](design-suspendpolicy.md)。 |
 | `Accepted` | `delivery_id`、`through_seq`、`fed` | 接受记录同步写入[工作区](../../glossary.md)[投递意图日志](../../glossary.md)后才发送。`fed` 报告本批按日志去重后是否仍有事件喂给 Agent；`fed=false` 时不为本批启动 Agent，控制面不转 `InTurn`。 |
@@ -249,6 +268,7 @@ stateDiagram-v2
 | `ToolExecResponse` | `exec_id`、`status`、`exit_code`、`result`、`error` | 工具执行请求的终态应答；`status` 取 `completed`、`failed`、`cancelled`，`error` 只在失败时非空。按 `(run_id, generation, exec_id)` 匹配请求。 |
 | `ToolExecData` | `exec_id`、`stream: stdout\|stderr`、`offset`、`data`、`eof` | 工具执行输出分片；`offset` 从该流起点计，接收方按偏移续传，重复或乱序分片被丢弃。`eof` 表示该流结束。 |
 
+- `permission_requested.tool` 携带待批工具调用的内容与[审批内容摘要](../../glossary.md)：`name` 为工具名；`input_size` 为工具输入规范 JSON 编码的字节数；`input_size ≤ S_tool_input`（1 MiB）时 `input` 为完整规范 JSON，`input_preview` 为空；超过时 `input` 为空，`input_preview` 为规范编码的前 `S_tool_preview`（64 KiB）字节，呈现时明示截断，`input_hash` 仍对完整内容计算。`Validate` 要求 `input` 与 `input_preview` 恰有一个非空，且 `input_size` 与 `input_hash` 同所携带的内容相符；不一致的帧不派发。
 - `session_epoch` 由看守进程按进程启动生成，用于识别同一代内看守进程的重启，不参与失效判定；失效判定只以 `generation` 为依据。
 - `agent_state.phase` 的取值为 `starting`、`in_turn`、`blocked`、`boundary`、`exited`；`blocked_on` 与 `turn_id` 描述回合位置，`blocked_on` 为空或为 `{kind, ref, call_id, since, predicted_ms, agent_expected_ms, mode}`，`kind` 取 `llm`、`timer`、`approval`、`wait_for`，字段语义与 `runcontroller` 的 `run.blocked_on` 列相同；新代 `Hello` 的 `session_id` 只用于核对，不改写控制面的恢复句柄。
 - `cursor_accepted` 与 `cursor_consumed` 只计常规投递的已接受与已消费前缀，不含定向投递与回合边界续接。
@@ -271,7 +291,7 @@ stateDiagram-v2
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
 | `HelloAck` | `accepted \| fenced{current_generation}`、`desired_state{running\|frozen}`、`last_received_msg_seq`、`cursor_accepted`、`owner_epoch`、`live_attached`、`live_as_of` | `Hello` 的应答。`accepted` 表示所有权已接管并完成状态对账；`fenced{current_generation}` 表示代已过期；认证失败不回 `HelloAck`。`desired_state` 让看守进程对齐 Agent 进程树的冻结状态；`last_received_msg_seq` 让看守进程裁剪重放缓冲并从其后重放；`cursor_accepted`、`owner_epoch`、`live_attached` 与 `live_as_of` 是状态对账字段。 |
-| `Deliver` | `delivery_id`、`batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`、`through_seq`、`target: next_user_message \| tool_result{call_id} \| permission_decision{id}`、`resume_session_id` | 只在出站流上，投递语义为至少一次。`batch` 按 `inbox_seq` 升序，`through_seq` 为批内最后一条；`subkind` 只在 `kind=internal_notice` 时非空，取值为 `turn_interrupted`、`timer_due`、`degraded_summary` 或 `delivery_abandoned`；`target` 决定喂入 Agent 的方式；`resume_session_id` 为空表示新会话；`payload` 超过 `S_max` 时以附件引用表达。 |
+| `Deliver` | `delivery_id`、`batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`、`through_seq`、`target: next_user_message \| tool_result{call_id} \| permission_decision{id, input_hash}`、`resume_session_id` | 只在出站流上，投递语义为至少一次。`batch` 按 `inbox_seq` 升序，`through_seq` 为批内最后一条；`subkind` 只在 `kind=internal_notice` 时非空，取值为 `turn_interrupted`、`timer_due`、`degraded_summary` 或 `delivery_abandoned`；`target` 决定喂入 Agent 的方式，`permission_decision.input_hash` 取待决审批保存的[审批内容摘要](../../glossary.md)，看守进程交付决定前对当前工具输入重算并比对，不等时拒绝该次调用；`resume_session_id` 为空表示新会话；`payload` 超过 `S_max` 时以附件引用表达。 |
 | `StartAgent` | `resume_session_id` | 以恢复句柄启动 Agent 主进程，不写入任何输入；Agent 进程已在运行时为空操作，重复与重放的 `StartAgent` 因而幂等。由 `runcontroller` 以 `send` 效果发出，用于本代 Agent 进程未运行而自唤醒条目非空的回合边界；`resume_session_id` 取落库的恢复句柄。以它启动的进程处于回合边界，Agent 续接会话后自行恢复会话内定时，到点时自行开始回合，该回合的 `turn_started.delivery_id` 为空。启动同样受「首次应用沙箱侧配置之前不启动 Agent 主进程」约束；新代看守进程在收到首个 `Deliver` 或 `StartAgent` 之前不启动 Agent 主进程。 |
 | `PrepareSuspend` | `suspend_id`、`mode: freeze\|freeze_shrink\|snapshot\|destroy`、`variant: cgroup\|signal`、`deadline`、`self_wake_cutoff`、`require{process_exit, no_bg_procs, no_ws_write_fds, sync}` | 请求看守进程满足挂起前置条件。`variant` 只在冻结类模式（`freeze`、`freeze_shrink`）时非空；`self_wake_cutoff` 是绝对时刻，只在 `mode=destroy` 时非空，取 `now − (L_self_wake(destroyed) + P_quiesce)`（`now` 为写入时刻），即 `destroyed` 形态下有效自唤醒条目的界限，由 `runcontroller` 在「发起挂起」与升级为销毁的「冻结中升级」中写入，与挂起尝试一同落库，重发同一 `suspend_id` 的 `PrepareSuspend` 时取同一值；看守进程复核安全点时，「自唤醒条目都随续接恢复」一步只检查 `fire_at` 为空或不早于 `self_wake_cutoff` 的条目中是否存在 `survives_resume=false` 的项，与控制面 I9 预检只看有效自唤醒条目与 `fire_at` 为空的条目的口径一致（复核步骤见 [Claude Code 驱动器](warden/design-warden-driver-claude-code.md)）；`require` 列出必须满足的条件，任一不满足时看守进程回 `Busy`；看守进程不为满足前置条件而终止进程，唯一的例外是 `mode=destroy` 时在 Agent 主进程正常退出之后终止已声明的第三方 MCP 服务器（含其子进程，见 [warden](warden/design-warden.md)）；后台作业、残留进程与孤儿进程都不终止，`process_exit` 只由 Agent 主进程的正常退出满足；`deadline` 用于对账器重驱动。 |
 | `CancelSuspend` | `suspend_id` | 撤销挂起尝试。确认载体为 `Busy{suspend_id, reason=cancelled}`；看守进程已越过不可撤销点时照常回 `ReadyToSuspend`。 |
@@ -280,7 +300,7 @@ stateDiagram-v2
 | `LiveState` | `attached`、`as_of` | [实时接入](../../glossary.md)状态推送；`as_of` 单调，看守进程只接受更新的值。`HelloAck` 携带同一对字段。 |
 | `Shutdown` | `graceful`、`reason`、`deadline` | 本代作废或运行实例已终态时关闭流；`graceful` 决定关闭 stdin 让 Agent 正常退出，还是强制终止；`deadline` 取发出时刻加 `T_shutdown_grace`。 |
 | `Fenced` | `current_generation` | 已建立的流上收到旧代非 `Hello` 消息时应答，每条流每个旧代一次，随后关闭该流。看守进程停止投递与副作用，强制终止 Agent 进程树。 |
-| `TokenRotate` | `token` | 轮换运行实例令牌。看守进程收到后用于 LLM 网关与连接器请求；令牌已过期而重连时，收到它之前不发起这类请求。 |
+| `TokenRotate` | `tokens`、`token_expires_at`、`access_ticket_keys` | 轮换运行实例令牌组与接入票据公钥集合。`tokens` 与领取响应相同，为按受众为键的对象 `{runcontroller, llmgateway, connectorhub, humanchannel, egress}`，同 `run_id`、同代、同 `exp`、同 `cnf.jkt`，`cnf.jkt` 与轮换前相同；`access_ticket_keys` 为接入票据的公钥集合。看守进程收到后按受众替换各令牌，此前不向对应服务发起需要运行实例令牌的请求；令牌已过期而重连时，收到它之前不发起这类请求。 |
 | `SandboxConfig` | `revision`、`config` | 推送[沙箱侧配置](../../glossary.md)。`config` 是 `connectorhub` 生成的 `{modes, tool_profile, wait_signatures, intent{hints, classifier}}` 的序列化字节，不含密钥，凭据只以占位符出现，序列化后不超过 32 KiB；其中 `wait_signatures` 是该运行实例可用外部系统的[等待签名](../../glossary.md)，`intent.hints` 与 `intent.classifier` 分别是情境提示与宿主侧分类的开关；这两项与其余各项一样由 `connectorhub` 生成，由看守进程应用。本模块按字节原样传输、不解析，内容无法解析不构成协议违规。`revision` 取同一次生成的 `EgressPolicy.Revision`，单调递增。控制面只在下列时机发出：被接受的 `Hello`（[runcontroller](design-runcontroller.md) 的「销毁态连接」除外）在 `run.sandbox_config_revision` 大于 `Hello.sandbox_config_revision` 时，于 `HelloAck` 之后随应答在同一流上发出；`PutSandboxConfig` 提高 `revision` 且本代沙箱有已接受的出站流时，由控制面在该流上发出。运行实例挂起或没有已接受的出站流时只保存，下一次被接受的 `Hello` 时补发。消息沿用出站流的确认与重放，看守进程按 `revision` 幂等应用，小于等于已应用版本的忽略；首次应用之前不启动 Agent 主进程，应用规则见 [warden](warden/design-warden.md)。 |
 | `ToolExecRequest` | `exec_id`、`op: exec\|read_file\|write_file\|stream\|list_jobs\|get_job\|terminate_job`、`args`、`deadline` | 工具执行请求。由链接进 `runcontroller` 的控制面循环驱动器发起，经本运行实例的出站流转发；`exec_id` 在同一代内唯一，`args` 与截止时间按操作定义。 |
 | `ToolExecCancel` | `exec_id` | 取消一次工具执行或输出流；看守进程按 `exec_id` 幂等，已结束的执行返回已完成。 |
@@ -288,6 +308,24 @@ stateDiagram-v2
 `HelloAck` 的 `last_received_msg_seq` 是控制面已处理的看守进程消息序号，与 `Hello` 的 `last_received_msg_seq` 方向相反；两者都只用于裁剪重放缓冲与启动对账，不替代投递游标。
 
 `ToolExec` 帧由 `runcontroller` 在进程内从控制面循环驱动器接收后写入该运行实例的出站流，并以同一 `(run_id, generation, exec_id)` 把响应与数据帧交回驱动器。控制面循环驱动器不持有运行实例令牌、不发送 `Hello`，也不建立第二条协议会话；帧的认证由出站流承担，代与终态由 `runcontroller` 在写入前复核。`ToolExec` 帧不进入投递、唤醒谓词或运行实例状态机。
+
+### 实例密钥与持有证明
+
+看守进程在启动后、领取之前生成 Ed25519 的[实例密钥](../../glossary.md)对，私钥只在进程内存，快照恢复沿用，不写入任何文件或日志。公钥以 JWK 形式随 `Hello.instance_key` 与引导领取请求体提交；公钥指纹 `instance_jkt` 按 `InstanceJKT` 计算，写入运行实例令牌的 `cnf.jkt` 与工作区租约的 `holder_jkt`。[持有证明](../../glossary.md)的签名文本与校验规则见外部接口契约中 `HolderProofMessage` 与 `HolderProof` 的说明；`Hello` 的 `holder_proof` 只携带 `{iat, sig}`，公钥取同一帧的 `instance_key`。
+
+### 审批内容与摘要
+
+`permission_requested.tool` 的字段为闭集：
+
+| 字段 | 语义 |
+| --- | --- |
+| `name` | 工具名 |
+| `input` | 完整工具输入的规范 JSON；`input_size ≤ S_tool_input`（1 MiB）时非空 |
+| `input_preview` | 规范编码的前 `S_tool_preview`（64 KiB）字节；超过 `S_tool_input` 时非空，呈现时明示截断 |
+| `input_hash` | [审批内容摘要](../../glossary.md)：完整工具输入规范 JSON 编码的 SHA-256 小写十六进制 |
+| `input_size` | 规范编码的字节数 |
+
+规范 JSON 编码与摘要的计算见外部接口契约中 `CanonicalJSON` 与 `ApprovalInputHash` 的说明。`input` 与 `input_preview` 恰有一个非空；摘要始终对完整内容计算，超限时呈现的截断预览不参与摘要。`permission_requested` 所在的所有者事务把 `tool` 写入 `runcontroller` 的待决审批记录，`permission_decision{id, input_hash}` 的 `input_hash` 取该记录保存的摘要。
 
 ### 入站端点契约
 
@@ -297,9 +335,14 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `/readyz` | [沙箱提供者](../../glossary.md)的唤醒探针、k8s 的就绪探针 | 就绪探针，不以领取为条件。看守进程尚未领取时，可服务即返回就绪；领取之后，k8s 路径上看守进程可服务且出站流已建立时返回就绪，否则返回未就绪；Substrate 路径上可服务即返回就绪，不以出站流为条件 | 无请求体与事件内容 |
 | `/wake` | `sandboxprovider`：Substrate 路径的快照恢复经路由器调用，k8s 路径的预热认领经 wake-router 调用 | 看守进程已领取时为恢复触发入口，返回即表示出站流已重建；尚未领取时为领取通知，看守进程先经[引导接口](../../glossary.md)领取，再建立出站流，出站流建立之后返回。调用幂等，并发的重复调用合并 | 无事件内容，不返回投递批 |
-| `/terminal` | `humanchannel` 完成用户身份校验后的终端接入，经入站路由 | 人类 shell 终端接入；建立后为双向字节流；看守进程领取成功之前返回 503，不启动 shell | 不承载协议消息、收件箱事件或投递批 |
+| `/terminal` | `humanchannel` 完成用户身份校验并签发接入票据后的终端接入，经入站路由 | 人类 shell 终端接入；建立后为双向字节流；看守进程领取成功之前返回 503，不启动 shell | 请求头 `x-castworks-access-ticket` 携带接入票据；不承载协议消息、收件箱事件或投递批 |
+| `/files` | `humanchannel` 把接入票据放进 `FileAccess` 请求的 `Ticket`、由 `workspace` 原样转发的读取请求，经入站路由 | 文件 API 的列表、读取、下载与流式读取；路径限定在运行实例子目录内；看守进程领取成功之前返回 503 | 请求头 `x-castworks-access-ticket` 携带接入票据；不承载协议消息、收件箱事件或投递批 |
 
-`/readyz` 不以领取为条件：看守进程尚未领取时可服务即返回就绪，尚未领取的沙箱实例（例如 k8s 的预热 Pod 与 Substrate 构建[模板快照](../../glossary.md)的 actor）据此通过探针。领取之后，k8s 路径的就绪状态以出站流为准：流未建立或握手未完成时返回未就绪，使提供者与探针不把流量送入尚未接通的看守进程。Substrate 路径的 `/readyz` 是 `wakeupProbe`，不以出站流为条件：看守进程到控制面的连接经 Substrate 出口网关，出口网关只接受运行态 actor 的连接，而 `ResumeActor` 在探针返回 200 之后才把 actor 置为运行态；快照恢复的出站流在此之后重建，路由器随后转发的 `/wake` 等出站流重建完成再返回。`/wake` 在出站流建立或重建完成之前不得返回成功。快照恢复路径上的调用失败由提供者按恢复失败处理；预热认领路径上的调用只作通知，提供者不等待其返回，调用失败由看守进程的退避领取兜底。`/terminal` 的接入身份由 `humanchannel` 校验，看守进程只接受已通过入站路由的请求。
+`/terminal` 与 `/files` 以[接入票据](../../glossary.md)端到端认证。票据由 `secrets` 应 `humanchannel` 申请签发，是短期一次性 JWT，经请求头 `x-castworks-access-ticket` 传递：`humanchannel` 建立 `/terminal` 时直接携带；文件读取时把票据放进 `workspace` 的 `FileAccess` 请求的 `Ticket`，由 `workspace` 原样转发到 `/files`；wake-router 与 Substrate 路由器原样转发。票据头部为 `{alg: EdDSA, kid, typ: castworks-access-ticket}`，载荷为 `{aud: warden, sub: <平台用户标识>, project_id, run_id, generation, channel, iat, exp, jti}`，`channel ∈ {terminal, file}`，`exp − iat ≤ T_access_ticket`（60 s），每个入站请求一张。公钥集合由引导响应与 `TokenRotate.access_ticket_keys` 下发；新签名密钥加入公钥集合不少于两个运行实例令牌有效期之后才用于签发，停止签发的旧密钥在集合中保留不少于 `T_access_ticket`。
+
+看守进程对每一张票据的校验穷举为：`alg`、`typ` 正确；`kid` 在公钥集合中且签名有效；`aud=warden`；`run_id`、`generation` 等于本沙箱；`channel` 与端点相符（`/terminal` 对应 `terminal`，`/files` 对应 `file`）；未过期且 `exp − iat ≤ T_access_ticket`；`jti` 未出现过（记录到 `exp`）。任一项不通过时返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；`sub` 写入终端审计。租约持有者核对与 `file` 通道的实时接入要求照常执行（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)）。
+
+`/readyz` 不以领取为条件：看守进程尚未领取时可服务即返回就绪，尚未领取的沙箱实例（例如 k8s 的预热 Pod 与 Substrate 构建[模板快照](../../glossary.md)的 actor）据此通过探针。领取之后，k8s 路径的就绪状态以出站流为准：流未建立或握手未完成时返回未就绪，使提供者与探针不把流量送入尚未接通的看守进程。Substrate 路径的 `/readyz` 是 `wakeupProbe`，不以出站流为条件：看守进程到控制面的连接经 Substrate 出口网关，出口网关只接受运行态 actor 的连接，而 `ResumeActor` 在探针返回 200 之后才把 actor 置为运行态；快照恢复的出站流在此之后重建，路由器随后转发的 `/wake` 等出站流重建完成再返回。`/wake` 在出站流建立或重建完成之前不得返回成功。快照恢复路径上的调用失败由提供者按恢复失败处理；预热认领路径上的调用只作通知，提供者不等待其返回，调用失败由看守进程的退避领取兜底。`/terminal` 与 `/files` 的接入身份由接入票据承载，校验规则见上；看守进程只接受已通过入站路由的请求。
 
 ### 消息尺寸与附件引用
 
@@ -413,7 +456,7 @@ sequenceDiagram
     participant P as 沙箱提供者
     participant X as 外部系统
     A->>W: 平台 MCP 工具 subscribe_event expected_wait=20m
-    W->>C: 登记订阅（运行时 HTTP，附运行实例令牌）
+    W->>C: 登记订阅（运行时 HTTP，附 `connectorhub` 受众令牌）
     C-->>W: sub_id=sub-9
     W->>R: AgentEvent subscription_created sub_id=sub-9 agent_expected_ms=1200000 msg_seq=22 ack_msg_seq=45
     R->>R: 处理事务提交，确认推进到 22
@@ -454,7 +497,7 @@ sequenceDiagram
     participant R as 控制面 runcontroller
     participant P as 沙箱提供者
     A->>W: PreToolUse hook 请求审批
-    W->>R: AgentEvent permission_requested id=p-1 blocking=false msg_seq=24 ack_msg_seq=46
+    W->>R: AgentEvent permission_requested id=p-1 blocking=false tool{name, input_hash=h-1} msg_seq=24 ack_msg_seq=46
     W-->>A: hook 返回 defer
     W->>R: AgentEvent turn_ended reason=tool_deferred msg_seq=25 ack_msg_seq=46
     R->>R: 处理事务提交，确认推进到 25
@@ -469,14 +512,14 @@ sequenceDiagram
     R->>W: HelloAck accepted msg_seq=0 ack_msg_seq=0 cursor_accepted=10
     R->>W: SandboxConfig revision=3 msg_seq=1 ack_msg_seq=0
     W->>W: 应用沙箱侧配置 revision=3
-    R->>W: Deliver delivery_id=d-5 through_seq=11 target=permission_decision{id=p-1} resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
+    R->>W: Deliver delivery_id=d-5 through_seq=11 target=permission_decision{id=p-1, input_hash=h-1} resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
     W-->>R: Accepted delivery_id=d-5 through_seq=11 fed=true msg_seq=1 ack_msg_seq=2
     W->>A: 以 resume_session_id 续接，hook 取回决定
     A-->>W: turn_started
     W->>R: AgentEvent turn_started delivery_id=d-5 msg_seq=2 ack_msg_seq=2
 ```
 
-图固定回合边界续接的定向投递：`target=permission_decision{id}`，`resume_session_id` 为上一代落库的恢复句柄。定向投递不推进 `cursor_accepted`，其消费只写入投递意图日志、不发送 `Consumed`。决定在销毁之前到达时，`Deliver` 在同一代的已建立流上发送，序号与重放规则不变；决定在销毁之后到达时，按图示在新代发送。运行实例状态机的转移与持久化字段见 [runcontroller](design-runcontroller.md)。
+图固定回合边界续接的定向投递：`target=permission_decision{id, input_hash}`，`input_hash` 为待决审批保存的[审批内容摘要](../../glossary.md)，`resume_session_id` 为上一代落库的恢复句柄。定向投递不推进 `cursor_accepted`，其消费只写入投递意图日志、不发送 `Consumed`。决定在销毁之前到达时，`Deliver` 在同一代的已建立流上发送，序号与重放规则不变；决定在销毁之后到达时，按图示在新代发送。运行实例状态机的转移与持久化字段见 [runcontroller](design-runcontroller.md)。
 
 ### 场景：等人并销毁重建
 
@@ -595,7 +638,7 @@ sequenceDiagram
 
 | 情形 | 关闭状态 | 产生方 | 触发与判定 | 看守进程动作 | 确认与重放 |
 | --- | --- | --- | --- | --- | --- |
-| `Hello` 的令牌签名或 `run_id` 无效，或令牌中的代与信封 `generation` 不符 | 不可重试认证失败 | 控制面 | `Hello` 公共校验 | 停止重连并上报；不再发送协议消息 | 不回 `HelloAck`、不携带当前代；不重放 |
+| `Hello` 的令牌签名、受众或 `run_id` 无效，令牌中的代与信封 `generation` 不符，持有证明无效，实例公钥指纹不一致，或令牌到期时刻低于接受下界 | 不可重试认证失败 | 控制面 | `Hello` 公共校验（到期接受规则见 [runcontroller](design-runcontroller.md) 的 Hello 处理） | 停止重连并上报；不再发送协议消息 | 不回 `HelloAck`、不携带当前代；不重放 |
 | `Hello.generation` 与当前代不符 | `HelloAck.fenced{current_generation}` | 控制面 | 代校验 | 停止投递与副作用，强制终止 Agent 进程树，停止重连 | 不重放 |
 | 已建立流上的非 `Hello` 消息的 `generation` 与当前代不符 | `Fenced{current_generation}` | 控制面 | 失效判定；每条流每个旧代一次 | 停止投递与副作用，强制终止 Agent 进程树，停止重连 | 不推进确认；不重放 |
 | 运行实例已终态 | `Shutdown{graceful=false}` | 控制面 | `Hello` 或消息处理前 | 停止；不再重连 | 不推进确认 |
@@ -607,7 +650,7 @@ sequenceDiagram
 | 重复的 `(generation, msg_seq)` | 无关闭 | 接收方 | 去重表 | 继续正常收发 | 已提交的不重复派发；未提交的重放重新派发；确认不回退 |
 | 低于已发送确认的迟到帧 | 无关闭 | 接收方 | 序号校验 | 继续正常收发 | 丢弃并保持确认 |
 
-语义化关闭与协议违规的区别：关闭状态是对端可据此决定停止或重连的信号；协议违规不产生关闭状态消息，连接被终止并计数，需按部署缺陷处理。可重试关闭可经重连与重放恢复；`Fenced` 表示代已过期，重连不会恢复该代。`intent_observed` 的等待意图字段是字段闭集校验的例外：等待意图只作软输入（[ADR-wait-intent-as-soft-input](../../adr/adr-wait-intent-as-soft-input.md)），丢弃一条事件只影响等待时长预测与宽限期选择，传输与运行实例状态机照常进行。
+入站端点的接入票据校验失败不产生关闭状态：看守进程返回 401、不启动 shell、不读文件，计数 `access_ticket_rejected`，规则见入站端点契约。语义化关闭与协议违规的区别：关闭状态是对端可据此决定停止或重连的信号；协议违规不产生关闭状态消息，连接被终止并计数，需按部署缺陷处理。可重试关闭可经重连与重放恢复；`Fenced` 表示代已过期，重连不会恢复该代。`intent_observed` 的等待意图字段是字段闭集校验的例外：等待意图只作软输入（[ADR-wait-intent-as-soft-input](../../adr/adr-wait-intent-as-soft-input.md)），丢弃一条事件只影响等待时长预测与宽限期选择，传输与运行实例状态机照常进行。
 
 ## 并发与事务边界
 
@@ -639,7 +682,7 @@ sequenceDiagram
 
 ### 新增入站端点
 
-新增入站端点须满足：不承载协议消息与投递事件；声明调用方身份与幂等语义；路径与语义加入入站端点契约；由 `sandboxprovider` 的入站路由按提供者路径转发。端点需要唤醒沙箱时，返回时机必须晚于出站流重建与 `Hello` 对账；端点需要传输事件内容时，应改为出站流消息，不在入站端点扩展。
+新增入站端点须满足：不承载协议消息与投递事件；声明调用方身份与幂等语义；路径与语义加入入站端点契约；由 `sandboxprovider` 的入站路由按提供者路径转发；以接入票据认证的端点须声明 `channel` 取值，并在校验中加入该端点对应的通道。端点需要唤醒沙箱时，返回时机必须晚于出站流重建与 `Hello` 对账；端点需要传输事件内容时，应改为出站流消息，不在入站端点扩展。
 
 ## 实现状态
 
@@ -653,3 +696,4 @@ sequenceDiagram
 | 协议版本协商 | 未实现 | — |
 | 出站流服务端与客户端适配层 | 未实现 | — |
 | 入站端点契约 | 未实现 | — |
+| 实例密钥、持有证明与审批内容摘要 | 未实现 | — |

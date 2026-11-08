@@ -35,7 +35,9 @@ cgroup v2 提供 `cgroup.freeze` 接口（[REF-linux-cgroup-v2](../references.md
 本决策使项目承担以下义务（穷举）：
 
 - 沙箱节点池必须允许特权 DaemonSet 并授予其访问容器运行时的权限；每个节点一个节点冻结代理 Pod。
-- 看守进程必须以停止态启动 Agent 主进程，并与节点冻结代理协调把它移入 `agent` 子 cgroup 后再继续；后续 fork 必须继承该子 cgroup。
+- 看守进程以运行实例 uid 直接启动的进程（例如 Agent 主进程与终端 shell）必须以停止态启动，经节点冻结代理的 `AdoptAgent` 入口进入 `agent` 子 cgroup 后再继续；后续 fork 必须继承该子 cgroup；移入被拒绝或不可达时，该进程不得继续执行。
+- 节点冻结代理的 `Freeze`、`Thaw` 与 `AdoptAgent` 入口都必须做调用方认证与目标授权。`Freeze` 与 `Thaw` 只接受 `sandboxprovider` 以 SPIFFE 身份（[REF-spiffe](../references.md)）发起的 mTLS 调用（[ADR-control-plane-call-authentication](adr-control-plane-call-authentication.md)），并核对目标 Pod 位于本节点、属于沙箱且代与请求一致。`AdoptAgent` 只经按 Pod 的 Unix 域套接字提供，以对端凭据与 cgroup 反查确认调用方是本容器的 PID 1 且为 root，只操作调用方自身所在的容器，只核验并移入调用方的直接子进程。
+- cgroup 路径只由节点冻结代理经容器运行时解析，不接受调用方给出的路径；节点冻结代理只写 `agent` 子 cgroup 的 `cgroup.freeze`。
 - 探针只配置在看守进程上；看守进程自身不得被冻结；preStop 必须先解冻再终止，否则 SIGTERM 会送给冻结进程。
 - 冻结、解冻与原地缩小 CPU request 必须以 `freeze_id` 幂等；已执行过解冻的 `freeze_id` 之后到达的冻结与缩小请求不得生效。
 - 冻结态的 Pod 必须标注 `safe-to-evict=false`（[REF-cluster-autoscaler-faq](../references.md)），但节点内存压力下仍可能被驱逐；状态机必须把「冻结态且沙箱已死」转入重建路径。
@@ -49,6 +51,8 @@ cgroup v2 提供 `cgroup.freeze` 接口（[REF-linux-cgroup-v2](../references.md
 - SIGSTOP 降级路径非原子，存在已接受的进程逃逸、SIGCHLD 噪声与定时器集中触发缺陷。
 - 冻结态 Pod 被驱逐时仍会丢失内存状态，只能走重建路径。
 - 冻结与原地缩放的 `freeze_id` 语义要求提供者与看守进程共同维护，跨模块约束更强。
+- 移入入口是 Pod 内可达的特权入口，其安全依赖对端凭据核验与 cgroup 反查的正确实现。
+- 强隔离运行时（gVisor、Kata）下 Agent 进程不是宿主进程，本决策的子 cgroup 冻结不适用，k8s 路径因此不采用强隔离运行时。
 
 ## 失效条件
 

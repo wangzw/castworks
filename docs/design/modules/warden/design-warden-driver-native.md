@@ -14,7 +14,7 @@
 
 - **定义 Agent 驱动器接口**：规定启动、喂入、挂起准备、恢复、终止、快照恢复衔接、事件流与状态查询操作，以及每个操作的输入、输出与前置条件；结果是两种循环共用同一套翻译层，`runcontroller` 不按循环位置分支。
 - **规定事件集合与顺序**：要求两种驱动器使用同一套 `AgentEvent` 种类与字段，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序，自唤醒条目事件只由存在自唤醒源的驱动器发出，[等待意图](../../../glossary.md)事件只由解析等待意图的驱动器发出；结果是收件箱、游标与唤醒谓词不依赖循环位置。
-- **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致。
+- **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id, input_hash}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致，审批决定只在[审批内容摘要](../../../glossary.md)与待决调用一致时解除等待。
 - **规定挂起与恢复语义**：定义回合边界、恢复点、以挂起为目的的退出、恢复句柄与快照恢复后的衔接；结果是两种循环的挂起决策与恢复准入使用同一套规则。
 - **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、帧关联、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
 - **实现控制面循环驱动器**：作为库链接进 `runcontroller`，运行原生 Agent 循环，经出站流上的 `ToolExec` 帧调用沙箱，按接口发出事件、接收 `Deliver`、执行挂起准备与恢复；结果是平台原生 Agent 不需要打包进沙箱镜像，也不需要独立的沙箱凭据与协议会话。
@@ -64,7 +64,7 @@ type Driver interface {
 
 type StartSpec struct {
     ResumeHandle string        // 恢复句柄；为空表示新会话
-    Cwd          string        // 与工作区挂载路径逐字一致
+    Cwd          string        // 与本运行实例工作区子目录的挂载路径逐字一致
     Env          []string      // 驱动器专属环境变量；含工具接入声明的凭据占位符环境变量与非秘密配置
 }
 
@@ -116,7 +116,7 @@ type DriverState struct {
 | `turn_ended{reason, agent_exited, bg_procs}` | 回合到达恢复点，或 `Terminate` 后 | 回合结束的判定由驱动器实现；`agent_exited` 为真时表示原生 Agent 退出 |
 | `tool_started{call_id}` | 开始一次工具调用，或发出一次 `ToolExec` 调用之前 | `call_id` 由驱动器分配，同一回合唯一 |
 | `tool_ended{call_id}` | 工具调用结束或失败 | 与 `tool_started` 配对；未配对的调用在 `turn_ended` 时清理 |
-| `permission_requested{id, call_id, blocking}` | 循环需要审批 | `blocking` 表示是否在回合中阻塞等待 |
+| `permission_requested{id, call_id, blocking, tool}` | 循环需要审批 | `blocking` 表示是否在回合中阻塞等待；`tool{name, input, input_preview, input_hash, input_size}` 取首次触发时捕获的待批工具调用，`input_hash` 为[审批内容摘要](../../../glossary.md)，`input_size` 为规范 JSON 编码的字节数；`input_size ≤ S_tool_input`（1 MiB）时 `input` 为完整规范 JSON、`input_preview` 为空，超过时 `input` 为空、`input_preview` 为规范编码的前 `S_tool_preview`（64 KiB）字节，摘要仍对完整内容计算 |
 | `wait_started{call_id, kind, ref, fire_at, predicted_ms, agent_expected_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer`；`agent_expected_ms` 没有自报时为空 |
 | `subscription_created{sub_id, since_cursor, agent_expected_ms}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记；`agent_expected_ms` 没有自报时为空 |
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
@@ -137,7 +137,7 @@ type DriverState struct {
 | --- | --- | --- |
 | `next_user_message` | 写入 `stream-json` 用户消息；进程已退出时先以 `resume_session_id` 启动 | 追加到循环状态的对话，启动或继续模型循环 |
 | `tool_result{call_id}` | 写入含 `tool_result` 块的用户消息 | 解除对应待决工具调用，把结果交回循环 |
-| `permission_decision{id}` | 交给挂起的 `PreToolUse` hook；进程已销毁时以 `--resume` 续接 | 解除对应待决审批，把允许或拒绝交回循环 |
+| `permission_decision{id, input_hash}` | 交给挂起的 `PreToolUse` hook；进程已销毁时以 `--resume` 续接 | 解除对应待决审批，把允许或拒绝交回循环；控制面只在 `input_hash` 与审批时的摘要相等时定向送达 |
 | `resume_session_id` | 以 `--resume <session_id>` 启动 | 按恢复句柄加载循环状态 |
 
 `redelivery=true` 不改变翻译形态，只表示输入可能已被处理；驱动器不自行去重，`Feed` 的 `fed` 报告按去重后是否仍有事件喂入。定向投递与回合边界续接的消费按两级确认语义报告，不推进 `cursor_accepted`。
