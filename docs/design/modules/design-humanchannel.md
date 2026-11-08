@@ -14,7 +14,7 @@
 
 - **消息摄入与适配**：接收聊天界面、即时通讯与 Issue 评论的原始请求，完成用户身份与项目归属校验，把每个输入规范化为收件箱事件（`kind=message`），填充 `Actor`、`occurred_at` 与由通道消息标识派生的 `event_id`、`dedup_key`，经汇入契约（[汇入契约](../../glossary.md)）调用 `AppendInbox` 写入；重复投递命中同一 `dedup_key`，不产生重复事件。
 - **审批决定写入**：接收人类对权限询问的决定，决定携带标识 `id`、`correlation.permission_id`、`allow | deny` 与可选的 `updatedInput`；校验决定标识、`permission_id` 与决定取值，以 `permission_id` 与决定标识共同派生唯一 `dedup_key`，以 `kind=approval_decision` 写入收件箱。权限询问是否处于等待由 `runcontroller` 的定向投递匹配判定，本模块不查询待定权限。同一 `permission_id` 的另一决定且决定标识不同时，本模块在写入前拒绝并审计；决定如何送达 Agent 由 `runcontroller` 的定向投递规则确定，本模块不执行 `allow` 或 `deny`。
-- **在线与「正在输入」信号**：维护平台界面会话的活跃状态，以 `ui_session` 接入通道写入接入事实；活跃状态由用户活动或心跳判定，空闲超过短于 `TTL` 的空闲超时后写接入值为假，会话打开而长时间无操作不视为实时接入。把界面产生的「正在输入」事件作为预测性恢复提示经 `SetRunFact{wake_hint}` 写入，载荷为 `WakeHint{Generation, RequestID}`，是否据此提前恢复由 `suspendpolicy` 批准。活跃状态不改变运行实例状态，只约束挂起决策。
+- **在线与「正在输入」信号**：维护平台界面会话的活跃状态，以 `ui_session` 接入通道写入接入事实；活跃状态由用户活动或心跳判定，空闲超过短于 `TTL` 的空闲超时后写接入值为假，会话打开而长时间无操作不视为实时接入。把界面产生的「正在输入」事件作为[预测性恢复](../../glossary.md)提示经 `SetRunFact{wake_hint}` 写入，载荷为 `WakeHint{Generation, Origin, RequestID}`，`Origin` 取 `ui`，是否据此提前恢复由 `suspendpolicy` 批准。活跃状态不改变运行实例状态，只约束挂起决策。
 - **实时接入状态**：为 `ui_session`、`terminal`、`file` 接入通道写入 `SetRunFact{live_attach}` 事实，给出 `Channel`、`Attached`、`TTL` 与单调递增的 `SourceSeq`；接入期间按小于 `TTL` 的周期续写，该通道无其他有效连接时写接入值为假，进程重启后以更大的 `SourceSeq` 重报仍有效的接入。`runcontroller` 据此唤醒、取消挂起或约束挂起决策；本模块不判定挂起机制。
 - **终端接入**：身份校验与以通道绑定判定的项目归属校验通过后写入 `terminal` 接入事实，按 `RunService.Get` 返回的状态决定直接转发或以退避轮询等待进入 `active`，再以 `run_id` 与运行实例的当前代（[代](../../glossary.md)）为目标经入站路由建立到看守进程 `/terminal` 的双向流；流内字节不在本模块解析，该通道无其他有效连接时写接入值为假。
 - **界面文件访问的接入门控**：工作区只在[沙箱](../../glossary.md)内可读时，身份与以通道绑定判定的项目归属校验通过后，界面先经本模块写入 `file` 接入事实；本模块按终端相同的条件，以退避轮询 `RunService.Get` 等到运行实例可接收后应答界面，文件内容由 `workspace` 的文件访问接口经同一入站路由读取，不经过本模块。
@@ -23,6 +23,8 @@
 - **通道侧状态维护**：保存通道绑定、人类消息与决定的去重记录、接入会话与附件对象；以本地记录重驱动未完成的汇入写入，保证至少一次写入而不产生重复事件。
 
 ### 非职责
+
+非职责举例如下，判定标准为：职责清单之外、由其他模块拥有的事实与机制。
 
 - 收件箱、唤醒信号（[唤醒信号](../../glossary.md)）、等待、投递游标与运行实例状态机归 `runcontroller`；本模块只经汇入契约与 `RunService` 调用，不读写其表。
 - 审批 hook 的注册与执行归看守进程的 [Agent 驱动器](../../glossary.md)与 Claude Code 托管策略设置；本模块只写入决定事件，不决定 hook 如何返回、何时续接回合。
@@ -230,7 +232,7 @@ stateDiagram-v2
     Attached --> Detached: 显式关闭
     Attached --> Expired: 超过 TTL 未续写
     Expired --> Attached: 以更大的 SourceSeq 重报
-    Expired --> Detached: 到期扫描确认连接已结束
+    Expired --> Detached: 下一次上报时连接已失效
 ```
 
 ### 终端接入时序图
@@ -420,6 +422,8 @@ sequenceDiagram
 - 「正在输入」只作为预测性恢复提示，不替代接入事实；是否提前恢复由 `suspendpolicy` 批准。
 
 ## 错误与失败语义
+
+失败的处置由请求拒绝、以同一 `dedup_key` 或 `SourceSeq` 的退避重试、接入值为假的写入、接入事实的到期与重报以及审计写入组合表达。下表列出已明确处置路径的失败，各行是举例。
 
 | 失败 | 处置 |
 | --- | --- |

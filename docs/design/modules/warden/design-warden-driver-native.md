@@ -1,6 +1,6 @@
 # 控制面循环驱动器
 
-控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一，与[沙箱](../../../glossary.md)内的[进程驱动器](../../../glossary.md)共用同一接口。其实现运行在控制面，以链接进 `runcontroller` 进程的库形式存在，运行平台原生 Agent 的模型循环；第一版只定义该接口。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对后者只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
+控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一，与[沙箱](../../../glossary.md)内的[进程驱动器](../../../glossary.md)共用同一接口。其实现运行在控制面，以链接进 `runcontroller` 进程的库形式存在，运行平台原生 Agent 的模型循环；第一版只定义该接口。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对控制面循环驱动器只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
 文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
 
@@ -23,7 +23,7 @@
 
 ### 非职责
 
-非职责的判定标准是职责清单之外、由其他模块拥有的事实与机制。
+非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
 
 - 协议信封、消息序号、重放、按 `(generation, msg_seq)` 去重与协议版本归 `agentprotocol`；本模块只声明接口级事件与翻译语义。
 - 运行实例状态机、收件箱、唤醒谓词、投递游标、代与失效判定归 `runcontroller`；本模块只发出同一套事件并按 `Deliver` 喂入。
@@ -91,12 +91,12 @@ type DriverState struct {
 }
 ```
 
-`Deliver` 与 `AgentEvent` 的字段取自 `agentprotocol`；`SuspendRequest`、`ResumeRequest` 与 `TerminateRequest` 由本接口定义，分别复用 `PrepareSuspend`、`Resumed` 与 `Shutdown` 的字段语义；`BlockedOn` 引用 `runcontroller` 的 `blocked_on` 结构（`Hello.agent_state.blocked_on` 携带同一结构），不是 `agentprotocol` 的同名消息。`Start` 只在无活动实例时调用；`Feed` 按到达顺序串行调用；`PrepareForSuspend` 只在回合边界调用；`Resume` 在同一代解冻与新代续接时调用；`Terminate` 按优雅程度区分；`SnapshotRestored` 在看守进程完成校时之后调用。
+`Deliver` 与 `AgentEvent` 的字段取自 `agentprotocol`；`SuspendRequest`、`ResumeRequest` 与 `TerminateRequest` 由本接口定义，分别复用 `PrepareSuspend`、`Resumed` 与 `Shutdown` 的字段语义；`BlockedOn` 取 `agentprotocol` 中 `Hello.agent_state.blocked_on` 的结构。`Start` 只在无活动实例时调用；`Feed` 按到达顺序串行调用；`PrepareForSuspend` 只在回合边界调用；`Resume` 在同一代解冻与新代续接时调用；`Terminate` 按优雅程度区分；`SnapshotRestored` 在看守进程完成校时之后调用。
 
 | 操作 | 前置条件 | 结果与边界 |
 | --- | --- | --- |
 | `Start` | 无活动实例；`ResumeHandle` 为空或指向可读的会话 | 启动原生 Agent 或控制面循环；失败时返回错误，不发出 `turn_started` |
-| `Feed` | 接口处于 `starting`、`in_turn` 或 `boundary` | 返回 `fed`、`turn_id` 与 `agent_exited`；`fed=false` 时不启动回合 |
+| `Feed` | 接口处于 `starting`、`in_turn`、`blocked` 或 `boundary` | 返回 `fed`、`turn_id` 与 `agent_exited`；`fed=false` 时不启动回合 |
 | `PrepareForSuspend` | 回合边界；I9 前置检查可执行 | 返回 `SuspendReady`，或返回 `Busy` 语义的错误；不绕过检查 |
 | `Resume` | 同一代解冻，或新代已预配 | 恢复原生 Agent 或循环状态；失败时按恢复失败处置 |
 | `Terminate` | 任意阶段 | 优雅终止或强制终止；之后释放工具执行与循环资源 |
@@ -123,7 +123,7 @@ type DriverState struct {
 
 事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出；`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。
 
-`WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经 `runcontroller` 的 `RunService.DeclareWait` 提交声明，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等；条件闭集为 `approval`、`wait_for` 与 `timer`，`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
+`WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经宿主 `runcontroller` 注入的事件入口提交声明，由宿主调用 `RunService.DeclareWait`，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等；条件种类与 `runcontroller` 的 `declared_kind` 闭集一致（`llm`、`timer`、`approval`、`wait_for`），`scope=run` 时只取 `approval`、`wait_for`、`timer`；`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
 
 ### `Deliver` 的翻译规则
 
@@ -145,18 +145,18 @@ type DriverState struct {
 1. 回合已到达恢复点：无在途模型调用，无未确认的工具调用，循环状态已同步写入。
 2. `ToolExec` 无在途执行；后台作业为空，或按策略已终止。
 3. 活动度静默不短于 `Q_quiet`：由看守进程的活动度采集提供；控制面循环没有 Agent 进程时，静默窗内无工具执行与后台作业时成立。
-4. 工作区持久化确认完成；本代没有工作区写文件描述符。
+4. 工作区[持久化确认](../../../glossary.md)完成；本代没有工作区写文件描述符。
 5. 需要销毁时，恢复句柄已确定并由 `SuspendReady.SessionID` 报告；控制面落库后才销毁。
 
 `Resume` 分两种：同一代解冻时继续原循环，`SnapshotRestored` 重建超时与流偏移；新代续接时按恢复句柄加载循环状态，重新建立 `ToolExec` 调用，不重放未确认的工具调用。工具调用以 `call_id` 与 `exec_id` 标识，恢复后先查询结果，查询不到时把该调用作为失败结果交回循环，不重新执行有副作用的命令。
 
-### `ToolExec` 的使用
+### `ToolExec` 的操作集合
 
 控制面循环通过下列操作使用沙箱；操作语义、路径边界与鉴权由 [看守进程](design-warden.md) 定义，本模块只规定调用方式。
 
 | 操作 | 控制面循环的用法 |
 | --- | --- |
-| exec | 执行工具命令，返回执行标识、退出码与标准输出、标准错误流；命令继承工具接入声明的凭据占位符环境变量与非秘密配置 |
+| exec | 执行工具命令，返回退出码与标准输出、标准错误流；命令继承工具接入声明的凭据占位符环境变量与非秘密配置 |
 | 文件读 | 读取运行实例子目录内的文件，作为工具结果的一部分 |
 | 文件写 | 在运行实例子目录内写入文件，作为工具副作用 |
 | 流式输出 | 按输出偏移续传一次执行或后台作业的输出；断线后从上次偏移继续 |
@@ -189,7 +189,7 @@ type DriverState struct {
 - 循环状态的持久化：位置由实现选定，约束是跨代可读、在恢复点同步写入，并与工作区或控制面持久化同寿命；恢复句柄经 `Deliver.resume_session_id` 与 `SuspendReady.SessionID` 传递。
 - 控制面循环的模型调用：在控制面执行，上游与凭据由实现该循环的模块决定；不经过看守进程的本地代理。
 
-方向约束：本模块只依赖 `agentprotocol`；`ToolExec` 客户端与事件入口由宿主 `runcontroller` 注入，不构成对 `runcontroller` 包的代码依赖，也不引入新的模块依赖边。新增一种驱动器实现不改变本模块的接口，只增加一个实现面。把控制面循环驱动器部署为独立进程需要另行定义受限的驱动器身份与会话，第一版不做。
+方向约束：本模块只依赖 `agentprotocol`；`ToolExecClient` 与事件入口由宿主 `runcontroller` 注入，本模块不引用 `runcontroller` 导出的接口或类型。`runcontroller` 以库的形式链接本模块并调用 Agent 驱动器接口，对应模块依赖图中 `runcontroller` 到 `warden` 的边，该边只及于本模块。新增一种驱动器实现不改变本模块的接口，只增加一个实现面。把控制面循环驱动器部署为独立进程需要另行定义受限的驱动器身份与会话，第一版不做。
 
 ## UML 图
 
@@ -228,7 +228,7 @@ classDiagram
     Driver --> DriverState : 报告
 ```
 
-图固定两种实现与接口的关系：`ProcessDriver` 与 `ControlPlaneLoopDriver` 实现同一接口，前者驱动沙箱内的 Claude Code，后者在控制面运行循环；只有控制面循环驱动器依赖 `ToolExecClient`，进程驱动器不依赖它。接口不定义协议字段，`AgentEvent` 与 `Deliver` 的字段归 `agentprotocol`。
+图固定两种实现与接口的关系：`ProcessDriver` 与 `ControlPlaneLoopDriver` 实现同一接口，`ProcessDriver` 驱动沙箱内的 Claude Code，`ControlPlaneLoopDriver` 在控制面运行循环；只有控制面循环驱动器依赖 `ToolExecClient`，进程驱动器不依赖它。接口不定义协议字段，`AgentEvent` 与 `Deliver` 的字段归 `agentprotocol`。
 
 ### 控制面循环驱动器与看守进程的交互时序图
 
@@ -305,7 +305,7 @@ sequenceDiagram
 | 字段 | 含义 |
 | --- | --- |
 | `call_id` | 驱动器分配的工具调用标识；`tool_started` 与 `tool_ended` 使用 |
-| `exec_id` | `ToolExec exec` 返回的执行标识；流式输出与查询使用 |
+| `exec_id` | 驱动器分配的执行标识，随 `exec` 请求帧发出；流式输出与查询使用 |
 | `operation` | exec、文件读、文件写、流式输出或后台作业 |
 | `args_digest` | 调用参数的摘要；用于恢复后核对，不用于重发 |
 | `output_offset` | 已消费的输出偏移；断线后从此处续传 |
@@ -366,9 +366,9 @@ sequenceDiagram
 `ToolExec` 的调用按以下规则：
 
 1. 每次调用经宿主写入本代出站流；流已关闭、代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。
-2. `exec` 返回 `exec_id`；驱动器以 `call_id` 与 `exec_id` 建立工具执行记录，`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
+2. 驱动器为每次 `exec` 分配同一代内唯一的 `exec_id` 并随请求帧发出，以 `call_id` 与 `exec_id` 建立工具执行记录；`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
 3. 流式输出按 `output_offset` 续传；断线后先查询执行状态，再从上次偏移继续，不从零重放。
-4. 后台作业由 `exec` 启动；驱动器列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使运行实例保持活动，回合边界不构成 I9 安全点。
+4. 后台作业由 `exec` 启动；驱动器列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使运行实例保持活动，回合边界不构成[安全点](../../../glossary.md)。
 5. 文件读写在运行实例子目录内进行，路径越界按错误返回。
 6. `Shutdown` 与 `Fenced` 到达后停止新调用，终止在途执行，不再接受新的工具调用。
 
@@ -389,7 +389,7 @@ sequenceDiagram
 | `ToolExec` 鉴权失败、代不匹配或运行实例终态 | 调用返回不可重试错误；循环把错误作为工具结果，不重试 |
 | `ToolExec` 执行启动失败 | 返回错误；`tool_ended` 携带失败结果，回合继续 |
 | 流式输出偏移无效或执行已过期 | 返回错误；该工具调用按失败结果交回循环，不重放执行 |
-| 后台作业未结束 | 运行实例视为活动；不报告 `SuspendReady`，回合边界不构成销毁安全点 |
+| 后台作业未结束 | 运行实例视为活动；不报告 `SuspendReady`，回合边界不构成安全点 |
 | 循环状态同步写入失败 | 不报告 `SuspendReady`；按退避重试，控制面在 `retry_after` 后复评 |
 | 在途工具调用未确认时请求挂起 | 返回 `Busy` 语义的错误；等待调用终态后重试 |
 | 恢复句柄不可读或循环状态损坏 | 恢复失败达到上限后进入 `Degraded`；兜底路径改用新循环并合成摘要 |
@@ -404,7 +404,7 @@ sequenceDiagram
 
 - **每运行实例单实例**：同一运行实例同一代只有一个循环驱动器实例；`Feed` 串行调用，回合不并发。
 - **事件顺序**：同一回合的 `event_seq` 单调；`turn_started` 先于工具与等待事件，`turn_ended` 最后；事件流是单写者。
-- **挂起屏障**：`PrepareForSuspend` 先停止新调用，再等待在途调用终态，再同步写入循环状态，最后返回 `SuspendReady`；三步之间不插入新的 `Feed`。
+- **挂起屏障**：`PrepareForSuspend` 先停止新调用，再等待在途调用终态，再同步写入循环状态，最后返回 `SuspendReady`；从停止新调用到返回 `SuspendReady` 之间不插入新的 `Feed`。
 - **工具执行记录**：按 `call_id` 与 `exec_id` 索引；同一 `exec_id` 的流式输出只有单读者，偏移前进串行化。恢复后的查询不重发执行。
 - **循环状态写入**：恢复点的写入先于 `SuspendReady`；写入失败时不报告成功。循环状态与事件流的顺序不跨代保证，跨代以状态为准。
 - **`ToolExec` 调用的串行边界**：同一工具调用内的读写按调用顺序；不同调用可并发，`bg_jobs_changed` 的集合变化在驱动器锁内合并。

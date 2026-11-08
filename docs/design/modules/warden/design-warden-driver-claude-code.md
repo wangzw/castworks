@@ -2,11 +2,11 @@
 
 Claude Code 驱动器是[看守进程](../../../glossary.md)内的[进程驱动器](../../../glossary.md)，以无头 `stream-json` 协议驱动完整的 Claude Code 进程。它把 Claude Code 的[回合](../../../glossary.md)、工具、权限询问、等待与后台作业翻译为协议事件，把 `Deliver` 的 `target` 翻译为原生输入，管理流式输入会话的存活、会话续接与以挂起为目的的退出。它不拥有协议信封与重放、[运行实例](../../../glossary.md)状态机、挂起决策、[沙箱](../../../glossary.md)冻结、[本地代理](../../../glossary.md)与平台 MCP 服务器的工具实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程的其他子模块。心智模型：驱动器是一台长期在线的翻译器，把 Agent 的原生信号翻译为控制面可判定的事件（[REF-claude-code-headless](../../../references.md)、[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）。
 
-文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、启动命令与环境变量、流式输入会话、回合边界判定、LLM 等待信号、审批路径、销毁安全点；术语表、依赖、UML 图、核心数据结构、后台作业、终止路径、错误与失败语义与并发与事务边界作为参考，在核对字段、事件顺序或失败路径时查阅。
+文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、启动命令与环境变量、流式输入会话、回合边界判定、LLM 等待信号、审批路径、安全点；术语表、依赖、UML 图、核心数据结构、后台作业、终止路径、错误与失败语义与并发与事务边界作为参考，在核对字段、事件顺序或失败路径时查阅。
 
 ## 核心概念
 
-本模块围绕流式输入会话组织。Claude Code 以 `--input-format stream-json` 启动后是一个长期存活的进程，而不是一回合一个进程：驱动器在 stdin 上逐行写入用户消息、工具结果与权限决定，从 stdout 读出回合、工具、会话状态与结果消息；回合结束后不关闭 stdin，下一条投递进入同一进程。托管环境据此把进程的生命周期切成回合：回合结束后进程仍在，这个位置是唯一允许以挂起为目的销毁的位置（[ADR-turn-boundary-destroy](../../../adr/adr-turn-boundary-destroy.md)）。沙箱销毁后进程随之消失，跨代延续由会话标识上的 `--resume` 承担，而不是由进程承担。系统需要这个机制：托管环境只在回合边界释放沙箱，又要在重建后从上一回合继续；把 Agent 的原生协议翻译为闭集事件，`runcontroller` 才能判定回合位置并选择安全点。
+本模块围绕流式输入会话组织。Claude Code 以 `--input-format stream-json` 启动后是一个长期存活的进程，而不是一回合一个进程：驱动器在 stdin 上逐行写入用户消息、工具结果与权限决定，从 stdout 读出回合、工具、会话状态与结果消息；回合结束后不关闭 stdin，下一条投递进入同一进程。托管环境据此把进程的生命周期切成回合：回合结束后进程仍在，这个位置是唯一允许以挂起为目的销毁的位置（[ADR-turn-boundary-destroy](../../../adr/adr-turn-boundary-destroy.md)）。沙箱销毁后进程随之消失，跨代延续由会话标识上的 `--resume` 承担，而不是由进程承担。系统需要这个机制：托管环境只在回合边界释放沙箱，又要在重建后从上一回合继续；把 Agent 的原生协议翻译为闭集事件，`runcontroller` 才能判定回合位置并选择[安全点](../../../glossary.md)。
 
 ## 职责
 
@@ -21,8 +21,8 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - **LLM 等待旁证**：以本地代理的 `llm.request.started` 为主信号，以 `UserPromptSubmit`、`PostToolBatch`、`Stop` 等 hook 事件为旁证；结果是 LLM 等待的开始与结束有独立于 Agent 自述的证据。
 - **审批路径**：实现 `PreToolUse` hook 的询问、`permissionDecision: "defer"` 的延迟、`stop_reason: tool_deferred` 的回合结束、以 `--resume` 不改写 prompt 的续接，以及实时接入中的阻塞等待；结果是回合中审批可以转为回合边界，或在不销毁沙箱时等待决定。
 - **平台 MCP 服务器接入**：向 Agent 暴露平台 MCP 服务器的工具，设置工具超时，并把阻塞型工具调用翻译为 `wait_started` 与 `tool_ended`；结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
-- **第三方 MCP 服务器接入**：合并项目作用域工具接入声明中已批准的第三方 MCP 服务器配置，只支持 stdio 本地子进程，注入其环境变量并管理生命周期；结果是第三方 MCP 工具经本地代理与出口代理执行，平台不为其增加平台工具。
-- **销毁安全点**：在回合边界执行 I9 检查，关闭 stdin、等待正常退出、终止已声明的第三方 MCP 服务器、复核本地代理无外部在途连接、核对会话记录 JSONL 末尾、工作区持久化、进程与工作区写文件描述符，并上报 `ReadyToSuspend`；结果是销毁前会话已落盘，`--resume` 不丢失最后一回合。
+- **第三方 MCP 服务器接入**：合并项目作用域工具接入声明中已批准的第三方 MCP 服务器配置，只支持 stdio 本地子进程，注入其环境变量并管理生命周期；结果是第三方 MCP 工具经本地代理或[透明拦截器](../../../glossary.md)到出口代理执行，平台不为其增加平台工具。
+- **安全点检查**：在回合边界执行 I9 检查，关闭 stdin、等待正常退出、终止已声明的第三方 MCP 服务器、复核本地代理与透明拦截器无外部在途连接、核对会话记录 JSONL 末尾、工作区持久化、进程与工作区写文件描述符，并上报 `ReadyToSuspend`；结果是销毁前会话已落盘，`--resume` 不丢失最后一回合。
 - **快照恢复后的衔接**：在看守进程校时并清理旧 TCP 连接之后恢复事件处理，丢弃按旧时钟计算的 hook 截止时间，重新建立超时；结果是半死连接与时钟跳变不使驱动器误判回合状态。
 - **后台作业登记**：通过 `PostToolUse` 与进程表登记后台 Bash 作业与子代理，在集合变化时发出 `bg_jobs_changed`；结果是存在后台作业的运行实例不被判定为空闲。
 - **终止路径**：按优雅程度关闭 stdin 或发送 `SIGTERM`，杀死 Bash 进程树并执行 `SessionEnd` hook；结果是终止只用于失效判定与超时，以挂起为目的的销毁走正常退出路径。
@@ -30,7 +30,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 
 ### 非职责
 
-非职责的判定标准是职责清单之外、由其他模块拥有的事实与机制。
+非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
 
 - 协议信封、消息序号、重放、按 `(generation, msg_seq)` 去重与协议版本归 `agentprotocol`；本模块只产生每条消息的沙箱侧内容。
 - 运行实例状态机、收件箱、唤醒谓词、投递游标、代与失效判定归 `runcontroller`；本模块只报告回合、工具、等待与退出信号。
@@ -39,7 +39,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - LLM 请求的代理、模式选择、缓冲与回放取回归本地代理；本模块只消费其请求事件。
 - 平台 MCP 服务器的工具实现、令牌附加与订阅登记归看守进程的平台 MCP 服务器；本模块只接入工具、设置超时并翻译工具事件。
 - 审批决定的内容、人类身份与实时接入状态归 `humanchannel`；本模块只把决定交给 hook，或在阻塞等待中返回给 Claude Code。
-- Agent 会话记录的内容归 Agent 自身；本模块只保证状态目录位于工作区，并在销毁安全点核对末尾与持久化。
+- Agent 会话记录的内容归 Agent 自身；本模块只保证状态目录位于工作区，并在安全点核对末尾与持久化。
 - 控制面循环驱动器、`ToolExec` 的使用与控制面原生循环归 [控制面循环驱动器](design-warden-driver-native.md)；本模块只实现进程驱动器一侧。
 
 ## 术语表
@@ -63,7 +63,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | --- | --- |
 | `Start` | 以固定命令启动进程，设置环境变量与托管策略设置，必要时带 `--resume <session_id>`；进程的 cgroup 迁移由看守进程的进程监督完成 |
 | `Feed` | 把 `Deliver` 的 `target` 翻译为 stdin 上的 `stream-json` 用户消息；返回是否喂入、回合标识与 Agent 是否已退出 |
-| `PrepareForSuspend` | 只在回合边界执行 I9 检查；关闭 stdin、等待退出码、核对 JSONL 末尾与工作区持久化；返回 `ReadyToSuspend` 字段 |
+| `PrepareForSuspend` | 只在回合边界执行 I9 检查；关闭 stdin、等待退出码、终止已声明的第三方 MCP 服务器、核对 JSONL 末尾与工作区持久化；返回 `ReadyToSuspend` 字段 |
 | `Resume` | 同一代解冻时继续原进程；新代或进程已退出时以 `--resume <session_id>` 启动，必要时不带 prompt |
 | `Terminate` | 优雅终止关闭 stdin；强制终止发送 `SIGTERM`、杀死 Bash 进程树并执行 `SessionEnd` hook |
 | `SnapshotRestored` | 校时完成后重新建立超时，丢弃按旧时钟计算的 hook 截止时间；进程保留时继续驱动 |
@@ -119,13 +119,13 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - Claude Code 网络行为：流式空闲看门狗与停滞处理（[REF-claude-code-network-config](../../../references.md)）。
 - Agent SDK 的 stream-json 消息类型：`session_state_changed`、`result.queued_turn_count`、`tool_use` 与 `tool_result`（[REF-claude-agent-sdk-typescript](../../../references.md)）。
 - MCP：平台 MCP 服务器的工具与传输（[REF-mcp](../../../references.md)）。
-- 本地代理：`llm.request.started` 等事件与回环地址；平台 MCP 服务器：工具调用与超时；`workspace`：`CLAUDE_CONFIG_DIR` 与工作区持久化确认。
+- 本地代理：`llm.request.started` 等事件与回环地址；平台 MCP 服务器：工具调用与超时；`workspace`：`CLAUDE_CONFIG_DIR` 与工作区[持久化确认](../../../glossary.md)。
 
 方向约束：驱动器只依赖 `agentprotocol`，因此不修改 `runcontroller` 与 `suspendpolicy`；新增一个原生信号只扩展翻译表，不改变协议消息集合。
 
 ## UML 图
 
-下列图分别固定回合的生命周期、延迟审批的续接顺序与销毁安全点的检查顺序；图中不表达的约束由每张图后的正文给出。
+下列图分别固定回合的生命周期、延迟审批的续接顺序与安全点的检查顺序；图中不表达的约束由每张图后的正文给出。
 
 ### 回合生命周期状态图
 
@@ -139,7 +139,7 @@ stateDiagram-v2
 
     [*] --> Starting
     Starting --> InTurn: 首条输入开始处理
-    InTurn --> Blocked: 权限询问、LLM 等待或工具等待
+    InTurn --> Blocked: 阻塞型审批、LLM 等待或工具等待
     Blocked --> InTurn: 条件满足
     InTurn --> Boundary: result 与 idle 齐备且 queued_turn_count=0
     Boundary --> InTurn: 喂入下一条输入
@@ -186,7 +186,7 @@ sequenceDiagram
 
 图固定延迟审批的关键点：回合以 `stop_reason: tool_deferred` 结束，而不是以阻塞等待结束；决定到达后的续接以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 才从驱动器取回决定。并行工具调用使 `defer` 被忽略时，退回阻塞等待，各调用的决定以定向投递分别送达；只剩一个阻塞调用时才允许冻结。
 
-### 销毁安全点时序图
+### 安全点时序图
 
 ```mermaid
 sequenceDiagram
@@ -197,19 +197,20 @@ sequenceDiagram
     participant A as Agent 进程
     participant S as workspace
     R->>W: PrepareSuspend{suspend_id, mode=destroy, require}
-    W->>D: 进入销毁安全点
-    D->>D: 核对回合边界、无在途请求、活动度静默、无后台作业、无其他进程与工作区写文件描述符
+    W->>D: 进入安全点
+    D->>D: 核对回合边界、无在途请求、活动度静默、无后台作业、除已声明的第三方 MCP 服务器外无其他进程、无工作区写文件描述符
     D->>A: 关闭 stdin
     A-->>D: 正常退出并返回退出码
-    D->>S: 等待工作区持久化确认
+    D->>D: 终止已声明的第三方 MCP 服务器，复核无剩余进程与外部在途连接
     D->>D: 核对会话记录 JSONL 末尾已含本回合
+    D->>S: 等待工作区持久化确认
     D-->>W: ReadyToSuspend{exited_at, session_id, procs_remaining, ws_write_fds}
     W-->>R: ReadyToSuspend
     R->>R: 落库恢复句柄
     R->>W: 销毁沙箱
 ```
 
-图固定检查与销毁的先后：任一检查不满足时回 `Busy`，不进入销毁；恢复句柄在销毁之前落库；`ReadyToSuspend.session_id` 取本代 Agent 进程使用的会话标识，本代未启动进程时取最近一次收到的 `resume_session_id`。以挂起为目的的销毁不使用 `SIGTERM`，`force` 只终止 Agent 主进程之外的进程。
+图固定检查与销毁的先后：任一检查不满足时回 `Busy`，不进入销毁；恢复句柄在销毁之前落库；`ReadyToSuspend.session_id` 取本代 Agent 进程使用的会话标识，本代未启动进程时取最近一次收到的 `resume_session_id`。以挂起为目的的销毁不以 `SIGTERM` 终止 Agent 主进程；`force` 只终止 Agent 主进程与已声明的第三方 MCP 服务器进程之外的进程，已声明的第三方 MCP 服务器在 Agent 正常退出之后才终止。
 
 ## 核心数据结构
 
@@ -286,10 +287,10 @@ sequenceDiagram
 | 2 | 以 `--resume ses-1` 启动 Claude Code，PID 4101 | `starting` | 无 |
 | 3 | 把事件作为下一条用户消息写入 stdin | `starting` | 无 |
 | 4 | Agent 开始处理，驱动器观察到属于该输入的首个 Assistant 事件 | `in_turn`；`turn_id=turn-9` | 追加 `consumed{11, turn-9}` 并同步写入；随后发 `Consumed{11, turn-9}` |
-| 5 | 工具调用触发 `PreToolUse`，异步渠道返回 `defer` | `blocked`；`permission_id=p-1`，`blocking=false` | 无 |
-| 6 | Agent 返回 `result{stop_reason=tool_deferred}` 与 `idle`，`queued_turn_count=0` | `boundary` | 无；发出 `permission_requested{blocking=false}` 与 `turn_ended{reason=tool_deferred}` |
-| 7 | 收到 `PrepareSuspend{mode=destroy}`；关闭 stdin，等待退出码 0 | `exited` | 核对 JSONL 末尾含 `turn-9`；等待工作区持久化确认 |
-| 8 | 核对无其他进程、无工作区写文件描述符 | `exited` | 上报 `ReadyToSuspend{session_id=ses-1}`；控制面落库后销毁沙箱 |
+| 5 | 工具调用触发 `PreToolUse`，异步渠道返回 `defer` | `in_turn`；`pending_permissions` 新增 `permission_id=p-1`，`blocking=false` | 无；返回 `defer` 之前发出 `permission_requested{id=p-1, blocking=false}` |
+| 6 | Agent 返回 `result{stop_reason=tool_deferred}` 与 `idle`，`queued_turn_count=0` | `boundary` | 无；发出 `turn_ended{reason=tool_deferred}` |
+| 7 | 收到 `PrepareSuspend{mode=destroy}`，关闭 stdin 之前的检查通过；关闭 stdin，等待退出码 0 | `exited` | 无 |
+| 8 | 终止已声明的第三方 MCP 服务器，复核进程树无剩余进程、外部在途连接计数为 0；核对 JSONL 末尾含 `turn-9` | `exited` | 等待工作区持久化确认；上报 `ReadyToSuspend{session_id=ses-1}`；控制面落库后销毁沙箱 |
 | 9 | 审批决定到达，`Deliver{target=permission_decision{id=p-1}, resume_session_id=ses-1}` | 启动前 | 追加接受记录；定向投递的消费只记日志 |
 | 10 | 以 `claude -p --resume ses-1` 不带 prompt 启动；同一工具调用再次触发 `PreToolUse` | `starting` | 无 |
 | 11 | hook 取回决定并返回 allow；Agent 继续本回合 | `in_turn`；`turn_id=turn-10` | 追加该定向投递的消费记录；不发 `Consumed` |
@@ -316,7 +317,7 @@ claude -p --output-format stream-json --input-format stream-json --verbose [--re
 | `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` | `1` | 产生 `session_state_changed` 的 `idle` 与 `requires_action` |
 | `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING` | `0` | 存在后台任务时仍报告 `idle`；后台作业由驱动器另行登记 |
 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` | `1` | 被中断回合在 `--resume` 时自动续接，作为降级路径 |
-| `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` | 不超过工作区保留期 | 只对早于该时长的被中断回合自动续接；超过时按新会话或合成摘要处理 |
+| `CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS` | 不超过工作区保留期 | 只对年龄不超过该值的被中断回合自动续接；超过时按新会话或合成摘要处理 |
 | `CLAUDE_CODE_MAX_RETRIES` | 默认 10 | Claude Code 对上游请求的重试次数 |
 | `API_TIMEOUT_MS` | 默认 600000 | 响应头超时；不限制流式响应体的总时长 |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` | 关闭遥测与更新检查等非必要外联，避免冷启动等待 |
@@ -362,9 +363,9 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 `PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。驱动器在 hook 与 Claude Code 之间传递询问与决定。按渠道分别处置：
 
-**异步渠道。** hook 返回 `permissionDecision: "defer"`，Claude Code 以 `stop_reason: tool_deferred` 结束回合；驱动器发出 `permission_requested{blocking=false}` 与 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 从驱动器取回决定并返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
+**异步渠道。** 驱动器先发出 `permission_requested{blocking=false}`，hook 再返回 `permissionDecision: "defer"`，阶段保持 `in_turn`，不经过 `blocked`；Claude Code 以 `stop_reason: tool_deferred` 结束回合后，驱动器发出 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 从驱动器取回决定并返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
 
-**实时接入。** hook 阻塞等待，驱动器发出 `permission_requested{blocking=true}`；决定到达后交给挂起的 hook。hook 显式设置 `timeout` 与 `onFailure: block`，覆盖 Claude Code 超时后默认放行的行为；超时按阻塞处理并返回拒绝结果，不默认放行。阻塞等待的冻结上限取 hook 超时、per-server timeout 与 MCP 传输上限的较小值减去安全余量，各项按墙钟计时，冻结期间照常流逝；取值归 `suspendpolicy`。
+**实时接入。** hook 阻塞等待，驱动器发出 `permission_requested{blocking=true}`；决定到达后交给挂起的 hook。hook 显式设置 `timeout` 与 `onFailure: block`，覆盖 Claude Code 超时后默认放行的行为；超时按阻塞处理并返回拒绝结果，不默认放行。阻塞等待的冻结上限 `F_cap(approval)` 取 hook 超时与 MCP 传输上限的较小值减去 60 s，各项按墙钟计时，冻结期间照常流逝；取值归 `suspendpolicy`。
 
 同一回合有多个并行工具调用时，`defer` 被忽略，退回阻塞等待；各调用的审批决定以定向投递分别送达，只有剩一个阻塞调用时才允许冻结。审批决定在沙箱销毁之前到达时，在同一代的已建立流上送达；销毁之后到达时，在新代以 `--resume` 续接。
 
@@ -372,25 +373,28 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 驱动器向 Claude Code 注入平台 MCP 服务器的连接配置，并合并项目作用域工具接入声明中已批准的第三方 MCP 服务器；工作区内的 `.mcp.json` 被忽略，`--strict-mcp-config` 或等效配置只使用平台下发的服务器集合。工具集合与语义归平台 MCP 服务器与第三方服务器；本模块负责以下接入工作：把工具调用的开始与结束翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，把 `subscribe_event`、`sleep_until` 与 `wait_for` 的结果翻译为 `subscription_created`、`timer_requested{scope=run}` 与 `wait_started{kind=wait_for}`，以及设置 `MCP_TOOL_TIMEOUT`。
 
-第三方 MCP 服务器只支持 stdio 本地子进程，可执行文件来自镜像内预置并固定版本与摘要；进程是 Agent 的子进程，位于 `agent` 子 cgroup，随 Agent 冻结与解冻，不进入 `bg_jobs`。Agent 退出后驱动器终止它们；快照恢复后重连或重启，销毁重建后必然重启。远程 MCP 视为普通外部系统流量，经本地代理到出口代理，不在沙箱内起进程。
+第三方 MCP 服务器只支持 stdio 本地子进程，可执行文件来自镜像内预置并固定版本与摘要；进程是 Agent 的子进程，位于 `agent` 子 cgroup，随 Agent 冻结与解冻，不进入 `bg_jobs`。本文所称已声明的第三方 MCP 服务器进程包含这些服务器进程的子进程，与 `Activity.mcp_procs` 的计数范围相同；安全点检查第 5、8 步与 `force` 的作用范围都按此口径。Agent 退出后驱动器终止它们；快照恢复后重连或重启，销毁重建后必然重启。远程 MCP 视为普通外部系统流量，经本地代理或透明拦截器到出口代理，不在沙箱内起进程。
 
-`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限；实际约束是 MCP 客户端的 HTTP 首字节 60 s、首字节后 idle 300 s 加 30 s 检查粒度，以及 stdio idle 1800 s 加 30 s 检查粒度。per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于对应的传输上限；超过传输上限时以传输上限为准。平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的窗口生效；`wait_for` 的默认路径是在冻结前转为订阅。工具超时返回错误结果，不无限占用回合；已经转为订阅或定时的阻塞型调用按转换结果返回。工具调用的开始与结束必须配对；进程退出时未配对的调用由驱动器清理，并在 `turn_ended{bg_procs}` 中报告剩余进程。
+`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限；实际约束是 MCP 客户端的 HTTP 首字节 60 s、首字节后 idle 300 s 加 30 s 检查粒度，以及 stdio idle 1800 s 加 30 s 检查粒度。per-server timeout 配置为 `F_cap(approval / wait_for)` 加 `safety_margin`，且不得大于对应的传输上限；超过传输上限时以传输上限为准。平台 MCP 服务器应在调用开始立即发送首字节并周期发送进度，使首字节后的窗口生效；`wait_for` 在冻结临近上限时返回已转为订阅的结果。工具超时返回错误结果，不无限占用回合；已经转为订阅或定时的阻塞型调用按转换结果返回。工具调用的开始与结束必须配对；进程退出时未配对的调用由驱动器清理，并在 `turn_ended{bg_procs}` 中报告剩余进程。
 
 启动期非必要外联必须由 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 关闭；RST 与黑洞在启动期都约 5 s，不能只依赖本地代理立即拒绝。MCP 初始化默认可等满 30 s，必须显式下调 `MCP_TIMEOUT` 与 `MCP_CONNECT_TIMEOUT_MS`，否则冷启动目标会被默认值拖到阈值之外。
 
-### 销毁安全点
+### 安全点
 
 `PrepareSuspend{mode=destroy}` 只在回合边界处理。驱动器按以下顺序执行检查，任一不满足时回 `Busy{reason, retry_after}`，不进入销毁：
 
 1. 回合边界成立：`idle` 与 `result` 齐备，`queued_turn_count=0`。
-2. 本代无在途请求：本地代理与平台 MCP 服务器登记的在途请求为空。
+2. 本代无在途请求：本地代理的 LLM 在途请求为空，且本地代理与透明拦截器的外部在途连接计数为 0。
 3. 活动度静默不短于 `Q_quiet`：由看守进程的活动度采集提供。
 4. 后台作业为空：`bg_jobs` 为空，对应 `PrepareSuspend.require.no_bg_procs`。
-5. 进程树中除 Agent 主进程外无其他进程：`procs_remaining` 为 0；`force` 只终止这些其他进程，不终止 Agent 主进程。
+5. 进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外无其他进程；`force` 只终止这些其他进程，不终止 Agent 主进程与已声明的第三方 MCP 服务器进程。
 6. 无工作区写文件描述符：`ws_write_fds` 为 0。
 7. 关闭 stdin，等待进程正常退出并取得退出码。
-8. 核对会话记录 JSONL 末尾已含本回合；transcript 写入是异步的，退出后仍可能滞后，核对在退出码之后执行。
-9. 等待工作区持久化确认：共享文件系统为 fsync 完成；`durableDir` 退化配置下为同步挂起上传完成。
+8. 终止已声明的第三方 MCP 服务器进程，复核进程树中无剩余进程且外部在途连接计数为 0：`procs_remaining` 为 0。
+9. 核对会话记录 JSONL 末尾已含本回合；transcript 写入是异步的，退出后仍可能滞后，核对在退出码之后执行。
+10. 等待工作区持久化确认：共享文件系统为 fsync 完成；`durableDir` 退化配置下为同步挂起上传完成。
+
+第 2 步的外部在途连接计数按连接从建立到关闭计算，包含已声明的第三方 MCP 服务器进程经本地代理或透明拦截器持有的连接；本地代理与透明拦截器不终止 TLS，无法区分空闲长连接与在途请求。已声明的第三方 MCP 服务器在回合边界保持外部长连接（空闲连接池或流式订阅）时，第 2 步持续不满足，驱动器回 `Busy`，不为满足检查而提前终止该服务器；运行实例回到 `Active`，`runcontroller` 在 `retry_after` 之后重新调用挂起决策；控制面的 I9 预检不含外部在途连接，连接关闭之前以挂起为目的的销毁不会成功。
 
 检查通过后上报 `ReadyToSuspend{suspend_id, mode=destroy, exited_at, session_id, procs_remaining, ws_write_fds}`。`session_id` 取本代进程使用的会话标识；本代未启动 Agent 进程时取最近一次收到的 `resume_session_id`，都没有时为空。控制面只在非空时落库恢复句柄，落库后才销毁沙箱。
 
@@ -411,7 +415,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 驱动器通过以下路径登记后台作业：`PostToolUse` 中对后台 Bash 命令的识别，以及进程表中属于 Agent 进程树的子进程与子代理。集合变化时发出 `bg_jobs_changed{job_ids}`；存在未结束作业时运行实例视为活动，`suspendpolicy` 不对其挂起。
 
-`CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0` 使存在后台任务时仍报告 `idle`，回合边界照常成立；I9 的 `no_bg_procs` 检查仍要求后台作业为空，因此带后台作业的回合边界不构成销毁安全点。`-p` 在回合结束后等待主会话的后台命令，默认等待上限与总上限由 Claude Code 给出；超时按策略终止。`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 置位时禁用后台任务，作业集合为空。
+`CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0` 使存在后台任务时仍报告 `idle`，回合边界照常成立；I9 的 `no_bg_procs` 检查仍要求后台作业为空，因此带后台作业的回合边界不构成安全点。`-p` 在回合结束后等待主会话的后台命令，默认等待上限与总上限由 Claude Code 给出；超时按策略终止。`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS` 置位时禁用后台任务，作业集合为空。
 
 ### 终止路径
 
@@ -445,7 +449,8 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 | 关闭 stdin 后进程未在截止时间退出 | 回 `Busy{reason, retry_after}`；不发送 `SIGTERM` 完成以挂起为目的的销毁，由控制面在 `retry_after` 后复评 |
 | 会话记录 JSONL 末尾不含本回合 | 回 `Busy`；等待 transcript 刷盘后重试，不销毁 |
 | 工作区持久化确认未完成 | 回 `Busy`；不销毁，恢复句柄不落库 |
-| 存在其他进程或工作区写文件描述符 | 回 `Busy`；`force` 只终止 Agent 主进程之外的进程，不绕过 Agent 正常退出 |
+| 存在其他进程或工作区写文件描述符 | 回 `Busy`；`force` 只终止 Agent 主进程与已声明的第三方 MCP 服务器进程之外的进程，不绕过 Agent 正常退出 |
+| 已声明的第三方 MCP 服务器在回合边界保持外部长连接 | 回 `Busy`；不提前终止该服务器，由控制面在 `retry_after` 后复评；连接关闭之前不销毁 |
 | `PreToolUse` hook 超时 | `onFailure: block` 生效，返回拒绝结果并带消息；不默认放行，不无限阻塞 |
 | 审批决定的目标已失效 | 回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递 |
 | 并行工具调用使 `defer` 被忽略 | 退回阻塞等待；各决定以定向投递分别送达，不销毁 |
@@ -454,7 +459,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 | 第三方工具返回 401 或 403 | 工具未发送认证头时上游返回 401；占位符发往未允许主机或没有匹配注入规则时出口代理返回 403；错误作为工具结果返回 Agent，平台不补头、不重试 |
 | 占位符未被替换 | 工具未把占位符放进请求头时上游收到占位符并返回错误；出口代理按头名与主机匹配规则，不感知工具身份 |
 | 快照恢复后时钟跳变 | 丢弃旧截止时间并按校时后的时钟重建；不重放已交付输入 |
-| 后台作业未结束 | 运行实例视为活动，不挂起；超时按策略终止，或回合边界不构成 I9 安全点 |
+| 后台作业未结束 | 运行实例视为活动，不挂起；超时按策略终止，或回合边界不构成安全点 |
 | `Fenced` 或 `Shutdown{graceful=false}` | 强制终止：`SIGTERM`、退出码 143、杀死 Bash 进程树、执行 `SessionEnd` hook |
 | 未知或无法解析的 stream-json 消息 | 丢弃并计数；不改变回合状态，不产生 `AgentEvent` |
 | 会话标识在 `--resume` 后变化 | 以新报告的值更新 `session_id` 并用于后续 `turn_started` 与 `ReadyToSuspend`；控制面按新值落库 |
@@ -510,7 +515,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 | 平台 MCP 服务器接入与超时 | 未实现 | — |
 | 第三方 MCP 服务器接入 | 未实现 | — |
 | 工具接入声明的环境变量注入 | 未实现 | — |
-| 销毁安全点与 `ReadyToSuspend` | 未实现 | — |
+| 安全点与 `ReadyToSuspend` | 未实现 | — |
 | 快照恢复后的衔接 | 未实现 | — |
 | 后台作业登记 | 未实现 | — |
 | 终止路径 | 未实现 | — |

@@ -2,7 +2,7 @@
 
 ## 背景
 
-沙箱提供者的能力不同：k8s 提供者可以冻结（`Freeze{cgroup}` 或 `Freeze{signal}`）、销毁、使用预热池与原地缩小 CPU request（[REF-agent-sandbox](../references.md)、[REF-linux-cgroup-v2](../references.md)、[REF-k8s-in-place-pod-resize](../references.md)）；Substrate 提供者可以快照、销毁、使用预热池、落地出口策略（`EgressInject`），但不具备冻结能力（[REF-substrate](../references.md)）。同一套挂起策略要在 k8s 提供者与 Substrate 提供者上运行，并在能力缺失时退化。
+沙箱提供者的能力不同：k8s 提供者可以冻结（`Freeze{cgroup}` 或 `Freeze{signal}`）、销毁、使用预热池与原地缩小 CPU request（[REF-agent-sandbox](../references.md)、[REF-linux-cgroup-v2](../references.md)、[REF-k8s-in-place-pod-resize](../references.md)）；Substrate 提供者可以快照、销毁与落地出口策略（`EgressInject`），新建 actor 从[模板快照](../glossary.md)恢复，但不具备冻结能力与预热池（[REF-substrate](../references.md)）。同一套挂起策略要在 k8s 提供者与 Substrate 提供者上运行，并在能力缺失时退化。
 
 没有一种机制同时满足全部等待形态：冻结保留内存、恢复最快，但不释放内存；快照释放全部资源，但恢复是秒级且成本更高；销毁重建释放资源，但丢失回合上下文并拉长恢复；原地缩小只降低 CPU request，不释放内存。内核级检查点恢复（CRIU）需要特权与内核兼容性，不能作为跨运行时的默认机制（[REF-criu](../references.md)）。
 

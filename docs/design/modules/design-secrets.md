@@ -14,11 +14,11 @@
 
 - **对接密钥库**：读取凭据对象与令牌签名密钥，按项目、外部系统与认证方式解析；凭据材料只出现在密钥库与控制面调用方的进程内存中，不复制到[工作区](../../glossary.md)、沙箱或本模块的持久化存储。
 - **维护项目作用域**：每次换取按调用方提供的 `project_id` 定位凭据对象；凭据对象只在其所属项目下可见，换取只解析 `project_id` 所指项目下的凭据对象，跨项目读取一律拒绝。
-- **签发运行实例令牌**：以 `run_id`、`generation` 与 `exp` 构造 JWT，按令牌签名密钥签名，返回令牌与到期时刻；首个令牌由 `provision` 效果投递，令牌返回给效果执行器，由 `runcontroller` 经预配的引导参数交给 `sandboxprovider`，经看守进程的私有引导通道注入。令牌不持久化，由签名自证。
+- **签发运行实例令牌**：以 `run_id`、`generation` 与 `exp` 构造 JWT，按令牌签名密钥签名，返回令牌与到期时刻；首个令牌由 `sandboxprovider` 的[引导接口](../../glossary.md)在看守进程领取时调用签发，随领取响应交给看守进程。令牌不持久化，由签名自证。
 - **校验运行实例令牌**：验证签名、`run_id` 与 `exp`，返回令牌载荷与过期标记；不查询运行实例当前代，代比较归调用方。
 - **轮换运行实例令牌**：在到期前签发后继令牌，交 `runcontroller` 经 `TokenRotate` 发往看守进程；旧令牌在 `exp` 之前继续有效，后继令牌投递成功时新旧令牌存在有效期重叠。
-- **换取真实凭据**：校验运行实例令牌与调用方身份，按调用方给出的目标读取凭据对象，按凭据对象的 `token_minting` 铸造真实凭据，返回控制面调用方；不返回沙箱，不写入工作区。
-- **校验调用方授权**：按调用方身份与部署白名单限制可换取的 `(Kind, System, AuthMethod)` 集合，三者均必填；目标不在允许集合时拒绝并写拒绝审计，不读取凭据对象，不暴露其存在性。
+- **换取真实凭据**：校验运行实例令牌与调用方身份（不携带令牌的状态核对只校验调用方身份），按调用方给出的目标读取凭据对象，按凭据对象的 `token_minting` 铸造真实凭据，返回控制面调用方；不返回沙箱，不写入工作区。
+- **校验调用方授权**：按调用方身份与部署白名单限制可换取的 `(Kind, System, AuthMethod)` 集合，三者均必填；目标不在允许集合时拒绝并写拒绝审计，不读取凭据对象，不暴露其存在性。`IssueRunToken` 只为白名单内的 `sandboxprovider` 与 `runcontroller` 签发。
 - **提供出口代理的凭据来源**：k8s 路径由平台出口代理调用换取接口；Substrate 路径由出口网关经凭据提供者协议取得占位符对应的真实凭据（[REF-substrate](../../references.md)）。
 - **记录审计**：每次换取、占位符解析与拒绝写只追加审计记录，关联调用方身份、`run_id`、`generation`、外部系统与操作；审计写入先于凭据返回。
 - **缓存真实凭据**：在凭据到期时刻与安全余量之内复用，按凭据对象版本与到期时刻失效；运行实例令牌与代不进入该缓存。
@@ -32,6 +32,7 @@
 - 不持有运行实例状态：状态机、当前代、终态与本代作废判定归 `runcontroller`；本模块不读写 `run` 表，不判断令牌中的代是否为当前代。
 - 不管理凭据对象的授权：凭据对象的创建、授权与撤销由密钥库的管理流程执行；本模块只读取。
 - 不校验用户身份与项目归属：`humanchannel` 完成用户身份校验；`project_id` 由受信控制面调用方提供。
+- 不交付首个令牌：引导接口、看守进程的认证与领取的一次性归 `sandboxprovider`；本模块只在引导接口调用时签发令牌，不与看守进程直接通信。
 - 不持有沙箱与工作区：沙箱生命周期归 `sandboxprovider`，工作区归 `workspace`。
 
 ## 术语表
@@ -40,8 +41,8 @@
 | --- | --- | --- | --- |
 | 凭据对象 | credential object | secrets | 密钥库中按项目、凭据类别、外部系统与认证方式存放的长期凭据及其元数据，含 `secret_schema` 与 `token_minting` |
 | 项目作用域 | project scope | secrets | 凭据对象按 `project_id` 隔离的可见范围；换取只解析调用方所指项目下的凭据对象 |
-| 凭据换取 | credential exchange | secrets | 以运行实例令牌与调用方身份换取真实凭据的处理，含身份与授权校验、令牌校验、授权范围校验、铸造与审计 |
-| 调用方身份 | caller identity | secrets | 控制面调用方在 mTLS 客户端证书中携带的工作负载身份；secrets 按它限制可换取的凭据类别、系统与认证方式 |
+| 凭据换取 | credential exchange | secrets | 以调用方身份换取真实凭据的处理，请求携带运行实例令牌时一并校验令牌；含身份与授权校验、令牌校验、授权范围校验、铸造与审计 |
+| 调用方身份 | caller identity | secrets | 控制面调用方在 mTLS 客户端证书中携带的工作负载身份；secrets 按它校验部署白名单，并限制可换取的凭据类别、系统与认证方式 |
 | 授权范围 | authorization scope | secrets | 凭据对象允许请求使用的 `scopes` 集合；`token_minting.scopes` 非空时取它，否则取凭据对象的 `scopes` |
 | 本次实际范围 | effective scope | secrets | 本次换取实际使用的 `scopes` 集合；`Target.Scopes` 非空时取它，否则取授权范围 |
 | 凭据提供者 | credential provider | secrets 与 Substrate 出口路径 | Substrate 出口网关按请求调用、返回真实凭据的协议接口，由 `secrets` 实现 |
@@ -73,7 +74,8 @@ type VerifyResult struct {
 }
 ```
 
-- `IssueRunToken` 只由 `runcontroller` 的预配与轮换效果在事务提交后调用；`generation` 由调用方传入，本模块不生成代，也不持久化令牌。
+- `IssueRunToken` 的调用方穷举如下：`sandboxprovider` 的引导接口在看守进程领取时调用，签发首个令牌；`runcontroller` 的 `rotate_token` 效果在事务提交后调用，签发轮换令牌。`generation` 由调用方传入，本模块不生成代，也不持久化令牌。
+- `IssueRunToken` 以 mTLS 暴露，本模块在入口按部署白名单校验调用方身份，白名单穷举为 `sandboxprovider` 与 `runcontroller`；身份不在白名单返回未认证错误，不签发令牌。
 - `VerifyRunToken` 的结果分为有效、过期、无效与不可达：签名与 `run_id` 有效而 `exp` 已过时，`Expired` 为真且不返回错误；签名无效、`run_id` 无效或签名算法不被接受时返回 `ErrInvalidToken`；密钥库不可达或超时返回传输错误，与无效分开。调用方依赖这一区分：`runcontroller` 在 `Hello` 中接受仅过期的令牌并写 `rotate_token`，换取路径则拒绝过期令牌。
 - 校验只覆盖签名、`run_id` 与 `exp`，不比较运行实例当前代。需要代校验的调用方经 `runcontroller` 的 `Generations.Current` 取得当前代、终态与本代作废状态后自行比较。
 - 令牌载荷为 `run_id`、`generation` 与 `exp`；签名算法与有效期由签发配置决定，本模块在 `exp` 中返回到期时刻。
@@ -116,16 +118,17 @@ type MintedCredential struct {
 }
 ```
 
-- `Token` 的 `run_id` 与 `generation` 必须与 `Usage` 一致；不一致返回 `ErrInvalidArgument`。这项一致性检查不是当前代校验。
+- `Token` 非空时，其 `run_id` 与 `generation` 必须与 `Usage` 一致；不一致返回 `ErrInvalidArgument`。这项一致性检查不是当前代校验。
+- 状态核对可以不携带运行实例令牌。[状态式轮询](../../glossary.md)由 `connectorhub` 在后台按周期执行，运行实例挂起期间同样执行，不持有运行实例令牌。`Token` 为空时，调用方身份必须是 `connectorhub`（其平台出口代理不适用），`Usage.Operation` 必须以 `verify:` 开头，否则返回 `ErrInvalidArgument`；`Usage.RunID` 取[订阅](../../glossary.md)所属运行实例，`Usage.Generation` 取调用方经 `Generations.Current` 取得的当前代。本模块对这类请求不调用 `VerifyRunToken`，不比对令牌载荷，审计的 `run_id` 与 `generation` 取 `Usage`。携带令牌的状态核对按常规换取校验。
 - `Usage.UsageID` 必须非空；为空返回 `ErrInvalidArgument`。
-- `ProjectID` 由调用方提供。调用方必须传入令牌所属运行实例的项目；本模块以 mTLS 客户端证书中的调用方身份为信任边界，不解析运行实例归属；归属与当前代归 `runcontroller`。错误归属由调用方的身份与审计追溯约束。
+- `ProjectID` 由调用方提供。调用方必须传入 `Usage.RunID` 所属运行实例的项目；本模块以 mTLS 客户端证书中的调用方身份为信任边界，不解析运行实例归属；归属与当前代归 `runcontroller`。错误归属由调用方的身份与审计追溯约束。
 - `Target.Kind` 的取值为闭集 `llm` 与 `external_system`。`Kind=llm` 时 `System` 为 LLM 提供方，`AuthMethod` 为该提供方的认证方式，`System` 与 `AuthMethod` 均由调用方传入，取值来自调用方的部署配置；`Kind=external_system` 时 `System` 为 `ExternalSystem` 名，`AuthMethod` 取自该外部系统定义的 `auth.methods`。
 - 凭据对象按 `(ProjectID, Kind, System, AuthMethod)` 读取；这组字段在项目内是唯一键，同一项目可存在多个同 `kind` 对象，按这组字段读取即可消歧；重复定义视为部署配置错误，返回 `ErrCredentialNotConfigured` 并告警。对象不存在或 `status=disabled` 返回 `ErrCredentialNotConfigured`。
 - `Target.Scopes` 非空时必须是授权范围的子集，超出返回 `ErrScopeDenied`，不铸造、不返回凭据，并写拒绝审计；为空时使用授权范围。授权范围在 `token_minting.scopes` 非空时取它，否则取凭据对象的 `scopes`。本次实际范围在 `Target.Scopes` 非空时取它，否则取授权范围；对 `token_minting` 为空的凭据，不允许收窄：`Target.Scopes` 必须为空或等于授权范围，否则返回 `ErrScopeDenied`，此时本次实际范围等于授权范围。`MintedCredential.Scopes` 返回本次实际范围。
 - `Usage.Operation` 由调用方传入且必须非空，为空返回 `ErrInvalidArgument`：LLM 为 `llm.request`，状态核对为 `verify:<event>`，占位符替换为占位符、请求方法与目标主机。本模块不校验 `Operation` 与 `Kind` 的匹配，审计记录关联调用方身份。
-- 调用方身份与授权：`ExchangeCredential` 以 mTLS 暴露，调用方身份即客户端的 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)）；本模块在入口按部署白名单校验该身份，并把身份映射到允许的 `(Kind, System, AuthMethod)` 集合，三者均必填。身份缺失由 mTLS 在握手阶段拒绝，不进应用层；身份与目标授权在 `VerifyRunToken` 之后校验。身份不在白名单返回未认证错误，写 `denied` 审计，`run_id` 与 `generation` 取令牌载荷。目标不在允许集合返回 `ErrTargetNotAuthorized`，不读取凭据对象，不暴露其存在性，写 `denied` 审计。典型映射：`llmgateway` 允许 `Kind=llm`；`connectorhub` 与其平台出口代理允许 `Kind=external_system`；每个调用方的 `System` 与 `AuthMethod` 允许集合由部署配置枚举，不因 `Kind` 相同而默认放行。
+- 调用方身份与授权：`ExchangeCredential` 以 mTLS 暴露，调用方身份即客户端的 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)）；本模块在入口按部署白名单校验该身份，并把身份映射到允许的 `(Kind, System, AuthMethod)` 集合，三者均必填。身份缺失由 mTLS 在握手阶段拒绝，不进应用层；`Token` 非空时，身份与目标授权在 `VerifyRunToken` 之后校验；`Token` 为空时不调用 `VerifyRunToken`，直接校验。身份不在白名单返回未认证错误，写 `denied` 审计，`run_id` 与 `generation` 取令牌载荷，`Token` 为空时取 `Usage`。目标不在允许集合返回 `ErrTargetNotAuthorized`，不读取凭据对象，不暴露其存在性，写 `denied` 审计。典型映射：`llmgateway` 允许 `Kind=llm`；`connectorhub` 与其平台出口代理允许 `Kind=external_system`；`sandboxprovider` 的允许集合为空，其身份只用于 `IssueRunToken`；每个调用方的 `System` 与 `AuthMethod` 允许集合由部署配置枚举，不因 `Kind` 相同而默认放行。
 - 返回的 `MintedCredential` 只给控制面调用方。本模块不把它写入工作区、不交给看守进程、不放进沙箱环境变量或文件。
-- 调用方在换取前按其入口规则校验代：订阅登记与 k8s 路径的出口请求不使用缓存的代，LLM 请求可按 `llmgateway` 的 `T_gen_cache` 缓存代查询结果。调用方在换取返回后仍以令牌载荷中的代核对。
+- 调用方在换取前按其入口规则校验代：订阅登记与 k8s 路径的出口请求不使用缓存的代，LLM 请求可按 `llmgateway` 的 `T_gen_cache` 缓存代查询结果。携带令牌的调用方在换取返回后仍以令牌载荷中的代核对。
 - 错误分类：`ErrInvalidToken`、`ErrTokenExpired`、`ErrInvalidArgument`、`ErrCredentialNotConfigured`、`ErrScopeDenied` 与 `ErrTargetNotAuthorized` 为不可重试；调用方身份缺失在 mTLS 握手阶段拒绝；身份不在白名单返回未认证错误，同样不可重试；密钥库不可达、审计存储不可用与铸造上游的暂时性失败为可重试。
 
 ### 审计接口
@@ -218,13 +221,14 @@ type ProviderResponse struct {
 
 ## 依赖
 
-依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖密钥库与部署提供的控制面 mTLS；`runcontroller`、`llmgateway`、`connectorhub` 与 `humanchannel` 依赖本模块。本模块不依赖 `runcontroller`、`sandboxprovider`、看守进程与事件源模块，满足基础层不反向依赖的约束。
+依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖密钥库与部署提供的控制面 mTLS；`runcontroller`、`sandboxprovider`、`llmgateway`、`connectorhub` 与 `humanchannel` 依赖本模块。本模块不依赖 `runcontroller`、`sandboxprovider`、看守进程与事件源模块，满足基础层不反向依赖的约束。
 
 - 密钥库（Vault 类）：唯一的密钥材料依赖，凭据对象与令牌签名密钥的权威存储。本模块按项目路径读取凭据对象，按 `kid` 读取令牌签名密钥；不拥有凭据表，不复制凭据材料。
-- Substrate credential provider 协议：Substrate 出口网关在运行时调用本模块实现的凭据提供者；这是运行时调用，不是代码依赖，`sandboxprovider` 不依赖本模块。
-- `runcontroller`：调用 `IssueRunToken` 与 `VerifyRunToken`；签发在效果记录内、事务提交后执行。`runcontroller` 的 `Hello` 处理以 `VerifyRunToken` 区分无效、过期与不可达，并据过期结果触发 `rotate_token`。本模块不读 `run` 表，代比较归 `runcontroller` 与各调用方。
+- Substrate credential provider 协议：Substrate 出口网关在运行时调用本模块实现的凭据提供者；这是出口网关的运行时调用，不是代码依赖；`sandboxprovider` 对本模块的依赖只来自引导接口对 `IssueRunToken` 的调用。
+- `runcontroller`：在 `rotate_token` 效果中调用 `IssueRunToken`，签发在效果记录所在事务提交后执行；调用 `VerifyRunToken`。`runcontroller` 的 `Hello` 处理以 `VerifyRunToken` 区分无效、过期与不可达，并据过期结果触发 `rotate_token`。本模块不读 `run` 表，代比较归 `runcontroller` 与各调用方。
+- `sandboxprovider`：[引导接口](sandboxprovider/design-sandboxprovider.md)在看守进程领取时调用 `IssueRunToken(run_id, generation)` 签发首个令牌，令牌随领取响应交给看守进程，不持久化，不进入提供者的持久记录。本模块不感知领取的认证方式与一次性约束。
 - `llmgateway`：以运行实例令牌与调用方身份调用 `ExchangeCredential`，`Target.Kind=llm`，`System` 与 `AuthMethod` 取 `llmgateway` 部署配置中的 LLM 提供方与认证方式；校验令牌后按 `Generations.Current` 比较代。
-- `connectorhub`：以运行实例令牌与调用方身份换取外部系统凭据；[订阅](../../glossary.md)登记与有外部副作用的操作不使用缓存的代。平台出口代理以调用方身份调用 `ExchangeCredential`，对 k8s 路径的每个出口请求换取凭据并逐请求校验代。
+- `connectorhub`：以运行实例令牌与调用方身份换取外部系统凭据，状态式轮询的状态核对不携带令牌，只以调用方身份换取（规则见[凭据换取接口](#凭据换取接口)）；[订阅](../../glossary.md)登记不使用缓存的代。平台出口代理以调用方身份调用 `ExchangeCredential`，对 k8s 路径的每个出口请求换取凭据并逐请求校验代。
 - 控制面 mTLS：调用方身份由部署的 mTLS 基础设施提供，本模块不签发调用方身份。
 - `humanchannel`：用 `VerifyRunToken` 校验附件取回请求携带的运行实例令牌；拒绝路径调用 `ReportDenial`，附件取回不涉及凭据目标，`kind` 为空；不换取外部系统凭据。
 - 审计存储：另一项外部依赖，由部署配置决定介质；本模块通过内部 `appendAudit` 写入，对控制面调用方以 `ReportDenial` 接收上报的拒绝记录，不参与运行实例状态的数据库事务。
@@ -296,11 +300,20 @@ classDiagram
 ```mermaid
 sequenceDiagram
     autonumber
+    participant W as 看守进程
+    participant P as sandboxprovider 引导接口
     participant R as runcontroller
     participant S as secrets
     participant V as 密钥库
-    participant W as 看守进程
     participant G as llmgateway 或 connectorhub
+    Note over W,S: 首个令牌：看守进程领取
+    W->>P: POST /v1/bootstrap/claim
+    P->>S: IssueRunToken(run_id, generation)
+    S->>V: 按 kid 读取令牌签名密钥
+    V-->>S: 令牌签名密钥
+    S-->>P: {token, expires_at}
+    P-->>W: {run_id, generation, sandbox_id, lease_id, token, token_expires_at}
+    Note over W,S: 轮换令牌：rotate_token 效果
     R->>S: IssueRunToken(run_id, generation)
     S->>V: 按 kid 读取令牌签名密钥
     V-->>S: 令牌签名密钥
@@ -315,7 +328,7 @@ sequenceDiagram
     Note over G: 比较令牌中的代与当前代<br/>过期、终态或作废时拒绝
 ```
 
-签发只在 `runcontroller` 的效果执行器中发生。轮换的令牌经出站流上的 `TokenRotate` 交给看守进程，不经过本模块与看守进程之间的直接连接；首个令牌由 `provision` 效果在预配时投递，`IssueRunToken` 的结果由 `runcontroller` 经预配的引导参数交给 `sandboxprovider`，由其经看守进程的私有引导通道注入，不进入 Agent 的环境变量或文件系统。校验返回的 `expired` 是调用方分支的依据：`runcontroller` 的 `Hello` 接受仅过期的令牌并触发轮换，`llmgateway` 与 `connectorhub` 的换取路径拒绝过期令牌。代比较发生在校验之后、换取之前或换取响应之后，由调用方经 `Generations.Current` 完成；本模块不持有当前代。
+签发只由 `sandboxprovider` 的引导接口与 `runcontroller` 的 `rotate_token` 效果发起。首个令牌由看守进程经 `sandboxprovider` 的引导接口领取，引导接口调用 `IssueRunToken` 后把令牌随领取响应交给看守进程，令牌不进入提供者的持久记录，也不进入 Agent 的环境变量或文件系统；轮换令牌由 `runcontroller` 的 `rotate_token` 效果签发，经出站流上的 `TokenRotate` 交给看守进程。本模块与看守进程之间没有直接连接。校验返回的 `expired` 是调用方分支的依据：`runcontroller` 的 `Hello` 接受仅过期的令牌并触发轮换，`llmgateway` 与 `connectorhub` 的换取路径拒绝过期令牌。代比较发生在校验之后、换取之前或换取响应之后，由调用方经 `Generations.Current` 完成；本模块不持有当前代。
 
 ### 凭据换取与审计时序图
 
@@ -341,7 +354,7 @@ sequenceDiagram
     G->>G: 使用真实凭据访问外部系统
 ```
 
-审计写入先于凭据返回：审计存储不可用时换取失败，不返回凭据。代比较在换取之前完成，换取返回后可再次核对，`secrets` 不复核当前代；换取请求中的 `run_id` 与 `generation` 只与令牌载荷比对，用于发现调用方传参错误。`connectorhub` 对有外部副作用的操作在每次调用前取得当前代，不使用缓存；`llmgateway` 对 LLM 请求可按 `T_gen_cache` 缓存代查询结果。
+审计写入先于凭据返回：审计存储不可用时换取失败，不返回凭据。代比较在换取之前完成，换取返回后可再次核对，`secrets` 不复核当前代；换取请求携带令牌时，其中的 `run_id` 与 `generation` 只与令牌载荷比对，用于发现调用方传参错误。`connectorhub` 对订阅登记与 k8s 路径的每个出口请求取得当前代，不使用缓存；`llmgateway` 对 LLM 请求可按 `T_gen_cache` 缓存代查询结果。
 
 ### 凭据提供者对接图
 
@@ -418,7 +431,7 @@ flowchart TB
 | `occurred_at` | 记录时刻 |
 | `project_id` | 项目作用域 |
 | `run_id` | 运行实例标识 |
-| `generation` | 使用发生时令牌中的代 |
+| `generation` | 使用发生时令牌中的代；不携带运行实例令牌的状态核对取 `Usage.Generation`，即调用方经 `Generations.Current` 取得的当前代 |
 | `kind` | `llm` 或 `external_system` |
 | `system` | LLM 提供方或 `ExternalSystem` 名 |
 | `auth_method` | 认证方式 |
@@ -468,7 +481,7 @@ flowchart TB
 1. 调用方传入 `run_id` 与 `generation`；本模块不生成代，也不读取运行实例状态。
 2. 构造载荷 `{run_id, generation, exp}`，`exp` 取当前时刻加签发配置的有效期。
 3. 选择当前令牌签名密钥，按 `kid` 写入 JOSE 头部，签名后返回 `token` 与 `expires_at`。
-4. 调用方以效果记录的 `ref` 幂等；同一参数被重复调用时，返回的令牌只要在 `exp` 之前都有效，本模块不维护已签发令牌的清单。
+4. 本模块不维护已签发令牌的清单；同一参数被重复调用时，返回的令牌只要在 `exp` 之前都有效。重复签发由调用方约束：`rotate_token` 效果以效果记录的 `ref` 幂等，引导接口对同一沙箱实例只完成一次领取。
 
 签发不持久化，因而不存在令牌表的写入事务；令牌的失效由 `exp`、代递增与调用方的代比较共同完成。
 
@@ -490,27 +503,27 @@ flowchart TB
 4. 旧令牌在 `exp` 之前继续有效；新旧令牌在重叠期内都能通过校验，换取路径不因轮换而拒绝。
 5. 看守进程未收到 `TokenRotate` 时，旧令牌到期后换取返回 `ErrTokenExpired`；看守进程重连时 `Hello` 携带过期令牌，`runcontroller` 接受并再次触发轮换。
 
-轮换只由 `runcontroller` 发起，本模块不与看守进程直接通信。轮换不撤销旧令牌，也不使真实凭据缓存失效；旧令牌的失效由 `exp` 与代递增完成。`TokenRotate` 是看守进程获得轮换令牌的唯一路径；首个令牌由预配投递，不经 `TokenRotate`，其通道见令牌签发与校验时序图后的说明。
+轮换只由 `runcontroller` 发起，本模块不与看守进程直接通信。轮换不撤销旧令牌，也不使真实凭据缓存失效；旧令牌的失效由 `exp` 与代递增完成。`TokenRotate` 是看守进程获得轮换令牌的唯一路径；首个令牌由看守进程经引导接口领取，不经 `TokenRotate`，见令牌签发与校验时序图后的说明。
 
 ### 凭据换取
 
-1. 调用方提交 `ExchangeRequest`，其中 `Token` 为看守进程持有的运行实例令牌，`ProjectID` 为运行实例所属项目。
-2. 调用 `VerifyRunToken`。无效返回 `ErrInvalidToken`，过期返回 `ErrTokenExpired`，传输错误原样返回。
-3. 校验调用方身份与允许目标；身份缺失由 mTLS 在握手阶段拒绝，不进应用层；身份不在白名单返回未认证错误并写 `denied` 审计；目标不在允许集合返回 `ErrTargetNotAuthorized`，写 `denied` 审计且不读取凭据对象。两项审计的 `run_id` 与 `generation` 取令牌载荷。
-4. 比对 `Usage.RunID` 与 `Usage.Generation` 是否等于令牌载荷；不一致返回 `ErrInvalidArgument`。
+1. 调用方提交 `ExchangeRequest`，其中 `Token` 为看守进程持有的运行实例令牌（状态核对可为空），`ProjectID` 为运行实例所属项目。
+2. `Token` 非空时调用 `VerifyRunToken`。无效返回 `ErrInvalidToken`，过期返回 `ErrTokenExpired`，传输错误原样返回。`Token` 为空时跳过令牌校验。
+3. 校验调用方身份与允许目标；身份缺失由 mTLS 在握手阶段拒绝，不进应用层；身份不在白名单返回未认证错误并写 `denied` 审计；`Token` 为空时按凭据换取接口中的状态核对规则校验调用方身份与 `Usage.Operation`，不满足返回 `ErrInvalidArgument`；目标不在允许集合返回 `ErrTargetNotAuthorized`，写 `denied` 审计且不读取凭据对象。两项审计的 `run_id` 与 `generation` 取令牌载荷，`Token` 为空时取 `Usage`。
+4. `Token` 非空时比对 `Usage.RunID` 与 `Usage.Generation` 是否等于令牌载荷；不一致返回 `ErrInvalidArgument`。
 5. 按 `(ProjectID, Target.Kind, Target.System, Target.AuthMethod)` 读取凭据对象。对象不存在或 `status=disabled` 返回 `ErrCredentialNotConfigured`。
 6. 计算授权范围并校验 `Target.Scopes`：`Target.Scopes` 非空时必须是授权范围的子集，超出返回 `ErrScopeDenied`；为空时使用授权范围。授权范围在 `token_minting.scopes` 非空时取它，否则取凭据对象的 `scopes`。本次实际范围在 `Target.Scopes` 非空时取它，否则取授权范围；`token_minting` 为空时不允许收窄，`Target.Scopes` 必须为空或等于授权范围，否则返回 `ErrScopeDenied`。
 7. `token_minting` 非空时按 `ttl` 与本次实际范围向密钥库请求铸造；为空时使用凭据对象中的凭据本身。铸造失败按上游错误分类返回。
 8. 写入 `allowed` 审计记录；审计写入失败则不返回凭据。
 9. 返回 `MintedCredential`，其中 `source_version` 为凭据对象的 `secret_version`，`Scopes` 为本次实际范围。
 
-本模块不判断令牌中的代是否为当前代。调用方在换取前或使用前经 `Generations.Current` 比较；有外部副作用的操作在每次调用前取得当前代，不使用缓存。
+本模块不判断令牌中的代是否为当前代。调用方在换取前或使用前经 `Generations.Current` 比较；订阅登记与 k8s 路径的每个出口请求取得当前代，不使用缓存。
 
 ### 出口代理的凭据来源
 
 k8s 路径：
 
-1. 本地代理在转发给平台出口代理的请求上附加运行实例令牌。
+1. 本地代理或透明拦截器在转发给平台出口代理的请求上附加运行实例令牌。
 2. 平台出口代理对每个请求调用 `Generations.Current`，校验令牌中的代、运行实例是否终态与本代是否作废，不使用缓存的代；任一不通过则拒绝，计入旧代拒绝计数。
 3. 通过校验后，平台出口代理以调用方身份调用 `ExchangeCredential`，`Target` 为 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则；`Usage.UsageID` 取出口代理的 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机。
 4. 平台出口代理把占位符替换为返回的真实凭据，转发到允许主机。
@@ -549,7 +562,7 @@ git 流量经平台反向代理重写，Basic 与 Bearer 头同样由出口侧�
 - 每次刷新读取凭据对象的 `secret_version`；与条目记录的 `source_version` 不一致时丢弃旧条目并重新铸造。
 - 凭据对象在密钥库中被撤销时提升版本；缓存条目的失效上界为其 `expires_at`，本模块不设跨进程推送。
 - 运行实例令牌的过期与轮换不使真实凭据缓存失效；缓存键不含 `run_id` 与 `generation`，代校验在每次请求上完成。
-- 令牌不缓存；代查询结果由调用方缓存，`llmgateway` 的缓存窗口不超过 `T_gen_cache`，`connectorhub` 对有外部副作用的操作与订阅登记不缓存。
+- 令牌不缓存；代查询结果由调用方缓存，`llmgateway` 的缓存窗口不超过 `T_gen_cache`，`connectorhub` 对订阅登记与 k8s 路径的每个出口请求不缓存。
 - 验签公钥按 `kid` 缓存；令牌签名密钥轮换期间同时保留旧公钥，直到旧令牌全部过期。
 
 ### 凭据提供者对接
@@ -571,7 +584,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 | 失败 | 判定与处置 |
 | --- | --- |
 | 调用方身份缺失 | mTLS 握手失败，传输层拒绝，不可重试；不进应用层，不写审计 |
-| 调用方身份不在白名单 | 未认证错误，不可重试；令牌校验后写 `denied` 审计（`run_id` 与 `generation` 取令牌载荷），不读取凭据对象，不暴露其存在性 |
+| 调用方身份不在白名单 | 未认证错误，不可重试；令牌校验后写 `denied` 审计（`run_id` 与 `generation` 取令牌载荷；`Token` 为空时不做令牌校验，取 `Usage`），不读取凭据对象，不暴露其存在性 |
 | 目标不在调用方允许集合 | `ErrTargetNotAuthorized`，不可重试；写 `denied` 审计，不读取凭据对象 |
 | 签名无效、`alg` 不被接受或 `kid` 未知 | `ErrInvalidToken`，不可重试；调用方拒绝请求，计入旧代拒绝计数并写拒绝审计 |
 | `run_id` 为空或与载荷不一致 | `ErrInvalidToken`，不可重试；不换取、不返回凭据 |
@@ -581,7 +594,8 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 | 认证方式与凭据对象不匹配 | `ErrCredentialNotConfigured`，不可重试；写 `denied` 审计 |
 | 请求的授权范围超出凭据对象的授权范围，或 `token_minting` 为空而 `Target.Scopes` 不等于授权范围 | `ErrScopeDenied`，不可重试；写 `denied` 审计，不铸造；`Target.Scopes` 为空时使用授权范围，不触发该错误 |
 | 密钥库不可达或超时 | 可重试；有效期内的缓存可继续服务，缓存不可用时换取失败，不返回过期凭据 |
-| 令牌签名密钥不可用 | `IssueRunToken` 失败；`runcontroller` 的效果按退避重试；已签发令牌在 `exp` 前继续有效，预配等待令牌签发 |
+| 令牌签名密钥不可用 | `IssueRunToken` 失败；引导接口向看守进程返回 503，看守进程退避重试领取；`rotate_token` 效果按退避重试；已签发令牌在 `exp` 前继续有效 |
+| `IssueRunToken` 的调用方身份不在白名单 | 未认证错误，不可重试；不签发令牌 |
 | 铸造被上游拒绝 | 区分上游的暂时性与永久性错误；暂时性错误可重试，永久性错误不可重试；均不返回凭据，写 `denied` 审计 |
 | 审计存储不可用 | 可重试；不返回真实凭据，调用方以同一 `usage_id` 重试 |
 | 凭据提供者收到未认证调用 | 未认证错误，不可重试；写 `denied` 审计，不暴露凭据对象是否存在 |
@@ -595,7 +609,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 
 ### 令牌签发与轮换
 
-`IssueRunToken` 不在 `runcontroller` 的状态转移事务内执行：状态转移与效果记录同事务提交，签发在提交后由效果执行器调用。因此签发与代递增之间没有共享数据库锁；轮换的原子性由有效期重叠与调用方的代比较保证，而不是由两阶段提交保证。
+`IssueRunToken` 只签名、不写存储，不参与调用方的数据库事务：`rotate_token` 效果的签发在状态转移与效果记录同事务提交之后由效果执行器调用；引导接口的签发在领取时调用，领取的一次性由 `sandboxprovider` 保证。因此签发与代递增之间没有共享数据库锁；轮换的原子性由有效期重叠与调用方的代比较保证，而不是由两阶段提交保证。
 
 - 轮换先签发后继令牌，再经 `TokenRotate` 投递；新旧令牌在重叠期内都有效，看守进程在收到新令牌后替换，投递成功时不出现无可用令牌的窗口。
 - 后继令牌未送达时，旧令牌到期后换取返回 `ErrTokenExpired`；看守进程重连的 `Hello` 触发再次轮换。
@@ -618,7 +632,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 
 多个调用方可以并发换取同一项目、同一外部系统的凭据；缓存键相同则合并密钥库调用，缓存键不同则各自铸造。身份与目标授权在读取凭据对象之前完成；本模块不缓存授权结果。本模块不按运行实例加锁，也不在换取与外部调用之间持有锁。
 
-代递增与换取并发时，代比较由调用方完成；代递增在比较之后、外部调用之前提交时，该次外部调用仍可能发生。失效判定不替代外部系统的幂等键，连接器对创建或改变外部对象的操作以幂等键约束重做。
+代递增与换取并发时，代比较由调用方完成；代递增在比较之后、外部调用之前提交时，该次外部调用仍可能发生。失效判定不替代外部系统的幂等键；平台不提供按操作的幂等键，第三方工具对创建或改变外部对象的操作自行实现重试与幂等（[ADR-platform-does-not-execute-external-operations](../../adr/adr-platform-does-not-execute-external-operations.md)）。
 
 ## 扩展点
 

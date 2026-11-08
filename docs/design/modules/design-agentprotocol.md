@@ -16,7 +16,7 @@
 - **维护按代单调的流序号与确认**：每个方向、每个代独立分配 `msg_seq`；接收方以 `ack_msg_seq` 确认连续已提交前缀，确认只在消息的处理事务提交之后推进。
 - **保留并重放未确认消息**：发送方在重放缓冲中保留 `ack_msg_seq` 之后的已发送消息；流重建后按原序号与原内容重放，未确认消息不因连接中断而丢弃。
 - **按 `(generation, msg_seq)` 去重与按序派发**：接收方丢弃已提交的重复帧，缓存序号不连续的帧直到重放补齐；未提交的消息在重放时重新派发，效果由应用层幂等吸收。
-- **以 `Hello` 与 `HelloAck` 做状态对账**：交换 `last_received_msg_seq`、`cursor_accepted`、`pending_intents`、`agent_state`、`owner_epoch` 与 `live_attached`，使双方在流重建后以持久化状态恢复一致，不重放事件历史（[ADR-state-based-reconciliation](../../adr/adr-state-based-reconciliation.md)）。
+- **以 `Hello` 与 `HelloAck` 做状态对账**：交换 `last_received_msg_seq`、`cursor_accepted`、`pending_intents`、`agent_state`、`sandbox_config_revision`、`owner_epoch` 与 `live_attached`，使双方在流重建后以持久化状态恢复一致，不重放事件历史（[ADR-state-based-reconciliation](../../adr/adr-state-based-reconciliation.md)）。
 - **定义消息闭集与字段语义**：按方向穷举应用消息种类、字段与语义，定义共用的确认帧，约束字段取值闭集；消息种类不在当前协议版本闭集内的帧按协议违规处理。
 - **定义关闭状态闭集**：`Fenced`、可重试关闭、不可重试认证失败与 `Shutdown`；规定每种状态的触发、确认推进与看守进程动作，并与协议违规造成的传输终止相区分。
 - **协商协议版本**：按双方支持的连续版本区间选择版本，版本在协商完成后不变；版本决定信封字段、消息闭集与字段语义。
@@ -30,7 +30,8 @@
 - 每条消息对运行实例状态机的作用、持久化点与效果记录归 `runcontroller`。本模块只把消息按序、去重后交给它。
 - 投递批的选择、`delivery_id`、`Accepted` 与 `Consumed` 的游标语义归 `runcontroller`。协议层的 `ack_msg_seq` 只确认消息已处理，不是投递确认（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
 - 沙箱的预配、挂起、解冻、快照、销毁与恢复触发归 `sandboxprovider`；`/readyz`、`/wake` 与 `/terminal` 的 HTTP 服务归看守进程，入站路由归 `sandboxprovider` 的提供者子模块。
-- 运行实例令牌的签发、签名校验、轮换与有效期归 `secrets`。本模块只承载 `resume_token` 与 `TokenRotate`，并定义认证失败的关闭状态。
+- 运行实例令牌的签发、签名校验、轮换与有效期归 `secrets`。本模块只承载 `resume_token` 与 `TokenRotate`，并定义认证失败的关闭状态。首个令牌与工作区租约的 `lease_id` 由看守进程经 `sandboxprovider` 的[引导接口](../../glossary.md)领取，不经过出站流。
+- [沙箱侧配置](../../glossary.md)的生成归 `connectorhub`，按运行实例保存与发送时机归 `runcontroller`，应用归看守进程。本模块只承载 `SandboxConfig` 消息与 `Hello.sandbox_config_revision`，不解析配置内容。
 - [收件箱](../../glossary.md)、[唤醒信号](../../glossary.md)、[等待](../../glossary.md)、定时器、[订阅](../../glossary.md)与在途请求的持久化归 `runcontroller` 与事件源模块。本模块只承载 `Hello` 中的状态摘要与 `Deliver` 中的投递批。
 - 本地代理与 LLM 网关之间的 HTTP、连接器与外部系统之间的 HTTP、MCP 工具调用都不归本模块；它们与出站流是并行的运行时调用。
 - 看守进程对 Agent 的进程监督、[投递意图日志](../../glossary.md)、活动度采集与本地代理归 `warden` 模块的对应子模块。
@@ -165,6 +166,7 @@ classDiagram
         +CursorConsumed int64
         +PendingIntents List
         +AgentState AgentState
+        +SandboxConfigRevision int64
         +OwnerEpoch uint64
         +LiveAttached bool
         +LiveAsOf Time
@@ -228,25 +230,25 @@ stateDiagram-v2
 
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
-| `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq` | 出站流首帧。以 `resume_token` 认证并声明代与工作区租约，提交状态摘要。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放。 |
+| `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq`、`sandbox_config_revision` | 出站流首帧。以 `resume_token` 认证并声明代与工作区租约，提交状态摘要。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放；`sandbox_config_revision` 是看守进程已应用的[沙箱侧配置](../../glossary.md)版本，尚未应用为 0。 |
 | `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms}`、`bg_jobs_changed{job_ids}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为回合事件；`event_seq` 在同一回合内单调，用于丢弃重复与乱序事件。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。 |
-| `WaitDeclared` | `wait_id`、`scope: run\|generation`、`conditions[{cond_id, kind, ref}]`、`deadline`、`safe_to` | 仅 L2 协作式 Agent 使用；沙箱内的 L2 进程驱动器经出站流发送，控制面循环驱动器经 `runcontroller` 的 `RunService.DeclareWait` 提交同一组字段。向控制面追加显式等待条件。`kind=timer` 的条件必须引用已存在且同范围的 `timer` 行，否则整条声明被拒绝并计数；带 `deadline` 时登记同范围的 `declared_deadline` 定时器。 |
-| `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`throttled_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。 |
+| `WaitDeclared` | `wait_id`、`scope: run\|generation`、`conditions[{cond_id, kind, ref}]`、`deadline`、`safe_to` | 仅 L2 协作式 Agent 使用；沙箱内的 L2 进程驱动器经出站流发送，控制面循环驱动器经宿主 `runcontroller` 注入的事件入口提交同一组字段，由宿主调用 `RunService.DeclareWait`。向控制面追加显式等待条件。`kind=timer` 的条件必须引用已存在且同范围的 `timer` 行，否则整条声明被拒绝并计数；带 `deadline` 时登记同范围的 `declared_deadline` 定时器。 |
+| `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`mcp_procs`、`throttled_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`procs` 计 Agent 进程树的全部进程；`mcp_procs` 为其中已声明的第三方 MCP 服务器进程及其子进程的数量；`procs` 各态计数之和减 `mcp_procs` 为 Agent 主进程与其他进程的数量，控制面据此判定进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外是否还有其他进程。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。 |
 | `Accepted` | `delivery_id`、`through_seq`、`fed` | 接受记录同步写入[工作区](../../glossary.md)[投递意图日志](../../glossary.md)后才发送。`fed` 报告本批按日志去重后是否仍有事件喂给 Agent；`fed=false` 时不为本批启动 Agent，控制面不转 `InTurn`。 |
 | `Consumed` | `through_seq`、`turn_id` | 只针对 `target=next_user_message` 的常规投递；消费记录同步写入投递意图日志后才发送；`through_seq` 取已开始处理的常规批的序号。定向投递与回合边界续接不发 `Consumed`。 |
 | `DeliveryFailed` | `delivery_id`、`seqs`、`reason`、`retryable` | 一批投递未能喂给 Agent。`reason` 含 `target_gone`；`retryable` 为真时由 `runcontroller` 以新 `delivery_id` 退避重投；`retryable` 为假且 `reason=target_gone` 时不放弃，事件取消定向并回退为常规投递；其余 `retryable` 为假的情形放弃失败的事件并通知 Agent。 |
-| `ReadyToSuspend` | `suspend_id`、`mode`、`frozen_at \| exited_at`、`session_id`、`procs_remaining`、`ws_write_fds` | 看守进程侧安全点已满足。冻结模式报告 `frozen_at`，销毁模式报告 `exited_at`；`session_id` 为[恢复句柄](../../glossary.md)，空值不覆盖已落库的值。 |
+| `ReadyToSuspend` | `suspend_id`、`mode`、`frozen_at \| exited_at`、`session_id`、`procs_remaining`、`ws_write_fds` | 看守进程侧的挂起前置条件已满足，`mode=destroy` 时即看守进程对[安全点](../../glossary.md)的复核已通过。冻结模式报告 `frozen_at`，销毁模式报告 `exited_at`；`session_id` 为[恢复句柄](../../glossary.md)，空值不覆盖已落库的值。 |
 | `Busy` | `suspend_id`、`reason`、`retry_after` | 挂起前置条件不满足；`reason=cancelled` 是 `CancelSuspend` 的确认；`retry_after` 给出复评时刻。 |
 | `Thawed` | `suspend_id` | `suspend_id` 取冻结标识 `freeze_id`；按 `freeze_id` 幂等。`signal` 变体在自行解冻进程树之后上报，`cgroup` 变体在观察到 Agent 子 cgroup 未冻结之后上报，进程树从未冻结时立即上报。 |
 | `LeaseLost` | `lease_id`、`expires_at` | [工作区租约](../../glossary.md)续约失败后上报；看守进程冻结或杀死 Agent 进程树并停止写入。 |
 | `llm.request.started` | `request_id`、`mode: passthrough\|hold`、`predicted_ms` | 本地代理获得上游响应头，或确认同一逻辑请求在途之后上报。`mode` 决定阻塞条件的冻结上限取 `F_stream` 或 `F_cap(llm)`；`predicted_ms` 是等待时长的单点预测，`suspendpolicy` 按来源先验把它展开为分位区间与置信度。 |
-| `llm.first_token` | `request_id` | 收到首个内容事件后上报，保活事件不计入；每个逻辑请求至多一次。控制面据此写 `wake_hint` 事实供预测性恢复，并按已等待时长重估同一 `request_id` 的剩余等待；不单独满足阻塞条件。 |
+| `llm.first_token` | `request_id` | 收到首个内容事件后上报，保活事件不计入；每个逻辑请求至多一次。控制面据此写 `wake_hint` 事实供[预测性恢复](../../glossary.md)，并按已等待时长重估同一 `request_id` 的剩余等待；不单独满足阻塞条件。 |
 | `llm.request.completed`、`llm.request.failed` | `request_id`；失败另带 `reason` | LLM 请求完成或失败；满足同一 `request_id` 的阻塞条件。`failed` 可以在 `started` 之前发出（网关不可达、准入失败），此时只写失败信号并关闭该 `request_id` 的在途行。`reason` 取 `upstream_error`、`upstream_timeout`、`stream_interrupted`、`admission_failed`、`replay_missing`。 |
 | `ToolExecResponse` | `exec_id`、`status`、`exit_code`、`result`、`error` | 工具执行请求的终态应答；`status` 取 `completed`、`failed`、`cancelled`，`error` 只在失败时非空。按 `(run_id, generation, exec_id)` 匹配请求。 |
 | `ToolExecData` | `exec_id`、`stream: stdout\|stderr`、`offset`、`data`、`eof` | 工具执行输出分片；`offset` 从该流起点计，接收方按偏移续传，重复或乱序分片被丢弃。`eof` 表示该流结束。 |
 
 - `session_epoch` 由看守进程按进程启动生成，用于识别同一代内看守进程的重启，不参与失效判定；失效判定只以 `generation` 为依据。
-- `agent_state.phase` 的取值为 `starting`、`in_turn`、`blocked`、`boundary`、`exited`；`blocked_on` 与 `turn_id` 描述回合位置；新代 `Hello` 的 `session_id` 只用于核对，不改写控制面的恢复句柄。
+- `agent_state.phase` 的取值为 `starting`、`in_turn`、`blocked`、`boundary`、`exited`；`blocked_on` 与 `turn_id` 描述回合位置，`blocked_on` 为空或为 `{kind, ref, call_id, since, predicted_ms, mode}`，`kind` 取 `llm`、`timer`、`approval`、`wait_for`，字段语义与 `runcontroller` 的 `run.blocked_on` 列相同；新代 `Hello` 的 `session_id` 只用于核对，不改写控制面的恢复句柄。
 - `cursor_accepted` 与 `cursor_consumed` 只计常规投递的已接受与已消费前缀，不含定向投递与回合边界续接。
 - `pending_intents[]` 携带投递意图日志中尚未被控制面确认的记录；控制面按其中常规投递的最大已接受序号前进 `cursor_accepted`（[ADR-delivery-intent-log](../../adr/adr-delivery-intent-log.md)）。
 
@@ -256,7 +258,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `HelloAck` | `accepted \| fenced{current_generation}`、`desired_state{running\|frozen}`、`last_received_msg_seq`、`cursor_accepted`、`owner_epoch`、`live_attached`、`live_as_of` | `Hello` 的应答。`accepted` 表示所有权已接管并完成状态对账；`fenced{current_generation}` 表示代已过期；认证失败不回 `HelloAck`。`desired_state` 让看守进程对齐 Agent 进程树的冻结状态；`last_received_msg_seq` 让看守进程裁剪重放缓冲并从其后重放；`cursor_accepted`、`owner_epoch`、`live_attached` 与 `live_as_of` 是状态对账字段。 |
 | `Deliver` | `delivery_id`、`batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`、`through_seq`、`target: next_user_message \| tool_result{call_id} \| permission_decision{id}`、`resume_session_id` | 只在出站流上，投递语义为至少一次。`batch` 按 `inbox_seq` 升序，`through_seq` 为批内最后一条；`subkind` 只在 `kind=internal_notice` 时非空，取值为 `turn_interrupted`、`timer_due`、`degraded_summary` 或 `delivery_abandoned`；`target` 决定喂入 Agent 的方式；`resume_session_id` 为空表示新会话；`payload` 超过 `S_max` 时以附件引用表达。 |
-| `PrepareSuspend` | `suspend_id`、`mode: freeze\|freeze_shrink\|snapshot\|destroy`、`variant: cgroup\|signal`、`deadline`、`require{process_exit, no_bg_procs, no_ws_write_fds, sync}`、`force` | 请求看守进程到达安全点。`variant` 只在冻结类模式（`freeze`、`freeze_shrink`）时非空；`require` 列出必须满足的条件；`force` 允许终止 Agent 主进程之外的进程；`deadline` 用于对账器重驱动。 |
+| `PrepareSuspend` | `suspend_id`、`mode: freeze\|freeze_shrink\|snapshot\|destroy`、`variant: cgroup\|signal`、`deadline`、`require{process_exit, no_bg_procs, no_ws_write_fds, sync}`、`force` | 请求看守进程满足挂起前置条件。`variant` 只在冻结类模式（`freeze`、`freeze_shrink`）时非空；`require` 列出必须满足的条件；`force` 允许终止 Agent 主进程与已声明的第三方 MCP 服务器进程（含其子进程，范围同 `Activity.mcp_procs`）之外的进程；`deadline` 用于对账器重驱动。 |
 | `CancelSuspend` | `suspend_id` | 撤销挂起尝试。确认载体为 `Busy{suspend_id, reason=cancelled}`；看守进程已越过不可撤销点时照常回 `ReadyToSuspend`。 |
 | `Thaw` | `suspend_id` | `suspend_id` 取冻结标识 `freeze_id`。`signal` 变体由看守进程收到后自行解冻；`cgroup` 变体由控制面在沙箱提供者的解冻调用返回之后发送。看守进程以 `Thawed` 应答。 |
 | `Resumed` | `suspend_id`、`suspended_for_ms`、`wall_clock_now`、`drain` | 恢复完成通知；按 `suspend_id` 幂等。`drain=true` 按 `T_drain` 周期重发；看守进程收到后，已在等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 都按 DRAIN 规则立即返回。 |
@@ -264,6 +266,7 @@ stateDiagram-v2
 | `Shutdown` | `graceful`、`reason`、`deadline` | 本代作废或运行实例已终态时关闭流；`graceful` 决定关闭 stdin 让 Agent 正常退出，还是强制终止；`deadline` 取发出时刻加 `T_shutdown_grace`。 |
 | `Fenced` | `current_generation` | 已建立的流上收到旧代非 `Hello` 消息时应答，每条流每个旧代一次，随后关闭该流。看守进程停止投递与副作用，强制终止 Agent 进程树。 |
 | `TokenRotate` | `token` | 轮换运行实例令牌。看守进程收到后用于 LLM 网关与连接器请求；令牌已过期而重连时，收到它之前不发起这类请求。 |
+| `SandboxConfig` | `revision`、`config` | 推送[沙箱侧配置](../../glossary.md)。`config` 是 `connectorhub` 生成的 `{modes, tool_profile}` 的序列化字节，不含密钥，凭据只以占位符出现，序列化后不超过 32 KiB；本模块按字节原样传输、不解析，内容无法解析不构成协议违规。`revision` 取同一次生成的 `EgressPolicy.Revision`，单调递增。控制面只在下列时机发出：被接受的 `Hello`（[runcontroller](design-runcontroller.md) 的「销毁态连接」除外）在 `run.sandbox_config_revision` 大于 `Hello.sandbox_config_revision` 时，于 `HelloAck` 之后随应答在同一流上发出；`PutSandboxConfig` 提高 `revision` 且本代沙箱有已接受的出站流时，由控制面在该流上发出。运行实例挂起或没有已接受的出站流时只保存，下一次被接受的 `Hello` 时补发。消息沿用出站流的确认与重放，看守进程按 `revision` 幂等应用，小于等于已应用版本的忽略；首次应用之前不启动 Agent 主进程，应用规则见 [warden](warden/design-warden.md)。 |
 | `ToolExecRequest` | `exec_id`、`op: exec\|read_file\|write_file\|stream\|list_jobs\|get_job\|terminate_job`、`args`、`deadline` | 工具执行请求。由链接进 `runcontroller` 的控制面循环驱动器发起，经本运行实例的出站流转发；`exec_id` 在同一代内唯一，`args` 与截止时间按操作定义。 |
 | `ToolExecCancel` | `exec_id` | 取消一次工具执行或输出流；看守进程按 `exec_id` 幂等，已结束的执行返回已完成。 |
 
@@ -277,11 +280,11 @@ stateDiagram-v2
 
 | 路径 | 调用方 | 语义 | 内容约束 |
 | --- | --- | --- | --- |
-| `/readyz` | [沙箱提供者](../../glossary.md)的唤醒探针、k8s 的就绪探针 | 就绪探针。看守进程可服务且出站流已建立时返回就绪，否则返回未就绪 | 无请求体与事件内容 |
-| `/wake` | `sandboxprovider` 的恢复路径，Substrate 路径经路由器 | 恢复触发入口。返回即表示出站流已重建；调用幂等，并发的重复调用合并 | 无事件内容，不返回投递批 |
-| `/terminal` | `humanchannel` 完成用户身份校验后的终端接入，经入站路由 | 人类 shell 终端接入；建立后为双向字节流 | 不承载协议消息、收件箱事件或投递批 |
+| `/readyz` | [沙箱提供者](../../glossary.md)的唤醒探针、k8s 的就绪探针 | 就绪探针，不以领取为条件。看守进程尚未领取时，可服务即返回就绪；领取之后，k8s 路径上看守进程可服务且出站流已建立时返回就绪，否则返回未就绪；Substrate 路径上可服务即返回就绪，不以出站流为条件 | 无请求体与事件内容 |
+| `/wake` | `sandboxprovider`：Substrate 路径的快照恢复经路由器调用，k8s 路径的预热认领经 wake-router 调用 | 看守进程已领取时为恢复触发入口，返回即表示出站流已重建；尚未领取时为领取通知，看守进程先经[引导接口](../../glossary.md)领取，再建立出站流，出站流建立之后返回。调用幂等，并发的重复调用合并 | 无事件内容，不返回投递批 |
+| `/terminal` | `humanchannel` 完成用户身份校验后的终端接入，经入站路由 | 人类 shell 终端接入；建立后为双向字节流；看守进程领取成功之前返回 503，不启动 shell | 不承载协议消息、收件箱事件或投递批 |
 
-`/readyz` 的就绪状态以出站流为准：流未建立或握手未完成时返回未就绪，使提供者与探针不把流量送入尚未接通的看守进程。`/wake` 在出站流重建完成之前不得返回成功；调用失败时由提供者按恢复失败处理。`/terminal` 的接入身份由 `humanchannel` 校验，看守进程只接受已通过入站路由的请求。
+`/readyz` 不以领取为条件：看守进程尚未领取时可服务即返回就绪，尚未领取的沙箱实例（例如 k8s 的预热 Pod 与 Substrate 构建[模板快照](../../glossary.md)的 actor）据此通过探针。领取之后，k8s 路径的就绪状态以出站流为准：流未建立或握手未完成时返回未就绪，使提供者与探针不把流量送入尚未接通的看守进程。Substrate 路径的 `/readyz` 是 `wakeupProbe`，不以出站流为条件：看守进程到控制面的连接经 Substrate 出口网关，出口网关只接受运行态 actor 的连接，而 `ResumeActor` 在探针返回 200 之后才把 actor 置为运行态；快照恢复的出站流在此之后重建，路由器随后转发的 `/wake` 等出站流重建完成再返回。`/wake` 在出站流建立或重建完成之前不得返回成功。快照恢复路径上的调用失败由提供者按恢复失败处理；预热认领路径上的调用只作通知，提供者不等待其返回，调用失败由看守进程的退避领取兜底。`/terminal` 的接入身份由 `humanchannel` 校验，看守进程只接受已通过入站路由的请求。
 
 ### 消息尺寸与附件引用
 
@@ -306,17 +309,17 @@ stateDiagram-v2
 
 ### 走查
 
-走查把一次断流前后的序号、确认与重放落到具体值上。初始条件：`generation=5`；控制面已发送 `Deliver` 41 与 42，最后收到的看守进程确认是 17；看守进程已处理 41 并发出 `Accepted` 18，`Accepted` 18 的 `ack_msg_seq` 为 41，42 已收到但尚未处理；`Accepted` 18 在控制面收到之前流中断。握手帧与确认帧的 `msg_seq` 为 0。
+走查把一次断流前后的序号、确认与重放落到具体值上。初始条件：`generation=5`；控制面已发送 `Deliver` 41 与 42，最后收到的看守进程确认是 40；看守进程最后收到的控制面确认是 17，已处理 41 并发出 `Accepted` 18，`Accepted` 18 的 `ack_msg_seq` 为 41，42 已收到但尚未处理；`Accepted` 18 在控制面收到之前流中断。握手帧与确认帧的 `msg_seq` 为 0。
 
 | 步骤 | 事件或动作 | 控制面到看守进程：重放缓冲 / 对端确认 | 看守进程到控制面：重放缓冲 / 对端确认 |
 | --- | --- | --- | --- |
-| 1 | 控制面已发送 41、42；看守进程已处理 41 并发出 18；流中断 | `[41, 42] / 17` | `[18] / 17` |
+| 1 | 控制面已发送 41、42；看守进程已处理 41 并发出 18；流中断 | `[41, 42] / 40` | `[18] / 17` |
 | 2 | 看守进程重连，发送 `Hello{generation=5, msg_seq=0, ack_msg_seq=41, last_received_msg_seq=41}`；控制面处理 `Hello` 后删除 41 | `[42] / 41` | `[18] / 17` |
 | 3 | 控制面回 `HelloAck{accepted, msg_seq=0, ack_msg_seq=17, last_received_msg_seq=17, cursor_accepted}` | `[42] / 41` | `[18] / 17` |
 | 4 | 看守进程重放 18；控制面按 `(5, 18)` 首次收到，派发给状态机并在事务提交后把待发确认置为 18 | `[42] / 41` | `[18] / 17` |
-| 5 | 控制面重放 42；看守进程首次处理 42，提交后发出 `Accepted` 19 `ack_msg_seq=42` | `[42] / 41` | `[18, 19] / 17` |
-| 6 | 控制面收到 19 并提交，对端确认变为 42；删除 42 | `[] / 42` | `[18, 19] / 17` |
-| 7 | 控制面下一次发往看守进程的消息携带 `ack_msg_seq=19`；看守进程删除 18 与 19 | `[] / 42` | `[] / 19` |
+| 5 | 控制面重放 42，信封携带 `ack_msg_seq=18`；看守进程删除 18，首次处理 42，提交后发出 `Accepted` 19 `ack_msg_seq=42` | `[42] / 41` | `[19] / 18` |
+| 6 | 控制面收到 19 并提交，对端确认变为 42；删除 42 | `[] / 42` | `[19] / 18` |
+| 7 | 控制面下一次发往看守进程的消息携带 `ack_msg_seq=19`；看守进程删除 19 | `[] / 42` | `[] / 19` |
 
 走查结束时控制面最后收到看守进程的确认 42，看守进程最后收到控制面的确认 19；两个方向的重放缓冲最终为空。协议层把 18 与 42 各派发一次；应用层的 `delivery_id` 与游标 CAS 保证重复的 `Accepted` 不重复推进游标。`Hello.last_received_msg_seq=41` 让控制面在应用确认 18 丢失时仍能裁剪 41，42 因未被确认而保留并重放。协议确认与投递确认是两层：`ack_msg_seq` 确认消息已处理，`Accepted` 与 `Consumed` 确认投递与消费。
 
@@ -325,7 +328,7 @@ stateDiagram-v2
 - **序号分配**：每个方向、每个代独立编号。握手帧与确认帧 `msg_seq=0`；第一个应用消息为 1，此后每条加一。序号在发送前分配，重放时保留原序号。
 - **发送与保留**：消息分配序号后先写入重放缓冲，再交给传输。未确认消息不因发送失败或连接中断而删除。
 - **确认推进**：接收方按 `msg_seq` 顺序派发；`ack_msg_seq` 取连续已提交的最大序号。处理事务失败时不确认，消息留在对向的重放缓冲中等待重放。批量确认取连续前缀的最高值，不跳号；没有应用消息可搭载时，确认帧独立发送，不等待反向消息。
-- **重放**：流重建后先发送 `Hello` 与 `HelloAck`，再按 `ack_msg_seq+1` 升序重放。接收方在握手后丢弃旧流的乱序缓存，从对端重放的序号重新接收。重放完成之前不分配新的应用序号；重放保持原 `msg_seq`、原消息体与原 `sent_at`。
+- **重放**：流重建后先发送 `Hello` 与 `HelloAck`，再按 `ack_msg_seq+1` 升序重放。接收方在握手后丢弃旧流的乱序缓存，从对端重放的序号重新接收。重放完成之前不分配新的应用序号；重放保持原 `msg_seq`、原消息体与原 `sent_at`，信封的 `ack_msg_seq` 取重放时的当前确认序号。
 - **背压**：重放窗口达到配置上限时，发送方在分配序号前返回背压错误并暂停产生新应用消息；确认帧与确认推进不受背压影响，窗口随确认回收；已处理的消息随确认帧离开窗口，关键事件不被已处理未确认的消息阻塞。已分配的序号一定已写入重放缓冲，窗口内未确认消息不被丢弃。
 - **代变化**：新代清空两个方向的重放缓冲与去重表，流序号从 1 重新开始。旧代消息不重放、不跨代复用 `msg_seq`；跨代重投由 `runcontroller` 生成新的 `Deliver` 与 `delivery_id`，并置 `redelivery=true`（[ADR-delivery-intent-log](../../adr/adr-delivery-intent-log.md)）。
 - **时钟**：`sent_at` 只用于测量与诊断；序号、确认、重放与去重都不依赖墙钟。冻结与解冻造成的时钟跳变不影响协议状态。
@@ -336,11 +339,11 @@ stateDiagram-v2
 - **重复确认**：重复帧可以再次确认，确认值不因重复而回退。低于已发送确认的迟到帧直接丢弃，不视为错误。
 - **乱序**：接收方不为序号不连续的消息建立新前缀，也不跳过缺口派发后续消息。缺口由重放补齐；重连并完成状态对账之后仍不连续时，按可重试关闭处理。
 - **去重表裁剪**：不高于已发送确认的条目删除；高于确认的条目保留到被确认或代变化。去重表的大小由重放窗口与背压约束，不随运行时长增长。
-- **幂等边界**：协议去重只覆盖传输层的重复投递。应用层重复由 `runcontroller` 的 `delivery_id`、`suspend_id`、`freeze_id` 与带代的游标 CAS 处理；本模块不解释这些标识。
+- **幂等边界**：协议去重只覆盖传输层的重复投递。应用层重复由 `runcontroller` 的 `delivery_id`、`suspend_id`、`freeze_id` 与带代的游标 CAS 处理，重复的 `SandboxConfig` 由看守进程按 `revision` 吸收；本模块不解释这些标识。
 
 ### 状态对账
 
-- **看守进程到控制面**：`Hello` 携带 `last_received_msg_seq`、`cursor_accepted`、`cursor_consumed`、`pending_intents` 与 `agent_state`。控制面以 `last_received_msg_seq` 裁剪控制面到看守进程的重放缓冲，从其后重放；以 `pending_intents` 前进 `cursor_accepted`，再对账 `cursor_consumed`，选择恢复后的进入点。对账以持久化状态为准，不重放事件历史（[ADR-state-based-reconciliation](../../adr/adr-state-based-reconciliation.md)）。
+- **看守进程到控制面**：`Hello` 携带 `last_received_msg_seq`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`agent_state` 与 `sandbox_config_revision`。控制面以 `last_received_msg_seq` 裁剪控制面到看守进程的重放缓冲，从其后重放；以 `pending_intents` 前进 `cursor_accepted`，再对账 `cursor_consumed`，选择恢复后的进入点；`sandbox_config_revision` 小于 `run.sandbox_config_revision` 时，在 `HelloAck{accepted}` 之后随应答发送 `SandboxConfig`（「销毁态连接」除外，见[控制面到看守进程](#控制面到看守进程)）。对账以持久化状态为准，不重放事件历史（[ADR-state-based-reconciliation](../../adr/adr-state-based-reconciliation.md)）。
 - **控制面到看守进程**：`HelloAck` 携带 `last_received_msg_seq`、`cursor_accepted`、`owner_epoch`、`live_attached` 与 `live_as_of`。看守进程以 `last_received_msg_seq` 裁剪自己的重放缓冲并从其后重放；以 `desired_state` 对齐 Agent 进程树的冻结状态；以 `live_as_of` 只接受更新的实时接入状态。
 - **确认与对账的分工**：信封的 `ack_msg_seq` 是流内的连续确认；`Hello` 与 `HelloAck` 的 `last_received_msg_seq` 是流重建时的对账起点。两者都不替代投递游标，也不使控制面跳过未提交的消息处理。
 - **跨所有者副本**：控制面副本崩溃后，新所有者以 `Hello.last_received_msg_seq` 与持久化的流状态继续出站序号，并以 `Hello` 与 `HelloAck` 的状态对账恢复一致。出站序号跨所有者副本单调；控制面出站序号与未确认消息由本模块的会话状态持有，不在 `runcontroller` 的数据模型中持久化，旧副本未确认的消息不按事件历史重放，由状态机按持久化状态重新产生（[ADR-single-writer-per-run](../../adr/adr-single-writer-per-run.md)、[ADR-state-based-reconciliation](../../adr/adr-state-based-reconciliation.md)）。
@@ -350,7 +353,7 @@ stateDiagram-v2
 - **取值与区间**：`protocol_version` 为正整数，双方各自支持一个连续的版本区间。看守进程以自身支持的最高版本发送 `Hello`。
 - **选择规则**：控制面在该版本落在自身区间内时以同一版本应答；高于自身上限时以自身上限应答，看守进程支持该版本时按它继续，不支持时终止连接并上报；低于自身下限时终止连接、不回 `HelloAck`，并计入配置错误。版本只降不升，协商完成后不再变化。
 - **版本的作用域**：版本决定信封字段、消息闭集与字段语义。新增消息种类或改变既有字段语义必须递增版本；同一版本内新增可选字段不改变既有语义，接收方忽略不认识的字段。
-- **无公共版本**：双方没有公共版本时连接终止，看守进程停止重连并上报；该情形按部署配置错误处理，不产生语义化关闭状态。
+- **无公共版本**：双方没有公共版本时连接终止，看守进程停止重连并上报；该情形按部署配置错误处理，不产生关闭状态。
 
 ### 场景：等 LLM 时的冻结与恢复
 
@@ -366,9 +369,9 @@ sequenceDiagram
     R->>R: 处理事务提交，确认推进到 18
     R->>W: PrepareSuspend suspend_id=s-1 mode=freeze variant=cgroup msg_seq=43 ack_msg_seq=18
     W-->>R: ReadyToSuspend suspend_id=s-1 frozen_at=t1 msg_seq=19 ack_msg_seq=43
+    R->>R: 处理事务提交，确认推进到 19
     R->>P: Freeze freeze_id=s-1
     P-->>R: 冻结确认
-    R->>R: 处理事务提交，确认推进到 19
     Note over W,R: 冻结期间看守进程不被冻结，出站流保持，确认照常推进
     W->>R: llm.request.completed request_id=r-1 msg_seq=20 ack_msg_seq=43
     R->>R: 写唤醒信号并提交，确认推进到 20
@@ -379,7 +382,7 @@ sequenceDiagram
     R->>W: Resumed suspend_id=s-1 drain=false msg_seq=45 ack_msg_seq=21
 ```
 
-图固定冻结与恢复期间的消息顺序：`PrepareSuspend` 与 `ReadyToSuspend` 以 `suspend_id` 幂等，`Thaw` 与 `Thawed` 以 `freeze_id` 幂等；看守进程在冻结期间继续收发协议消息，控制面的确认只在消息处理事务提交后推进。流在冻结期间中断时，双方按走查的规则重连、对账与重放；`PrepareSuspend`、`ReadyToSuspend`、`Thaw` 与 `Thawed` 的重放不重复执行效果，因为链接方按 `suspend_id` 与 `freeze_id` 幂等。
+图固定冻结与恢复期间的消息顺序：`PrepareSuspend` 与 `ReadyToSuspend` 以 `suspend_id` 幂等，`Thaw` 与 `Thawed` 以 `freeze_id` 幂等；看守进程在冻结期间继续收发协议消息，控制面的确认只在消息处理事务提交后推进。各场景图中控制面对沙箱提供者的调用由 `runcontroller` 写入的效果记录在事务提交后执行，确认推进不等待提供者返回（[ADR-effect-record-after-commit](../../adr/adr-effect-record-after-commit.md)）。流在冻结期间中断时，双方按走查的规则重连、对账与重放；`PrepareSuspend`、`ReadyToSuspend`、`Thaw` 与 `Thawed` 的重放不重复执行效果，因为链接方按 `suspend_id` 与 `freeze_id` 幂等。
 
 ### 场景：等 PR 门禁的订阅与销毁重建
 
@@ -404,24 +407,26 @@ sequenceDiagram
     R->>R: 处理事务提交，确认推进到 23
     R->>W: PrepareSuspend suspend_id=s-2 mode=destroy msg_seq=46 ack_msg_seq=23
     W-->>R: ReadyToSuspend suspend_id=s-2 exited_at=t2 session_id=ses-1 msg_seq=24 ack_msg_seq=46
+    R->>R: 处理事务提交，确认推进到 24
     R->>P: Destroy generation=5
     P-->>R: 销毁确认
-    R->>R: 处理事务提交，确认推进到 24
     Note over W,R: 出站流随沙箱销毁终止，代仍为 5
     X->>C: webhook
     C->>R: 订阅完成事件（汇入契约）
     R->>R: 准入放行，代边界推进到 generation=6
     Note over W,R: 旧代的重放缓冲与去重表作废，跨代重投由 delivery_id 与投递意图日志承担
-    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0
+    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0 sandbox_config_revision=0
     R->>W: HelloAck accepted msg_seq=0 ack_msg_seq=0 cursor_accepted=10
-    R->>W: Deliver delivery_id=d-4 through_seq=11 target=next_user_message resume_session_id=ses-1 msg_seq=1 ack_msg_seq=0
-    W-->>R: Accepted delivery_id=d-4 through_seq=11 fed=true msg_seq=1 ack_msg_seq=1
+    R->>W: SandboxConfig revision=3 msg_seq=1 ack_msg_seq=0
+    W->>W: 应用沙箱侧配置 revision=3
+    R->>W: Deliver delivery_id=d-4 through_seq=11 target=next_user_message resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
+    W-->>R: Accepted delivery_id=d-4 through_seq=11 fed=true msg_seq=1 ack_msg_seq=2
     W->>A: 以 resume_session_id 启动并喂入事件
     A-->>W: turn_started
-    W->>R: AgentEvent turn_started delivery_id=d-4 msg_seq=2 ack_msg_seq=1
+    W->>R: AgentEvent turn_started delivery_id=d-4 msg_seq=2 ack_msg_seq=2
 ```
 
-图固定销毁重建前后的代边界：旧代流上的确认与重放随代递增作废，`Deliver` 不复用旧代 `msg_seq`；新代 `Hello` 以状态对账恢复游标，投递以新的 `delivery_id` 与 `redelivery` 标记重投。旧代沙箱在代递增之后发来的非 `Hello` 消息收到 `Fenced{current_generation=6}`，随后流关闭（[ADR-generation-fencing](../../adr/adr-generation-fencing.md)）。订阅完成事件按[汇入契约](../../glossary.md)进入收件箱；收件箱与 `Deliver` 的选择归 `runcontroller` 与 `connectorhub`，本模块只承载消息与序号。
+图固定销毁重建前后的代边界：旧代流上的确认与重放随代递增作废，`Deliver` 不复用旧代 `msg_seq`；新代 `Hello` 以状态对账恢复游标，投递以新的 `delivery_id` 与 `redelivery` 标记重投。新代沙箱的看守进程先经[引导接口](../../glossary.md)领取令牌与 `lease_id`，再发送 `Hello`；领取不经过出站流，图中省略。新代看守进程尚未应用[沙箱侧配置](../../glossary.md)，`Hello.sandbox_config_revision=0`，控制面在 `HelloAck` 之后发送 `SandboxConfig`，看守进程应用之后才启动 Agent 主进程；审批与等人场景的新代流按同一顺序开始。旧代沙箱在代递增之后发来的非 `Hello` 消息收到 `Fenced{current_generation=6}`，随后流关闭（[ADR-generation-fencing](../../adr/adr-generation-fencing.md)）。订阅完成事件按[汇入契约](../../glossary.md)进入收件箱；收件箱与 `Deliver` 的选择归 `runcontroller` 与 `connectorhub`，本模块只承载消息与序号。
 
 ### 场景：审批 defer 与续接
 
@@ -433,23 +438,27 @@ sequenceDiagram
     participant H as humanchannel
     participant R as 控制面 runcontroller
     participant P as 沙箱提供者
-    A->>W: PreToolUse hook 返回 defer
+    A->>W: PreToolUse hook 请求审批
+    W->>R: AgentEvent permission_requested id=p-1 blocking=false msg_seq=24 ack_msg_seq=46
+    W-->>A: hook 返回 defer
     W->>R: AgentEvent turn_ended reason=tool_deferred msg_seq=25 ack_msg_seq=46
     R->>R: 处理事务提交，确认推进到 25
     R->>W: PrepareSuspend suspend_id=s-3 mode=destroy msg_seq=47 ack_msg_seq=25
     W-->>R: ReadyToSuspend suspend_id=s-3 exited_at=t3 session_id=ses-1 msg_seq=26 ack_msg_seq=47
+    R->>R: 处理事务提交，确认推进到 26
     R->>P: Destroy generation=5
     P-->>R: 销毁确认
-    R->>R: 处理事务提交，确认推进到 26
     H->>R: 审批决定写入收件箱（汇入契约）
     R->>R: 准入放行，代边界推进到 generation=6
-    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0
+    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0 sandbox_config_revision=0
     R->>W: HelloAck accepted msg_seq=0 ack_msg_seq=0 cursor_accepted=10
-    R->>W: Deliver delivery_id=d-5 through_seq=11 target=permission_decision{id=p-1} resume_session_id=ses-1 msg_seq=1 ack_msg_seq=0
-    W-->>R: Accepted delivery_id=d-5 through_seq=11 fed=true msg_seq=1 ack_msg_seq=1
+    R->>W: SandboxConfig revision=3 msg_seq=1 ack_msg_seq=0
+    W->>W: 应用沙箱侧配置 revision=3
+    R->>W: Deliver delivery_id=d-5 through_seq=11 target=permission_decision{id=p-1} resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
+    W-->>R: Accepted delivery_id=d-5 through_seq=11 fed=true msg_seq=1 ack_msg_seq=2
     W->>A: 以 resume_session_id 续接，hook 取回决定
     A-->>W: turn_started
-    W->>R: AgentEvent turn_started delivery_id=d-5 msg_seq=2 ack_msg_seq=1
+    W->>R: AgentEvent turn_started delivery_id=d-5 msg_seq=2 ack_msg_seq=2
 ```
 
 图固定回合边界续接的定向投递：`target=permission_decision{id}`，`resume_session_id` 为上一代落库的恢复句柄。定向投递不推进 `cursor_accepted`，其消费只写入投递意图日志、不发送 `Consumed`。决定在销毁之前到达时，`Deliver` 在同一代的已建立流上发送，序号与重放规则不变；决定在销毁之后到达时，按图示在新代发送。运行实例状态机的转移与持久化字段见 [runcontroller](design-runcontroller.md)。
@@ -470,19 +479,21 @@ sequenceDiagram
     Note over R,P: 宽限期内按策略冻结或复评，期满选定销毁
     R->>W: PrepareSuspend suspend_id=s-4 mode=destroy msg_seq=48 ack_msg_seq=27
     W-->>R: ReadyToSuspend suspend_id=s-4 exited_at=t4 session_id=ses-1 msg_seq=28 ack_msg_seq=48
+    R->>R: 处理事务提交，确认推进到 28
     R->>P: Destroy generation=5
     P-->>R: 销毁确认
-    R->>R: 处理事务提交，确认推进到 28
     H->>R: 人类消息写入收件箱（汇入契约）
     R->>R: 准入放行，代边界推进到 generation=6
-    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0
+    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0 sandbox_config_revision=0
     R->>W: HelloAck accepted msg_seq=0 ack_msg_seq=0 cursor_accepted=10
-    R->>W: Deliver delivery_id=d-6 through_seq=11 target=next_user_message resume_session_id=ses-1 msg_seq=1 ack_msg_seq=0
-    W-->>R: Accepted delivery_id=d-6 through_seq=11 fed=true msg_seq=1 ack_msg_seq=1
+    R->>W: SandboxConfig revision=3 msg_seq=1 ack_msg_seq=0
+    W->>W: 应用沙箱侧配置 revision=3
+    R->>W: Deliver delivery_id=d-6 through_seq=11 target=next_user_message resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
+    W-->>R: Accepted delivery_id=d-6 through_seq=11 fed=true msg_seq=1 ack_msg_seq=2
     W->>A: 以 resume_session_id 启动并喂入用户消息
     A-->>W: turn_started
-    W->>R: AgentEvent turn_started delivery_id=d-6 msg_seq=2 ack_msg_seq=1
-    W->>R: Consumed through_seq=11 turn_id=turn-9 msg_seq=3 ack_msg_seq=1
+    W->>R: AgentEvent turn_started delivery_id=d-6 msg_seq=2 ack_msg_seq=2
+    W->>R: Consumed through_seq=11 turn_id=turn-9 msg_seq=3 ack_msg_seq=2
 ```
 
 图固定等人路径的两级确认：`Accepted` 表示接受记录已写入投递意图日志，`Consumed` 表示 Agent 已开始处理该常规投递；`Consumed` 在消费记录同步写入之后发送，只推进 `cursor_consumed`。人类消息的写入与 `WakeQueued` 转移归 `runcontroller`，本模块只保证 `Deliver` 的消息、序号与确认按图推进。
@@ -499,12 +510,12 @@ sequenceDiagram
 | 运行实例已终态 | `Shutdown{graceful=false}` | 控制面 | `Hello` 或消息处理前 | 停止；不再重连 | 不推进确认 |
 | 本代已作废而代尚未递增 | `Shutdown{graceful=false}` | 控制面 | 非 `Hello` 消息；`degraded` 或 `destroyed` 的作废状态 | 停止；不再重连 | 不推进确认 |
 | 消息处理依赖的令牌校验或 `workspace.GetLease` 调用失败 | 可重试关闭 | 控制面 | 处理前的事务外调用 | 不终止 Agent 进程树；退避重连后重放未确认消息 | 该消息不处理、不推进确认；重放 |
-| 双方没有公共协议版本 | 无 `HelloAck`，传输终止 | 控制面 | 版本协商 | 停止重连并上报 | 不重放；按配置错误处理 |
-| 帧格式非法、消息种类未知、新帧的确认序号低于已记录值、重连后仍有序号缺口 | 传输终止，不产生语义关闭状态 | 接收方 | 编解码与顺序校验 | 计数；重连后仍失败则停止并上报 | 不派发；按部署缺陷处理 |
+| 双方没有公共协议版本 | 传输终止，不产生关闭状态 | 控制面或看守进程 | 版本协商：`Hello` 的版本低于控制面下限时，控制面终止连接，不回 `HelloAck`；`Hello` 的版本高于控制面上限时，控制面以自身上限应答 `HelloAck`，看守进程不支持该版本时由看守进程终止连接 | 停止重连并上报 | 不重放；按配置错误处理 |
+| 帧格式非法、消息种类未知、新帧的确认序号低于已记录值、重连后仍有序号缺口 | 传输终止，不产生关闭状态 | 接收方 | 编解码与顺序校验 | 计数；重连后仍失败则停止并上报 | 不派发；按部署缺陷处理 |
 | 重复的 `(generation, msg_seq)` | 无关闭 | 接收方 | 去重表 | 继续正常收发 | 已提交的不重复派发；未提交的重放重新派发；确认不回退 |
 | 低于已发送确认的迟到帧 | 无关闭 | 接收方 | 序号校验 | 继续正常收发 | 丢弃并保持确认 |
 
-语义化关闭与协议违规的区别：关闭状态是对端可据此决定停止或重连的信号，携带足够的判定信息；协议违规不产生关闭状态消息，连接被终止并计数，需按部署缺陷处理。可重试关闭可经重连与重放恢复；`Fenced` 表示代已过期，重连不会恢复该代。
+语义化关闭与协议违规的区别：关闭状态是对端可据此决定停止或重连的信号；协议违规不产生关闭状态消息，连接被终止并计数，需按部署缺陷处理。可重试关闭可经重连与重放恢复；`Fenced` 表示代已过期，重连不会恢复该代。
 
 ## 并发与事务边界
 
@@ -513,7 +524,7 @@ sequenceDiagram
 - **单写者**：看守进程侧同时只有一条出站流，序号分配由该流的写者串行执行。控制面侧同一运行实例同一时刻只有一个所有者副本是状态机写者，出站序号跨所有者副本单调，新所有者以 `Hello.last_received_msg_seq` 与持久化的流状态继续；重放缓冲与未确认消息由本模块的会话状态持有，不归 `runcontroller` 持久化（[ADR-single-writer-per-run](../../adr/adr-single-writer-per-run.md)）。
 - **代变化**：代递增与旧代作废的事务提交后，旧代的重放缓冲、去重表与未发送消息全部丢弃；旧代流上的消息按 `Fenced` 拒绝。新代从空缓冲与序号 1 开始，不复用旧代的协议状态。
 - **冻结期间**：看守进程不被冻结，出站流、确认与活动度上报继续；Agent 进程树的冻结状态经 `agent_state.frozen`、`freeze_id` 与 `Activity` 表达。协议状态不依赖墙钟，冻结造成的时钟跳变不影响序号与去重。
-- **入站端点**：`/wake` 的并发调用合并为一次恢复与一次流重建，返回时握手已完成；`/readyz` 读取当前流状态，不加协议序号；`/terminal` 的字节流与协议序号无关，不推进确认。
+- **入站端点**：`/wake` 的并发调用合并为同一次处理，看守进程尚未领取时为一次领取与一次流建立，已领取时为一次恢复与一次流重建，返回时握手已完成；`/readyz` 读取领取状态，k8s 路径另读取当前流状态，不加协议序号；`/terminal` 的字节流与协议序号无关，不推进确认。
 - **背压与内存**：重放缓冲与去重表的大小由重放窗口约束；窗口满时停止分配新的应用消息序号，不丢弃未确认消息。去重表随确认推进裁剪，不随运行时长增长。
 
 ## 扩展点

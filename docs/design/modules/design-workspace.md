@@ -1,6 +1,6 @@
 # workspace
 
-`workspace` 位于控制面基础层，并在沙箱内以[看守进程](../../glossary.md)的一部分运行。它为每个[运行实例](../../glossary.md)维护一块跨代存续的[工作区](../../glossary.md)，把存储后端、挂载路径、运行实例 uid 与配额绑定成稳定的绑定记录，用[工作区租约](../../glossary.md)保证同一时刻只有一个[沙箱](../../glossary.md)写入，并在销毁沙箱前给出持久化确认。它不创建或销毁沙箱，不拥有 Agent 的会话内容，也不决定何时挂起。心智模型：工作区是运行实例跨代不变的家，租约是家门唯一的钥匙；沙箱只是当前住在家里的那一代。
+`workspace` 位于控制面基础层，并在沙箱内以[看守进程](../../glossary.md)的一部分运行。它为每个[运行实例](../../glossary.md)维护一块跨代存续的[工作区](../../glossary.md)，把存储后端、挂载路径、运行实例 uid 与配额绑定成稳定的绑定记录，用[工作区租约](../../glossary.md)保证同一时刻只有一个[沙箱](../../glossary.md)写入，并在销毁沙箱前给出[持久化确认](../../glossary.md)。它不创建或销毁沙箱，不拥有 Agent 的会话内容，也不决定何时挂起。心智模型：工作区是运行实例跨代不变的家，租约是家门唯一的钥匙；沙箱只是当前住在家里的那一代。
 
 文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、走查、绑定与存储模式选择、工作区租约的建立、续约与接管、释放与墓碑、持久化确认、隔离与目录布局、文件访问与文件 API；术语表、外部接口契约、依赖、UML 图与核心数据结构作为核对接口、字段与挂载关系时的参考。并发与事务边界末尾的竞态用例留到最后自测：先按前文的 CAS 规则判断每个交错序列的结果，再与表中结论核对。
 
@@ -30,7 +30,7 @@
 
 - 不做沙箱生命周期：预配、认领、冻结、解冻、快照、快照恢复、销毁、预热池与提供者能力归 `sandboxprovider`；本模块只提供绑定与租约，不调用沙箱提供者的生命周期接口。
 - 不拥有 Agent 会话内容：会话记录、Agent 状态目录下的文件与 Agent 的读写由 Agent 自身产生；本模块只提供持久化位置与访问边界，不解析、不索引、不改写会话内容。
-- 不决定挂起时机与机制：挂起决策、冻结中复评、恢复准入与销毁安全点的判定归 `suspendpolicy` 与 `runcontroller`；本模块只在被调用时给出持久化确认与租约状态。
+- 不决定挂起时机与机制：挂起决策、冻结中复评、恢复准入与[安全点](../../glossary.md)的判定归 `suspendpolicy` 与 `runcontroller`；本模块只在被调用时给出持久化确认与租约状态。
 - 不执行投递与协议：`Deliver`、`Accepted`、`Consumed`、`LeaseLost` 等协议消息的收发与状态机效果归看守进程与 `runcontroller`；本模块不读写[收件箱](../../glossary.md)、[唤醒信号](../../glossary.md)与运行实例状态机。
 - 不签发或校验运行实例令牌：令牌的签发、轮换与签名校验归 `secrets`；文件 API 的鉴权由看守进程以自身持有的运行实例令牌核对代与实时接入状态完成，本模块不持有令牌与签名密钥。
 - 不生成出口策略与凭据：允许主机、占位符规则与出口策略归 `connectorhub`；真实凭据归 `secrets` 与密钥库；工作区内不存放长期凭据。
@@ -44,9 +44,8 @@
 | --- | --- | --- | --- |
 | 绑定 | binding | workspace | 运行实例到存储模式、卷或导出标识、挂载路径、运行实例 uid、配额与持久化语义的映射，跨代稳定 |
 | 存储模式 | storage mode | workspace | 工作区承载方式的闭集：`shared_fs`、`block`、`external_csi`、`durable_dir` |
-| 持久化确认 | persistence confirmation | workspace | 在销毁沙箱前确认工作区写入已持久化的处理；`sync` 为 fsync 完成，`on_suspend` 为同步挂起上传完成 |
 | 沙箱外访问 | out-of-sandbox access | workspace | 沙箱不运行或人在平台界面时对工作区文件的访问，按存储模式读取导出或经入站路由到达看守进程的文件 API |
-| 删除确认 | delete confirmation | workspace | 沙箱提供者确认某一代的沙箱已删除或已挂起的结果，携带 `run_id`、代与 `sandbox_id`；作为接管 `proof` 时其 `run_id` 必须等于租约的 `run_id`，其代必须等于租约所属的代 |
+| 删除确认 | delete confirmation | workspace | 沙箱提供者整代销毁某一代沙箱后返回的确认（`sandboxprovider` 的 `DestroyReceipt`），携带 `run_id` 与被删除的代；作为接管 `proof` 时其 `run_id` 必须等于租约的 `run_id`，其代必须等于租约所属的代；`DestroySandbox` 的单个沙箱删除确认不构成 `proof` |
 | 释放墓碑 | release tombstone | workspace | `ReleaseRunLease` 留下的运行实例级标记，此后拒绝该 `run_id` 的一切租约创建与接管 |
 
 ## 外部接口契约
@@ -126,7 +125,6 @@ type TakeoverResult struct {
 type DeleteProof struct {
     RunID      RunID
     Generation int
-    SandboxID  string
 }
 
 type LeaseState struct {
@@ -140,7 +138,7 @@ type LeaseState struct {
 ```
 
 - `CreateLease` 只用于第 1 代，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约时，请求的代必须大于租约的代，否则返回不可重试的代错误；已有未到期且未释放的租约、或运行实例已有墓碑时拒绝。
-- `TakeoverLease` 用于重建，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约且请求的代不大于 `lease.generation` 时返回不可重试的代错误。运行实例尚无租约时直接建立；旧租约已到期时不需要 `proof`；旧租约未到期时只在 `proof` 是沙箱提供者整代销毁的删除确认、其 `run_id` 等于 `run_id`、且其携带的代等于 `lease.generation` 时接管；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`，`proof.sandbox_id` 只用于审计与错误归因，不参与接管判定；其余情形返回旧租约的到期时刻作为 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
+- `TakeoverLease` 用于重建，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约且请求的代不大于 `lease.generation` 时返回不可重试的代错误。运行实例尚无租约时直接建立；旧租约已到期时不需要 `proof`；旧租约未到期时只在 `proof` 是沙箱提供者整代销毁的删除确认、其 `run_id` 等于 `run_id`、且其携带的代等于 `lease.generation` 时接管；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`；其余情形返回旧租约的到期时刻作为 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
 - `RenewLease` 由看守进程周期调用，CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。调用以 `lease_id` 与代认证，不经 `secrets` 校验，也不以运行实例令牌未过期为前提。
 - `HoldLease` 用于快照期间：以 `lease_id`、代匹配、`released=false` 且持有者为空或等于 `holder` 为 CAS 条件，把到期时刻设为 `until` 并清空持有者；快照恢复的沙箱以首次续约重新绑定。持有者已是其他沙箱时为空操作。
 - `ReleaseLease` 只在同代沙箱的删除确认之后调用，以 `lease.generation=generation` 为 CAS 条件；租约已被更大的代接管时为空操作。释放把租约标记为已释放并清空持有者，`expires_at` 不变，此后 `RenewLease` 以 CAS 失败返回；释放本身不构成接管条件。
@@ -412,27 +410,27 @@ sequenceDiagram
 
 ### 走查
 
-初始条件：运行实例 `R` 首次预配，存储模式为 `shared_fs`，租约有效期 `T_lease`，沙箱标识 `sb-1` 与快照恢复后的 `sb-1'` 属于第 1 代。下表逐步给出调用与持久化结果。
+初始条件：运行实例 `R` 首次预配，存储模式为 `shared_fs`，租约有效期 `T_lease`，沙箱标识 `sb-1` 属于第 1 代。下表逐步给出调用与持久化结果。
 
 | 步骤 | 调用或事件 | 持久化结果 |
 | --- | --- | --- |
 | 1 | `Bind(R, project, k8s, shared_fs, volume)` 与 `Ensure(R)` | 绑定 `{storage_mode=shared_fs, mount_path=/runs/R, run_uid=2001, durability=sync}`；运行实例子目录由 `Ensure` 以 0700 创建并设配额 |
 | 2 | `CreateLease(R, 1, a1)` | 租约 `{lease_id=L1, generation=1, holder=null, expires_at=now+T_lease, released=false}` |
 | 3 | 看守进程首次续约 `RenewLease(L1, 1, sb-1)` | `holder=sb-1`，`expires_at` 延长；续约成功之后看守进程才发 `Hello` |
-| 4 | 快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)` | `holder=null`，`expires_at=now+2T_lease`；快照恢复的沙箱以首次续约重新绑定 |
-| 5 | 快照恢复后 `RenewLease(L1, 1, sb-1')` | `holder=sb-1'` |
-| 6 | 同代沙箱删除确认到达后 `ReleaseLease(R, 1)` | `released=true`，`holder=null`，`expires_at` 不变 |
-| 7 | `TakeoverLease(R, 2, a2, proof={R, 1, sb-1'})` | 旧租约未到期，`proof` 的代等于 `L1.generation`，接管成功；新租约 `{lease_id=L2, generation=2, holder=null, durability=sync}` |
-| 8 | 显式结束 `ReleaseRunLease(R)` | 写入墓碑；此后 `CreateLease(R, ...)` 与 `TakeoverLease(R, ...)` 均返回墓碑错误 |
+| 4 | 第 1 代整代销毁的删除确认 `{R, 1}` 到达后 `ReleaseLease(R, 1)` | `released=true`，`holder=null`，`expires_at` 不变 |
+| 5 | `TakeoverLease(R, 2, a2, proof={R, 1})` | 旧租约未到期，`proof` 的代等于 `L1.generation`，接管成功；新租约 `{lease_id=L2, generation=2, holder=null, durability=sync}` |
+| 6 | 显式结束 `ReleaseRunLease(R)` | 写入墓碑；此后 `CreateLease(R, ...)` 与 `TakeoverLease(R, ...)` 均返回墓碑错误 |
 
-第 7 步的替代路径：旧租约已到期时 `proof` 可为空；旧租约未到期且 `proof` 为空或代不匹配时返回 `NotBefore=expires_at`，调用方等待到期后重试，不产生新租约。第 6 步先释放再接管不是必需顺序：删除确认也可以直接作为第 7 步的 `proof`，任一顺序都要求 `proof` 的代为租约所属的代。
+第 5 步的替代路径：旧租约已到期时 `proof` 可为空；旧租约未到期且 `proof` 为空、不是整代销毁的删除确认或代不匹配时返回 `NotBefore=expires_at`，调用方等待到期后重试，不产生新租约。第 4 步先释放再接管不是必需顺序：第 1 代整代销毁的删除确认也可以直接作为第 5 步的 `proof`，任一顺序都要求 `proof` 的代为租约所属的代。
+
+Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之后：快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)`，持久化结果为 `holder=null`、`expires_at=now+2T_lease`；快照恢复沿用同一沙箱，看守进程以首次续约 `RenewLease(L1, 1, sb-1)` 重新绑定 `holder=sb-1`。k8s 提供者不具备快照能力，不经过这两步；第 2 步起的租约步骤在两个提供者上相同，第 1 步的存储模式按提供者选择，见[绑定与存储模式选择](#绑定与存储模式选择)。
 
 ### 绑定与存储模式选择
 
 1. `Bind` 在数据库事务内解析项目策略、选择存储模式、分配 `run_uid` 并写入绑定；`Ensure` 在项目根挂载后以幂等方式创建运行实例子目录，已存在时校验所有者、权限与配额，不重复创建。绑定接口不创建卷，卷或导出由 `sandboxprovider` 提供。
 2. k8s 提供者优先选择 `shared_fs`：共享文件系统无卷挂接步骤、无节点亲和，预热 Pod 在创建时挂载项目根，认领时看守进程只切换到运行实例子目录。`shared_fs` 不可用时选择 `block`，绑定携带节点或可用区亲和；块存储不能预绑定预热池，认领与重建都受挂接等待约束。
 3. Substrate 提供者优先选择 `external_csi`：每 actor 一卷，写穿持久、崩溃不丢，内容不进快照、`Revert` 不回滚；外部 CSI 不可用时选择 `durable_dir`，持久化语义变为 `on_suspend`，绑定时即写入，运行中不切换。
-4. 存储模式在绑定时固定。已绑定 `external_csi` 的运行实例在运行中遇到 CSI 不可用时，提供者错误向上返回，`sandboxprovider` 的预配或恢复按自身规则失败；本模块不静默退化为 `durable_dir`，因为退化会改变持久化语义与销毁安全点的判定。
+4. 存储模式在绑定时固定。已绑定 `external_csi` 的运行实例在运行中遇到 CSI 不可用时，提供者错误向上返回，`sandboxprovider` 的预配或恢复按自身规则失败；本模块不静默退化为 `durable_dir`，因为退化会改变持久化语义与安全点的判定。
 5. 退化配置的补偿由绑定携带：`durable_dir` 的回合边界销毁一律使用同步挂起，上传完成才返回；回合中崩溃按「回合被中断」重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失。
 
 ### 工作区租约的建立、续约与接管
@@ -440,7 +438,7 @@ sequenceDiagram
 1. **建立**：第 1 代由 `CreateLease` 建立，`attempt_id` 取 `resume_id`。运行实例已有租约时，请求的代必须大于租约的代，否则返回不可重试的代错误；已有未到期且未释放的租约时返回冲突；已有墓碑时返回墓碑错误。相同 `(run_id, generation, attempt_id)` 的重复调用返回同一 `lease_id` 与 `durability`。
 2. **续约**：看守进程按小于租约有效期的周期调用 `RenewLease`。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`、持有者为空或等于 `sandbox_id`；持有者为空时本次续约绑定持有者。持有者不同、租约已释放或已到期时 CAS 失败，调用方停止写入并按续约失败处理。
 3. **快照持有**：快照前调用 `HoldLease`，把到期时刻延长到快照保留期可覆盖的范围并清空持有者。清空持有者使快照恢复的沙箱实例以首次续约重新绑定；旧沙箱在快照期间不再执行，迟到的续约由 CAS 的 `expires_at` 与执行顺序决定，不与快照恢复并发写入。
-4. **接管**：重建时调用 `TakeoverLease`，`attempt_id` 取 `resume_id`。请求的代必须大于当前租约的代，同一幂等键的重复调用除外。运行实例尚无租约时直接建立；旧租约已到期时无需 `proof`；旧租约未到期时只接受 `run_id` 相同且代等于 `lease.generation` 的删除确认作为 `proof`；其余返回 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
+4. **接管**：重建时调用 `TakeoverLease`，`attempt_id` 取 `resume_id`。请求的代必须大于当前租约的代，同一幂等键的重复调用除外。运行实例尚无租约时直接建立；旧租约已到期时无需 `proof`；旧租约未到期时只接受沙箱提供者整代销毁的删除确认作为 `proof`，且其 `run_id` 相同、代等于 `lease.generation`；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`；其余返回 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
 5. **查询**：`GetLease` 返回 `lease_id`、代、持有者、到期时刻、`durability` 与 `released`。调用方以它核对 `Hello`、判断是否可写与选择持久化确认模式。
 6. **看守进程的义务**：首次续约成功之后才发 `Hello`；在 `expires_at` 减时钟余量之前停止向工作区写入；续约失败时冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。本模块不代为执行这些保护动作。
 
@@ -515,11 +513,13 @@ sequenceDiagram
 
 ## 错误与失败语义
 
+失败的处置由租约的条件更新与代比较、操作前校验、墓碑拒绝、绑定时的退化以及持久化确认组合表达；操作前校验覆盖路径、配额与权限。下表列出已明确处置路径的失败，各行是举例。
+
 | 失败 | 检测 | 行为 | 调用方可见 |
 | --- | --- | --- | --- |
 | 租约过期 | `RenewLease` 的 CAS 发现 `expires_at <= now()`；`GetLease` 返回已过期的到期时刻 | 旧持有者停止写入，冻结或杀死 Agent 进程树并上报 `LeaseLost`；新代可无 `proof` 接管 | `ErrLeaseExpired`，或 `GetLease` 返回过期状态 |
 | 续约失败 | 数据库不可用、超时、锁等待超时，或持有者不匹配 | 看守进程在到期前重试；仍失败则执行本地保护动作并上报；不自行改写租约 | 暂时性错误或 `ErrNotHolder` |
-| 接管 `proof` 缺失或代不符 | `TakeoverLease` 发现旧租约未到期，`proof` 为空、非删除确认、`run_id` 不符或代不等于 `lease.generation` | 不建立新租约，返回旧租约到期时刻；调用方等待到期后重试 | `NotBefore` |
+| 接管 `proof` 缺失或代不符 | `TakeoverLease` 发现旧租约未到期，`proof` 为空、不是整代销毁的删除确认、`run_id` 不符或代不等于 `lease.generation` | 不建立新租约，返回旧租约到期时刻；调用方等待到期后重试 | `NotBefore` |
 | `durableDir` 上传失败 | 沙箱提供者的同步挂起返回上传错误，或 `Confirm(suspend_upload)` 核对失败 | 不进入 `Suspended`；销毁路径以同一 `suspend_id` 重试同步挂起；不发出新的 `ReadyToSuspend` | 暂时性错误；重试耗尽由 `runcontroller` 的挂起截止处置 |
 | CSI 不可用 | 绑定时无法供给外部 CSI 卷，或已绑定卷挂接失败 | 绑定时可退到 `durable_dir` 并写入 `on_suspend`；已绑定 `external_csi` 时不静默退化，错误交给 `sandboxprovider` 的预配或恢复路径 | 不可重试的存储错误，或绑定时的退化结果 |
 | 配额耗尽 | 写入或上传前检查失败，或落盘返回空间不足 | 不删除已有文件，不产生部分文件；临时文件清理 | `ErrQuotaExceeded`；Agent 侧写入失败 |
@@ -551,7 +551,7 @@ sequenceDiagram
 
 ## 扩展点
 
-- **新增沙箱提供者的存储驱动**：实现绑定接口、持久化确认接口与沙箱外读取能力，声明存储模式与 `durability`；租约接口与文件 API 的语义不变。新驱动必须满足：运行实例子目录可挂载或可导出、运行实例 uid 可隔离、目录权限与配额可施加、销毁前能给出 fsync 或同步挂起上传的确认、沙箱外访问能按 `Direct` 或入站路由表达。不能确认持久化的驱动只能声明 `on_suspend` 并接受崩溃丢失窗口；不能隔离 uid 或施加目录权限的驱动不被接入。
+- **新增沙箱提供者的存储驱动**：实现绑定接口、持久化确认接口与沙箱外读取能力，声明存储模式与 `durability`；租约接口与文件 API 的语义不变。新驱动必须满足：运行实例子目录可挂载或可导出；运行实例 uid 可隔离；目录权限与配额可施加；销毁前能给出 fsync 或同步挂起上传的确认；沙箱外访问能按 `Direct` 或入站路由表达。不能确认持久化的驱动只能声明 `on_suspend` 并接受崩溃丢失窗口；不能隔离 uid 或施加目录权限的驱动不被接入。
 - **新增存储模式**：`StorageMode` 是闭集，新增取值改变绑定接口与持久化语义，须同步修改本模块文档、`sandboxprovider` 的绑定调用与 `runcontroller` 的持久化判定；这不是配置扩展。
 - **新增文件 API 操作**：操作集合是闭集，新增操作改变文件 API 契约与鉴权边界，须同步修改本模块文档、入站路由与调用方；文件 API 之外没有额外的读写旁路，`FileAccess` 是独立的只读沙箱外入口，直接读取只在 `Direct` 为真时发生。
 - **多租户隔离**：单组织模型下预热池与挂载根共享；多租户时按租户划分预热池与挂载根，租约与绑定接口不变，隔离由部署与 `sandboxprovider` 承担（[ADR-tenant-dimension-without-enforcement](../../adr/adr-tenant-dimension-without-enforcement.md)）。

@@ -19,7 +19,7 @@
 - **终态持久化与信号**：上游正常结束、返回错误、超时、流中断或流内 `error` 事件时，在同一事务提交回放条目与 `llm_request.status`；提交后经汇入契约写入 `llm_completed` 或 `llm_failed` [唤醒信号](../../glossary.md)。
 - **单次回放**：以 `(run_id, generation, request_hash)` 保证客户端重发与恢复取回命中已登记请求或回放条目，不产生第二次上游请求；上游在未收到任何响应体内容前的有限次重试属于同一逻辑请求内的重试。按 `(run_id, request_id)` 保存终态响应，供本地代理在[快照](../../glossary.md)恢复或[销毁重建](../../glossary.md)后取回，取回不再次访问上游。
 - **限流、计费与审计**：在凭据换取与转发之前按运行实例限流；按上游响应的 `usage` 记录输入与输出 token；审计凭据换取、代校验结果与请求终态，关联 `run_id`、`generation` 与 `request_id`。
-- **时延直方图**：按 `model`、`thinking` 预算档、`max_tokens` 档与输入 token 档维护首 token 时延与总时长直方图，随 OpenTelemetry 指标导出，并按维度给出预测输入交给 `runcontroller`。
+- **时延直方图**：按 `model`、`thinking` 预算档、`max_tokens` 档与输入 token 档维护首 token 时延与总时长直方图，随 OpenTelemetry 指标导出，供校准 `suspendpolicy` 的 LLM 先验与诊断；直方图不逐请求传入 `runcontroller`。
 
 ### 非职责
 
@@ -28,11 +28,11 @@
 - **不做 MITM**：不拦截 Agent 的其他出站 TLS 流量；外部系统的凭据占位符替换归 `connectorhub` 的出口代理。
 - **不决定何时冻结、快照或销毁**：[挂起](../../glossary.md)决策归 `suspendpolicy`，状态转移与执行归 `runcontroller` 与 `sandboxprovider`。
 - **不持有沙箱**：不创建、销毁、[冻结](../../glossary.md)或恢复沙箱，不读取沙箱内进程状态。
-- **不直接接 Agent**：只接受本地代理的请求；Agent 进程只能到达回环地址上的本地代理与 [平台 MCP 服务器](../../glossary.md)，不持有网关凭据（I6）。
-- **不选择直通模式或缓存模式**：模式由本地代理在请求开始时一次性选定；网关记录 `mode` 用于审计与指标分层，不据此改变转发行为。
+- **不直接接 Agent**：只接受本地代理的请求；Agent 进程能到达的网络端点见[架构不变量](../architecture.md#架构不变量) I6，Agent 不持有网关凭据。
+- **不选择[直通模式](../../glossary.md)或[缓存模式](../../glossary.md)**：模式由本地代理在请求开始时一次性选定；网关记录 `mode` 用于审计与指标分层，不据此改变转发行为。
 - **不拥有[收件箱](../../glossary.md)、唤醒信号、在途请求事实与实例租约**：这些状态归 `runcontroller`；网关只经汇入契约写入，失联后的合成信号由 `runcontroller` 写入。
 - **不签发、轮换或校验运行实例令牌的签名**：归 `secrets`。
-- **不做外部系统连接器操作**：归 `connectorhub`。
+- **不接入外部系统**：webhook 接收、状态式轮询与订阅匹配归 `connectorhub`。
 
 ## 术语表
 
@@ -40,8 +40,6 @@
 | --- | --- | --- | --- |
 | 回放条目 | replay entry | llmgateway | 按 `(run_id, request_id)` 保存的上游终态响应流与失败结果；本地代理在快照恢复或重建后取回，取回不再次访问上游 |
 | 单次回放 | single replay | llmgateway 与本地代理 | 同一 `(run_id, generation, request_hash)` 的客户端重发与恢复取回命中已登记请求或回放条目，不产生第二次上游请求；上游在未收到响应体内容前的有限次重试属于同一逻辑请求内的重试 |
-| 直通模式 | passthrough | 本地代理与 llmgateway | 本地代理逐条转发上游 SSE 事件；网关按同一事件顺序转发，模式不改变网关的转发行为 |
-| 缓存模式 | hold | 本地代理与 llmgateway | 本地代理缓冲内容事件、只转发 ping 保活事件，解冻后一次性交付；网关仍按同一事件顺序转发并写入回放条目 |
 
 ## 外部接口契约
 
@@ -49,7 +47,7 @@
 
 ### 对本地代理的 HTTP 接口
 
-本地代理向网关发起的请求与 Anthropic Messages API 的请求体同形，平台元数据放在下列请求头中；`anthropic-version`、`content-type` 等 Anthropic 请求头由本地代理透传，网关以换取的凭据替换认证头。
+本地代理向网关发起的请求沿用 Anthropic Messages API 的请求体格式，平台元数据放在下列请求头中；`anthropic-version`、`content-type` 等 Anthropic 请求头由本地代理透传，网关以换取的凭据替换认证头。
 
 | 请求头 | 含义 |
 | --- | --- |
@@ -314,7 +312,7 @@ flowchart TD
 
 网关把请求体原样转发给 Anthropic API，只替换认证头为换取的真实凭据。响应按 Anthropic Messages API 的 SSE 格式处理：每个事件的 `event` 与 `data` 字段按原顺序转发，不合并事件、不重排事件、不改写内容事件。`ping` 事件按原顺序转发，用于维持本地代理与网关之间的连接；`ping` 不参与首 token 计时与用量统计。
 
-直通模式与缓存模式的差异在本地代理：直通模式下本地代理逐条转发内容事件；缓存模式下本地代理缓冲内容事件、只转发 `ping`，解冻后一次性交付。网关对直通模式与缓存模式执行相同的转发与回放写入，`mode` 只记录在 `llm_request` 与指标标签中。
+直通模式与缓存模式的差异只在本地代理；网关对两种模式执行相同的转发与回放写入，`mode` 只记录在 `llm_request` 与指标标签中。
 
 上游响应期间本地代理断开连接不取消上游请求：网关继续读取到终态并提交回放条目，供本地代理重发或恢复后取回。客户端在未收到任何内容时中止并重发（[REF-claude-code-network-config](../../references.md)）时，本地代理以同一 `request_hash` 重发；网关按唯一索引命中原行，不产生重复的上游调用。已收到部分内容时客户端保留截断结果，网关不重试上游。
 
@@ -346,7 +344,7 @@ flowchart TD
 
 网关按 `model`、`thinking` 预算档、`max_tokens` 档与输入 token 档维护首 token 时延与总时长直方图。首 token 时延从向上游发出请求起算，到首个内容事件为止，`ping` 不计入；总时长从发出请求起算，到终态事件或失败为止。分档边界是网关的部署配置，网关按该配置分桶。
 
-直方图按维度在网关进程内聚合，随 OpenTelemetry 指标周期导出；多副本各自聚合，观测后端按维度合并。指标导出 `count`、`sum` 与桶计数，`p25`、`p50`、`p90` 由观测后端按桶近似计算。网关按观测后端的历史样本计算预测输入（各维度的 `p25`、`p50`、`p90` 与样本数），在汇入前随上下文交给 `runcontroller`；`runcontroller` 在 `decide` 上下文中把它传给 `suspendpolicy`，`suspendpolicy` 不读取观测后端，也不反向调用本模块，事件源到 `runcontroller` 的单向依赖不变。进程重启只清空进程内聚合，观测后端保留的历史样本不随之清零；样本不足时按 `suspendpolicy` 的先验处理。
+直方图按维度在网关进程内聚合，随 OpenTelemetry 指标周期导出；多副本各自聚合，观测后端按维度合并。指标导出 `count`、`sum` 与桶计数，`p25`、`p50`、`p90` 由观测后端按桶近似计算。观测后端的历史样本用于校准 `suspendpolicy` 的 LLM 先验（比例系数与先验置信度）与诊断，不逐请求传入 `runcontroller`；`suspendpolicy` 不读取观测后端，也不反向调用本模块，事件源到 `runcontroller` 的单向依赖不变。进程重启只清空进程内聚合，观测后端保留的历史样本不随之清零；校准规则与样本不足时的先验置信度由 `suspendpolicy` 定义。
 
 在途请求数按 `gateway_instance`、`model` 与 `mode` 统计 `status=in_flight` 的 `llm_request` 行数，随同一 OpenTelemetry 指标周期导出；数据来源为 `llm_request` 表，多副本与进程重启后的取值一致。
 
@@ -358,7 +356,7 @@ flowchart TD
 
 ## 错误与失败语义
 
-客户端指本地代理，上游指 Anthropic API。错误分类决定是否产生上游调用、是否写回放条目与唤醒信号，以及是否允许重试。重试只用于同一 `(run_id, generation, request_hash)` 的请求，适用情形只有两类：请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；请求完整发出后的超时、连接重置与 `5xx` 不重试。
+客户端指本地代理，上游指 Anthropic API。错误分类决定是否产生上游调用、是否写回放条目与唤醒信号，以及是否允许重试。重试只用于同一 `(run_id, generation, request_hash)` 的请求，适用情形只有请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；请求完整发出后的超时、连接重置与 `5xx` 不重试。下表列出已明确处置路径的失败，各行是举例。
 
 | 情形 | 分类 | 返回 | 副作用与信号 | 重试 |
 | --- | --- | --- | --- | --- |
@@ -387,7 +385,7 @@ flowchart TD
 | 代在请求期间递增 | 不影响已完成的上游调用 | 继续 | 完成信号按登记的代写入，旧代被拒绝；旧代回放可由同一运行实例按 `request_id` 取回，新代同一 `request_hash` 按新请求登记 | 不重试 |
 | 回放缺失或已过保留期 | 取回错误 | `404` | 本地代理写 `llm.request.failed`；网关不重发上游 | Agent 以新请求重试 |
 
-`llm_request.reason` 的闭集为 `upstream_error`、`upstream_timeout`、`stream_interrupted` 与 `registration_failed`；`llm_failed` 信号的 `reason` 闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`，`registration_failed` 不写信号；`gateway_lost` 只由 `runcontroller` 合成。重试的适用情形只有两类：请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；其余 `4xx` 与 `5xx` 不重试。网关不把客户端错误转换为 `llm_failed`，因为客户端错误没有产生上游调用。
+`llm_request.reason` 的闭集为 `upstream_error`、`upstream_timeout`、`stream_interrupted` 与 `registration_failed`；`llm_failed` 信号的 `reason` 闭集为 `upstream_error`、`upstream_timeout` 与 `stream_interrupted`，`registration_failed` 不写信号；`gateway_lost` 只由 `runcontroller` 合成。重试的适用情形只有请求尚未完整发往上游时的失败，以及上游明确返回的 `408` 与 `429`；其余 `4xx` 与 `5xx` 不重试。网关不把客户端错误转换为 `llm_failed`，因为客户端错误没有产生上游调用。
 
 ## 并发与事务边界
 

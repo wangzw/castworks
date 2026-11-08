@@ -2,7 +2,7 @@
 
 ## 背景
 
-托管环境在 Agent 等待 LLM、外部系统或人类时释放沙箱占用的计算资源。释放手段包括冻结、快照与删除重建，其中销毁重建会移除 Agent 进程及其内存。任务身份、待处理输入、等待条件、投递进度与 Agent 会话的续接信息不能随沙箱消失，否则每一次资源释放都等同于结束任务，恢复时无法判断应当唤醒哪个执行实体、投递哪些事件、从哪个回合位置继续。
+托管环境在 Agent 等待 LLM、外部系统或人类时释放沙箱占用的计算资源。释放手段包括冻结、快照与销毁重建，其中销毁重建会移除 Agent 进程及其内存。任务身份、待处理输入、等待条件、投递进度与 Agent 会话的续接信息不能随沙箱消失，否则每一次资源释放都等同于结束任务，恢复时无法判断应当唤醒哪个执行实体、投递哪些事件、从哪个回合位置继续。
 
 沙箱本身也会在任意时刻丢失：看守进程崩溃、冻结中的 Pod 被驱逐、工作区租约过期。这类丢失不区分资源释放与任务失败，恢复路径必须能在沙箱不存在时继续工作。
 
@@ -22,25 +22,21 @@
 
 ## 决策
 
-运行实例是持久主体，沙箱只是某一代的执行载体。
-
-运行实例由 `run_id` 标识，拥有工作区、收件箱、唤醒信号与等待、投递游标、回合位置与恢复句柄。每次预配沙箱递增代 `generation`，代标识载体代次；沙箱的创建、冻结、快照、销毁与重建都不改变运行实例身份。
-
-失效判定以代为依据，旧代沙箱的消息、令牌、工作区写入、游标推进与出口请求一律拒绝（[ADR-generation-fencing](adr-generation-fencing.md)）。等待在持久化收件箱与唤醒信号上推导（[ADR-wait-on-durable-inbox](adr-wait-on-durable-inbox.md)）；工作区持久化按沙箱提供者选择（[ADR-workspace-persistence-per-provider](adr-workspace-persistence-per-provider.md)）；回合位置随运行实例持久化（[ADR-turn-position-persisted](adr-turn-position-persisted.md)）；投递去重状态随工作区跨代有效（[ADR-delivery-intent-log](adr-delivery-intent-log.md)）。
+采用运行实例作为控制面持久主体、沙箱作为某一代的执行载体：运行实例由 `run_id` 标识，其状态跨代存续；每代沙箱以代 `generation` 区分，沙箱的创建、冻结、快照、销毁与重建都不改变运行实例身份。
 
 ## 后果
 
-本决策使项目承担以下义务：
+本决策使项目承担以下义务（穷举）：
 
 - 控制面持久化自身决定的状态机状态与子状态；沙箱的实际存在与健康从沙箱提供者读取，控制面只记录驱动状态转移与调度所需的观察结果。
 - 状态转移与该转移的持久化点在同一事务写入；跨进程副作用经效果记录在提交后执行（[ADR-effect-record-after-commit](adr-effect-record-after-commit.md)）。
 - 资源释放必须区分挂起与结束：挂起保留运行实例，结束进入终态。
 - 工作区在两代沙箱之间可用，持久化确认随沙箱提供者能力不同（[ADR-workspace-persistence-per-provider](adr-workspace-persistence-per-provider.md)）。
-- 每代沙箱只读写当前代；控制面对沙箱侧输入与副作用按代校验。
+- 每代沙箱只读写当前代；控制面对沙箱侧输入与副作用按代校验（[ADR-generation-fencing](adr-generation-fencing.md)）。
 - 沙箱丢失不进入运行实例的终态，由重建路径承接；重建失败达到上限才进入降级与失败。
 - 运行实例的存储与清理独立于沙箱，需要保留期与清理规则。
 
-承担的代价如下：
+承担的代价穷举如下：
 
 - 控制面需要持续对账持久化状态与沙箱侧观察结果，纠正性对账成为常驻组件（[ADR-state-based-reconciliation](adr-state-based-reconciliation.md)）。
 - `run` 行承载跨代字段，字段组合约束与转移表复杂度上升。

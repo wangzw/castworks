@@ -1,6 +1,6 @@
 # 平台出口代理（k8s 路径）
 
-`connectorhub` 的平台出口代理是 k8s 路径的出口网关进程，部署在控制面命名空间之外。它监听本地代理发起的 CONNECT 与 HTTP 前置请求，按[运行实例](../../../glossary.md)令牌与出口策略逐请求鉴权，在请求头中替换凭据占位符，再把请求转发到允许主机。它不生成出口策略，不落地 NetworkPolicy，不处理 LLM 流量，也不代理 Substrate 路径的出口。文档围绕凭据占位符替换这一机制组织。心智模型：出口策略是一张按运行实例给出的允许主机与请求头改写表，每个请求只有在该运行实例的当前代上通过一次新查询才被放行（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。
+`connectorhub` 的平台出口代理是 k8s 路径的出口网关进程，部署在控制面命名空间之外。它监听本地代理发起的 CONNECT 与 HTTP 前置请求以及[透明拦截器](../../../glossary.md)发起的 CONNECT 隧道，按[运行实例](../../../glossary.md)令牌与出口策略逐请求鉴权，在请求头中替换凭据占位符，再把请求转发到允许主机。它不生成出口策略，不落地 NetworkPolicy，不处理 LLM 流量，也不代理 Substrate 路径的出口。文档围绕凭据占位符替换这一机制组织。心智模型：出口策略是一张按运行实例给出的允许主机与请求头改写表，每个请求只有在该运行实例的当前代上通过一次新查询才被放行（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。
 
 文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、规则档位、状态一览、走查、请求鉴权与规则选择、占位符替换、按代撤销与残余窗口；术语表、外部接口契约、依赖、UML 图与数据结构作为参考，在核对字段、状态码或配置调用时查阅。并发与事务边界末尾的竞态用例留到最后自测：先按前文规则判断每个交错序列的结果，再与表中结论核对。
 
@@ -8,13 +8,13 @@
 
 凭据占位符替换是本子模块的核心机制。需要凭据的请求头在沙箱内只携带占位符，例如 `Authorization: Bearer {{github.token}}`；代理在逐请求鉴权通过之后，按该运行实例的[出口策略](../../../glossary.md)匹配注入规则，以[运行实例令牌](../../../glossary.md)向 `secrets` 换取真实凭据，只替换请求中已存在的头里的占位符，再把请求发往上游。占位符也可以由看守进程作为环境变量注入第三方工具，例如 `GH_TOKEN={{github.token}}`；工具把它放进请求头，代理不感知工具身份，只按主机、头名与占位符匹配。
 
-系统需要它，是因为[沙箱](../../../glossary.md)内不存放真实凭据（[架构不变量](../../architecture.md#架构不变量) I6），而沙箱内的调用方只接触占位符；代理在最后一跳完成占位符到真实凭据的转换，调用方无需持有真实凭据，真实凭据只出现在代理进程内存中。替换要求代理看到请求头，因此有注入规则的 CONNECT 目标使用 `https` 档终止 TLS 后处理，没有注入规则的 CONNECT 目标使用 `tls_passthrough` 档按端到端 TLS 直通；证书固定目标不能接受 TLS 终止，故不为其声明注入规则。`https` 档是唯一的 TLS 终止点，向客户端出示由平台 CA 签发的目标主机证书；平台 CA 私钥只在出口代理侧持有，沙箱只注入信任锚。`mitm` 与 `passthrough` 通道由沙箱内本地 DNS 把目标域名解析到本地拦截器，拦截器不终止 TLS，只把原始 TLS 字节以 CONNECT 隧道转给出口代理；出口代理按注入规则选 `https` 或 `tls_passthrough`，不感知通道来源，不使用 CNI、eBPF 或 sidecar。
+系统需要它，是因为[沙箱](../../../glossary.md)内不存放真实凭据（[架构不变量](../../architecture.md#架构不变量) I6），而沙箱内的调用方只接触占位符；代理在最后一跳完成占位符到真实凭据的转换，调用方无需持有真实凭据，真实凭据只出现在代理进程内存中。替换要求代理看到请求头，因此有注入规则的 CONNECT 目标使用 `https` 档终止 TLS 后处理，没有注入规则的 CONNECT 目标使用 `tls_passthrough` 档按端到端 TLS 直通；证书固定目标不能接受 TLS 终止，故不为其声明注入规则。`https` 档是唯一的 TLS 终止点，向客户端出示由平台 CA 签发的目标主机证书；平台 CA 私钥只在出口代理侧持有，沙箱只注入信任锚。`mitm` 与 `passthrough` 通道由沙箱内本地 DNS 把目标域名解析到透明拦截器，透明拦截器不终止 TLS，只把原始 TLS 字节以 CONNECT 隧道转给出口代理；出口代理按注入规则选 `https` 或 `tls_passthrough`，不感知通道来源，不使用 CNI、eBPF 或 sidecar。
 
 ## 职责
 
 本子模块的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体算法、字段与调用细节见后续章节。
 
-- **CONNECT 终止与 HTTP 前置终止**：在单一监听端口上接受本地代理的 CONNECT 与绝对形式 HTTP 请求，解析目标主机与请求形态，把请求交给鉴权与替换阶段；无法解析目标主机的请求立即拒绝，不建立上游连接。
+- **CONNECT 终止与 HTTP 前置终止**：在单一监听端口上接受本地代理的 CONNECT 与绝对形式 HTTP 请求以及透明拦截器的 CONNECT 隧道，解析目标主机与请求形态，把请求交给鉴权与替换阶段；无法解析目标主机的请求立即拒绝，不建立上游连接。
 - **按运行实例白名单鉴权**：从代理认证头取运行实例令牌，经 `secrets` 校验签名、过期时间与 `run_id`，逐请求经 `runcontroller` 的 `Generations.Current` 校验代、终态与本代作废状态，并检查目标主机属于该运行实例出口策略的 `AllowedHosts`；任一条件不通过即拒绝，不向上游发送任何字节。
 - **凭据占位符替换**：对命中的注入规则，只在请求已存在的头中把占位符替换为真实凭据；缺少该头时不注入，请求体、请求行与其他头保持不变；代理自身的认证头在转发前移除。真实凭据由 `secrets.ExchangeCredential` 以策略中的 `project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 换取，调用携带本进程的调用方身份，`Usage.UsageID` 取本次请求的 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；换取结果按 `(run_id, generation, system, auth_method, scopes)` 缓存在进程内直到 `ExpiresAt`；策略缺 `project_id`、凭据对象未配置或认证方式不匹配时返回 `503`，请求的授权范围超出凭据对象的授权范围时返回 `403`，均审计。
 - **规则档位选择**：按目标主机、请求形态与出口策略，把请求归入 `https`、`tls_passthrough`、`http` 档位；`https` 档终止客户端 TLS，`http` 档解析明文请求，两者都检查请求头；`tls_passthrough` 档保留端到端 TLS 并按目标主机放行。
@@ -26,9 +26,11 @@
 
 ### 非职责
 
+非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
+
 - 出口策略内容的生成、允许主机并集的合并、`Inject` 与 `Git` 规则的产出归 `connectorhub` 主文档的连接器部分；本子模块只消费已生成的策略。
 - 平台出口代理配置与 NetworkPolicy 的落地、按代撤销墓碑与策略副本保存归 `sandboxprovider` 的 k8s 子模块；k8s 路径的按代撤销为空操作，本子模块不接收撤销墓碑。
-- 本地代理的 CONNECT 与 HTTP 前置发起、运行实例令牌附加、LLM 流量转发与直通或缓存模式归看守进程的本地代理；本子模块不接触 LLM 请求。
+- 本地代理的 CONNECT 与 HTTP 前置发起、运行实例令牌附加、LLM 流量转发与[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)的选择归看守进程的本地代理；本子模块不接触 LLM 请求。
 - 运行实例令牌的签发、轮换与签名校验归 `secrets`；本子模块调用其校验函数，不签发也不轮换令牌。
 - 运行实例状态机、代递增、终态与本代作废判定归 `runcontroller`；本子模块逐请求查询，不自行推导这些状态。
 - Substrate 路径的出口策略落地、MITM 与 `replaceHeaders` 替换归 Substrate 出口网关（[REF-substrate](../../../references.md)）；本子模块只服务 k8s 路径。
@@ -87,14 +89,14 @@ type CurrentGeneration struct {
 
 ## 依赖
 
-依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本子模块依赖 `runcontroller`、`secrets`、`sandboxprovider` 的 k8s 子模块与 Envoy 数据面（[REF-envoy](../../../references.md)）；本地代理是运行时 HTTP 调用方，不是代码依赖，不出现在模块依赖图中。
+依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本子模块依赖 `runcontroller`、`secrets`、`sandboxprovider` 的 k8s 子模块与 Envoy 数据面（[REF-envoy](../../../references.md)）；本地代理与透明拦截器是运行时调用方，不是代码依赖，不出现在模块依赖图中。
 
 - `runcontroller`：代查询接口 `Generations.Current`，逐请求调用，不使用缓存。本子模块不读 `run` 表，不参与状态转移；`runcontroller` 不反向调用本子模块。
 - `secrets`：运行实例令牌的签名、过期时间与 `run_id` 校验，以及占位符对应凭据的取得。凭据换取以策略中的 `project_id` 为项目范围、以 `(run_id, generation)` 定位运行实例与代、以 `system` 与 `auth_method` 选择凭据对象、以 `scopes` 约束授权；调用 `ExchangeCredential` 时以调用方身份认证，`Target` 取 `Kind=external_system`，`System`、`AuthMethod` 与 `Scopes` 取注入规则，`Usage.UsageID` 取 `RequestID` 与规则标识（目标主机、头名与占位符）拼接，`Usage.Operation` 取占位符、请求方法与目标主机；代理不使用缓存之外的代。真实凭据只在本进程内存中出现，不写入策略副本、审计记录或请求头事件。
 - `sandboxprovider` 的 k8s 子模块：平台出口代理配置与 NetworkPolicy 的落地，出口策略副本的保存与按运行实例推送。k8s 路径的 `RevokeEgressPolicy` 为空操作，本子模块不依赖撤销墓碑；NetworkPolicy 默认拒绝沙箱出口，只放行控制面地址、LLM 网关与平台出口代理。
 - `connectorhub` 主文档：出口策略的内容来源，包括 `AllowedHosts` 的并集、`Inject` 规则与 `GitRule`。本子模块与连接器同属 `connectorhub`，不构成跨模块依赖。
 - Envoy：数据面。CONNECT 终止、TLS 终止与发起、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 由 Envoy 提供；本子模块实现 `ext_authz` 与 `ext_proc` 的策略逻辑。
-- 运行时调用方：看守进程的本地代理经 CONNECT 或 HTTP 前置调用本进程，携带运行实例令牌。这是运行时调用，不是代码依赖。
+- 运行时调用方：看守进程的本地代理经 CONNECT 或 HTTP 前置、透明拦截器经 CONNECT 调用本进程，都携带运行实例令牌。这是运行时调用，不是代码依赖。
 
 架构不变量 I1 与 I6 要求全部外部系统流量经托管侧、沙箱零长期凭据；I7 要求出口请求按代校验（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)、[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本子模块的依赖方向满足这些约束：它只调用 `runcontroller`、`secrets` 与 `sandboxprovider` 的接口，三者不反向调用它。
 
@@ -192,7 +194,7 @@ stateDiagram-v2
 
 档位选择规则穷举如下：绝对形式 HTTP 请求使用 `http` 档；CONNECT 目标主机在该运行实例的策略中有注入规则时使用 `https` 档；CONNECT 目标主机没有注入规则时使用 `tls_passthrough` 档。
 
-外部系统定义的 `access.mode` 与 `access.host_modes` 决定沙箱侧通道，不改变本子模块的档位选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由本地 DNS 把域名指向沙箱内拦截器，拦截器以附带运行实例令牌的 CONNECT 把原始 TLS 字节交给出口代理，不终止 TLS。出口代理只按请求形态与注入规则选择档位，不感知通道来源。证书固定的目标不能接受平台出口代理的 TLS 终止，因此不得为其声明注入规则；需要凭据的证书固定目标不受支持（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)）。
+外部系统定义的 `access.mode` 与 `access.host_modes` 决定沙箱侧通道，不改变本子模块的档位选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由本地 DNS 把域名指向透明拦截器，透明拦截器以附带运行实例令牌的 CONNECT 把原始 TLS 字节交给出口代理，不终止 TLS。出口代理只按请求形态与注入规则选择档位，不感知通道来源。证书固定的目标不能接受平台出口代理的 TLS 终止，因此不得为其声明注入规则；需要凭据的证书固定目标不受支持（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)）。
 
 ### 策略与请求视图
 
@@ -274,14 +276,13 @@ k8s 路径与 Substrate 路径的语义一致：默认拒绝未列入的主机�
 
 ### 按代撤销与残余窗口
 
-k8s 路径的放行不依赖按代策略副本，也不依赖撤销墓碑。每个请求在鉴权阶段调用一次 `Generations.Current`：代递增、运行实例进入终态或本代被判定作废的事务提交之后，新请求的下一次查询立即看到新值并被拒绝，不需要等待策略撤销生效。
+k8s 路径的放行不依赖按代策略副本，也不依赖撤销墓碑（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。每个请求在鉴权阶段调用一次 `Generations.Current`：代递增、运行实例进入终态或本代被判定作废的事务提交之后，新请求的下一次查询立即看到新值并被拒绝，不需要等待策略撤销生效。
 
 残余窗口穷举如下：
 
 - 已通过鉴权并建立上游连接的请求不因代变化而中断，窗口等于该请求从鉴权到上游响应结束的剩余时间。代理不在响应中途重新查询代。
 - 鉴权查询在代递增事务提交之前返回旧代、上游副作用发生在提交之后：窗口上界为单次请求的鉴权查询到上游完成之间的时长，不使用缓存的代使该窗口最小。
 - `runcontroller` 不可达时不放行新请求，窗口不因查询失败而扩大；在途请求继续完成。
-- 与 Substrate 路径相比，k8s 路径以每请求一次代查询换取撤销立即生效，不承担撤销效果截止之前的窗口；代价是出口请求的放行依赖 `runcontroller` 的可用性与查询时延（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。
 
 ### 在途请求事件上报
 
