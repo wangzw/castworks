@@ -32,9 +32,9 @@
 - 沙箱的预配、挂起、解冻、快照、销毁与恢复触发归 `sandboxprovider`；`/readyz`、`/wake` 与 `/terminal` 的 HTTP 服务归看守进程，入站路由归 `sandboxprovider` 的提供者子模块。
 - 运行实例令牌的签发、签名校验、轮换与有效期归 `secrets`。本模块只承载 `resume_token` 与 `TokenRotate`，并定义认证失败的关闭状态。首个令牌与工作区租约的 `lease_id` 由看守进程经 `sandboxprovider` 的[引导接口](../../glossary.md)领取，不经过出站流。
 - [沙箱侧配置](../../glossary.md)的生成归 `connectorhub`，按运行实例保存与发送时机归 `runcontroller`，应用归看守进程。本模块只承载 `SandboxConfig` 消息与 `Hello.sandbox_config_revision`，不解析配置内容。
-- [收件箱](../../glossary.md)、[唤醒信号](../../glossary.md)、[等待](../../glossary.md)、定时器、[订阅](../../glossary.md)与在途请求的持久化归 `runcontroller` 与事件源模块。本模块只承载 `Hello` 中的状态摘要与 `Deliver` 中的投递批。
+- [收件箱](../../glossary.md)、[唤醒信号](../../glossary.md)、[等待](../../glossary.md)、定时器、[订阅](../../glossary.md)、在途请求与自唤醒条目的持久化归 `runcontroller` 与事件源模块。本模块只承载 `Hello` 中的状态摘要、`Deliver` 中的投递批与 `self_wake_changed` 中的条目集合及其 `crons_synced`。
 - 本地代理与 LLM 网关之间的 HTTP、连接器与外部系统之间的 HTTP、MCP 工具调用都不归本模块；它们与出站流是并行的运行时调用。
-- 看守进程对 Agent 的进程监督、[投递意图日志](../../glossary.md)、活动度采集与本地代理归 `warden` 模块的对应子模块。
+- 看守进程对 Agent 的进程监督、[投递意图日志](../../glossary.md)、活动度采集、冻结期间入站数据的观测与本地代理归 `warden` 模块的对应子模块；后台作业集合与自唤醒条目（Agent 各[自唤醒源](../../glossary.md)的下一次触发）的维护归 Agent 驱动器。本模块只定义承载这些事实的消息字段与语义，不规定采集与识别方法。
 
 ## 术语表
 
@@ -231,15 +231,16 @@ stateDiagram-v2
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
 | `Hello` | `generation`、`session_epoch`、`resume_token`、`workspace_lease_id`、`sandbox_id`、`agent_state{phase, turn_id, blocked_on, frozen, freeze_id, frozen_since, session_id}`、`cursor_accepted`、`cursor_consumed`、`pending_intents[]`、`last_received_msg_seq`、`sandbox_config_revision` | 出站流首帧。以 `resume_token` 认证并声明代与工作区租约，提交状态摘要。控制面据 `generation`、令牌中的代与租约决定 `accepted`、`fenced`、不可重试认证失败、可重试关闭或 `Shutdown`；`last_received_msg_seq` 是看守进程已处理的控制面消息序号，控制面从它之后重放；`sandbox_config_revision` 是看守进程已应用的[沙箱侧配置](../../glossary.md)版本，尚未应用为 0。 |
-| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms}`、`bg_jobs_changed{job_ids}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为回合事件；`event_seq` 在同一回合内单调，用于丢弃重复与乱序事件。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。 |
+| `AgentEvent` | `turn_id`、`event_seq`、`kind`：`turn_started{session_id, delivery_id}`、`turn_ended{reason, agent_exited, bg_procs}`、`tool_started{call_id}`、`tool_ended{call_id}`、`permission_requested{id, call_id, blocking}`、`subscription_created{sub_id, since_cursor}`、`timer_requested{timer_id, fire_at, scope}`、`wait_started{call_id, kind: wait_for\|timer, ref, fire_at, predicted_ms}`、`bg_jobs_changed{job_ids}`、`self_wake_changed{entries, crons_synced}`、`state_changed{idle\|requires_action}` | 驱动器把 Agent 原生信号翻译为事件；回合内事件的 `event_seq` 在同一回合内单调，用于丢弃重复与乱序事件；没有进行中回合时发出的事件，其 `turn_id` 与 `event_seq` 为空，见表后说明。`turn_ended` 只在回合结果与 `idle` 齐备且 `queued_turn_count` 为 0 后发出；`turn_started.delivery_id` 为本回合消费的投递，Agent 自行开始的回合（任务通知回合、会话内定时触发的回合）为空；`timer_requested` 只以 `scope=run` 发出，`scope=generation` 由 `WaitDeclared` 的 `deadline` 表达。`bg_jobs_changed` 与 `self_wake_changed` 携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换或合并 `cron` 条目，条目与发送时机见表后说明。 |
 | `WaitDeclared` | `wait_id`、`scope: run\|generation`、`conditions[{cond_id, kind, ref}]`、`deadline`、`safe_to` | 仅 L2 协作式 Agent 使用；沙箱内的 L2 进程驱动器经出站流发送，控制面循环驱动器经宿主 `runcontroller` 注入的事件入口提交同一组字段，由宿主调用 `RunService.DeclareWait`。向控制面追加显式等待条件。`kind=timer` 的条件必须引用已存在且同范围的 `timer` 行，否则整条声明被拒绝并计数；带 `deadline` 时登记同范围的 `declared_deadline` 定时器。 |
-| `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`mcp_procs`、`throttled_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`procs` 计 Agent 进程树的全部进程；`mcp_procs` 为其中已声明的第三方 MCP 服务器进程及其子进程的数量；`procs` 各态计数之和减 `mcp_procs` 为 Agent 主进程与其他进程的数量，控制面据此判定进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外是否还有其他进程。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。 |
+| `Activity` | `psi{cpu, io, mem}`、`procs{R, D, S, T, Z}`、`timed_sleepers{known_earliest_expiry, unknown}`、`mcp_procs`、`throttled_usec`、`cpu_usage_usec`、`last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`、`llm_last_request_at`、`llm_last_retryable_failure_at`、`frozen`、`freeze_id` | 按固定周期发送的活动度摘要。`procs` 计 Agent 进程树的全部进程；`mcp_procs` 为其中已声明的第三方 MCP 服务器进程及其子进程的数量；`procs` 各态计数之和减 `mcp_procs` 为 Agent 主进程与其他进程的数量，控制面据此判定进程树中除 Agent 主进程与已声明的第三方 MCP 服务器进程外是否还有其他进程。`frozen` 为 Agent 子 cgroup 的冻结状态；`Active` 中 `frozen=true` 且 `freeze_id` 不等于 `aborted_suspend_id` 时控制面判定本代沙箱作废。`psi`、`cpu_usage_usec`、`timed_sleepers` 与两个 LLM 时刻字段的取值见表后说明，它们作为忙信号的解释归 [suspendpolicy](design-suspendpolicy.md)。 |
 | `Accepted` | `delivery_id`、`through_seq`、`fed` | 接受记录同步写入[工作区](../../glossary.md)[投递意图日志](../../glossary.md)后才发送。`fed` 报告本批按日志去重后是否仍有事件喂给 Agent；`fed=false` 时不为本批启动 Agent，控制面不转 `InTurn`。 |
 | `Consumed` | `through_seq`、`turn_id` | 只针对 `target=next_user_message` 的常规投递；消费记录同步写入投递意图日志后才发送；`through_seq` 取已开始处理的常规批的序号。定向投递与回合边界续接不发 `Consumed`。 |
 | `DeliveryFailed` | `delivery_id`、`seqs`、`reason`、`retryable` | 一批投递未能喂给 Agent。`reason` 含 `target_gone`；`retryable` 为真时由 `runcontroller` 以新 `delivery_id` 退避重投；`retryable` 为假且 `reason=target_gone` 时不放弃，事件取消定向并回退为常规投递；其余 `retryable` 为假的情形放弃失败的事件并通知 Agent。 |
 | `ReadyToSuspend` | `suspend_id`、`mode`、`frozen_at \| exited_at`、`session_id`、`procs_remaining`、`ws_write_fds` | 看守进程侧的挂起前置条件已满足，`mode=destroy` 时即看守进程对[安全点](../../glossary.md)的复核已通过。冻结模式报告 `frozen_at`，销毁模式报告 `exited_at`；`session_id` 为[恢复句柄](../../glossary.md)，空值不覆盖已落库的值。 |
 | `Busy` | `suspend_id`、`reason`、`retry_after` | 挂起前置条件不满足；`reason=cancelled` 是 `CancelSuspend` 的确认；`retry_after` 给出复评时刻。 |
 | `Thawed` | `suspend_id` | `suspend_id` 取冻结标识 `freeze_id`；按 `freeze_id` 幂等。`signal` 变体在自行解冻进程树之后上报，`cgroup` 变体在观察到 Agent 子 cgroup 未冻结之后上报，进程树从未冻结时立即上报。 |
+| `conn.inbound` | `freeze_id` | 冻结期间入站数据的通知，由看守进程发出。触发为下列之一（穷举）：Agent 进程树处于冻结状态时，本地代理或透明拦截器在 Agent 持有的非 LLM 上游连接上收到载荷字节；冻结确认时 Agent 进程树中受检套接字的接收队列非空（有未读数据）。受检套接字排除 Agent 与看守进程组件之间承载平台内部交互的回环连接，排除范围穷举为：承载 LLM 请求的连接（Agent 到本地代理的 LLM 端点）与 Agent 和平台 MCP 服务器之间的连接，它们的进展分别由 `llm.first_token`、`llm.request.completed`、`llm.request.failed` 与定向投递表达；经本地代理转发的外部系统连接（CONNECT 隧道与绝对 URI 转发）与透明拦截器接管的连接照常检查。`freeze_id` 取该冻结尝试的 `suspend_id`；看守进程对每个 `freeze_id` 至多发出一次。TCP 保活等无载荷报文不计；看守进程不终止 TLS，不区分应用层保活帧与业务数据，由此产生的误唤醒按普通唤醒处理。冻结确认的判定与接收队列的检查方法见 [warden](warden/design-warden.md)，控制面对它的处理见 [runcontroller](design-runcontroller.md)。 |
 | `LeaseLost` | `lease_id`、`expires_at` | [工作区租约](../../glossary.md)续约失败后上报；看守进程冻结或杀死 Agent 进程树并停止写入。 |
 | `llm.request.started` | `request_id`、`mode: passthrough\|hold`、`predicted_ms` | 本地代理获得上游响应头，或确认同一逻辑请求在途之后上报。`mode` 决定阻塞条件的冻结上限取 `F_stream` 或 `F_cap(llm)`；`predicted_ms` 是等待时长的单点预测，`suspendpolicy` 按来源先验把它展开为分位区间与置信度。 |
 | `llm.first_token` | `request_id` | 收到首个内容事件后上报，保活事件不计入；每个逻辑请求至多一次。控制面据此写 `wake_hint` 事实供[预测性恢复](../../glossary.md)，并按已等待时长重估同一 `request_id` 的剩余等待；不单独满足阻塞条件。 |
@@ -251,6 +252,15 @@ stateDiagram-v2
 - `agent_state.phase` 的取值为 `starting`、`in_turn`、`blocked`、`boundary`、`exited`；`blocked_on` 与 `turn_id` 描述回合位置，`blocked_on` 为空或为 `{kind, ref, call_id, since, predicted_ms, mode}`，`kind` 取 `llm`、`timer`、`approval`、`wait_for`，字段语义与 `runcontroller` 的 `run.blocked_on` 列相同；新代 `Hello` 的 `session_id` 只用于核对，不改写控制面的恢复句柄。
 - `cursor_accepted` 与 `cursor_consumed` 只计常规投递的已接受与已消费前缀，不含定向投递与回合边界续接。
 - `pending_intents[]` 携带投递意图日志中尚未被控制面确认的记录；控制面按其中常规投递的最大已接受序号前进 `cursor_accepted`（[ADR-delivery-intent-log](../../adr/adr-delivery-intent-log.md)）。
+- 没有进行中回合时发出的 `AgentEvent`（下称回合外事件，例如回合边界上的 `bg_jobs_changed`、`self_wake_changed` 与 `state_changed`）的 `turn_id` 与 `event_seq` 为空；`event_seq` 的单调约束与按 `event_seq` 丢弃重复、乱序事件的规则只适用于回合内事件。回合外事件的顺序由出站流的 `msg_seq` 保证，接收方按 `msg_seq` 顺序派发，不依赖 `event_seq`；集合类事件按替换语义处理（`self_wake_changed` 按 `crons_synced` 的合并规则），重复与重放不改变结果。
+- `bg_jobs_changed.job_ids` 是完整集合，按替换语义处理：接收方以最近一次收到的集合整体替换前值，不按差量合并；空集合表示没有存活的后台作业，重复或重放的同一集合不改变结果。后台作业集合由 Agent 驱动器维护，Claude Code 驱动器以 Agent 自身的后台任务集合为准（见 [Claude Code 驱动器](warden/design-warden-driver-claude-code.md)）。
+- `self_wake_changed.entries` 是完整集合，每一项为 `{entry_id, kind, fire_at, survives_resume}`，`entry_id` 在集合内唯一。`kind` 的取值闭集为 `cron`（会话内定时作业）、`wakeup`（一次性自唤醒）、`tool_timeout`（进行中工具调用的超时）与 `monitor_deadline`（监视任务的截止）；`fire_at` 为该项下一次触发的绝对时刻，可以为空，表示触发时刻未知，例如驱动器无法解析 cron 表达式时把 `fire_at` 置空并计数告警；`survives_resume` 表示沙箱销毁重建后，该项随 Agent 以恢复句柄续接而由 Agent 自行恢复，`cron` 为真，其余为假。没有自唤醒源的驱动器不发 `self_wake_changed`。
+- `self_wake_changed.crons_synced` 为真表示 `entries` 中的 `cron` 条目已按本进程的会话内定时集合（Claude Code 驱动器为 `session_crons`）对账；为假表示驱动器尚未取得本进程的会话内定时集合，`entries` 中的 `cron` 条目可能不完整。驱动器在本代 Agent 进程启动后即可发送 `self_wake_changed`，不必等待首次取得会话内定时集合：取得之前 `crons_synced` 为假，取得之后为真；同代 Agent 进程重启后重新从 `crons_synced=false` 起算。接收方按 `crons_synced` 处理：为真时以 `entries` 整体替换前值；为假时整体替换 `kind≠cron` 的条目，`cron` 条目按 `entry_id` 合并，`entries` 中出现的 `cron` 条目覆盖同 `entry_id` 的已有条目，已有而 `entries` 中未出现的 `cron` 条目保留。进程重启后以 `crons_synced=false` 发出的集合因此清除上一进程遗留的 `wakeup`、`tool_timeout` 与 `monitor_deadline` 条目，保留 `cron` 条目。两种处理下重复或重放的同一集合都不改变结果；控制面的处理见 [runcontroller](design-runcontroller.md) 的「自唤醒项更新」与「非 Active 回合进展」。
+- 控制面只以有效条目推算自唤醒时刻：`fire_at` 非空且不早于 `now − (L_self_wake(substate) + P_quiesce)` 的条目。`fire_at` 早于该界限的条目视为已触发、待驱动器下一次对账时更新或移除：它们不参与等待上界、所有者侧截止时间 `self_wake_at` 与探测定时器触发时刻的计算，不参与销毁预检，也不阻止挂起；存在 `fire_at` 为空的条目时运行实例不挂起，这类条目在销毁预检中按 `survives_resume` 照常检查。有效条目的判定与参数见 [suspendpolicy](design-suspendpolicy.md)，`self_wake_at` 的写入见 [runcontroller](design-runcontroller.md)。
+- `Activity.psi` 的 `cpu`、`io`、`mem` 分别取 Agent 子 cgroup 的 `cpu.pressure`、`io.pressure`、`memory.pressure` 中 `some` 行的 `total` 累计微秒值（[REF-linux-psi](../../references.md)）；相邻样本之差为零表示该采样窗口内无停滞。`avg10` 等指数平均值不进入 `Activity`：其平滑窗口与 `suspendpolicy` 的静默窗口 `Q_quiet` 粒度不匹配。
+- `Activity.cpu_usage_usec` 取 Agent 子 cgroup 的 `cpu.stat` 中 `usage_usec` 的累计微秒值（[REF-linux-cgroup-v2](../../references.md)）；相邻样本之差为该采样窗口内 Agent 进程树消耗的 CPU 时间。它与 `psi` 互补：`psi` 的 `total` 累计的是停滞时间，独占空闲 CPU 的进程不产生压力，它的 CPU 用量只体现在 `usage_usec` 中。静止证据据此判定的阈值 `U_quiet` 归 [suspendpolicy](design-suspendpolicy.md)。
+- `Activity.timed_sleepers` 描述 Agent 进程树中处于定时睡眠的进程，判定依据为 `/proc/<pid>/wchan` 属 nanosleep、hrtimer 类。`comm` 为 `sleep` 且参数可按 coreutils 的时长语法解析的进程，到期时刻为进程启动时刻（`/proc/<pid>/stat` 的 `starttime`）加参数时长，其中最早者为 `known_earliest_expiry`，没有这类进程时为空；其余定时睡眠进程的数量为 `unknown`。
+- `Activity.llm_last_request_at` 与 `llm_last_retryable_failure_at` 分别为本地代理最近一次发出 LLM 请求、最近一次收到可重试失败（429、5xx、`overloaded`）的时刻，尚未发生时为空。
 
 #### 控制面到看守进程
 
@@ -258,7 +268,8 @@ stateDiagram-v2
 | --- | --- | --- |
 | `HelloAck` | `accepted \| fenced{current_generation}`、`desired_state{running\|frozen}`、`last_received_msg_seq`、`cursor_accepted`、`owner_epoch`、`live_attached`、`live_as_of` | `Hello` 的应答。`accepted` 表示所有权已接管并完成状态对账；`fenced{current_generation}` 表示代已过期；认证失败不回 `HelloAck`。`desired_state` 让看守进程对齐 Agent 进程树的冻结状态；`last_received_msg_seq` 让看守进程裁剪重放缓冲并从其后重放；`cursor_accepted`、`owner_epoch`、`live_attached` 与 `live_as_of` 是状态对账字段。 |
 | `Deliver` | `delivery_id`、`batch[{inbox_seq, event_id, dedup_key, kind, subkind, payload, occurred_at, redelivery}]`、`through_seq`、`target: next_user_message \| tool_result{call_id} \| permission_decision{id}`、`resume_session_id` | 只在出站流上，投递语义为至少一次。`batch` 按 `inbox_seq` 升序，`through_seq` 为批内最后一条；`subkind` 只在 `kind=internal_notice` 时非空，取值为 `turn_interrupted`、`timer_due`、`degraded_summary` 或 `delivery_abandoned`；`target` 决定喂入 Agent 的方式；`resume_session_id` 为空表示新会话；`payload` 超过 `S_max` 时以附件引用表达。 |
-| `PrepareSuspend` | `suspend_id`、`mode: freeze\|freeze_shrink\|snapshot\|destroy`、`variant: cgroup\|signal`、`deadline`、`require{process_exit, no_bg_procs, no_ws_write_fds, sync}`、`force` | 请求看守进程满足挂起前置条件。`variant` 只在冻结类模式（`freeze`、`freeze_shrink`）时非空；`require` 列出必须满足的条件；`force` 允许终止 Agent 主进程与已声明的第三方 MCP 服务器进程（含其子进程，范围同 `Activity.mcp_procs`）之外的进程；`deadline` 用于对账器重驱动。 |
+| `StartAgent` | `resume_session_id` | 以恢复句柄启动 Agent 主进程，不写入任何输入；Agent 进程已在运行时为空操作，重复与重放的 `StartAgent` 因而幂等。由 `runcontroller` 以 `send` 效果发出，用于本代 Agent 进程未运行而自唤醒条目非空的回合边界；`resume_session_id` 取落库的恢复句柄。以它启动的进程处于回合边界，Agent 续接会话后自行恢复会话内定时，到点时自行开始回合，该回合的 `turn_started.delivery_id` 为空。启动同样受「首次应用沙箱侧配置之前不启动 Agent 主进程」约束；新代看守进程在收到首个 `Deliver` 或 `StartAgent` 之前不启动 Agent 主进程。 |
+| `PrepareSuspend` | `suspend_id`、`mode: freeze\|freeze_shrink\|snapshot\|destroy`、`variant: cgroup\|signal`、`deadline`、`require{process_exit, no_bg_procs, no_ws_write_fds, sync}` | 请求看守进程满足挂起前置条件。`variant` 只在冻结类模式（`freeze`、`freeze_shrink`）时非空；`require` 列出必须满足的条件，任一不满足时看守进程回 `Busy`；看守进程不为满足前置条件而终止进程，唯一的例外是 `mode=destroy` 时在 Agent 主进程正常退出之后终止已声明的第三方 MCP 服务器（含其子进程，见 [warden](warden/design-warden.md)）；后台作业、残留进程与孤儿进程都不终止，`process_exit` 只由 Agent 主进程的正常退出满足；`deadline` 用于对账器重驱动。 |
 | `CancelSuspend` | `suspend_id` | 撤销挂起尝试。确认载体为 `Busy{suspend_id, reason=cancelled}`；看守进程已越过不可撤销点时照常回 `ReadyToSuspend`。 |
 | `Thaw` | `suspend_id` | `suspend_id` 取冻结标识 `freeze_id`。`signal` 变体由看守进程收到后自行解冻；`cgroup` 变体由控制面在沙箱提供者的解冻调用返回之后发送。看守进程以 `Thawed` 应答。 |
 | `Resumed` | `suspend_id`、`suspended_for_ms`、`wall_clock_now`、`drain` | 恢复完成通知；按 `suspend_id` 幂等。`drain=true` 按 `T_drain` 周期重发；看守进程收到后，已在等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 都按 DRAIN 规则立即返回。 |
@@ -339,7 +350,7 @@ stateDiagram-v2
 - **重复确认**：重复帧可以再次确认，确认值不因重复而回退。低于已发送确认的迟到帧直接丢弃，不视为错误。
 - **乱序**：接收方不为序号不连续的消息建立新前缀，也不跳过缺口派发后续消息。缺口由重放补齐；重连并完成状态对账之后仍不连续时，按可重试关闭处理。
 - **去重表裁剪**：不高于已发送确认的条目删除；高于确认的条目保留到被确认或代变化。去重表的大小由重放窗口与背压约束，不随运行时长增长。
-- **幂等边界**：协议去重只覆盖传输层的重复投递。应用层重复由 `runcontroller` 的 `delivery_id`、`suspend_id`、`freeze_id` 与带代的游标 CAS 处理，重复的 `SandboxConfig` 由看守进程按 `revision` 吸收；本模块不解释这些标识。
+- **幂等边界**：协议去重只覆盖传输层的重复投递。应用层重复由 `runcontroller` 的 `delivery_id`、`suspend_id`、`freeze_id` 与带代的游标 CAS 处理，`conn.inbound` 以 `freeze_id` 标识，重复的 `SandboxConfig` 由看守进程按 `revision` 吸收，重复的 `StartAgent` 在 Agent 进程已运行时为空操作，`bg_jobs_changed` 以完整集合替换前值，`self_wake_changed` 按 `crons_synced` 整体替换或按 `entry_id` 合并 `cron` 条目，重复的同一集合不改变结果；按 `event_seq` 丢弃重复与乱序只适用于回合内事件，回合外事件不带 `event_seq`；本模块不解释这些标识。
 
 ### 状态对账
 
@@ -498,6 +509,79 @@ sequenceDiagram
 
 图固定等人路径的两级确认：`Accepted` 表示接受记录已写入投递意图日志，`Consumed` 表示 Agent 已开始处理该常规投递；`Consumed` 在消费记录同步写入之后发送，只推进 `cursor_consumed`。人类消息的写入与 `WakeQueued` 转移归 `runcontroller`，本模块只保证 `Deliver` 的消息、序号与确认按图推进。
 
+### 场景：后台作业存活时的冻结与入站数据唤醒
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent 进程
+    participant W as 看守进程
+    participant R as 控制面 runcontroller
+    participant P as 沙箱提供者
+    participant X as 外部系统
+    A->>W: 后台 shell 命令启动
+    W->>R: AgentEvent bg_jobs_changed job_ids=[t-1] msg_seq=29 ack_msg_seq=48
+    A-->>W: result 与 idle
+    W->>R: AgentEvent turn_ended msg_seq=30 ack_msg_seq=48
+    W->>R: Activity psi 样本差为零 cpu_usage_usec 增量不超过 U_quiet×窗口时长 timed_sleepers.unknown=0 msg_seq=31 ack_msg_seq=48
+    R->>R: 静止证据成立，选定 FREEZE，处理事务提交，确认推进到 31
+    R->>W: PrepareSuspend suspend_id=s-5 mode=freeze variant=cgroup msg_seq=49 ack_msg_seq=31
+    W-->>R: ReadyToSuspend suspend_id=s-5 frozen_at=t5 msg_seq=32 ack_msg_seq=49
+    R->>P: Freeze freeze_id=s-5
+    P-->>R: 冻结确认
+    W->>W: 读到 agent/cgroup.events frozen=1，受检套接字的接收队列为空（不含 LLM 与平台 MCP 回环连接）
+    X->>W: 后台作业连接上的响应字节，经出口代理到透明拦截器
+    W->>R: conn.inbound freeze_id=s-5 msg_seq=33 ack_msg_seq=49
+    R->>R: 写唤醒信号 conn_inbound 并转 wake_queued，确认推进到 33
+    R->>P: Thaw freeze_id=s-5
+    P-->>R: 解冻返回
+    R->>W: Thaw suspend_id=s-5 msg_seq=50 ack_msg_seq=33
+    W-->>R: Thawed suspend_id=s-5 msg_seq=34 ack_msg_seq=50
+    R->>W: Resumed suspend_id=s-5 drain=false msg_seq=51 ack_msg_seq=34
+```
+
+图固定[静止冻结](../../glossary.md)与入站数据唤醒的消息顺序。后台作业存活时回合边界不构成安全点，控制面只在 `Activity` 给出的静止证据成立时选定冻结，不快照、不销毁；`PrepareSuspend` 与冻结、解冻的消息顺序与等 LLM 场景相同。冻结确认之后看守进程检查 Agent 进程树套接字的接收队列，承载 LLM 请求的连接与 Agent 和平台 MCP 服务器之间的连接不在检查范围内；接收队列检查发现未读数据，或冻结期间本地代理与透明拦截器在 Agent 持有的非 LLM 上游连接上收到载荷字节时，看守进程发出 `conn.inbound`，同一 `freeze_id` 至多一次；看守进程不为冻结终止后台作业。静止证据的判据、探测定时器与冻结上限见 [suspendpolicy](design-suspendpolicy.md) 与 [runcontroller](design-runcontroller.md)。
+
+### 场景：会话内定时跨销毁重建
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent 进程
+    participant W as 看守进程
+    participant R as 控制面 runcontroller
+    participant P as 沙箱提供者
+    A->>W: 会话内定时工具调用，cron 表达式，recurring
+    W->>R: AgentEvent self_wake_changed entries=[e-1 cron fire_at=t9 survives_resume=true] crons_synced=true msg_seq=35 ack_msg_seq=51
+    A-->>W: result 与 idle
+    W->>R: AgentEvent turn_ended msg_seq=36 ack_msg_seq=51
+    R->>R: 处理事务提交，销毁预检通过，选定销毁
+    R->>W: PrepareSuspend suspend_id=s-6 mode=destroy msg_seq=52 ack_msg_seq=36
+    W-->>R: ReadyToSuspend suspend_id=s-6 exited_at=t6 session_id=ses-1 msg_seq=37 ack_msg_seq=52
+    R->>P: Destroy generation=5
+    P-->>R: 销毁确认
+    R->>R: 销毁落地，写 self_wake_at = t9 − L_self_wake(destroyed)
+    Note over R: self_wake_at 到期，转 wake_queued，wake_reason=timer
+    R->>R: 准入放行，代边界推进到 generation=6
+    W->>R: Hello generation=6 msg_seq=0 ack_msg_seq=0 last_received_msg_seq=0 sandbox_config_revision=0
+    R->>W: HelloAck accepted msg_seq=0 ack_msg_seq=0 cursor_accepted=10
+    R->>W: SandboxConfig revision=3 msg_seq=1 ack_msg_seq=0
+    W->>W: 应用沙箱侧配置 revision=3
+    R->>W: StartAgent resume_session_id=ses-1 msg_seq=2 ack_msg_seq=0
+    W->>A: 以 resume_session_id 启动，不写入输入
+    Note over A: 续接会话后自行恢复会话内定时，t9 到点触发
+    A-->>W: turn_started
+    W->>R: AgentEvent turn_started delivery_id 为空 msg_seq=1 ack_msg_seq=2
+    A->>W: ScheduleWakeup 调用成功返回
+    W->>R: AgentEvent self_wake_changed entries=[w-1 wakeup fire_at=t11 survives_resume=false] crons_synced=false msg_seq=2 ack_msg_seq=2
+    R->>R: 整体替换非 cron 条目，cron 条目按 entry_id 合并，e-1 保留
+    A-->>W: Stop hook 输入携带会话内定时集合
+    W->>R: AgentEvent self_wake_changed entries=[e-1 cron fire_at=t10 survives_resume=true, w-1 wakeup fire_at=t11 survives_resume=false] crons_synced=true msg_seq=3 ack_msg_seq=2
+    R->>R: 整体替换 run.self_wake
+```
+
+图固定自唤醒条目跨销毁重建的消息顺序。第 5 代 Agent 进程已取得会话内定时集合，`self_wake_changed` 以 `crons_synced=true` 携带完整集合；控制面在销毁落地时以有效条目中最早的 `fire_at` 减按恢复机制的提前量写所有者侧截止时间，到期时以 `wake_reason=timer` 排队并推进代边界；新代流在 `HelloAck` 与 `SandboxConfig` 之后由 `StartAgent` 启动 Agent 主进程，不发 `Deliver`；Agent 续接会话后自行触发定时，该回合的 `turn_started.delivery_id` 为空。新代 Agent 进程取得会话内定时集合之前，驱动器以 `crons_synced=false` 发出集合，控制面整体替换非 `cron` 条目、按 `entry_id` 合并 `cron` 条目，跨代保留的 `e-1` 因而留在集合中；`Stop` hook 带来会话内定时集合之后，集合以 `crons_synced=true` 发出并整体替换，`e-1` 的 `fire_at` 随之更新为 `t10`。存在 `survives_resume=false` 的条目（例如图末的 `w-1`）时，销毁预检不通过，运行实例不以挂起为目的销毁。所有者侧截止时间、提前量与转移见 [runcontroller](design-runcontroller.md)，驱动器对会话内定时的镜像见 [Claude Code 驱动器](warden/design-warden-driver-claude-code.md)。
+
 ## 错误与失败语义
 
 关闭状态为闭集：`Fenced`、可重试关闭、不可重试认证失败与 `Shutdown`。下表按触发穷举关闭状态与看守进程的动作；协议违规造成的传输终止不产生关闭状态，单独列出。
@@ -511,7 +595,7 @@ sequenceDiagram
 | 本代已作废而代尚未递增 | `Shutdown{graceful=false}` | 控制面 | 非 `Hello` 消息；`degraded` 或 `destroyed` 的作废状态 | 停止；不再重连 | 不推进确认 |
 | 消息处理依赖的令牌校验或 `workspace.GetLease` 调用失败 | 可重试关闭 | 控制面 | 处理前的事务外调用 | 不终止 Agent 进程树；退避重连后重放未确认消息 | 该消息不处理、不推进确认；重放 |
 | 双方没有公共协议版本 | 传输终止，不产生关闭状态 | 控制面或看守进程 | 版本协商：`Hello` 的版本低于控制面下限时，控制面终止连接，不回 `HelloAck`；`Hello` 的版本高于控制面上限时，控制面以自身上限应答 `HelloAck`，看守进程不支持该版本时由看守进程终止连接 | 停止重连并上报 | 不重放；按配置错误处理 |
-| 帧格式非法、消息种类未知、新帧的确认序号低于已记录值、重连后仍有序号缺口 | 传输终止，不产生关闭状态 | 接收方 | 编解码与顺序校验 | 计数；重连后仍失败则停止并上报 | 不派发；按部署缺陷处理 |
+| 帧格式非法、消息种类未知、字段取值越出闭集（例如 `self_wake_changed` 条目的 `kind`）、新帧的确认序号低于已记录值、重连后仍有序号缺口 | 传输终止，不产生关闭状态 | 接收方 | 编解码与顺序校验 | 计数；重连后仍失败则停止并上报 | 不派发；按部署缺陷处理 |
 | 重复的 `(generation, msg_seq)` | 无关闭 | 接收方 | 去重表 | 继续正常收发 | 已提交的不重复派发；未提交的重放重新派发；确认不回退 |
 | 低于已发送确认的迟到帧 | 无关闭 | 接收方 | 序号校验 | 继续正常收发 | 丢弃并保持确认 |
 
@@ -523,7 +607,7 @@ sequenceDiagram
 - **派发顺序**：每个方向的入站消息按 `msg_seq` 顺序派发；链接方可以在前一条提交之前开始下一条，但确认只推进连续已提交前缀，不跳号。乱序到达的帧缓存在接收侧，不进入状态机。
 - **单写者**：看守进程侧同时只有一条出站流，序号分配由该流的写者串行执行。控制面侧同一运行实例同一时刻只有一个所有者副本是状态机写者，出站序号跨所有者副本单调，新所有者以 `Hello.last_received_msg_seq` 与持久化的流状态继续；重放缓冲与未确认消息由本模块的会话状态持有，不归 `runcontroller` 持久化（[ADR-single-writer-per-run](../../adr/adr-single-writer-per-run.md)）。
 - **代变化**：代递增与旧代作废的事务提交后，旧代的重放缓冲、去重表与未发送消息全部丢弃；旧代流上的消息按 `Fenced` 拒绝。新代从空缓冲与序号 1 开始，不复用旧代的协议状态。
-- **冻结期间**：看守进程不被冻结，出站流、确认与活动度上报继续；Agent 进程树的冻结状态经 `agent_state.frozen`、`freeze_id` 与 `Activity` 表达。协议状态不依赖墙钟，冻结造成的时钟跳变不影响序号与去重。
+- **冻结期间**：看守进程不被冻结，出站流、确认与活动度上报继续；Agent 进程树的冻结状态经 `agent_state.frozen`、`freeze_id` 与 `Activity` 表达，Agent 持有的外部系统连接上到达的入站数据经 `conn.inbound` 上报，每个 `freeze_id` 至多一次；承载 LLM 请求与平台 MCP 调用的回环连接不经 `conn.inbound` 表达。协议状态不依赖墙钟，冻结造成的时钟跳变不影响序号与去重。
 - **入站端点**：`/wake` 的并发调用合并为同一次处理，看守进程尚未领取时为一次领取与一次流建立，已领取时为一次恢复与一次流重建，返回时握手已完成；`/readyz` 读取领取状态，k8s 路径另读取当前流状态，不加协议序号；`/terminal` 的字节流与协议序号无关，不推进确认。
 - **背压与内存**：重放缓冲与去重表的大小由重放窗口约束；窗口满时停止分配新的应用消息序号，不丢弃未确认消息。去重表随确认推进裁剪，不随运行时长增长。
 
@@ -536,6 +620,10 @@ sequenceDiagram
 ### 新增可选字段
 
 同一协议版本内可以新增可选字段，条件是既有字段的语义与消息闭集不变，接收方忽略不认识的字段。新增字段改变既有语义、改变取值闭集或使旧接收方产生不同行为时，必须递增协议版本。新增字段不改变信封结构；信封本身增删字段一律视为新版本。
+
+### 新增自唤醒条目种类
+
+控制面的唤醒集合、所有者侧截止时间、销毁预检与等待时长预测的上界只读取条目的 `fire_at` 与 `survives_resume`，不依赖 `kind`；`kind` 只在 `crons_synced=false` 的合并中区分 `cron` 条目与其余条目。新驱动器的自唤醒源能归入现有 `kind` 时沿用该取值；不能归入时按取值闭集的变化递增协议版本，并为新取值规定 `survives_resume`，新取值在 `crons_synced=false` 的合并中与其余非 `cron` 条目一样整体替换。新自唤醒源的触发时刻无法确定时，驱动器把 `fire_at` 置空。
 
 ### 新增入站端点
 

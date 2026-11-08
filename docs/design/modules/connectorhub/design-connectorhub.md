@@ -239,7 +239,7 @@ Authorization: Bearer <运行实例令牌>
 - 附件存储：保存超过 `S_max` 的原始负载；存储实现由部署配置决定，接口约束见附件取回一节。
 - 运行时调用方：[看守进程](../../../glossary.md)的本地代理、透明拦截器与平台 MCP 服务器调用本模块，携带运行实例令牌：本地代理经 CONNECT 或 HTTP 前置、透明拦截器经 CONNECT 调用平台出口代理，平台 MCP 服务器经 HTTP 调用；这是运行时调用，不是代码依赖，不出现在模块依赖图中。
 
-架构不变量 I1 与 I6 要求全部外部系统流量经托管侧、沙箱零长期凭据（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)）；I2 要求订阅登记回溯匹配并核对对象当前状态；I7 要求出口请求与订阅登记按代校验（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本模块的依赖方向满足这些约束。
+架构不变量 I1 与 I6 要求全部外部系统流量经托管侧、沙箱零长期凭据（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）；I2 要求订阅登记回溯匹配并核对对象当前状态；I7 要求出口请求与订阅登记按代校验（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本模块的依赖方向满足这些约束。
 
 ## UML 图
 

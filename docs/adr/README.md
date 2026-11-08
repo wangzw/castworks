@@ -19,7 +19,7 @@
 
 | 决策 |
 | --- |
-| [托管环境拥有全部唤醒源与外部流量](adr-host-owns-all-wake-sources.md) |
+| [外部唤醒源与外部流量由托管侧持有，Agent 自唤醒源由托管侧镜像](adr-host-owns-external-wake-sources.md) |
 | [平台不执行第三方操作，只提供出口凭据替换、连接器事件日志与订阅](adr-platform-does-not-execute-external-operations.md) |
 | [LLM 流量经沙箱内本地代理与 LLM 网关两级](adr-two-tier-llm-proxy.md) |
 

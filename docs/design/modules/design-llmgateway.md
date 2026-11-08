@@ -126,7 +126,7 @@ cred, err := ExchangeCredential(ctx, ExchangeRequest{
 依赖穷举如下，方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块依赖 `runcontroller` 与 `secrets`，存储为 PostgreSQL，上游为 Anthropic API；`runcontroller` 不反向调用本模块。
 
 - `runcontroller`：[汇入契约](../../glossary.md)与代查询接口。在途请求事实、实例租约、完成与失败信号按[运行实例](../../glossary.md)写入；代查询用于请求准入。这些调用都由本模块发起，`runcontroller` 不感知本模块。
-- `secrets`：运行实例令牌校验与 LLM 凭据换取；调用 `ExchangeCredential` 时以调用方身份认证，`Target.Kind=llm`。真实凭据只在本模块与上游之间使用，不跨越沙箱边界（[ADR-host-owns-all-wake-sources](../../adr/adr-host-owns-all-wake-sources.md)）。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.ReportDenial` 写 `denied` 记录。
+- `secrets`：运行实例令牌校验与 LLM 凭据换取；调用 `ExchangeCredential` 时以调用方身份认证，`Target.Kind=llm`。真实凭据只在本模块与上游之间使用，不跨越沙箱边界（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。代不匹配、运行实例终态与本代作废等拒绝路径调用 `secrets.ReportDenial` 写 `denied` 记录。
 - PostgreSQL：`llm_request` 表与回放条目的持久化，提供唯一索引、行锁与状态 CAS。
 - Anthropic API：上游 LLM 服务。流式响应的 SSE 事件与 ping 保活事件按 Anthropic Messages API 的格式处理（[REF-anthropic-streaming](../../references.md)）；网关不定义上游协议。
 - OpenTelemetry：追踪与指标遵循 `gen_ai` 语义约定（[REF-otel-genai-semconv](../../references.md)），使一次请求在本地代理、网关与上游之间按同一条追踪关联。

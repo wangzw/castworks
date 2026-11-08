@@ -13,7 +13,7 @@
 控制面循环驱动器的职责穷举如下，每条先写执行的动作，再写产生的结果或边界；具体接口、字段与算法见后续章节。
 
 - **定义 Agent 驱动器接口**：规定启动、喂入、挂起准备、恢复、终止、快照恢复衔接、事件流与状态查询操作，以及每个操作的输入、输出与前置条件；结果是两种循环共用同一套翻译层，`runcontroller` 不按循环位置分支。
-- **规定事件集合与顺序**：要求两种驱动器发出同一套 `AgentEvent`，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序；结果是收件箱、游标与唤醒谓词不依赖循环位置。
+- **规定事件集合与顺序**：要求两种驱动器使用同一套 `AgentEvent` 种类与字段，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序，自唤醒条目事件只由存在自唤醒源的驱动器发出；结果是收件箱、游标与唤醒谓词不依赖循环位置。
 - **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致。
 - **规定挂起与恢复语义**：定义回合边界、恢复点、以挂起为目的的退出、恢复句柄与快照恢复后的衔接；结果是两种循环的挂起决策与恢复准入使用同一套规则。
 - **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、帧关联、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
@@ -87,6 +87,8 @@ type DriverState struct {
     SessionID    string
     BlockedOn    *BlockedOn
     BgJobs       []string
+    SelfWake     []SelfWakeEntry // 自唤醒条目，项结构取自 agentprotocol 的 self_wake_changed；没有自唤醒源的驱动器为空
+    CronsSynced  bool          // 语义同 agentprotocol 的 self_wake_changed.crons_synced；没有自唤醒源的驱动器不使用
     RunningTools []string
 }
 ```
@@ -95,18 +97,18 @@ type DriverState struct {
 
 | 操作 | 前置条件 | 结果与边界 |
 | --- | --- | --- |
-| `Start` | 无活动实例；`ResumeHandle` 为空或指向可读的会话 | 启动原生 Agent 或控制面循环；失败时返回错误，不发出 `turn_started` |
+| `Start` | 无活动实例；`ResumeHandle` 为空或指向可读的会话 | 启动原生 Agent 或控制面循环；失败时返回错误，不发出 `turn_started`。看守进程处理 `StartAgent` 时只调用 `Start`、不调用 `Feed`，进程驱动器启动后处于 `boundary`；控制面循环没有自唤醒源，`runcontroller` 不为它发出 `StartAgent` |
 | `Feed` | 接口处于 `starting`、`in_turn`、`blocked` 或 `boundary` | 返回 `fed`、`turn_id` 与 `agent_exited`；`fed=false` 时不启动回合 |
 | `PrepareForSuspend` | 回合边界；I9 前置检查可执行 | 返回 `SuspendReady`，或返回 `Busy` 语义的错误；不绕过检查 |
 | `Resume` | 同一代解冻，或新代已预配 | 恢复原生 Agent 或循环状态；失败时按恢复失败处置 |
 | `Terminate` | 任意阶段 | 优雅终止或强制终止；之后释放工具执行与循环资源 |
 | `SnapshotRestored` | 看守进程已校时并清理旧连接 | 重建超时与流偏移；不重放已交付输入 |
-| `Events` | 任意阶段 | 事件流；同一回合的 `event_seq` 单调，终止后关闭 |
-| `State` | 任意阶段 | 返回阶段、回合、会话、阻塞条件与后台作业快照 |
+| `Events` | 任意阶段 | 事件流；回合内事件的 `event_seq` 在同一回合内单调，回合外事件的 `turn_id` 与 `event_seq` 为空；终止后关闭 |
+| `State` | 任意阶段 | 返回阶段、回合、会话、阻塞条件、后台作业与自唤醒条目快照 |
 
 ### 对 `runcontroller` 的事件
 
-两种驱动器发出同一套 `AgentEvent`，种类与字段由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。
+两种驱动器使用同一套 `AgentEvent` 种类与字段，由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。`self_wake_changed{entries, crons_synced}` 只由存在[自唤醒源](../../../glossary.md)的驱动器发出（[Claude Code 驱动器](design-warden-driver-claude-code.md)）；控制面循环没有会话内定时等自唤醒源，定时只经 `timer_requested` 登记，控制面循环驱动器不产生该事件，运行实例的自唤醒集合因而为空，`runcontroller` 不为其发出 `StartAgent`。
 
 | 事件 | 触发点 | 约束 |
 | --- | --- | --- |
@@ -118,10 +120,11 @@ type DriverState struct {
 | `wait_started{call_id, kind, ref, fire_at, predicted_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer` |
 | `subscription_created{sub_id, since_cursor}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记 |
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
-| `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 未结束的作业使运行实例保持活动 |
-| `state_changed{idle\|requires_action}` | 驱动器有对应的原生状态时；控制面循环没有原生状态时在回合结束发出 `state_changed{idle}` | 不替代 `turn_ended` |
+| `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 携带完整集合；未结束的作业使回合边界不构成安全点；回合结束之后集合变化时作为回合外事件发出 |
+| `self_wake_changed{entries, crons_synced}` | 控制面循环驱动器不发出 | 由存在自唤醒源的驱动器发出；可作为回合外事件发出 |
+| `state_changed{idle\|requires_action}` | 驱动器有对应的原生状态时；控制面循环没有原生状态时在回合结束发出 `state_changed{idle}` | 不替代 `turn_ended`；进程驱动器在没有进行中回合时发出的为回合外事件 |
 
-事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出；`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。
+回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，重复与乱序不改变结果。
 
 `WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经宿主 `runcontroller` 注入的事件入口提交声明，由宿主调用 `RunService.DeclareWait`，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等；条件种类与 `runcontroller` 的 `declared_kind` 闭集一致（`llm`、`timer`、`approval`、`wait_for`），`scope=run` 时只取 `approval`、`wait_for`、`timer`；`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
 
@@ -143,10 +146,12 @@ type DriverState struct {
 以挂起为目的的销毁只在回合边界；回合中只允许冻结或快照。`PrepareForSuspend` 的检查按 I9 与恢复点执行：
 
 1. 回合已到达恢复点：无在途模型调用，无未确认的工具调用，循环状态已同步写入。
-2. `ToolExec` 无在途执行；后台作业为空，或按策略已终止。
+2. `ToolExec` 无在途执行；后台作业为空，驱动器不为挂起终止后台作业。
 3. 活动度静默不短于 `Q_quiet`：由看守进程的活动度采集提供；控制面循环没有 Agent 进程时，静默窗内无工具执行与后台作业时成立。
 4. 工作区[持久化确认](../../../glossary.md)完成；本代没有工作区写文件描述符。
 5. 需要销毁时，恢复句柄已确定并由 `SuspendReady.SessionID` 报告；控制面落库后才销毁。
+
+控制面循环没有自唤醒条目，I9 中「自唤醒条目都随续接恢复」一项恒成立。
 
 `Resume` 分两种：同一代解冻时继续原循环，`SnapshotRestored` 重建超时与流偏移；新代续接时按恢复句柄加载循环状态，重新建立 `ToolExec` 调用，不重放未确认的工具调用。工具调用以 `call_id` 与 `exec_id` 标识，恢复后先查询结果，查询不到时把该调用作为失败结果交回循环，不重新执行有副作用的命令。
 
@@ -160,7 +165,7 @@ type DriverState struct {
 | 文件读 | 读取运行实例子目录内的文件，作为工具结果的一部分 |
 | 文件写 | 在运行实例子目录内写入文件，作为工具副作用 |
 | 流式输出 | 按输出偏移续传一次执行或后台作业的输出；断线后从上次偏移继续 |
-| 后台作业 | 列出、查询与终止后台作业；未结束的作业计入活动 |
+| 后台作业 | 列出、查询与终止后台作业；未结束的作业计入后台作业集合 |
 
 每次调用经宿主写入本代出站流并按代校验；`Shutdown` 与 `Fenced` 到达后停止新调用并终止在途执行。控制面循环不得假定沙箱内存在 Agent 进程、会话文件或 hook；它只把沙箱当作工具执行器。
 
@@ -174,7 +179,7 @@ type DriverState struct {
 
 ### 稳定性承诺
 
-- 接口操作、事件种类、`Deliver.target` 闭集、`agent_state.phase` 闭集与挂起/恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
+- 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集与挂起/恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
 - `ToolExec` 的操作集合对控制面循环稳定；新增操作须同时修改看守进程主文档、本模块与 `agentprotocol`。
 - 接口变更须同时覆盖进程驱动器与控制面循环驱动器，并以同一套契约测试约束；事件种类变化另须提升协议版本。
 
@@ -252,7 +257,7 @@ sequenceDiagram
     D->>R: AgentEvent tool_ended{call_id}
     D->>R: AgentEvent turn_ended
     R->>D: PrepareForSuspend{suspend_id, mode}
-    D->>R: ListJobs 与 TerminateJob
+    D->>R: ListJobs，确认后台作业为空
     R->>W: ToolExec 帧
     D->>D: 同步写入循环状态
     D-->>R: SuspendReady{suspend_id}
@@ -260,7 +265,7 @@ sequenceDiagram
     W-->>R: ReadyToSuspend
 ```
 
-图固定控制面循环与沙箱之间的边界：循环在控制面运行并链接进 `runcontroller`，沙箱只执行工具；`ToolExec` 帧经看守进程已认证的出站流往返，输出按偏移续传；驱动器不持有令牌，也不建立第二条会话。挂起准备由驱动器先停循环并持久化循环状态，看守进程再确认沙箱侧静默。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
+图固定控制面循环与沙箱之间的边界：循环在控制面运行并链接进 `runcontroller`，沙箱只执行工具；`ToolExec` 帧经看守进程已认证的出站流往返，输出按偏移续传；驱动器不持有令牌，也不建立第二条会话。挂起准备由驱动器先停循环、确认后台作业为空并持久化循环状态，看守进程再确认沙箱侧静默；后台作业未结束时驱动器返回 `Busy` 语义的错误，不为挂起终止作业。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
 
 ## 核心数据结构
 
@@ -347,9 +352,9 @@ sequenceDiagram
 
 ### 事件输出
 
-事件按外部接口契约中的触发点发出，顺序约束为：`turn_started` 先于本回合全部工具、等待与状态事件，`turn_ended` 最后；`event_seq` 在同一回合内单调，重复或乱序事件按它丢弃。`tool_started` 与 `tool_ended` 按 `call_id` 配对；`bg_jobs_changed` 在集合变化时发出，未结束的作业使运行实例保持活动。
+事件按外部接口契约中的触发点发出，顺序约束为：`turn_started` 先于本回合全部工具、等待与状态事件，`turn_ended` 最后；回合内事件的 `event_seq` 在同一回合内单调，按 `event_seq` 丢弃重复或乱序事件的规则只适用于回合内事件。`tool_started` 与 `tool_ended` 按 `call_id` 配对；`bg_jobs_changed` 在集合变化时以完整集合发出，未结束的作业使回合边界不构成安全点。回合结束之后 `ToolExec` 后台作业结束时，`bg_jobs_changed` 作为回合外事件发出，`turn_id` 与 `event_seq` 为空，接收方按替换语义处理。
 
-控制面循环没有 `requires_action` 概念；此时以回合结束作为等价信号发出 `state_changed{idle}`，由 `turn_ended` 表达回合边界。事件种类不因实现而增减。
+控制面循环没有 `requires_action` 概念；此时以回合结束作为等价信号发出 `state_changed{idle}`，由 `turn_ended` 表达回合边界。事件种类由 `agentprotocol` 定义，不因实现而增加；控制面循环驱动器不产生 `self_wake_changed`。
 
 ### 挂起与恢复
 
@@ -368,7 +373,7 @@ sequenceDiagram
 1. 每次调用经宿主写入本代出站流；流已关闭、代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。
 2. 驱动器为每次 `exec` 分配同一代内唯一的 `exec_id` 并随请求帧发出，以 `call_id` 与 `exec_id` 建立工具执行记录；`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
 3. 流式输出按 `output_offset` 续传；断线后先查询执行状态，再从上次偏移继续，不从零重放。
-4. 后台作业由 `exec` 启动；驱动器列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使运行实例保持活动，回合边界不构成[安全点](../../../glossary.md)。
+4. 后台作业由 `exec` 启动；驱动器按循环的需要列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使回合边界不构成[安全点](../../../glossary.md)，运行实例不以挂起为目的销毁；驱动器不为挂起终止作业。
 5. 文件读写在运行实例子目录内进行，路径越界按错误返回。
 6. `Shutdown` 与 `Fenced` 到达后停止新调用，终止在途执行，不再接受新的工具调用。
 
@@ -389,7 +394,7 @@ sequenceDiagram
 | `ToolExec` 鉴权失败、代不匹配或运行实例终态 | 调用返回不可重试错误；循环把错误作为工具结果，不重试 |
 | `ToolExec` 执行启动失败 | 返回错误；`tool_ended` 携带失败结果，回合继续 |
 | 流式输出偏移无效或执行已过期 | 返回错误；该工具调用按失败结果交回循环，不重放执行 |
-| 后台作业未结束 | 运行实例视为活动；不报告 `SuspendReady`，回合边界不构成安全点 |
+| 后台作业未结束 | 不报告 `SuspendReady`，回合边界不构成安全点；不为挂起终止作业 |
 | 循环状态同步写入失败 | 不报告 `SuspendReady`；按退避重试，控制面在 `retry_after` 后复评 |
 | 在途工具调用未确认时请求挂起 | 返回 `Busy` 语义的错误；等待调用终态后重试 |
 | 恢复句柄不可读或循环状态损坏 | 恢复失败达到上限后进入 `Degraded`；兜底路径改用新循环并合成摘要 |
@@ -403,7 +408,7 @@ sequenceDiagram
 控制面循环驱动器不参与看守进程的数据库事务；它的持久化边界是循环状态的同步写入与 `ToolExec` 记录的终态。运行实例状态的权威仍在控制面 PostgreSQL，接口只提交事件与喂入结果。
 
 - **每运行实例单实例**：同一运行实例同一代只有一个循环驱动器实例；`Feed` 串行调用，回合不并发。
-- **事件顺序**：同一回合的 `event_seq` 单调；`turn_started` 先于工具与等待事件，`turn_ended` 最后；事件流是单写者。
+- **事件顺序**：回合内事件的 `event_seq` 在同一回合内单调；`turn_started` 先于工具与等待事件，`turn_ended` 最后；回合外事件不带 `event_seq`，按事件流的发出顺序交付；事件流是单写者。
 - **挂起屏障**：`PrepareForSuspend` 先停止新调用，再等待在途调用终态，再同步写入循环状态，最后返回 `SuspendReady`；从停止新调用到返回 `SuspendReady` 之间不插入新的 `Feed`。
 - **工具执行记录**：按 `call_id` 与 `exec_id` 索引；同一 `exec_id` 的流式输出只有单读者，偏移前进串行化。恢复后的查询不重发执行。
 - **循环状态写入**：恢复点的写入先于 `SuspendReady`；写入失败时不报告成功。循环状态与事件流的顺序不跨代保证，跨代以状态为准。

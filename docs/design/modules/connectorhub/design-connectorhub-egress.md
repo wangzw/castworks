@@ -98,7 +98,7 @@ type CurrentGeneration struct {
 - Envoy：数据面。CONNECT 终止、TLS 终止与发起、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 由 Envoy 提供；本子模块实现 `ext_authz` 与 `ext_proc` 的策略逻辑。
 - 运行时调用方：看守进程的本地代理经 CONNECT 或 HTTP 前置、透明拦截器经 CONNECT 调用本进程，都携带运行实例令牌。这是运行时调用，不是代码依赖。
 
-架构不变量 I1 与 I6 要求全部外部系统流量经托管侧、沙箱零长期凭据；I7 要求出口请求按代校验（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)、[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本子模块的依赖方向满足这些约束：它只调用 `runcontroller`、`secrets` 与 `sandboxprovider` 的接口，三者不反向调用它。
+架构不变量 I1 与 I6 要求全部外部系统流量经托管侧、沙箱零长期凭据；I7 要求出口请求按代校验（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)、[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本子模块的依赖方向满足这些约束：它只调用 `runcontroller`、`secrets` 与 `sandboxprovider` 的接口，三者不反向调用它。
 
 ## UML 图
 
@@ -194,7 +194,7 @@ stateDiagram-v2
 
 档位选择规则穷举如下：绝对形式 HTTP 请求使用 `http` 档；CONNECT 目标主机在该运行实例的策略中有注入规则时使用 `https` 档；CONNECT 目标主机没有注入规则时使用 `tls_passthrough` 档。
 
-外部系统定义的 `access.mode` 与 `access.host_modes` 决定沙箱侧通道，不改变本子模块的档位选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由本地 DNS 把域名指向透明拦截器，透明拦截器以附带运行实例令牌的 CONNECT 把原始 TLS 字节交给出口代理，不终止 TLS。出口代理只按请求形态与注入规则选择档位，不感知通道来源。证书固定的目标不能接受平台出口代理的 TLS 终止，因此不得为其声明注入规则；需要凭据的证书固定目标不受支持（[ADR-host-owns-all-wake-sources](../../../adr/adr-host-owns-all-wake-sources.md)）。
+外部系统定义的 `access.mode` 与 `access.host_modes` 决定沙箱侧通道，不改变本子模块的档位选择：`proxy` 依赖代理环境变量；`mitm` 与 `passthrough` 由本地 DNS 把域名指向透明拦截器，透明拦截器以附带运行实例令牌的 CONNECT 把原始 TLS 字节交给出口代理，不终止 TLS。出口代理只按请求形态与注入规则选择档位，不感知通道来源。证书固定的目标不能接受平台出口代理的 TLS 终止，因此不得为其声明注入规则；需要凭据的证书固定目标不受支持（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 
 ### 策略与请求视图
 
