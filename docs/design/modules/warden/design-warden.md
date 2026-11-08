@@ -19,7 +19,7 @@
 - **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
 - **投递意图日志**：`Deliver` 到达后先在 `.platform/deliveries.jsonl` 追加 `accepted{seq}` 并同步写入，按日志去重后把事件喂给 Agent；观察到回合开始后追加 `consumed{seq, turn_id}` 并同步写入，再发出 `Consumed`。结果是至少一次投递在跨代重建后仍可由日志去重，重建后不重复处理已消费事件（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
 - **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的带令牌调用，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。初始化时以 `instructions` 提供[等待方式的选择](#等待方式的选择)规则；解析 `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`expected_wait` 换算为毫秒后经 Agent 驱动器随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报，`reason` 连同 `run_id`、`call_id`、工具名与 `expected_wait` 写入结构化日志，供诊断与抽检。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1），Agent 自报的等待时长与平台的预测分开进入控制面，`reason` 不进入协议事件。
-- **托管 hook**：随镜像在工作区之外提供 Claude Code 托管 hook 的二进制，以 `exec <托管 hook 二进制路径>` 的形式注册在托管策略设置中；二进制经本地 IPC 把 hook 输入交给 Agent 驱动器并同步返回驱动器的应答，IPC 端点以 `SO_PEERCRED` 认证对端，并按 Agent 驱动器观察到的 stream-json 事件对查询做一次性核对，只应答由 Agent 主进程执行的托管 hook 二进制针对已存在、尚未应答事件的查询：`PostToolUse` 与 `PostToolBatch` 返回等待意图的情境提示，`SubagentStart` 向子代理注入等待方式的选择规则，审批所用的 `PreToolUse` 与旁证所用的其余 hook 共用同一机制；查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果。结果是提示只搭载在 Agent 下一次本来就要发出的模型请求上，与等待意图相关的 hook 输出只有 `additionalContext`，不拒绝、不阻塞工具调用，也不让对话继续，审批在平台不可用时不放行（[REF-claude-code-hooks](../../../references.md)、[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
+- **托管 hook**：随镜像在工作区之外提供 Claude Code 托管 hook 的二进制，按使其父进程为 Agent 主进程的方式注册在托管策略设置中（经 shell 执行时写成 `exec <托管 hook 二进制路径>`）；二进制经本地 IPC 把 hook 输入交给 Agent 驱动器并同步返回驱动器的应答，IPC 端点以 `SO_PEERCRED` 认证对端，并按 Agent 驱动器观察到的 stream-json 事件对查询做一次性核对，只应答由 Agent 主进程执行的托管 hook 二进制针对已存在、尚未应答事件的查询：`PostToolUse` 与 `PostToolBatch` 返回等待意图的情境提示，`SubagentStart` 向子代理注入等待方式的选择规则，审批所用的 `PreToolUse` 与旁证所用的其余 hook 共用同一机制；查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果。结果是提示只搭载在 Agent 下一次本来就要发出的模型请求上，与等待意图相关的 hook 输出只有 `additionalContext`，不拒绝、不阻塞工具调用，也不让对话继续，审批在平台不可用时不放行（[REF-claude-code-hooks](../../../references.md)、[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 - **等待意图配置应用**：按沙箱侧配置中的 `wait_signatures`、`intent.hints` 与 `intent.classifier` 设置 Agent 驱动器的签名匹配、情境提示开关与宿主侧分类开关；宿主侧分类请求经本地代理附分类标记发往 `llmgateway`，不经 Agent 进程、不进入 Agent 上下文，也不计入在途请求与 LLM 等待信号，不参与事件源实例租约。结果是[等待签名](../../../glossary.md)随外部系统定义下发，提示与宿主侧分类可按运行实例关闭，意图解析与 `intent_observed` 始终进行。
 - **工具接入声明执行**：按[沙箱侧配置](../../../glossary.md)（`SandboxConfig`，接收与应用见[沙箱侧配置](#沙箱侧配置)）中的[工具接入声明](../../../glossary.md)向 Agent 进程与 `ToolExec.exec` 注入凭据占位符环境变量与非秘密配置，合并已批准的第三方 MCP 服务器配置；只注入字面占位符，不解析、不换取、不缓存真实凭据。结果是第三方工具经同一组环境变量使用平台的出口凭据通道，平台不需要知道哪个工具使用了哪条通道。
 - **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 exec、文件读写、流式输出与后台作业帧，按代校验；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，且驱动器无需持有运行实例令牌。
@@ -149,7 +149,7 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 
 ### 托管 hook
 
-托管 hook 二进制随镜像放在工作区之外，以 `exec <托管 hook 二进制路径>` 的形式注册在托管策略设置中，`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效；托管策略设置的内容、hook 事件的完整集合与审批、旁证等用途见 [Claude Code 驱动器](design-warden-driver-claude-code.md)（[REF-claude-code-settings](../../../references.md)）。Claude Code 在 hook 事件发生时执行注册的命令并把 hook 输入写入二进制的标准输入；二进制把输入原样经本地 IPC 交给 Agent 驱动器，按驱动器的应答写出 hook 输出后退出；IPC 端点只应答通过对端认证与一次性事件核对的查询，查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果，执行过程、认证与核对规则见[托管 hook 的执行](#托管-hook-的执行)。与等待意图相关的 hook 及其输出穷举如下：
+托管 hook 二进制随镜像放在工作区之外，按使其父进程为 Agent 主进程的方式注册在托管策略设置中（经 shell 执行时写成 `exec <托管 hook 二进制路径>`，注册方式见[托管 hook 的执行](#托管-hook-的执行)），`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效；托管策略设置的内容、hook 事件的完整集合与审批、旁证等用途见 [Claude Code 驱动器](design-warden-driver-claude-code.md)（[REF-claude-code-settings](../../../references.md)）。Claude Code 在 hook 事件发生时执行注册的命令并把 hook 输入写入二进制的标准输入；二进制把输入原样经本地 IPC 交给 Agent 驱动器，按驱动器的应答写出 hook 输出后退出；IPC 端点只应答通过对端认证与一次性事件核对的查询，查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果，执行过程、认证与核对规则见[托管 hook 的执行](#托管-hook-的执行)。与等待意图相关的 hook 及其输出穷举如下：
 
 | hook 事件 | 驱动器对输入的用途 | hook 输出 |
 | --- | --- | --- |
@@ -196,7 +196,7 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 - Kubernetes 投射 ServiceAccount 令牌（k8s 路径）与 Substrate 的 `systemInfo` 卷及出口网关的 actor JWT 注入（Substrate 路径）：领取所用的沙箱实例身份凭据、`actor-name` 与出口网关 CA 的来源。
 - Substrate 出口网关（Substrate 路径）：actor 除发往 53 端口的 DNS 之外的全部 TCP 出站都经出口网关，出口网关只接受运行态 actor 的出口连接。看守进程到控制面的连接，包括出站流、`RenewLease`、本地代理发往 `llmgateway` 的请求与平台 MCP 服务器发往 `connectorhub`、`humanchannel` 的请求，经出口网关以 `tls_passthrough` 按 SNI 透传，出口网关不终止其 TLS、不替换其请求头；这些连接所用的控制面主机名不得与引导接口主机名相同，否则会落入引导接口主机的 MITM 规则，`Authorization` 头被替换为 actor JWT。放行规则由 [substrate 子模块](../sandboxprovider/design-sandboxprovider-substrate.md)在落地 EgressPolicy 时追加。
 - Linux cgroup v2、PSI 与 procfs：`Freeze{cgroup}` 的冻结状态观察、活动度采集（PSI 累计停滞时间、`cpu.stat`、进程态、`wchan` 与进程启动时刻）、接收队列检查（`/proc/net/tcp`、`/proc/net/tcp6`）与托管 hook IPC 端点的对端认证（`SO_PEERCRED`、`/proc/<pid>/exe`、`/proc/<pid>/stat`）的内核接口（[REF-linux-cgroup-v2](../../../references.md)、[REF-linux-psi](../../../references.md)）。
-- Claude Code：无头模式、hooks、托管策略设置、环境变量、网络看门狗、stream-json 消息，以及后台任务消息与会话内定时工具的契约；hooks 中本模块依赖 command hook 的执行方式（经 shell 执行时 `exec` 前缀使 hook 二进制的父进程为 Agent 主进程）、`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 的 `hookSpecificOutput.additionalContext`（出现位置与 10000 字符上限）、`PreToolUse` 输出的 `permissionDecision`、`Stop` 输入的 `last_assistant_message` 与各 hook 的退出码语义；stream-json 消息（例如 Assistant 消息中的 `tool_use`、`tool_result` 与后台任务消息）另作托管 hook 查询一次性核对的依据（[REF-claude-code-settings](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)、[REF-claude-code-network-config](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-hooks](../../../references.md)）。
+- Claude Code：无头模式、hooks、托管策略设置、环境变量、网络看门狗、stream-json 消息，以及后台任务消息与会话内定时工具的契约；hooks 中本模块依赖 command hook 的执行方式（是否经 shell 执行，以及据此选定的注册方式能否使 hook 二进制的父进程为 Agent 主进程）、`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 的 `hookSpecificOutput.additionalContext`（出现位置与 10000 字符上限）、`PreToolUse` 输出的 `permissionDecision`、`Stop` 输入的 `last_assistant_message` 与各 hook 的退出码语义；stream-json 消息（例如 Assistant 消息中的 `tool_use`、`tool_result` 与后台任务消息）另作托管 hook 查询一次性核对的依据（[REF-claude-code-settings](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)、[REF-claude-code-network-config](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-hooks](../../../references.md)）。
 - MCP：平台 MCP 服务器的工具、传输与初始化应答中的 `instructions`（[REF-mcp](../../../references.md)）。
 
 方向约束：看守进程的代码依赖只指向基础层的 `agentprotocol` 与 `workspace` 沙箱侧部分，不依赖 `runcontroller`、`sandboxprovider` 与事件源模块，因此可独立于它们演进，新增一个事件源不改变本模块。
@@ -229,7 +229,7 @@ flowchart TB
         driver -->|"宿主侧分类请求"| proxy
         agent -->|"回环 HTTP"| proxy
         agent -->|"MCP 工具调用"| mcp
-        agent -->|"hook 事件时经 shell 以 exec 执行"| hook
+        agent -->|"hook 事件时执行，父进程为 Agent 主进程"| hook
         hook -->|"本地 IPC 查询，对端认证与一次性核对"| driver
     end
     nfa["节点冻结代理，特权 DaemonSet"]
@@ -564,7 +564,7 @@ sequenceDiagram
 
 看守进程在工作区之外的 Unix 域套接字上提供本地 IPC 端点，运行实例 uid 可以连接；端点只接受 hook 查询，应答中不含运行实例令牌与沙箱侧配置原文。该端点是 Agent 进程可到达的端点之一，连同下述认证方式登记在[架构不变量](../../architecture.md#架构不变量) I6 中。
 
-托管策略设置中注册的 hook 命令写成 `exec <托管 hook 二进制路径>`：Claude Code 经 shell 执行 hook 命令时，shell 以 `exec` 让位给托管 hook 二进制，二进制沿用 shell 的 pid，父进程为 Agent 主进程。这一进程关系依赖 Claude Code 执行 command hook 的方式，核实项与不成立时的退路见[实施路线与技术验证](../../../roadmap.md)的托管 hook 实测项。
+托管策略设置中 hook 命令的注册方式保证托管 hook 二进制的父进程为 Agent 主进程：Claude Code 经 shell 执行 hook 命令时，命令写成 `exec <托管 hook 二进制路径>`，shell 以 `exec` 让位给二进制，二进制沿用 shell 的 pid；Claude Code 直接执行 hook 命令时，命令写成二进制路径本身，二进制即为 Agent 主进程的子进程。采用哪一种取决于 Claude Code 执行 command hook 的方式，核实项见[实施路线与技术验证](../../../roadmap.md)的托管 hook 实测项；两种方式都不能使父进程为 Agent 主进程时，对端认证放宽为允许父进程是 Agent 主进程的直接子进程，一次性核对作为主要的认证依据。
 
 托管 hook 二进制每次执行按以下步骤处理，审批所用的 `PreToolUse` 共用同一端点、同一认证与同一核对，其等待与决定的规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md)：
 
@@ -574,9 +574,9 @@ sequenceDiagram
 4. 驱动器按当前生效的沙箱侧配置与意图状态应答：`PostToolUse` 与 `PostToolBatch` 的应答为一条情境提示或空，`SubagentStart` 的应答为等待方式的选择规则，`Stop` 与 `SubagentStop` 的应答恒为空。驱动器在应答之前把 hook 输入计入意图解析，例如 `Stop` 的 `last_assistant_message` 计入回合意图分类。
 5. 二进制把应答写为[托管 hook](#托管-hook)规定的输出并以退出码 0 退出。
 
-一次性核对以 Agent 驱动器从 Agent 的 stream-json 输出维护的已观察事件状态为依据：查询所指的事件必须已由驱动器观察到且尚未应答，例如 `PreToolUse` 只接受已观察到 `tool_use`、尚未决定的调用，`PostToolBatch` 只接受已观察到结束的批次，`SubagentStart` 只在观察到对应子代理开始时接受；同一事件标识只接受一次。查询到达时驱动器先处理 stdout 中已到达的消息，再核对，hook 执行之前 Claude Code 已写出的事件因而不会因读取时差被误拒。各 hook 事件的接受条件与事件标识穷举在 [Claude Code 驱动器](design-warden-driver-claude-code.md#托管-hook-查询的一次性核对)，其中 `Stop` 与 `SubagentStop` 的窗口从响应结束起算，因为这两个 hook 先于 `result` 执行。
+一次性核对以 Agent 驱动器从 Agent 的 stream-json 输出维护的已观察事件状态为依据：查询所指的事件必须已由驱动器观察到且尚未应答，例如 `PreToolUse` 只接受已观察到 `tool_use`、尚未决定的调用，`PostToolBatch` 只接受已观察到结束的批次，`SubagentStart` 只在观察到对应子代理开始时接受；同一事件标识只接受一次。查询到达时驱动器先处理 stdout 中已到达的消息，再核对；所指事件尚未观察到时，驱动器在 `T_hook_sync`（200 ms）之内继续读取 stdout 并重新核对，期满仍不满足才判为不通过，hook 进程与对应事件写出 stdout 的先后时差因而不会造成误拒。各 hook 事件的接受条件与事件标识穷举在 [Claude Code 驱动器](design-warden-driver-claude-code.md#托管-hook-查询的一次性核对)，其中 `Stop` 与 `SubagentStop` 的窗口从响应结束起算，因为这两个 hook 先于 `result` 执行。
 
-查询的耗时目标为 10 ms 以内。二进制对查询设截止时间，截止时间小于托管策略设置中为该 hook 配置的 `timeout`。IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析时，二进制按查询失败处理并计数，输出按 hook 区分：
+所指事件已观察到时，查询的耗时目标为 10 ms 以内；等待对应事件时最多再加 `T_hook_sync`。二进制对查询设截止时间，取该 hook 的 `timeout` 减 30 s；`PreToolUse` 的截止时间晚于驱动器待决审批记录的 `deadline`，驱动器在 `deadline` 到达时应答拒绝，二进制因而总在自身截止之前收到应答，先后关系见 [Claude Code 驱动器](design-warden-driver-claude-code.md)的审批路径。IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析时，二进制按查询失败处理并计数，输出按 hook 区分：
 
 - `PreToolUse`（审批）输出拒绝，`permissionDecision` 为 `deny`，原因为「平台审批暂不可用」，不放行。
 - 其余托管 hook（`PostToolUse`、`PostToolUseFailure`、`PostToolBatch`、`SubagentStart`、`Stop`、`SubagentStop` 与 `UserPromptSubmit`）以空输出、退出码 0 退出，不提示、不拒绝、不阻塞工具调用。
@@ -680,7 +680,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 
 ### 新增托管 hook
 
-新增托管 hook 须给出：hook 事件与 matcher；驱动器对输入的用途；输出字段及其在模型上下文中出现的位置；一次性核对的接受条件，即作为依据的 stream-json 事件与事件标识；查询截止时间与失败时的输出，审批类 hook 失败时输出拒绝，其余输出空结果。新增 hook 使用同一个托管 hook 二进制与 IPC 端点，在托管策略设置中以 `exec <托管 hook 二进制路径>` 注册，注册命令里的路径与 IPC 端点核对的路径一致，按同一规则认证对端并做一次性核对。用于等待意图的 hook 只输出 `additionalContext` 或空输出，不输出 `decision`、`continue` 与权限决定，退出码恒为 0，且不在 `Stop`、`SubagentStop` 等会让对话继续的 hook 上输出 `additionalContext`；托管策略设置、本模块的[托管 hook](#托管-hook)表与 Claude Code 驱动器同步修改。
+新增托管 hook 须给出：hook 事件与 matcher；驱动器对输入的用途；输出字段及其在模型上下文中出现的位置；一次性核对的接受条件，即作为依据的 stream-json 事件与事件标识；查询截止时间与失败时的输出，审批类 hook 失败时输出拒绝，其余输出空结果。新增 hook 使用同一个托管 hook 二进制与 IPC 端点，在托管策略设置中按同一注册方式注册，注册命令里的路径与 IPC 端点核对的路径一致，按同一规则认证对端并做一次性核对。用于等待意图的 hook 只输出 `additionalContext` 或空输出，不输出 `decision`、`continue` 与权限决定，退出码恒为 0，且不在 `Stop`、`SubagentStop` 等会让对话继续的 hook 上输出 `additionalContext`；托管策略设置、本模块的[托管 hook](#托管-hook)表与 Claude Code 驱动器同步修改。
 
 ### 新增冻结变体
 

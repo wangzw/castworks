@@ -369,7 +369,7 @@ flowchart TD
 1. **标记的来源**：本地代理剥离 Agent 进程请求中的 `x-castworks-purpose`，Agent 进程只能经本地代理到达网关且取不到运行实例令牌（[架构不变量](../architecture.md#架构不变量) I6），因此到达网关的标记只来自看守进程自身发起的分类请求；本地代理剥离 Agent 进程附带的标记后，该请求按 `purpose=agent` 登记在途请求事实并写唤醒信号。网关拒绝不符合分类请求形态的标记：取值不是 `classifier`，或 `mode` 不是 `passthrough`，或请求体 `stream` 为真时返回 `400`，计入分类标记拒绝计数，不换取凭据、不登记、不产生上游调用。
 2. **照常执行的步骤**：请求准入与代校验、按运行实例限流（与 Agent 的 LLM 请求共用同一限额）、凭据换取、`llm_request` 登记与唯一索引判重、上游转发、终态持久化、回放取回、计费与审计，规则与 Agent 的 LLM 请求相同；行的 `purpose` 为 `classifier`。
 3. **不写入控制面的事实**：不调用 `SetRunFact{inflight_request}`，终态提交后不调用 `AppendWakeSignal`；本地代理也不为它发送 `llm.request.*`。`runcontroller` 因而没有它的 `source_request` 行与唤醒信号：它不影响 I9 预检中的「本代无在途请求」，不进入阻塞条件与静止证据，完成或失败不产生唤醒。它不计入本实例的在途请求事实，不触发 `RenewSourceLease`。网关实例失联时控制面不为它合成 `llm_failed{gateway_lost}`，其 `in_flight` 行按网关自身的超时到期后由回收规则删除。
-4. **网关自身的超时**：分类请求不参与实例租约，网关以部署配置给出的 `T_classifier_timeout` 跟踪它。登记时 `lease_expires_at` 取 `registered_at + T_classifier_timeout`，此后不刷新，本实例有无在途请求事实、续租成功与否都不改变它；网关在 `lease_expires_at` 减去时钟余量时中止仍未结束的上游请求，按 `reason=upstream_timeout` 提交失败条目并返回 `504`。实例崩溃时，该行在 `lease_expires_at` 之前对其他实例的 `POST` 与 `GET` 返回 `409`，到期后由回收规则删除。
+4. **网关自身的超时**：分类请求不参与实例租约，网关以部署配置给出的 `T_classifier_timeout` 跟踪它；`T_classifier_timeout` 大于本地代理为分类请求设的截止时间加时钟余量，网关的超时中止只兜底本地代理已放弃的请求。登记时 `lease_expires_at` 取 `registered_at + T_classifier_timeout`，此后不刷新，本实例有无在途请求事实、续租成功与否都不改变它；网关在 `lease_expires_at` 减去时钟余量时中止仍未结束的上游请求，按 `reason=upstream_timeout` 提交失败条目并返回 `504`。实例崩溃时，该行在 `lease_expires_at` 之前对其他实例的 `POST` 与 `GET` 返回 `409`，到期后由回收规则删除。
 5. **回放与沙箱消失**：响应写入回放条目，同一代内请求体相同的分类请求命中已有行或条目，不产生第二次上游调用。沙箱在分类请求在途时被快照或销毁，网关照常读取上游到终态并提交回放条目；本地代理不再取回它，条目在保留期满后删除。
 6. **计费、审计与可观测性**：用量按运行实例记录并标注 `purpose=classifier`，审计记录同样带 `purpose`。分类请求不进入时延直方图；网关导出分类请求计数与分类标记拒绝计数，见[时延直方图](#时延直方图)。
 

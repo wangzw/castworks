@@ -135,7 +135,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 
 - `agentprotocol`：`AgentEvent` 的种类、字段、`event_seq` 与出站流发送；驱动器只负责事件内容。
 - Claude Code 无头模式：`-p`、`--output-format stream-json`、`--input-format stream-json`、`--verbose` 与 `--resume`（[REF-claude-code-headless](../../../references.md)）。
-- Claude Code hooks：command hook 经 shell 执行时以 `exec` 前缀让位给 hook 二进制的执行方式，`PreToolUse` 的 `defer`、`timeout`、`onFailure` 与输出中的 `permissionDecision`、`permissionDecisionReason`，`Stop` 与 `SubagentStop` 输入中的 `background_tasks` 与 `session_crons{id, schedule, recurring, prompt}`，`Stop` 输入中的 `last_assistant_message`，`PostToolUse` 与 `PostToolUseFailure` 输入中的 `tool_name`、`tool_input` 与 `tool_use_id`，`Stop` 与 `SubagentStop` 先于回合或子代理结束执行（两者可以阻止停止），`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 输出的 `hookSpecificOutput.additionalContext`（上限 10000 字符；前两者出现在工具结果旁，模型在下一次模型请求时读到，`SubagentStart` 的出现在子代理开始时；`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，本模块不使用），以及 `UserPromptSubmit`、`StopFailure`、`SessionEnd`（[REF-claude-code-hooks](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)）。
+- Claude Code hooks：command hook 的执行方式（是否经 shell 执行，决定注册命令是否带 `exec` 前缀），`PreToolUse` 的 `defer`、`timeout`、`onFailure` 与输出中的 `permissionDecision`、`permissionDecisionReason`，`Stop` 与 `SubagentStop` 输入中的 `background_tasks` 与 `session_crons{id, schedule, recurring, prompt}`，`Stop` 输入中的 `last_assistant_message`，`PostToolUse` 与 `PostToolUseFailure` 输入中的 `tool_name`、`tool_input` 与 `tool_use_id`，`Stop` 与 `SubagentStop` 先于回合或子代理结束执行（两者可以阻止停止），`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 输出的 `hookSpecificOutput.additionalContext`（上限 10000 字符；前两者出现在工具结果旁，模型在下一次模型请求时读到，`SubagentStart` 的出现在子代理开始时；`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，本模块不使用），以及 `UserPromptSubmit`、`StopFailure`、`SessionEnd`（[REF-claude-code-hooks](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)）。
 - Claude Code 设置：托管策略设置文件的作用域、优先级与 `allowManagedHooksOnly`（[REF-claude-code-settings](../../../references.md)）。
 - Claude Code 环境变量：`ANTHROPIC_BASE_URL`、`HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`、`CLAUDE_CONFIG_DIR`、`CLAUDE_CODE_*` 与 `API_TIMEOUT_MS`，以及 `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0` 下每个回合结束都报 `idle` 的行为（[REF-claude-code-env-vars](../../../references.md)）。
 - Claude Code 网络行为：流式空闲看门狗与停滞处理（[REF-claude-code-network-config](../../../references.md)）。
@@ -326,7 +326,7 @@ sequenceDiagram
 | `blocking` | 是否以阻塞等待处理；实时接入与并行工具调用退回时为真 |
 | `deferred` | 是否已返回 `defer` 并以回合边界结束 |
 | `decision` | 允许或拒绝；允许可携带 `updatedInput`，拒绝携带消息 |
-| `deadline` | 阻塞等待的截止时间；取 hook 超时、per-server timeout 与 MCP 传输上限的较小值 |
+| `deadline` | 阻塞等待的截止时间；取 hook 超时减 60 s、per-server timeout 与 MCP 传输上限减 60 s 中的最小值，因而不早于冻结上限 `F_cap(approval)`，并早于托管 hook 二进制的查询截止时间（hook 超时减 30 s），先后关系见[审批路径](#审批路径)中的「查询失败时关闭」 |
 
 ### 后台作业记录
 
@@ -503,7 +503,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 ### 审批路径
 
-`PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外，在托管策略设置中以 `exec <托管 hook 二进制路径>` 的形式注册，Claude Code 经 shell 执行 hook 时 shell 以 `exec` 让位，二进制的父进程为 Agent 主进程；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。二进制经看守进程的托管 hook IPC 端点向驱动器查询，端点以 `SO_PEERCRED` 与一次性事件核对认证查询方，见[托管 hook 的执行](design-warden.md#托管-hook-的执行)与[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对)。驱动器在 hook 与 Claude Code 之间传递询问与决定。按渠道分别处置：
+`PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外，在托管策略设置中的注册方式保证二进制的父进程为 Agent 主进程：Claude Code 经 shell 执行 hook 命令时注册为 `exec <托管 hook 二进制路径>`，shell 以 `exec` 让位；直接执行时注册为二进制路径本身（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)）；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。二进制经看守进程的托管 hook IPC 端点向驱动器查询，端点以 `SO_PEERCRED` 与一次性事件核对认证查询方，见[托管 hook 的执行](design-warden.md#托管-hook-的执行)与[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对)。驱动器在 hook 与 Claude Code 之间传递询问与决定。按渠道分别处置：
 
 **异步渠道。** 驱动器先发出 `permission_requested{blocking=false}`，hook 再返回 `permissionDecision: "defer"`，阶段保持 `in_turn`，不经过 `blocked`；Claude Code 以 `stop_reason: tool_deferred` 结束回合后，驱动器发出 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，hook 从驱动器取回决定并返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
 
@@ -511,11 +511,11 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 同一回合有多个并行工具调用时，`defer` 被忽略，退回阻塞等待；各调用的审批决定以定向投递分别送达，只有剩一个阻塞调用时才允许冻结。审批决定在沙箱销毁之前到达时，在同一代的已建立流上送达；销毁之后到达时，在新代以 `--resume` 续接。
 
-**查询失败时关闭。** 托管 `PreToolUse` hook 在 IPC 端点不可达、认证被拒（`SO_PEERCRED` 校验或一次性核对不通过）、超过查询截止时间或应答无法解析时，输出 `permissionDecision: "deny"`，`permissionDecisionReason` 为「平台审批暂不可用」，不放行；拒绝作为工具结果交回模型，回合继续。其余托管 hook（`PostToolUse`、`PostToolUseFailure`、`PostToolBatch`、`SubagentStart`、`Stop`、`SubagentStop` 与 `UserPromptSubmit`）查询失败时输出空结果、退出码 0，不阻塞工具调用。二进制的查询截止时间小于托管策略设置中为该 hook 配置的 `timeout`；二进制自身未在 `timeout` 之内退出时，`onFailure: block` 使 Claude Code 按拒绝处理。审批的三层兜底因而都不放行：驱动器在 `deadline` 到达时应答拒绝，二进制在查询失败时输出拒绝，Claude Code 在 hook 超时时按拒绝处理。
+**查询失败时关闭。** 托管 `PreToolUse` hook 在 IPC 端点不可达、认证被拒（`SO_PEERCRED` 校验或一次性核对不通过）、超过查询截止时间或应答无法解析时，输出 `permissionDecision: "deny"`，`permissionDecisionReason` 为「平台审批暂不可用」，不放行；拒绝作为工具结果交回模型，回合继续。其余托管 hook（`PostToolUse`、`PostToolUseFailure`、`PostToolBatch`、`SubagentStart`、`Stop`、`SubagentStop` 与 `UserPromptSubmit`）查询失败时输出空结果、退出码 0，不阻塞工具调用。审批路径上的截止时间先后固定为：冻结上限 `F_cap(approval)` 不晚于驱动器待决审批记录的 `deadline`，`deadline` 早于二进制的查询截止时间（hook 超时减 30 s），二进制的查询截止时间早于托管策略设置中为该 hook 配置的 `timeout`。驱动器在 `deadline` 到达时应答拒绝，二进制因而总在自身截止之前收到应答；二进制随 Agent 进程树冻结，其计时在冻结期间照常流逝，`F_cap(approval)` 保证解冻先于驱动器的 `deadline`，已批准的决定不会因二进制在冻结期间到期而交付不了。二进制自身未在 `timeout` 之内退出时，`onFailure: block` 使 Claude Code 按拒绝处理。审批的三层兜底因而都不放行：驱动器在 `deadline` 到达时应答拒绝，二进制在查询失败时输出拒绝，Claude Code 在 hook 超时时按拒绝处理。
 
 ### 托管 hook 查询的一次性核对
 
-托管 hook IPC 端点以 `SO_PEERCRED` 核对对端是 Agent 主进程执行的托管 hook 二进制；工具命令同样能以 `exec` 运行该二进制，父进程校验不足以区分真伪，端点另按驱动器从 stream-json 观察到的事件对每次查询做一次性核对（[托管 hook 的执行](design-warden.md#托管-hook-的执行)）。查询到达时，驱动器先处理 stdout 中已到达的消息，再在驱动器锁内按下表核对查询的 hook 事件名与事件标识；通过时把该事件标识记为已接受，同一事件标识只接受一次。核对不通过时端点拒绝该查询并计数告警，查询不进入驱动器的应答、对账与意图解析，hook 二进制按查询失败处理（见[审批路径](#审批路径)中的「查询失败时关闭」）。下表穷举托管策略设置中注册的 hook 事件：
+托管 hook IPC 端点以 `SO_PEERCRED` 核对对端是 Agent 主进程执行的托管 hook 二进制；工具命令同样能以 `exec` 运行该二进制，父进程校验不足以区分真伪，端点另按驱动器从 stream-json 观察到的事件对每次查询做一次性核对（[托管 hook 的执行](design-warden.md#托管-hook-的执行)）。查询到达时，驱动器先处理 stdout 中已到达的消息，再在驱动器锁内按下表核对查询的 hook 事件名与事件标识；所指事件尚未观察到时，驱动器在 `T_hook_sync`（200 ms）之内继续读取 stdout 并重新核对，期满仍不满足才判为不通过，hook 进程先于对应事件写出 stdout 时不会因此被误拒。这一核对依赖 hook 执行时对应事件已经写出或随即写出，以及子代理的事件出现在主会话的 stream-json 中，两项列入[实施路线与技术验证](../../../roadmap.md)的托管 hook 实测项；通过时把该事件标识记为已接受，同一事件标识只接受一次。核对不通过时端点拒绝该查询并计数告警，查询不进入驱动器的应答、对账与意图解析，hook 二进制按查询失败处理（见[审批路径](#审批路径)中的「查询失败时关闭」）。下表穷举托管策略设置中注册的 hook 事件：
 
 | hook 事件 | 接受条件（已观察事件状态） | 事件标识 |
 | --- | --- | --- |
@@ -810,7 +810,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 - **单进程单回合**：同一代沙箱内只有一个 Agent 主进程和一个活动回合；驱动器不并发启动第二个进程，`StartAgent` 在进程已运行时为空操作，与同时到达的 `Deliver` 在进程监督锁内串行，先到者启动进程，后到者按进程已存在处理。回合进行中收到的常规投递由驱动器暂存，不写入 stdin，在 `turn_ended` 之后按到达顺序喂入。
 - **集合事件**：`bg_tasks`、`bg_jobs` 与 `self_wake` 的更新在驱动器锁内执行，`bg_jobs_changed` 与 `self_wake_changed` 按更新顺序发出，后发的完整集合覆盖先发者；`self_wake_changed` 在 `crons_synced` 为假时只覆盖非 `cron` 条目，`cron` 条目按 `entry_id` 合并。驱动器在看守进程内运行、不随 Agent 冻结，冻结期间照常维护条目并发出变化。
 - **意图与提示状态**：`intents`、`pending_hints` 与 `hint_state` 的更新在驱动器锁内执行。托管 hook 的查询只读写内存状态，不执行网络调用、不等待分类请求、不写盘，也不持有进程监督锁，耗时目标 10 ms 以内；`hint_state` 的持久化在锁外异步执行。宿主侧分类请求在锁外异步执行，结果回到锁内按对象是否仍存在决定发出或丢弃。`intent_observed{ref_kind=call}` 在同一回合内按 `event_seq` 位于该调用的 `tool_started` 与 `tool_ended` 之间；`job` 意图位于使该作业进入集合的 `bg_jobs_changed` 之后。
-- **一次性核对**：核对与把事件标识记为已接受在驱动器锁内一次完成，同一事件标识的并发查询只有一个通过；核对之前先处理 stdout 中已到达的消息，使 hook 执行之前已输出的事件进入 `hook_ledger`。核对不执行网络调用、不写盘，也不持有进程监督锁；`PreToolUse` 在实时接入中的阻塞等待发生在核对通过之后，不占用驱动器锁。
+- **一次性核对**：核对与把事件标识记为已接受在驱动器锁内一次完成，同一事件标识的并发查询只有一个通过；核对之前先处理 stdout 中已到达的消息，使 hook 执行之前已输出的事件进入 `hook_ledger`；`T_hook_sync` 之内的等待在锁外进行，每次重新核对时再取锁。核对不执行网络调用、不写盘，也不持有进程监督锁；`PreToolUse` 在实时接入中的阻塞等待发生在核对通过之后，不占用驱动器锁。
 - **stdin 单写者**：所有写入由同一协程串行执行；写入与进程退出通过 `closed` 标志协调，不向已关闭的管道写入。
 - **回合边界串行**：`result` 与 `idle` 的到达可能并发，边界判定在驱动器锁内执行；同一回合只发一次 `turn_ended`。
 - **事件顺序**：同一回合的 `turn_started` 先于工具与等待事件，`turn_ended` 最后；回合内事件的 `event_seq` 单调，重复或乱序的回合内事件按它丢弃。回合外事件的 `turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件按替换或合并语义处理，重复与乱序不改变结果。

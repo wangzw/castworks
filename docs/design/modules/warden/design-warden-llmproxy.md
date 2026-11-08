@@ -416,7 +416,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 
 ### 宿主侧分类请求
 
-`intent.classifier` 开启时，Claude Code 驱动器把规则判不了的命令、描述或最后一条消息构造成分类请求体，连同截止时间经进程内入口交给本地代理；请求体的内容与模型由驱动器决定，见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。本地代理按以下步骤处理：
+`intent.classifier` 开启时，Claude Code 驱动器把规则判不了的命令、描述或最后一条消息构造成分类请求体，连同截止时间经进程内入口交给本地代理，截止时间短于 `llmgateway` 的 `T_classifier_timeout` 减时钟余量，网关因超时中止之前本地代理已按截止时间结束该请求；请求体的内容与模型由驱动器决定，见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。本地代理按以下步骤处理：
 
 1. 令牌过期或临近到期且未收到 `TokenRotate` 时不排队，直接按失败返回。
 2. 生成新的 `request_id` 与 `request_hash`，附运行实例令牌与平台请求头，`x-castworks-mode` 取 `passthrough`，`x-castworks-purpose` 取 `classifier`，以 `POST /v1/messages` 发往 `llmgateway`；同一代内请求体相同的分类请求命中网关的回放条目，不产生第二次上游调用。
