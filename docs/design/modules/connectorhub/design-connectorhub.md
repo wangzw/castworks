@@ -865,7 +865,7 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 
 出口策略以运行实例为键生成，`Revision` 递增，经 `PutEgressPolicy` 推送给沙箱提供者。沙箱提供者在预配与认领沙箱时按代落地，并把更新同步到尚未撤销的代；按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动。同一时机，本模块以同一 `Revision` 调用 `PutSandboxConfig` 推送沙箱侧配置，包括运行实例的首次生成；调用失败时以同一 `revision` 退避重试，运行实例已终态时丢弃该修订并计数。工具接入声明或项目的等待意图开关变更后，该项目运行实例的出口策略与沙箱侧配置重新生成，以递增的 `Revision` 推送。推送遇到沙箱提供者不可达或超时时保留上一次成功推送的出口策略，按运行实例与 `Revision` 重试；默认拒绝使未列入的主机不会因推送失败而放行。
 
-Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符；`project_id` 与每条规则的 `system`、`auth_method`、`scopes` 一并写入策略文档，由 Substrate 出口网关的凭据提供者按同一组标识取得真实凭据；`PlaintextHosts` 中的主机落地为带注入规则的 `http` 规则，其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` 规则；`Modes` 只经沙箱侧配置到达看守进程，不进入 Substrate 的 EgressPolicy。k8s 路径落地为平台出口代理配置与 NetworkPolicy，代理逐请求校验 `egress` 受众令牌中的代，并以策略中的同一组字段向 `secrets` 换取凭据。
+Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符；`project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 编码在 `credential_uri` 的 `ate-secret://<provider-class>/<provider-name>/...` 路径段中，由 Substrate 出口网关按 URI 的 host 路由到已配置的凭据提供者；`PlaintextHosts` 中的主机落地为带注入规则的 `http` 规则，其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` 规则并显式列出端口；`Modes` 只经沙箱侧配置到达看守进程，不进入 Substrate 的 EgressPolicy。k8s 路径落地为平台出口代理配置与 NetworkPolicy，代理逐请求校验 `egress` 受众令牌中的代，并以策略中的同一组字段向 `secrets` 换取凭据。
 
 ### 平台出口代理（k8s 路径）
 

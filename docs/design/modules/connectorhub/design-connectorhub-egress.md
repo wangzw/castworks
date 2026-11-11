@@ -281,7 +281,7 @@ stateDiagram-v2
 | `tls_passthrough` | CONNECT | 不终止 TLS，按目标主机放行，原样转发 | 直通规则，无头替换 |
 | `http` | 绝对形式 HTTP 前置 | 解析明文请求，只对 `PlaintextHosts` 中的主机替换已有请求头，明文转发 | `PlaintextHosts` 对应 `http` 规则加 `replaceHeaders`；其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` |
 
-k8s 路径与 Substrate 路径的语义一致：默认拒绝未列入的主机；只替换已有头，缺头不注入；真实凭据只在 TLS 连接上注入，`PlaintextHosts` 是显式例外；`replaceHeaders` 与 `Inject` 都只作用于请求头。差异在凭据来源与失效判定：Substrate 路径的凭据来自凭据提供者，k8s 路径来自 `secrets`；Substrate 路径按（运行实例，代）落地并在代作废时撤销策略，k8s 路径逐请求查询代。映射只描述语义，不要求共用配置格式。
+k8s 路径与 Substrate 路径在默认拒绝未列入的主机、只替换已有头、`PlaintextHosts` 是显式例外与只作用于请求头上语义一致。差异在目的地核对、凭据来源与失效判定：Substrate 路径的出口网关在连接层要求 SNI 匹配、请求层要求 `Host` 等于 `:authority`，凭据来自按 `ate-secret://` URI 路由的凭据提供者，按（运行实例，代）落地并在代作废时撤销策略；k8s 路径的平台出口代理逐请求核对授权主机并查询代，凭据来自 `secrets`。映射只描述语义，不要求共用配置格式。
 
 ### 策略落地与原子替换
 

@@ -28,7 +28,7 @@
 | 冻结 | freeze | 停止 Agent 进程树的 CPU 调度并保留内存；反向操作为解冻 |
 | 静止冻结 | quiescent freeze | 没有单一等待条件可依（后台作业存活，或回合中多个 Agent 循环并发）时，依据静止证据——没有任何 Agent 循环能在不依赖托管侧唤醒的情况下推进——执行的冻结；附带探测定时器，由本代 LLM 完成或失败、冻结期间的入站数据、探测定时器、自唤醒到期或冻结上限唤醒，不升级为快照或销毁 |
 | 快照 | snapshot | 把沙箱的内存与文件系统状态持久化后释放全部资源；反向操作为快照恢复 |
-| 模板快照 | golden snapshot | Substrate 的 actor 模板控制器以模板运行一个 actor、待 `wakeupProbe` 返回 200 后制作的快照；新 actor 默认从它恢复，actor 模板尚无模板快照时新 actor 冷启动（[REF-substrate](references.md)） |
+| 模板快照 | golden snapshot | Substrate 的 actor 模板控制器以模板运行一个临时 actor、待 `wakeupProbe` 返回 200 后按模板的 `preferredFidelity` 制作的快照（每个容器都声明探针时跳过约 20 s 暖机）；新 actor 默认从它恢复，actor 模板尚无模板快照或快照与 worker 运行时不兼容时新 actor 冷启动或降级为 `ROOTFS` 冷启动（[REF-substrate](references.md)） |
 | 销毁重建 | destroy and recreate | 删除沙箱、保留工作区；恢复时新建沙箱并由 Agent 自身的会话恢复机制续接 |
 | 沙箱提供者 | SandboxProvider | 以能力集合自描述的沙箱生命周期实现，包括 k8s 提供者与 Substrate 提供者 |
 | 节点冻结代理 | node freeze agent | k8s 提供者中的特权 DaemonSet，对 Agent 子 cgroup（[REF-linux-cgroup-v2](references.md)）执行冻结与解冻 |

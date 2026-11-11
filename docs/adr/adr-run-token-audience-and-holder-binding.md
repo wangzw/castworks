@@ -60,7 +60,7 @@
 - `workspace` 在租约上保存实例公钥指纹，续约时核对指纹并验签；指纹只由引导接口在领取时登记，快照期间清空持有者的 `HoldLease` 不清除它；租约查询只向 `runcontroller` 提供（[ADR-control-plane-call-authentication](adr-control-plane-call-authentication.md)）。
 - `runcontroller` 保存实例公钥指纹与令牌接受下界，轮换时以记录的指纹申请令牌，在新代进入运行、代递增与沙箱销毁确认时清空两者。
 - 实例私钥只保存在看守进程的内存中，不写入任何文件或日志；快照恢复沿用同一密钥。
-- 快照包含实例私钥与令牌，快照对象必须静态加密，读取权限只授予 Substrate 控制面。
+- 快照包含实例私钥与令牌，快照对象必须静态加密，读写只经 in-tree `objectstore-plugin` sidecar，atelet 与 ate-api-server 主进程不直接持有存储凭据。
 
 承担的代价穷举如下：
 
