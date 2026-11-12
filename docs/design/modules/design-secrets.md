@@ -1,6 +1,6 @@
 # secrets
 
-`secrets` 坐在控制面基础层，是密钥库的唯一对接者。长期凭据只存在于密钥库，[沙箱](../../glossary.md)内的 Agent 进程只接触占位符，[运行实例令牌](../../glossary.md)只由[看守进程](../../glossary.md)持有：`secrets` 向[运行实例](../../glossary.md)签发按受众划分的令牌组，[LLM 网关](../../glossary.md)与 k8s 路径的平台出口代理凭本身受众的令牌与调用方身份换取真实凭据，[连接器](../../glossary.md)的状态核对只凭调用方身份换取，Substrate 路径的出口网关经凭据提供者按 `(run_id, generation)` 策略键与网关身份取得真实凭据。本模块拥有凭据对象与签名密钥的读取、运行实例令牌的签发与校验、[接入票据](../../glossary.md)的签发、凭据换取、调用方授权与使用审计；不拥有 LLM 请求转发、[出口策略](../../glossary.md)、运行实例状态、[代](../../glossary.md)与用户授权。心智模型：沙箱里看不到真实凭据，只看到占位符；托管侧换取真实凭据，每次换取都记一笔账，真实凭据不落进沙箱（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。
+`secrets` 位于控制面基础层，是密钥库的唯一对接者。长期凭据只存在于密钥库，[沙箱](../../glossary.md)内的 Agent 进程只接触占位符，[运行实例令牌](../../glossary.md)只由[看守进程](../../glossary.md)持有：`secrets` 向[运行实例](../../glossary.md)签发按受众划分的令牌组，[LLM 网关](../../glossary.md)与 k8s 路径的平台出口代理凭本身受众的令牌与调用方身份换取真实凭据，[连接器](../../glossary.md)的状态核对只凭调用方身份换取，Substrate 路径的出口网关经凭据提供者按 `(run_id, generation)` 策略键与网关身份取得真实凭据。本模块拥有凭据对象与签名密钥的读取、运行实例令牌的签发与校验、[接入票据](../../glossary.md)的签发、凭据换取、调用方授权与使用审计；不拥有 LLM 请求转发、[出口策略](../../glossary.md)、运行实例状态、[代](../../glossary.md)与用户授权。心智模型：沙箱里看不到真实凭据，只看到占位符；托管侧换取真实凭据，每次换取都记一笔账，真实凭据不落进沙箱（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。
 
 文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、走查、运行实例令牌的签发、校验与轮换、接入票据的签发与公钥轮换、凭据换取、出口代理的凭据来源、缓存与失效、凭据提供者对接；术语表、外部接口契约、核心数据结构、错误与失败语义与并发与事务边界作为核对接口、字段与失败处置时的参考。走查给出一次请求从令牌校验到审计落库的逐步状态变化；并发与事务边界末尾的轮换、缓存与审计交错留作最后自测。
 
@@ -103,9 +103,9 @@ type VerifyResult struct {
 
 - `IssueRunToken` 的调用方穷举如下：`sandboxprovider` 的引导接口在看守进程领取时调用，`instanceJKT` 取领取请求体中实例公钥的指纹，签发首个令牌组；`runcontroller` 的 `rotate_token` 效果在事务提交后以 `run.instance_jkt` 调用，签发轮换令牌组。`instanceJKT` 必填，为空返回 `ErrInvalidArgument`；`generation` 由调用方传入，本模块不生成代，也不持久化令牌。
 - 一次调用签发一组令牌：受众闭集中的每个受众各一张，全组的 `run_id`、`generation`、`exp` 与 `cnf.jkt` 相同。令牌载荷为 `{run_id, generation, aud, exp, cnf{jkt}}`，JOSE 头部为 `{kid, alg}`；签名算法与有效期由签发配置决定，本模块在 `ExpiresAt` 中返回到期时刻。
-- 看守进程按接收方选用令牌：`Hello.resume_token` 取 `runcontroller` 令牌；本地代理发往 `llmgateway` 的 `x-castworks-run-token` 取 `llmgateway` 令牌；本地代理与透明拦截器的 `Proxy-Authorization: Bearer` 取 `egress` 令牌；平台 MCP 服务器对 `connectorhub` 取 `connectorhub` 令牌，对 `humanchannel` 的附件取回取 `humanchannel` 令牌。
+- 看守进程按接收方选用令牌：`Hello.resume_token` 取 `runcontroller` 令牌；本地代理发往 `llmgateway` 的 `x-castworks-run-token` 取 `llmgateway` 令牌；本地代理与透明拦截器的 `Proxy-Authorization: Bearer` 取 `egress` 令牌；平台 MCP 服务器对 `connectorhub` 取 `connectorhub` 令牌，对 `humanchannel` 的附件取回用 `humanchannel` 令牌。
 - `VerifyRunToken` 的 `aud` 为调用方的期望受众，调用方与受众的对应见[调用方授权](#调用方授权)；令牌的 `aud` 不等于期望受众时返回 `ErrInvalidToken`，与签名无效同类。
-- `VerifyRunToken` 的结果分为有效、过期、无效与不可达：签名、`run_id`、`aud` 与 `cnf.jkt` 有效而 `exp` 已过时，`Expired` 为真且不返回错误；签名无效、`run_id` 无效、受众不符、缺少 `cnf.jkt` 或签名算法不被接受时返回 `ErrInvalidToken`；密钥库不可达或超时返回传输错误，与无效分开。调用方依赖这一区分：`runcontroller` 在 `Hello` 中只在同一沙箱实例延续或快照恢复的状态下、且令牌到期时刻不低于 `run.token_accept_floor` 时接受过期令牌并写 `rotate_token`，换取路径则拒绝过期令牌。
+- `VerifyRunToken` 的结果分为有效、过期、无效与不可达：签名、`run_id`、`aud` 与 `cnf.jkt` 有效而 `exp` 已过期，`Expired` 为真且不返回错误；签名无效、`run_id` 无效、受众不符、缺少 `cnf.jkt` 或签名算法不被接受时返回 `ErrInvalidToken`；密钥库不可达或超时返回传输错误，与无效分开。调用方依赖这一区分：`runcontroller` 在 `Hello` 中只在同一沙箱实例延续或快照恢复的状态下、且令牌到期时刻不低于 `run.token_accept_floor` 时接受过期令牌并写 `rotate_token`，换取路径则拒绝过期令牌。
 - 校验只覆盖签名、`run_id`、`aud` 与 `exp`，不比较运行实例当前代，也不核对持有证明。`InstanceJKT` 返回令牌的 `cnf.jkt`，`runcontroller` 在 `Hello` 中把它与 `instance_key` 的公钥指纹、`run.instance_jkt` 及租约的 `holder_jkt` 比对。需要代校验的调用方经 `runcontroller` 的 `Generations.Current` 取得当前代、终态与本代作废状态后自行比较。
 - 签名算法只接受配置声明的集合；`none` 与未知算法返回无效。验证按 `kid` 读取令牌签名密钥的公钥，接入票据签名密钥的 `kid` 不被接受；轮换窗口内同时接受旧密钥签发的未过期令牌。
 

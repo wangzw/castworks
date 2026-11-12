@@ -1,8 +1,8 @@
 # substrate 子模块
 
-substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口落到 agent-substrate/substrate（[REF-substrate](../../../references.md)）。它拥有 actor 的创建与激活、[快照](../../../glossary.md)的[挂起](../../../glossary.md)与恢复、入站唤醒的路由承载、[出口策略](../../../glossary.md)的落地与撤销，以及[引导接口](../../../glossary.md)在 Substrate 路径上的认证与领取触发；新 actor 由 Substrate 分配到预热 worker 并从[模板快照](../../../glossary.md)恢复。它不具备[冻结](../../../glossary.md)与 `WarmPool` 能力，不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：actor 是整体可挂起的进程容器，挂起以内存快照换出计算资源，恢复由经路由器的入站请求唤醒（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
+substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口落到 agent-substrate/substrate（[REF-substrate](../../../references.md)）。它负责 actor 的创建与激活、[快照](../../../glossary.md)的[挂起](../../../glossary.md)与恢复、入站唤醒的路由承载、[出口策略](../../../glossary.md)的落地与撤销，以及[引导接口](../../../glossary.md)在 Substrate 路径上的认证与领取触发；新 actor 由 Substrate 分配到预热 worker 并从[模板快照](../../../glossary.md)恢复。它不具备[冻结](../../../glossary.md)与 `WarmPool` 能力，不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：actor 是整体可挂起的进程容器，挂起以内存快照换出计算资源，恢复由经路由器的入站请求唤醒（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
 
-文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射、引导接口的认证与路由器契约、走查、领取的触发、Suspend 与快照、Resume 与路由器唤醒、EgressPolicy 落地与撤销、外部 CSI 卷与 durableDir 退化；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑、停泊与代的范围自测迟到调用。
+文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射、引导接口的认证与路由器契约、走查、领取的触发、Suspend 与快照、Resume 与路由器唤醒、EgressPolicy 落地与撤销、外部 CSI 卷与 durableDir 退化；术语表、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义以及并发与事务边界留到最后，按墓碑、停泊与代的范围自测迟到调用。
 
 ## 核心概念
 
@@ -14,7 +14,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 
 ## 职责
 
-职责穷举如下，每条先写本子模块执行的动作，再写产生的结果或边界；通用幂等、墓碑与能力协商语义见主文档，本条只写 Substrate 提供者层的落地方式。能力集合是闭合集合，本子模块声明 `Snapshot`、`Destroy` 与 `EgressInject`，不声明 `Freeze{cgroup}`、`Freeze{signal}`、`InPlaceResize` 与 `WarmPool`（[ADR-capability-tiered-suspension](../../../adr/adr-capability-tiered-suspension.md)）。
+职责穷举如下，每条先写本子模块执行的动作，再写产生的结果或边界；幂等、墓碑与能力协商的通用语义见主文档，本条只写 Substrate 提供者层的落地方式。能力集合是闭合集合，本子模块声明 `Snapshot`、`Destroy` 与 `EgressInject`，不声明 `Freeze{cgroup}`、`Freeze{signal}`、`InPlaceResize` 与 `WarmPool`（[ADR-capability-tiered-suspension](../../../adr/adr-capability-tiered-suspension.md)）。
 
 - **actor 模板与创建**：以 actor 模板声明 actor 镜像、入口、工作区卷与 `systemInfo` 卷，`wakeupProbe` 在每个容器上声明；模板没有网络字段，actor 网络由 Substrate 固定为私有 netns、内部地址段与 DNS 中继；镜像以看守进程为 PID 1，可自带 `ENTRYPOINT`，容器按镜像的 `USER` 与 `WORKDIR` 运行，看守进程容器以 uid 0 运行并在模板的 capability 白名单内声明所需能力；以 `(run_id, generation, attempt_id)` 派生 actor 名，按该名幂等创建 actor，actor 名不复用；Substrate 要求 actor 名是不超过 63 字符的 DNS-1123 label，`run_id` 为 UUID，三元组直接拼接会超出上限，派生取固定字母前缀加三元组 SHA-256 摘要前 160 位的小写 base32 编码；返回 `sandbox_id` 与放置位置。
 - **预配**：以 `Provision` 承担首次创建与销毁重建；调用 `workspace` 绑定工作区并按 `(run_id, generation)` 落地出口策略副本；在激活 actor 之前写入[引导记录](design-sandboxprovider.md#术语表)；以 `ResumeActor` 激活 actor，由 Substrate 分配 worker 并从模板快照恢复，模板没有模板快照时冷启动；本子模块不传 `sourceTag`，初始快照由模板决定，快照的运行时与 worker 不兼容且没有兼容 worker 有余量时降级为 `ROOTFS` 冷启动；创建墓碑或释放墓碑之后拒绝该代或该运行实例的创建。
@@ -79,7 +79,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 
 - **注入规则**：本子模块落地每代 EgressPolicy 时，追加一条由本子模块拥有、不属于 `connectorhub` 策略内容的规则：对引导接口主机的 https 请求，以 `replaceHeaders` 把 `Authorization` 占位符替换为 `actorJwt`，`prefix` 为 `"Bearer "`（含尾随空格），audience 为 `castworks-bootstrap`，`expirationSeconds` 为 300（Substrate 允许的最小值）；引导接口在两条路径上都按 `Bearer <令牌>` 解析 `Authorization` 头。
 - **调用方**：看守进程携带 `Authorization` 占位符头调用 `POST /v1/bootstrap/claim`；出口网关只替换请求中已存在的占位符请求头，缺头不注入。出口网关把该头替换为 `Bearer <actor JWT>`，JWT 由 Substrate 控制面为发出请求的 actor 签发，`sub` 为 `actor/<atespace>/<name>`，声明 `actor.ate.dev` 是含 `atespace`、`actorName` 与 `actorUID` 的对象。
-- **校验**：引导接口以部署配置固定 Substrate 的签发方 URL（ate-api-server 的 `--actor-jwt-issuer`），只经该签发方的 OIDC 发现（`<iss>/.well-known/openid-configuration`）取验签公钥，不按令牌自带的 `iss` 取公钥；公钥集按刷新周期缓存，遇到未知 `kid` 时限速重新拉取；签发方证书按主机名信任，集群内 `.svc` 主机只信任部署配置的 CA，公网签发方使用系统根或该 CA；有缓存公钥时刷新失败继续使用缓存，没有缓存公钥时返回 503，可重试。验签并校验 `iss` 等于该签发方、`aud` 含 `castworks-bootstrap`、`exp` 与 `nbf`，`sub` 以 `actor/` 开头（拒绝 `worker-for-actor` 形式的令牌），`actor.ate.dev` 声明中的 `atespace` 等于部署配置的 atespace；按该声明中的 `actorName` 查引导记录，记录中的 actor UID 与该声明中的 `actorUID` 不一致时返回 401。
+- **校验**：引导接口以部署配置固定 Substrate 的签发方 URL（ate-api-server 的 `--actor-jwt-issuer`），只经该签发方的 OIDC 发现（`<iss>/.well-known/openid-configuration`）取验签公钥，不按令牌自带的 `iss` 取公钥；公钥集按刷新周期缓存，遇到未知 `kid` 时限速重新拉取；签发方证书按主机名信任，集群内 `.svc` 主机只信任部署配置的 CA，公网签发方使用系统根或该 CA；有缓存公钥时刷新失败继续使用缓存，没有缓存公钥时返回 503，可重试。验签并校验 `iss` 等于该签发方、`aud` 含 `castworks-bootstrap`、`exp` 与 `nbf` 有效，`sub` 以 `actor/` 开头（拒绝 `worker-for-actor` 形式的令牌），`actor.ate.dev` 声明中的 `atespace` 等于部署配置的 atespace；按该声明中的 `actorName` 查引导记录，记录中的 actor UID 与该声明中的 `actorUID` 不一致时返回 401。
 - **沙箱实例身份**：引导记录以 actor 名为键，另存 actor UID。actor 名由 `(run_id, generation, attempt_id)` 派生且不复用；出口网关按 actor 名缓存 JWT，同名重建的 actor 可能拿到前任的 JWT，actor 名不复用与 actor UID 的核对共同排除这一情形。
 - **调用方区分**：出口网关不能区分同一 actor 内的看守进程与 Agent 进程，Agent 进程发往引导接口的请求同样带有 actor JWT；看守进程在启动 Agent 主进程之前完成领取，此后的领取请求返回 409。
 - **领取响应经过出口网关**：出口网关以 MITM 终止领取请求的 TLS 才能替换请求头，领取响应中的运行实例令牌以明文经过出口网关；部署要求出口网关不记录、不缓存引导接口主机的请求与响应正文，令牌因而不进入出口网关的任何持久记录。
@@ -112,13 +112,13 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - `workspace`：在预配时调用绑定接口取得卷标识、挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自 `ProvisionRequest`，不来自绑定；Substrate 提供者优先使用 `external_csi`，`durable_dir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。存储模式在绑定时固定，运行中不静默退化；外部 CSI 不可用时预配或恢复按自身规则失败，不在运行中切换到 `durableDir`。
 - `agentprotocol`：恢复完成以看守进程发送 `Hello` 为观察；`/readyz` 是路由器的 `wakeupProbe`，照常应答，不以领取为条件，也不以出站流为条件；`/wake` 返回表示出站流已重建。入站端点不承载事件内容，投递只在出站流上进行。
 - `secrets`：经主文档的引导接口调用 `secrets.IssueRunToken(run_id, generation, instance_jkt)`，在领取时签发同代、同一实例公钥指纹、按受众划分的首个令牌组，并调用 `secrets.AccessTicketKeys` 取得[接入票据](../../../glossary.md)公钥集合；令牌不持久化。凭据提供者由出口网关按 `ate-secret://` URI 的 host 路由调用；`FetchSecretRequest` 只有 `uri` 与 `actor_spiffe_id`，项目、系统、认证方式与作用域编码在 URI 路径段中；本子模块不调用凭据提供者协议。
-- Substrate 控制面：执行 actor 的创建、worker 分配、Suspend 与 Resume；同步快照等对象存储中的快照完成；快照保留期限由 `SnapshotReceipt` 返回；为发出请求的 actor 签发 actor JWT，签发方经 OIDC 发现公开验签公钥；处于 `CRASHED` 的 actor 由 `ResumeActor` 以 `FAILED_PRECONDITION` 拒绝，须先以 `RevertActor` 退回最近一次已完成的持久快照；worker 退役时只向 actor 发送 SIGTERM，actor 有 30 分钟以同步挂起保存状态。Substrate 控制面不可达时预配、挂起与恢复返回暂时性错误；`ResumeActor` 返回 `RESOURCE_EXHAUSTED` 时预配与快照恢复返回暂时性错误。
+- Substrate 控制面：执行 actor 的创建、worker 分配、Suspend 与 Resume；同步快照等待对象存储中的快照完成；快照保留期限由 `SnapshotReceipt` 返回；为发出请求的 actor 签发 actor JWT，签发方经 OIDC 发现公开验签公钥；处于 `CRASHED` 的 actor 由 `ResumeActor` 以 `FAILED_PRECONDITION` 拒绝，须先以 `RevertActor` 退回最近一次已完成的持久快照；worker 退役时只向 actor 发送 SIGTERM，actor 有 30 分钟以同步挂起保存状态。Substrate 控制面不可达时预配、挂起与恢复返回暂时性错误；`ResumeActor` 返回 `RESOURCE_EXHAUSTED` 时预配与快照恢复返回暂时性错误。
 - Substrate 路由器：以 `ate-target-actor: <atespace>/<actor>` 头调用 `/wake`，恢复 actor 并停泊请求到 `/readyz` 就绪；停泊预算只约束新的恢复重试，不取消在途恢复，客户端被持有的上限是预算加 5 s，停泊池满返回 503；调用方持有 SPIFFE 身份并在白名单内，入站白名单为 `sandboxprovider`、`humanchannel` 与 `workspace`，白名单是连接级的精确匹配，不按路径或目标 actor 再授权，只有 Envoy 数据面校验客户端证书，`agentgateway` 数据面尚不认证客户端，空白名单时路由器不服务任何入口；路由器不按路径区分调用方时 `/terminal` 与 `/files` 的授权由看守进程的接入票据校验承担。路由器同时承载 `/terminal` 与界面文件访问；事件投递与 `ToolExec` 帧都不经该路由，快照恢复经 `/wake` 触发；`ToolExec` 帧随看守进程的出站流往返，与路由器唤醒路径相互独立。
-- Substrate 出口网关：按 EgressPolicy 的规则处理出口连接。`https` 规则以 MITM 终止 TLS，并以 `replaceHeaders` 替换请求头中的凭据占位符；连接层要求 ClientHello 的 SNI 匹配某条 `https` 规则，请求层要求内层 `Host` 等于 `:authority` 且 `:authority` 匹配某条 `https` 规则，SNI 与内层 authority 可以指向不同的允许主机；`http` 规则只对 `PlaintextHosts` 中的主机执行注入，携带占位符的其他主机请求返回 403；`tls_passthrough` 规则（含本子模块追加的控制面主机）要求 ClientHello 的 SNI 存在且等于规则主机，规则显式列出端口，不终止 TLS；默认拒绝未列入的主机。SNI 缺失或不匹配时在 ClientHello 阶段关闭连接，请求层不一致时 `https`、`http` 档返回 403；拒绝以 `atenet.router.route.duration{outcome=denied}` 观测，不存在 `egress_destination_mismatch` 计数。出口网关接纳 `RESUMING` 与 `RUNNING` 状态的 actor，启动期出站在容器启动前即启用。出口网关按策略缓存 TTL（默认 10 s）缓存已编译策略，撤销后的新请求最多再滞后一个 TTL，`tls_passthrough` 长连接持续到连接结束。actor 经 `systemInfo` 卷的 `trustBundle` 数据源（`egress-mitm.ate.dev` 与 `system-roots.ate.dev`）在运行时取得出口网关 CA 与公共根证书，CA 不预置进镜像；CA 轮换保留不短于快照保留期上限的新旧 CA 同时受信重叠期。出口网关按本子模块追加的注入规则，把看守进程发往引导接口的 `Authorization` 占位符替换为 `Bearer <actor JWT>`。出口网关按 `ate-secret://` URI 的 host 路由到已配置的凭据提供者，可以配置多个提供者，URI 指向未配置的提供者时失败关闭；真实凭据不进入 actor。`CredentialHeader` 只有 `header`、`prefix`、`credential_uri` 与 `actor_jwt`，项目、系统、认证方式与作用域编码在 `credential_uri` 的路径段中，扩展提供者请求字段在固定 v1.0.0 的前提下不可行。
+- Substrate 出口网关：按 EgressPolicy 的规则处理出口连接。`https` 规则以 MITM 终止 TLS，并以 `replaceHeaders` 替换请求头中的凭据占位符；连接层要求 ClientHello 的 SNI 匹配某条 `https` 规则，请求层要求内层 `Host` 等于 `:authority` 且 `:authority` 匹配某条 `https` 规则，SNI 与内层 authority 可以指向不同的允许主机；`http` 规则只对 `PlaintextHosts` 中的主机执行注入，携带占位符的其他主机请求返回 403；`tls_passthrough` 规则（含本子模块追加的控制面主机）要求 ClientHello 的 SNI 存在且等于规则主机，规则显式列出端口，不终止 TLS；默认拒绝未列入的主机。SNI 缺失或不匹配时在 ClientHello 阶段关闭连接，请求层不一致时 `https`、`http` 规则返回 403；拒绝以 `atenet.router.route.duration{outcome=denied}` 观测，不存在 `egress_destination_mismatch` 计数。出口网关接纳 `RESUMING` 与 `RUNNING` 状态的 actor，启动期出站在容器启动前即启用。出口网关按策略缓存 TTL（默认 10 s）缓存已编译策略，撤销后的新请求最多再滞后一个 TTL，`tls_passthrough` 长连接持续到连接结束。actor 经 `systemInfo` 卷的 `trustBundle` 数据源（`egress-mitm.ate.dev` 与 `system-roots.ate.dev`）在运行时取得出口网关 CA 与公共根证书，CA 不预置进镜像；CA 轮换使新旧 CA 同时受信的重叠期不短于快照保留期上限。出口网关按本子模块追加的注入规则，把看守进程发往引导接口的 `Authorization` 占位符替换为 `Bearer <actor JWT>`。出口网关按 `ate-secret://` URI 的 host 路由到已配置的凭据提供者，可以配置多个提供者，URI 指向未配置的提供者时失败关闭；真实凭据不进入 actor。`CredentialHeader` 只有 `header`、`prefix`、`credential_uri` 与 `actor_jwt`，项目、系统、认证方式与作用域编码在 `credential_uri` 的路径段中，扩展提供者请求字段在固定 v1.0.0 的前提下不可行。
 - 对象存储：承载快照与 `durableDir` 上传数据；GCS 与 S3 都由 in-tree `objectstore-plugin` sidecar 访问，`ATE_STORAGE_BACKEND` 选择后端；atelet 与 ate-api-server 主进程不直接持有存储凭据；GCS 上 node sidecar 以 actor JWT 经 control sidecar 换取只覆盖该 actor 前缀的凭据，S3 上 node sidecar 使用插件 Pod 自身凭据，凭据交换返回 UNIMPLEMENTED。
 - PostgreSQL：Substrate 控制面的存储。
 - 外部 CSI 驱动：为每 actor 供给一卷外部 CSI 卷；写穿持久、崩溃不丢、沙箱外可经同一导出访问，内容不进快照。该能力仍为预览特性，需开启 ExternalVolumes、注册 CSIDriverConfig，并确认 NFS 导出可从沙箱外访问；hostpath 驱动只用于 kind。所有卷以 `nodev` 挂载，`mount_path` 不得为 `/dev` 或位于 `/dev/pts`、`/proc`、`/sys` 之下。
-- 部署前提：k8s 具备 PodCertificateRequest 与 ClusterTrustBundle API；节点运行 gVisor，microVM 模式需要 KVM；节点内核 6.7 及以上；PostgreSQL 与对象存储可用；快照位于 `<location>/atespaces/<atespace>/actors/<actor uid>/snapshots/<snapshot name>` 与 `<location>/atespaces/<atespace>/tags/<tag uid>`，`--snapshot-location` 的每个路径段必须匹配 `^[A-Za-z0-9_-]+$`、不得为空、不得等于 `atespaces`（任意大小写），模板级 `snapshotConfig.storageLocation` 受 `PerTemplateSnapshotLocation` 预览门约束；路由器与出口网关可达，SPIFFE 信任域已配置，控制面身份在路由器白名单内；actor 模板以 `systemInfo` 卷的 `trustBundle` 数据源在运行时投射出口网关 CA 与公共根证书，CA 不预置进镜像，凭据提供者可达；出口网关不记录、不缓存引导接口主机的请求与响应正文；引导接口的部署配置写入 Substrate 签发方 URL 与 atespace，引导接口以只承载领取端点的独立主机名部署，可经出口网关到达，并可访问该签发方的 OIDC 发现端点；签发方证书按主机名信任，集群内 `.svc` 主机只信任部署配置的 CA。actor 模板以 uid 0 运行看守进程，容器按镜像的 `USER` 与 `WORKDIR` 运行，`capabilities.add` 白名单穷举为 `AUDIT_WRITE`、`CHOWN`、`DAC_OVERRIDE`、`FOWNER`、`FSETID`、`KILL`、`NET_BIND_SERVICE`、`SETFCAP`、`SETGID`、`SETPCAP`、`SETUID` 与 `SYS_CHROOT`，看守进程至少需要 `SETUID`、`SETGID` 与 `DAC_OVERRIDE`，`SYS_PTRACE` 不可用；模板固定 `preferredFidelity: MEMORY`，每个容器声明 `wakeupProbe`；atespace 名不复用；`sandboxprovider` 在 atespace 上持有 editor 角色（`can_create_actor`、`can_use_template`、`can_resume`、`can_delete` 与 EgressPolicy 的 create/update/delete），创建模板的身份另需 `can_create_actor_template`，只读查询需 viewer，角色由 Substrate 的 access policy 配置。部署使用 Substrate v1.0.0 发布的官方镜像与预编译 `kubectl-ate`（[REF-substrate](../../../references.md)），安装器从 v1.0.0 的 checkout 运行；1.0.0 起 patch 与 minor 版本兼容，minor 不能跳过，组件按 `podcertificate-controller`、`atelet`、worker、`ate-api-server`、`ate-controller`、`atenet`、客户端的顺序升级，只能回滚一个版本，预览门控字段不在兼容承诺内。节点上的 `/var/lib/ate/image-cache` 必须为 v1.0.0 的 layout version 3，旧版本缓存须在无 actor 运行时删除。actor 的 `/tmp` 是 tmpfs（上限为 actor 内存的一半，占用计入内存限额，遮盖镜像自带 `/tmp`），`/dev/shm` 是 64 MiB tmpfs；需要保留的内容挂载 `durableDir`。所有卷以 `nodev` 挂载。网络前提穷举如下：actor 网络为 IPv4-only，内部 `169.254.17.0/30` 承载网关、DNS 中继、入站与探针；actor 内 uid 非 0 的出站只到回环；对离开内部网络的目的地，actor 的非 TCP 出站除 DNS 查询外不可用，UDP 被静默丢弃，其他非 TCP/UDP 以 ICMP unreachable 拒绝；DNS 中继对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机，其余返回 NXDOMAIN，不递归解析；出口网关对 `https` 规则在连接层要求 SNI 匹配、请求层要求 `Host` 等于 `:authority`，对 `tls_passthrough` 规则要求 SNI 等于规则主机；ECH 的处理须在目标集群实测；出口网关 CA 轮换保留不短于快照保留期上限的新旧 CA 同时受信重叠期。这些网络前提列入[实施路线与技术验证](../../../roadmap.md)，验证通过前 Substrate 路径不上线。
+- 部署前提：k8s 具备 PodCertificateRequest 与 ClusterTrustBundle API；节点运行 gVisor，microVM 模式需要 KVM；节点内核 6.7 及以上；PostgreSQL 与对象存储可用；快照位于 `<location>/atespaces/<atespace>/actors/<actor uid>/snapshots/<snapshot name>` 与 `<location>/atespaces/<atespace>/tags/<tag uid>`，`--snapshot-location` 的每个路径段必须匹配 `^[A-Za-z0-9_-]+$`、不得为空、不得等于 `atespaces`（任意大小写），模板级 `snapshotConfig.storageLocation` 受 `PerTemplateSnapshotLocation` 预览门约束；路由器与出口网关可达，SPIFFE 信任域已配置，控制面身份在路由器白名单内；actor 模板以 `systemInfo` 卷的 `trustBundle` 数据源在运行时投射出口网关 CA 与公共根证书，CA 不预置进镜像，凭据提供者可达；出口网关不记录、不缓存引导接口主机的请求与响应正文；引导接口的部署配置写入 Substrate 签发方 URL 与 atespace，引导接口以只承载领取端点的独立主机名部署，可经出口网关到达，并可访问该签发方的 OIDC 发现端点；签发方证书按主机名信任，集群内 `.svc` 主机只信任部署配置的 CA。actor 模板以 uid 0 运行看守进程，容器按镜像的 `USER` 与 `WORKDIR` 运行，`capabilities.add` 白名单穷举为 `AUDIT_WRITE`、`CHOWN`、`DAC_OVERRIDE`、`FOWNER`、`FSETID`、`KILL`、`NET_BIND_SERVICE`、`SETFCAP`、`SETGID`、`SETPCAP`、`SETUID` 与 `SYS_CHROOT`，看守进程至少需要 `SETUID`、`SETGID` 与 `DAC_OVERRIDE`，`SYS_PTRACE` 不可用；模板固定 `preferredFidelity: MEMORY`，每个容器声明 `wakeupProbe`；atespace 名不复用；`sandboxprovider` 在 atespace 上持有 editor 角色（`can_create_actor`、`can_use_template`、`can_resume`、`can_delete` 与 EgressPolicy 的 create/update/delete），创建模板的身份另需 `can_create_actor_template`，只读查询需 viewer，角色由 Substrate 的 access policy 配置。部署使用 Substrate v1.0.0 发布的官方镜像与预编译 `kubectl-ate`（[REF-substrate](../../../references.md)），安装器从 v1.0.0 的 checkout 运行；1.0.0 起 patch 与 minor 版本兼容，minor 不能跳过，组件按 `podcertificate-controller`、`atelet`、worker、`ate-api-server`、`ate-controller`、`atenet`、客户端的顺序升级，只能回滚一个版本，预览门控字段不在兼容承诺内。节点上的 `/var/lib/ate/image-cache` 必须为 v1.0.0 的 layout version 3，旧版本缓存须在无 actor 运行时删除。actor 的 `/tmp` 是 tmpfs（上限为 actor 内存的一半，占用计入内存限额，遮盖镜像自带 `/tmp`），`/dev/shm` 是 64 MiB tmpfs；需要保留的内容挂载 `durableDir`。所有卷以 `nodev` 挂载。网络前提穷举如下：actor 网络为 IPv4-only，内部 `169.254.17.0/30` 承载网关、DNS 中继、入站与探针；actor 内 uid 非 0 的出站只到回环；对离开内部网络的目的地，actor 的非 TCP 出站除 DNS 查询外不可用，UDP 被静默丢弃，其他非 TCP/UDP 以 ICMP unreachable 拒绝；DNS 中继对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机，其余返回 NXDOMAIN，不递归解析；出口网关对 `https` 规则在连接层要求 SNI 匹配、请求层要求 `Host` 等于 `:authority`，对 `tls_passthrough` 规则要求 SNI 等于规则主机；ECH 的处理须在目标集群实测；出口网关 CA 轮换使新旧 CA 同时受信的重叠期不短于快照保留期上限。这些网络前提列入[实施路线与技术验证](../../../roadmap.md)，验证通过前 Substrate 路径不上线。
 
 **验证前提与已知限制。** 以下条件未满足时，Substrate 提供者不能进入阶段 1：
 
@@ -128,13 +128,13 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - 网络前提未验证：actor 网络为 IPv4-only，内部 `169.254.17.0/30` 承载网关、DNS 中继、入站与探针；UDP 被静默丢弃而不是拒绝，其他非 TCP/UDP 以 ICMP unreachable 拒绝；DNS 中继不递归；出口网关对 `https` 在连接层要求 SNI 匹配、请求层要求 `Host` 等于 `:authority`，对 `tls_passthrough` 要求 SNI 等于规则主机；带 ECH 的 ClientHello 没有 v1.0.0 实现依据，须实测；CA 轮换重叠期也须实测。任一不成立时 Substrate 路径不上线。
 - `trustBundle` 的运行时投射与 CA 轮换须端到端验证：确认 actor 在快照恢复后读到的信任库、新旧 CA 的重叠期与 `T_ca_overlap` 的取值一致，预置 CA 的镜像在轮换后不再受信。
 - `parked-request-budget` 默认 5 s，只约束发起新的恢复重试，不取消在途恢复；客户端被持有的上限是预算加 5 s，停泊池满时返回 503。部署按恢复 p95 加 `/readyz` 余量设置，并同时设置 `drain-timeout` 与 `terminationGracePeriodSeconds`。
-- MEMORY 快照恢复后的 guest 时钟行为按运行时不同：microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 的行为没有文档依据；看守进程在恢复后按 `Resumed.wall_clock_now` 校时是防御性措施，不能把「快照恢复重置时钟」写成所有沙箱的必然事实。旧 TCP 连接也不能依赖读超时，看守进程必须在恢复后主动断开 Agent 的旧连接。
+- MEMORY 快照恢复后的 guest 时钟行为按运行时不同：microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 的行为没有文档依据；看守进程在恢复后按 `Resumed.wall_clock_now` 校时是防御性措施，不能把“快照恢复重置时钟”写成所有沙箱的必然事实。旧 TCP 连接也不能依赖读超时，看守进程必须在恢复后主动断开 Agent 的旧连接。
 - 对象存储由 in-tree `objectstore-plugin` sidecar 访问；GCS 上需要 control 侧交换服务能签发只覆盖 actor 前缀的凭据，S3 上 node sidecar 使用插件 Pod 自身凭据、没有按 actor 的存储凭据隔离；S3 路径仍需试点确认。
 - 路由器 `/wake`、EgressPolicy、凭据提供者、actor JWT 注入、同步快照、`CRASHED` 后的 `RevertActor` 恢复、worker 退役时的 30 分钟同步挂起窗口与 `image-cache` 升级路径需要在目标集群完成端到端试点；仅凭文档与源码不能判定 go。
 
 ## UML 图
 
-下列图固定 actor 的生命周期、预配与引导领取的调用顺序、Suspend 与 Resume 及路由器唤醒的调用顺序，以及 EgressPolicy 从生成到落地与撤销的路径；图中不表达的墓碑、幂等、停泊预算与代的范围由每张图后的正文与核心算法与流程给出。
+下列图固定 actor 的生命周期、预配与引导领取的调用顺序、Suspend 与 Resume 及路由器唤醒的调用顺序，以及 EgressPolicy 从生成到落地与撤销的路径；图中不表达的墓碑、幂等、停泊预算与代的范围由每张图后的正文以及核心算法与流程给出。
 
 ### actor 生命周期图
 
@@ -301,7 +301,7 @@ flowchart LR
 
 走查结束时 `generation` 由 `runcontroller` 决定，提供者不递增代；快照恢复在同一代内进行，`snapshot_id` 与 `suspend_id` 保留到撤销或释放。整代销毁与释放都保留运行实例级记录，创建墓碑与释放墓碑使迟到预配不产生第二次副作用；运行实例令牌在任何一步都不进入提供者侧状态。
 
-`durableDir` 退化配置下的回合边界销毁使用同步挂起，走查的差异只在挂起步骤：看守进程发出 `ReadyToSuspend` 后，提供者执行同步挂起并等待对象存储上传完成；上传完成才返回，销毁路径随后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功后才由 `runcontroller` 进入 `Suspended`。上传失败或确认失败时提供者返回暂时性错误，运行实例不进入 `Suspended`，销毁路径以同一 `suspend_id` 重试；`workspace.Confirm` 以 `(run_id, generation, lease_id)` 幂等。回合中 actor 崩溃时，上次上传之后的写入丢失，`runcontroller` 以「回合被中断」重投事件并接受该回合文件改动丢失。
+`durableDir` 退化配置下的回合边界销毁使用同步挂起，走查的差异只在挂起步骤：看守进程发出 `ReadyToSuspend` 后，提供者执行同步挂起并等待对象存储上传完成；上传完成才返回，销毁路径随后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功后才由 `runcontroller` 进入 `Suspended`。上传失败或确认失败时提供者返回暂时性错误，运行实例不进入 `Suspended`，销毁路径以同一 `suspend_id` 重试；`workspace.Confirm` 以 `(run_id, generation, lease_id)` 幂等。回合中 actor 崩溃时，上次上传之后的写入丢失，`runcontroller` 以“回合被中断”重投事件并接受该回合文件改动丢失。
 
 ### actor 创建与激活
 
@@ -326,7 +326,7 @@ flowchart LR
 ### Suspend 与快照
 
 1. `runcontroller` 选定快照后调用 `Snapshot`，请求携带 `run_id`、`generation`、`sandbox_id` 与 `suspend_id`；只有具备 `Snapshot` 能力的提供者会收到该调用。
-2. Substrate 控制面以 `DURABILITY_MODE_SYNCHRONOUS` 执行 MEMORY 快照，等对象存储中的快照完成后释放 actor 的计算资源；提供者持久化 `SnapshotTrace`，返回 `SnapshotReceipt`，其中 `SnapshotExpiresAt` 是快照保留期限。默认的异步模式返回时快照只在节点本地，节点丢失会连同快照一起丢失，本子模块不使用。
+2. Substrate 控制面以 `DURABILITY_MODE_SYNCHRONOUS` 执行 MEMORY 快照，等对象存储中的快照完成后释放 actor 的计算资源；提供者持久化 `SnapshotTrace`，返回 `SnapshotReceipt`，其中 `SnapshotExpiresAt` 是快照保留期限。默认的异步模式返回时快照只在节点本地，节点丢失时快照也一起丢失，本子模块不使用。
 3. `runcontroller` 在保留期临近前作废该代，避免恢复落在已过期快照上。快照保留期与工作区租约的覆盖范围一致：工作区以 `HoldLease` 延长到快照保留期加安全余量，快照恢复的 actor 以首次续约重新绑定租约持有者。
 4. 撤销尚未确认的快照尝试按 `suspend_id` 执行，提供者写入快照撤销墓碑；撤销确认之后到达的同一 `suspend_id` 的快照请求不生效。快照恢复不递增代，同一代内仍由同一 actor 承载，Substrate 可能把它分配到另一 worker；没有运行时兼容的 worker 有余量时降级为 `ROOTFS` 冷启动；快照不替代工作区持久化，外部 CSI 卷的内容不进快照。
 5. `durableDir` 退化配置下，快照仍按 `Snapshot` 执行；回合边界的销毁改用同步挂起：提供者等待对象存储上传完成才返回，销毁路径再以同一 `suspend_id` 调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`；确认成功后才进入 `Suspended`。上传或确认失败返回暂时性错误，运行实例停在 `Suspending`，不进入 `Suspended`。同步挂起的上传由同一 `suspend_id` 幂等，重复调用不重复上传；`workspace.Confirm` 以 `(run_id, generation, lease_id)` 幂等。
@@ -358,7 +358,7 @@ flowchart LR
 1. actor 只接受 `durableDir`、`external`、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷。`external` 即外部 CSI 卷，每 actor 一卷，由 CSI 驱动动态供给；`durableDir` 在挂起时上传对象存储。所有卷以 `nodev` 挂载，`mount_path` 不得为 `/dev` 或位于 `/dev/pts`、`/proc`、`/sys` 之下；actor 的 `/tmp` 与 `/dev/shm` 是 tmpfs，`/tmp` 上限为 actor 内存的一半并遮盖镜像自带内容，`/dev/shm` 只有 64 MiB。
 2. 外部 CSI 卷写穿持久、崩溃不丢，沙箱外可经同一导出访问；卷内容不进快照，快照恢复不改变卷上的文件，`Revert` 不回滚卷内容。工作区租约仍以控制面记录串行化写者，外部 CSI 卷的单写者由租约与 actor 生命周期共同保证。
 3. 外部 CSI 不可用时，绑定时选择 `durable_dir`，`durability` 变为 `on_suspend`；存储模式在绑定时固定，运行中不静默切换。`durableDir` 的数据只在挂起时上传对象存储，actor 崩溃丢失上次快照之后的全部写入，沙箱外没有读取接口；卷根以 0777 创建（gVisor 下没有 sticky 位），恢复时重放快照记录的模式。
-4. `durableDir` 退化配置的补偿：回合边界的销毁一律使用同步挂起，上传完成才返回；回合中崩溃按「回合被中断」重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失；界面读取工作区必须经路由器唤醒 actor 后到达文件 API。
+4. `durableDir` 退化配置的补偿：回合边界的销毁一律使用同步挂起，上传完成才返回；回合中崩溃按“回合被中断”重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失；界面读取工作区必须经路由器唤醒 actor 后到达文件 API。
 5. 外部 CSI 卷在恢复后仍以同一导出挂载，提供者只把卷标识交给 `workspace` 与 actor 模板；卷的供给、挂接与回收由 CSI 驱动完成。
 
 ### worker 容量与分配
@@ -390,12 +390,12 @@ flowchart LR
 | 出口网关取不到 actor JWT | Substrate 控制面不可达或超时时出口网关返回 503，看守进程按退避重试；actor 已不存在时返回 403，失败关闭 |
 | 外部 CSI 不可用 | 绑定时选择 `durable_dir`；已绑定 `external_csi` 的运行实例在运行中遇到 CSI 不可用时，提供者错误向上返回，预配或恢复按自身规则失败，不静默退化 |
 | `durableDir` 上传或确认失败 | 同步挂起返回暂时性错误，或 `workspace.Confirm(suspend_upload)` 核对失败；运行实例不进入 `Suspended`，销毁路径以同一 `suspend_id` 重试，上传完成且确认成功才返回 |
-| `durableDir` 下回合中 actor 崩溃 | 上次上传之后的写入丢失；`runcontroller` 写入「回合被中断」事件并从回退后的消费位置重投，已接受的事件带 `redelivery=true` |
+| `durableDir` 下回合中 actor 崩溃 | 上次上传之后的写入丢失；`runcontroller` 写入“回合被中断”事件并从回退后的消费位置重投，已接受的事件带 `redelivery=true` |
 | worker 容量耗尽 | `ResumeActor` 返回 `RESOURCE_EXHAUSTED`；`Provision` 与 `RestoreSnapshot` 返回暂时性错误，调用方按同一幂等键退避重试；快照恢复路径上路由器在停泊预算内发起重试，预算耗尽后新的尝试返回 503，在途恢复晚到的成功仍会转发；不存在绕开 worker 的冷启动路径 |
-| actor 在回合中丢失 | 提供者报告沙箱丢失；`runcontroller` 写「回合被中断」事件，经恢复准入以新代重建 |
+| actor 在回合中丢失 | 提供者报告沙箱丢失；`runcontroller` 写“回合被中断”事件，经恢复准入以新代重建 |
 | 整代销毁或释放之后到达的创建 | 创建墓碑或释放墓碑拒绝；不创建 actor 或运行实例级资源 |
 
-提供者不把能力缺失暴露为运行时错误：`Freeze` 与 `Thaw` 不在能力集内，调用以参数非法拒绝；`suspendpolicy` 不为此提供者选择冻结。删除确认、快照撤销与释放的重复调用都返回首次结果，调用方据此区分「已完成」与「未执行」。
+提供者不把能力缺失暴露为运行时错误：`Freeze` 与 `Thaw` 不在能力集内，调用以参数非法拒绝；`suspendpolicy` 不为此提供者选择冻结。删除确认、快照撤销与释放的重复调用都返回首次结果，调用方据此区分“已完成”与“未执行”。
 
 ## 并发与事务边界
 

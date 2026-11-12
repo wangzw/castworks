@@ -2,43 +2,43 @@
 
 路线图位于设计规范管辖的目录之外，不受设计文档章节结构的约束。设计结论以 [架构](design/architecture.md) 与 [ADR](adr/README.md) 为准；路线图只记录实施前必须实测的外部行为、每项结果决定的参数或路径，以及阶段之间的技术门槛。验证结果改变参数或机制选择时，修改对应设计文档与 ADR，路线图不复制状态机、协议与参数定义。
 
-技术验证清单中的「通过」表示可观察条件成立，「不通过」表示按对应回退路径处理。分阶段实施路线以技术门槛划分，不以时间划分；每个阶段的门槛由可观察结果表达，不以完成度或工作量表达。
+技术验证清单中的“通过”表示可观察条件成立，“不通过”表示按对应回退路径处理。分阶段实施路线以技术门槛划分，不以时间划分；每个阶段的门槛由可观察结果表达，不以完成度或工作量表达。
 
 ## 技术验证清单
 
-下表逐项列出实施前需要实测的事项。「影响」列给出该项结果所决定的参数或实现路径，「判定标准」列给出可通过观察区分通过与不通过的条件。
+下表逐项列出实施前需要实测的事项。“影响”列给出该项结果所决定的参数或实现路径，“判定标准”列给出可通过观察区分通过与不通过的条件。
 
 | 事项 | 影响 | 判定标准 |
 | --- | --- | --- |
-| Claude Code 被 `SIGSTOP` 30～600 s 后流式看门狗是否按墙钟计时；自定义 `ANTHROPIC_BASE_URL` 下字节级看门狗的取值（[REF-claude-code-network-config](references.md)） | `F_stream` 与 `F_cap(llm)`，决定直通模式与缓存模式下的冻结上限 | 通过——看门狗按墙钟推进，恢复后客户端行为与未冻结时一致；字节级取值可重复测量且不低于 `F_stream` 所需的安全余量。不通过——看门狗在冻结期间停止推进，或在恢复瞬间误判中止；此时按实测值下调 `F_stream`，直通模式在预测等待超过该值时不做冻结。 |
-| `--permission-prompt-tool` 的入参与返回格式；`claude -p --resume <session_id>` 不带 prompt 时的 `defer` 续接行为（[REF-claude-code-hooks](references.md)） | 审批路径：`PreToolUse` 的 `defer`、定向投递与回合边界续接 | 通过——不带 prompt 的续接重新触发 `PreToolUse`，hook 能返回 `allow` 或 `deny` 并改变该次调用结果；入参与返回格式与文档一致。不通过——续接不重新触发 hook，或决定无法生效；此时审批改为 hook 阻塞加冻结，冻结上限取 `F_cap(approval)`。 |
-| `--resume` 面对末尾悬空 `tool_use` 的行为；`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 的实际效果；`session_id` 在续接后是否变化（[REF-claude-code-headless](references.md)） | 降级路径：回合被中断后的重投与恢复句柄 | 通过——悬空 `tool_use` 的续接行为可区分，表现为拒绝或自动续接；被中断回合在该变量开启后自动续接；`session_id` 保持不变，若变化则能从通道观察并以新值更新恢复句柄。不通过——续接静默丢失回合或无法建立会话；此时被中断回合改走新会话加合成摘要的兜底路径。 |
-| 关闭 stdin 后进程退出与会话记录刷盘的先后；`CLAUDE_CONFIG_DIR` 与 cwd 变化对续接的影响（无头模式文档） | 安全点中的工作区持久化确认 | 通过——进程退出时可观察到本回合记录已写入会话记录文件，或存在可等待的刷盘完成判据；cwd 逐字一致且 `CLAUDE_CONFIG_DIR` 位于工作区内时续接成功。不通过——退出后会话记录文件仍缺本回合记录且无判据；此时销毁前改为同步快照上传确认，或改由新会话加合成摘要承接会话状态。 |
-| MCP 工具调用超时的默认值与可配置项；`SIGCONT` 后超时与已就绪响应的处理顺序；`wait_for` 阻塞调用在冻结 30、120、600 s 后的行为（[REF-mcp](references.md)） | `F_cap(approval/wait_for)` 与 `MCP_TOOL_TIMEOUT` | 通过——默认值与可配置项可确定；`SIGCONT` 后客户端先收到已就绪响应；冻结期间 `wait_for` 返回已转为订阅而非超时。不通过——冻结跨越超时导致调用被判失败；此时把 `F_cap` 下调到实测超时减 60 s，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果。 |
-| 托管策略设置文件在 `-p` 无头模式下对 hooks 与权限设置的生效；`allowManagedHooksOnly` 对工作区内设置与 `CLAUDE_CONFIG_DIR` 用户设置的屏蔽（[REF-claude-code-settings](references.md)） | hooks 注入位置与安全边界 | 通过——托管设置中的 hooks 与权限设置在 `-p` 下生效，工作区 `.claude/settings.json` 与 `CLAUDE_CONFIG_DIR` 用户设置中的 hooks 被屏蔽且不可覆盖。不通过——托管设置不生效，或可被工作区覆盖；此时审批 hook 不得放在工作区内，需重新确定注入位置并复核安全边界。 |
-| `-p` 下 `PostToolUse` 与 `PostToolBatch` hook 返回的 `additionalContext` 是否进入下一次模型请求，以及在请求中的位置（[REF-claude-code-hooks](references.md)） | 情境提示的载体；[ADR-wait-intent-as-soft-input](adr/adr-wait-intent-as-soft-input.md) 的失效条件 | 通过——本地代理观察到的下一次模型请求中含该 `additionalContext`，位于对应工具结果旁，且 hook 不引发额外的模型请求。不通过——该内容不进入模型请求，或只在回合结束之后出现；此时 `intent.hints` 保持关闭，等待意图停在只观测与自报，等待方式的选择规则仍由平台 MCP 服务器的 `instructions` 与工具描述承载。 |
-| 平台 MCP 服务器初始化时提供的 `instructions` 在 `-p` 下是否进入系统提示（[REF-mcp](references.md)） | 等待方式选择规则的常驻载体 | 通过——本地代理观察到的模型请求的系统提示中含该 `instructions` 原文。不通过——不含；此时同一规则由托管 `SessionStart` hook 的 `additionalContext` 注入，工具描述照常承载等待方式的选择规则。 |
-| `SubagentStart` hook 返回的 `additionalContext` 对子代理是否可见（[REF-claude-code-hooks](references.md)） | 子代理的等待方式契约 | 通过——本地代理观察到的子代理首个模型请求中含该 `additionalContext`。不通过——不含；此时不注册 `SubagentStart` hook，子代理只经平台 MCP 工具描述获得契约，子代理内的等待由机械层兜住。 |
-| `-p` 下 `Stop` hook 输入的 `last_assistant_message` 是否可用（[REF-claude-code-hooks](references.md)） | 回合意图的规则分类，以及回合完成时的宽限期 `G_turn_grace_done` 与「回合完成」先验 | 通过——每个回合结束时，`Stop` hook 输入含该回合最后一条助手消息的完整文本。不通过——字段缺失或为空；此时驱动器从 stream-json 输出中该回合最后一条 assistant 消息取文本，仍取不到时回合意图恒为 `unknown`，宽限期与先验保持默认。 |
-| 托管 hook 二进制同步返回的时延：从 Claude Code 启动 hook 到收到输出，含经本地 IPC 向驱动器查询、IPC 端点以 `SO_PEERCRED` 取得对端 pid 后对其可执行文件与父进程的校验，以及依据 stream-json 输出的一次性核对；Claude Code 执行 command hook 的方式：是否经 shell 执行，经 shell 时以 `exec <托管 hook 二进制路径>` 注册、直接执行时以二进制路径注册，能否使 hook 二进制的父进程为 Agent 主进程；hook 执行与对应事件写出 stdout 的先后：hook 启动时对应的 `tool_use`、批次结束、响应结束或子代理开始是否已经写出，或在 `T_hook_sync`（200 ms）之内写出；子代理的 `tool_use` 与响应是否出现在主会话的 stream-json 中（[REF-claude-code-hooks](references.md)） | 情境提示能否同步返回而不拉长工具结果的交付；托管 hook IPC 端点对端校验中的父进程条件；一次性核对能否接受全部真实查询，审批是否会因核对误拒而以「平台审批暂不可用」拒绝 | 通过——目标镜像中 p95 不超过 10 ms，并行工具批次下同样成立，情境提示所用 hook 失败时工具结果不变；按 hook 的执行方式选定的注册方式下，hook 二进制在 `/proc/<pid>/stat` 中的父进程号等于 Agent 主进程的 pid；全部托管 hook 事件的真实查询在 `T_hook_sync` 之内都能观察到对应事件，子代理事件出现在主会话的 stream-json 中，核对误拒为零。不通过——p95 超过 10 ms；此时驱动器在 `tool_started` 时预先算好该调用的提示并缓存，hook 只读缓存；仍超过时 `intent.hints` 保持关闭。hook 二进制的父进程不是 Agent 主进程时，父进程校验放宽为允许父进程是 Agent 主进程的直接子进程，一次性核对作为主要认证依据。对应事件在 `T_hook_sync` 之内仍未写出时，按实测的最大时差放大 `T_hook_sync`；子代理事件不出现在主会话 stream-json 中时，子代理上下文中的查询（`SubagentStart`、`SubagentStop` 与子代理内的工具调用）改以已观察到的子代理开始与结束窗口为依据，不按单个调用核对。 |
-| CLI 以 stream-json 输出时 `background_tasks_changed` 与 `task_started`、`task_updated`、`task_notification` 消息的输出；workflow 内各 agent 是否作为独立任务出现；`ambient` 的取值（[REF-claude-agent-sdk-typescript](references.md)） | 后台作业登记，即 `bg_jobs_changed` 的来源 | 通过——CLI 的 stream-json 输出包含这些消息，`background_tasks_changed` 推送完整的存活任务集合；workflow 内的 agent 各自作为任务出现，或其存活期被 workflow 任务覆盖；`ambient` 的取值与任务种类的对应关系可重复观察。不通过——CLI 不输出这些消息，或 workflow 内 agent 的存活不反映在任务集合中；此时以 Stop 与 SubagentStop hook 输入的 `background_tasks` 在每个回合结束时对账，仍无法覆盖时不设置 `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0`，改由其默认行为判定后台子代理与 workflow 的存活（二者存活时回合结束后仍报 running）；`ambient` 的取值无法判定时 `ambient` 任务一律计入后台作业。 |
-| `--resume` 对 `CronCreate` 与 `ScheduleWakeup` 作业的恢复；错过触发时刻后是否补跑；Stop hook 输入的 `session_crons` 是否包含 `ScheduleWakeup` 安排的唤醒（[REF-claude-agent-sdk-typescript](references.md)） | 自唤醒条目的 `survives_resume` 与 `L_self_wake` | 通过——`--resume` 后未过期的 `CronCreate` 作业按原计划触发；错过触发时刻时补跑一次或跳过，行为可重复观察；`session_crons` 是否包含 `ScheduleWakeup` 可确定。不通过——`--resume` 不恢复 `CronCreate` 作业，或恢复行为不可重复；此时 `cron` 条目的 `survives_resume` 取假，存在自唤醒条目时不以挂起为目的销毁，`L_self_wake` 只取冻结与快照两档；`session_crons` 不包含 `ScheduleWakeup` 时，`wakeup` 条目只按工具调用维护，不参与 `session_crons` 对账。 |
-| `--resume` 之后此前的后台任务（后台 shell、后台子代理、workflow）与 `Monitor` 的去留，以及续接后收到的 `task_notification`（[REF-claude-agent-sdk-typescript](references.md)） | I9 中「无后台作业」与「自唤醒条目都随续接恢复」的判定，以及「回合被中断」通知的内容 | 通过——续接后此前的后台任务与 `Monitor` 都已终止，续接后的后台任务集合从空集起算；此前任务的结局以可识别的方式呈现（带终止状态的 `task_notification`，或会话记录中的中断标记），且不重复通知已在进程退出前结束的任务。不通过——续接后旧任务仍出现在任务集合中而没有对应的执行体，或旧任务的结局不可识别；此时驱动器把续接前已存在的任务标识排除出后台作业，并在「回合被中断」通知中列出中断时存活的后台任务。 |
-| 非交互模式（`-p`）下长 MCP 调用自动转后台的消息序列：占位 `tool_result` 的内容、`task_notification.tool_use_id` 与真实结果的到达方式；超时的 shell 命令自动转后台的同类序列（[REF-claude-agent-sdk-typescript](references.md)、[REF-claude-code-env-vars](references.md)） | 平台 MCP 阻塞型 `wait_for` 与 `sleep_until` 被转后台时的转换；第三方 MCP 调用转后台后的后台作业登记 | 通过——非交互模式下会自动转后台，占位 `tool_result` 可识别，`task_notification` 携带原调用的 `tool_use_id`，并在真实结果到达时发出。不通过——非交互模式下不自动转后台，或占位与通知无法关联到原调用；不自动转后台时平台 MCP 阻塞调用沿用临近冻结上限时的转换语义，不需另行处理；无法关联时驱动器把未关联的 MCP 后台任务按 `task_id` 计入后台作业，平台 MCP 服务器在调用时长达到自动转后台阈值之前主动返回转换结果。 |
-| 非特权 Pod 的 `/sys/fs/cgroup` 挂载属性与 PSI 文件可读性；节点冻结代理对 50 个进程的进程树的冻结与解冻时延；`SIGSTOP` 降级路径的收敛轮数（[REF-linux-cgroup-v2](references.md)、[REF-linux-psi](references.md)） | `Freeze{cgroup}` 的实现与 L0 活动度采集 | 通过——PSI 文件可读；该进程树可被冻结与解冻，解冻后满足决策完成到可接收 p95 < 100 ms 与事件到达至可接收 p95 < 200 ms；`SIGSTOP` 降级在有限轮内收敛且不残留 T 态进程。不通过——cgroup 不可写或时延超出目标；此时 k8s 提供者只保留 `Freeze{signal}` 短冻结，或把冻结路径移出该环境。 |
-| 非特权沙箱中 `/proc/<pid>/wchan`、`/proc/<pid>/stat`、`/proc/net/tcp` 与 `/proc/net/tcp6` 的可读性；`wchan` 的符号名是否可见 | 静止证据中定时睡眠的识别（`timed_sleepers`）；入站数据唤醒中冻结确认时的接收队列检查，含两端都在 Agent 进程树内的回环连接的排除 | 通过——看守进程能读取 Agent 进程的 `wchan` 并得到 `nanosleep`、`hrtimer` 一类符号名，能读取 `starttime`，能读取 `rx_queue` 并按套接字 inode 关联到 Agent 进程，能按回环连接的对端地址找到对端套接字并按其 inode 判定持有者是否属于 Agent 进程树。不通过——任一文件不可读，或 `wchan` 只返回 0；此时定时睡眠一律视为忙，冻结确认时不做接收队列检查，改为解冻后短暂观察。 |
-| PSI 的 `cpu.pressure` 与 `io.pressure` 中 `some` 行 `total` 累计值的更新粒度，及其与活动度采样间隔、`Q_quiet` 的匹配（[REF-linux-psi](references.md)）；Claude Code 空闲（回合边界、无后台作业）时 `agent` 子 cgroup 的 `cpu.stat` 中 `usage_usec` 的增长基线，及其与 `U_quiet` 的匹配（[REF-linux-cgroup-v2](references.md)） | 静止证据中的 PSI 静默判定与 CPU 用量判据，`Q_quiet` 与 `U_quiet` 的取值 | 通过——Agent 进程树静止期间相邻样本差为零；Agent 进程树出现 CPU 或 I/O 停滞时，差值在一个采样间隔内变为非零；`total` 的更新粒度不粗于采样间隔；Claude Code 空闲期间任一静止窗内 `usage_usec` 的增量不超过 `U_quiet` 乘以窗口时长。不通过——静止期间出现非零差值，或停滞发生后差值滞后多个采样间隔才出现；此时把采样间隔上调到实测更新粒度以上，按实测滞后上调 `Q_quiet`；静止期间的非零差值来自可识别的固定噪声时，PSI 静默判定改为样本差不超过实测噪声上限。Claude Code 空闲期间静止窗内 `usage_usec` 的增量超过 `U_quiet` 乘以窗口时长时，按实测基线上调 `U_quiet`，或静止证据改以连续多个窗口判定 CPU 用量。 |
-| 原地缩小 CPU request 的生效时延；节点 CPU 分配 80% 时放大进入 `Deferred` 的比例与持续时间；agent-sandbox 控制器是否回滚 Pod 的 `resources`（[REF-k8s-in-place-pod-resize](references.md)） | `InPlaceResize` 能力，以及冻结是否真正释放调度额度 | 通过——缩小立即生效且不触发重建；节点 CPU 分配 80% 时 `Deferred` 的比例与持续时间可度量并落在设计可接受范围；控制器不回滚 `resources`。不通过——控制器回滚，或缩小不释放调度额度；此时从能力集中移除 `InPlaceResize`，冻结只释放用量、不释放 request。 |
-| 定制 seccomp profile（Localhost，以 RuntimeDefault 为起点）与 AppArmor 或 SELinux profile 下，Claude Code 负载与已声明第三方 MCP 服务器的兼容性，含 Claude Code 自带 Bash 沙箱所需的 user namespace | 沙箱 Pod 安全基线的 seccomp 白名单与 LSM 规则；不以移除系统调用换取约束 | 通过——一个完整回合的启动、LLM 请求、Bash 沙箱、文件读写、子代理、workflow 与第三方 MCP 调用在 profile 下完成，无 `EPERM` 或被 LSM 拒绝，Agent 功能所需系统调用可逐项列出。不通过——某项系统调用或 LSM 规则阻断 Agent 功能；此时把该系统调用保留进白名单，并由 AppArmor 或 SELinux 收窄其可达的高危子系统，不降低 Agent 能力。 |
-| `claude -p --resume` 冷启动分布：会话记录文件为 1、10、50 MB，CPU request 为 250m 与 2 核，二进制在镜像内与共享文件系统上，外联黑洞与 RST，MCP 初始化耗时（无头模式文档） | 销毁重建 p95 < 10 s 与 p95 < 20 s 的目标、`T_nofreeze` 与预热池容量 | 通过——预热池认领 p95 < 10 s，共享文件系统冷启动 p95 < 20 s，分布可按会话记录文件大小与 CPU 规格解释。不通过——启动期外联或 MCP 初始化使 p95 超出目标；此时把对应耗时计入 `T_nofreeze` 与抖动预算，并按实测补充前置时间重算预热池容量。 |
-| agent-sandbox 认领时延（单个与 100 并发）与池补充前置时间 L；共享文件系统的 `mkdir`、`chown`、`fsync` 时延与 `root_squash` 行为；块存储 `attach` 在 50 与 200 并发下的时延（[REF-agent-sandbox](references.md)） | 预热池容量公式、冷启动目标与工作区隔离实现 | 通过——100 并发认领满足 p95 < 10 s，池补充前置时间 L 可测；共享文件系统的 `mkdir`、`chown`、`fsync` 支持 I9 的持久化确认，`root_squash` 行为与工作区设计一致；块存储 `attach` 时延与目标一致。不通过——并发认领显著劣化，或 `root_squash` 阻止目录创建；此时池按分片扩容，或改由看守进程 `seteuid` 后创建目录。 |
-| Substrate 试点：以官方 v1.0.0 镜像与预编译 `kubectl-ate` 部署；看守进程作 PID 1 在 gVisor 下驱动 Claude Code；约 500 MB actor 的 Suspend 与 Resume 时延与快照大小；同步快照与对象存储上传完成时延；经路由器 `/wake` 唤醒；EgressPolicy 占位符注入；S3 插件；`parked-request-budget`；编译测试类负载；MEMORY 快照恢复后的时钟与旧连接；`CRASHED` 后的 `RevertActor` 恢复；`/tmp` 与 `/dev/shm` tmpfs、capability 白名单与 `/proc` 可读性；外部 CSI 卷；`durableDir` 退化配置；经出口网关注入 actor JWT 的[引导接口](glossary.md)领取，以及从[模板快照](glossary.md)恢复的 actor 以 `actor-name` 变化触发领取（[REF-substrate](references.md)） | Substrate 提供者的 go 与 no-go | 通过——阶段 0 的 go 判定全部满足。不通过——任一阻断项无法成立且无补偿路径；此时第一版只交付 k8s 提供者，Substrate 提供者顺延。 |
-| Substrate actor 的网络前提：uid 非 0 的出站是否只到回环；对离开内部网络的目的地，非 TCP 出站是否除 DNS 查询外不可用（UDP 静默丢弃，其他非 TCP/UDP 以 ICMP unreachable 拒绝）；DNS 中继能否对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机、其余返回 NXDOMAIN 且不递归解析；actor 网络是否 IPv4-only（[REF-substrate](references.md)） | Substrate 路径的出口边界；任一项不成立时 Substrate 路径不上线 | 通过——在 actor 内以 UDP 探测、ICMP 探测与 DNS 查询实测，UDP 无响应并最终超时，其他非 TCP 收到 ICMP unreachable，DNS 查询名不出沙箱，NXDOMAIN 可观察且中继无上游递归，IPv4 地址可用。不通过——任一约束无法由 Substrate 或部署实施；此时 Substrate 路径不上线，第一版只交付 k8s 提供者。 |
-| Substrate 出口网关的请求层一致性与 CA 轮换：`https` 规则在连接层要求 SNI 匹配规则、请求层要求内层 `Host` 等于 `:authority`；`tls_passthrough` 规则是否要求 SNI 等于规则主机并显式列端口；带 ECH 的 ClientHello 如何处理；CA 轮换能否保留不短于快照保留期上限的新旧 CA 同时受信重叠期（[REF-substrate](references.md)） | 出口一致性与 CA 运行时投射；不通过时 Substrate 路径不上线 | 通过——构造 `Host` 与 `:authority` 不一致、ECH ClientHello 与轮换期旧 CA 连接，网关分别返回 403、按实测结论处理 ECH、接受旧 CA，拒绝以 `atenet.router.route.duration{outcome=denied}` 可观察；`T_ca_overlap` 可配置且不短于快照保留期上限。不通过——任一情形无法核对；此时 Substrate 路径不上线，或按实测缩小 Substrate 的适用范围。 |
+| Claude Code 被 `SIGSTOP` 30～600 s 后流式看门狗是否按墙钟计时；自定义 `ANTHROPIC_BASE_URL` 下字节级看门狗的取值（[REF-claude-code-network-config](references.md)） | `F_stream` 与 `F_cap(llm)`，决定直通模式与缓存模式下的冻结上限 | 通过：看门狗按墙钟推进，恢复后客户端行为与未冻结时一致；字节级取值可重复测量且不低于 `F_stream` 所需的安全余量。不通过：看门狗在冻结期间停止推进，或在恢复瞬间误判中止；此时按实测值下调 `F_stream`，直通模式在预测等待超过该值时不做冻结。 |
+| `--permission-prompt-tool` 的入参与返回格式；`claude -p --resume <session_id>` 不带 prompt 时的 `defer` 续接行为（[REF-claude-code-hooks](references.md)） | 审批路径：`PreToolUse` 的 `defer`、定向投递与回合边界续接 | 通过：不带 prompt 的续接重新触发 `PreToolUse`，hook 能返回 `allow` 或 `deny` 并改变该次调用结果；入参与返回格式与文档一致。不通过：续接不重新触发 hook，或决定无法生效；此时审批改为 hook 阻塞加冻结，冻结上限取 `F_cap(approval)`。 |
+| `--resume` 面对末尾悬空 `tool_use` 的行为；`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 的实际效果；`session_id` 在续接后是否变化（[REF-claude-code-headless](references.md)） | 降级路径：回合被中断后的重投与恢复句柄 | 通过：悬空 `tool_use` 的续接行为可区分，表现为拒绝或自动续接；被中断回合在该变量开启后自动续接；`session_id` 保持不变，若变化则能从通道观察并以新值更新恢复句柄。不通过：续接静默丢失回合或无法建立会话；此时被中断回合改走新会话加合成摘要的兜底路径。 |
+| 关闭 stdin 后进程退出与会话记录刷盘的先后；`CLAUDE_CONFIG_DIR` 与 cwd 变化对续接的影响（无头模式文档） | 安全点中的工作区持久化确认 | 通过：进程退出时可观察到本回合记录已写入会话记录文件，或存在可等待的刷盘完成判据；cwd 逐字一致且 `CLAUDE_CONFIG_DIR` 位于工作区内时续接成功。不通过：退出后会话记录文件仍缺本回合记录且无判据；此时销毁前改为同步快照上传确认，或改由新会话加合成摘要承接会话状态。 |
+| MCP 工具调用超时的默认值与可配置项；`SIGCONT` 后超时与已就绪响应的处理顺序；`wait_for` 阻塞调用在冻结 30、120、600 s 后的行为（[REF-mcp](references.md)） | `F_cap(approval/wait_for)` 与 `MCP_TOOL_TIMEOUT` | 通过：默认值与可配置项可确定；`SIGCONT` 后客户端先收到已就绪响应；冻结期间 `wait_for` 返回已转为订阅而非超时。不通过：冻结跨越超时导致调用被判失败；此时把 `F_cap` 下调到实测超时减 60 s，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果。 |
+| 托管策略设置文件在 `-p` 无头模式下对 hooks 与权限设置的生效；`allowManagedHooksOnly` 对工作区内设置与 `CLAUDE_CONFIG_DIR` 用户设置的屏蔽（[REF-claude-code-settings](references.md)） | hooks 注入位置与安全边界 | 通过：托管设置中的 hooks 与权限设置在 `-p` 下生效，工作区 `.claude/settings.json` 与 `CLAUDE_CONFIG_DIR` 用户设置中的 hooks 被屏蔽且不可覆盖。不通过：托管设置不生效，或可被工作区覆盖；此时审批 hook 不得放在工作区内，需重新确定注入位置并复核安全边界。 |
+| `-p` 下 `PostToolUse` 与 `PostToolBatch` hook 返回的 `additionalContext` 是否进入下一次模型请求，以及在请求中的位置（[REF-claude-code-hooks](references.md)） | 情境提示的载体；[ADR-wait-intent-as-soft-input](adr/adr-wait-intent-as-soft-input.md) 的失效条件 | 通过：本地代理观察到的下一次模型请求中含该 `additionalContext`，位于对应工具结果旁，且 hook 不引发额外的模型请求。不通过：该内容不进入模型请求，或只在回合结束之后出现；此时 `intent.hints` 保持关闭，等待意图停在只观测与自报，等待方式的选择规则仍由平台 MCP 服务器的 `instructions` 与工具描述承载。 |
+| 平台 MCP 服务器初始化时提供的 `instructions` 在 `-p` 下是否进入系统提示（[REF-mcp](references.md)） | 等待方式选择规则的常驻载体 | 通过：本地代理观察到的模型请求的系统提示中含该 `instructions` 原文。不通过：不含；此时同一规则由托管 `SessionStart` hook 的 `additionalContext` 注入，工具描述照常承载等待方式的选择规则。 |
+| `SubagentStart` hook 返回的 `additionalContext` 对子代理是否可见（[REF-claude-code-hooks](references.md)） | 子代理的等待方式契约 | 通过：本地代理观察到的子代理首个模型请求中含该 `additionalContext`。不通过：不含；此时不注册 `SubagentStart` hook，子代理只经平台 MCP 工具描述获得契约，子代理内的等待由机械层兜住。 |
+| `-p` 下 `Stop` hook 输入的 `last_assistant_message` 是否可用（[REF-claude-code-hooks](references.md)） | 回合意图的规则分类，以及回合完成时的宽限期 `G_turn_grace_done` 与“回合完成”先验 | 通过：每个回合结束时，`Stop` hook 输入含该回合最后一条助手消息的完整文本。不通过：字段缺失或为空；此时驱动器从 stream-json 输出中该回合最后一条 assistant 消息取文本，仍取不到时回合意图恒为 `unknown`，宽限期与先验保持默认。 |
+| 托管 hook 二进制同步返回的时延：从 Claude Code 启动 hook 到收到输出，含经本地 IPC 向驱动器查询、IPC 端点以 `SO_PEERCRED` 取得对端 pid 后对其可执行文件与父进程的校验，以及依据 stream-json 输出的一次性核对；Claude Code 执行 command hook 的方式：是否经 shell 执行，经 shell 时以 `exec <托管 hook 二进制路径>` 注册、直接执行时以二进制路径注册，能否使 hook 二进制的父进程为 Agent 主进程；hook 执行与对应事件写出 stdout 的先后：hook 启动时对应的 `tool_use`、批次结束、响应结束或子代理开始是否已经写出，或在 `T_hook_sync`（200 ms）之内写出；子代理的 `tool_use` 与响应是否出现在主会话的 stream-json 中（[REF-claude-code-hooks](references.md)） | 情境提示能否同步返回而不拉长工具结果的交付；托管 hook IPC 端点对端校验中的父进程条件；一次性核对能否接受全部真实查询，审批是否会因核对误拒而以“平台审批暂不可用”拒绝 | 通过：目标镜像中 p95 不超过 10 ms，并行工具批次下同样成立，情境提示所用 hook 失败时工具结果不变；按 hook 的执行方式选定的注册方式下，hook 二进制在 `/proc/<pid>/stat` 中的父进程号等于 Agent 主进程的 pid；全部托管 hook 事件的真实查询在 `T_hook_sync` 之内都能观察到对应事件，子代理事件出现在主会话的 stream-json 中，核对误拒为零。不通过：p95 超过 10 ms；此时驱动器在 `tool_started` 时预先算好该调用的提示并缓存，hook 只读缓存；仍超过时 `intent.hints` 保持关闭。hook 二进制的父进程不是 Agent 主进程时，父进程校验放宽为允许父进程是 Agent 主进程的直接子进程，一次性核对作为主要认证依据。对应事件在 `T_hook_sync` 之内仍未写出时，按实测的最大时差放大 `T_hook_sync`；子代理事件不出现在主会话 stream-json 中时，子代理上下文中的查询（`SubagentStart`、`SubagentStop` 与子代理内的工具调用）改以已观察到的子代理开始与结束窗口为依据，不按单个调用核对。 |
+| CLI 以 stream-json 输出时 `background_tasks_changed` 与 `task_started`、`task_updated`、`task_notification` 消息的输出；workflow 内各 agent 是否作为独立任务出现；`ambient` 的取值（[REF-claude-agent-sdk-typescript](references.md)） | 后台作业登记，即 `bg_jobs_changed` 的来源 | 通过：CLI 的 stream-json 输出包含这些消息，`background_tasks_changed` 推送完整的存活任务集合；workflow 内的 agent 各自作为任务出现，或其存活期被 workflow 任务覆盖；`ambient` 的取值与任务种类的对应关系可重复观察。不通过：CLI 不输出这些消息，或 workflow 内 agent 的存活不反映在任务集合中；此时以 Stop 与 SubagentStop hook 输入的 `background_tasks` 在每个回合结束时对账，仍无法覆盖时不设置 `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING=0`，改由其默认行为判定后台子代理与 workflow 的存活（二者存活时回合结束后仍报 running）；`ambient` 的取值无法判定时 `ambient` 任务一律计入后台作业。 |
+| `--resume` 对 `CronCreate` 与 `ScheduleWakeup` 作业的恢复；错过触发时刻后是否补跑；Stop hook 输入的 `session_crons` 是否包含 `ScheduleWakeup` 安排的唤醒（[REF-claude-agent-sdk-typescript](references.md)） | 自唤醒条目的 `survives_resume` 与 `L_self_wake` | 通过：`--resume` 后未过期的 `CronCreate` 作业按原计划触发；错过触发时刻时补跑一次或跳过，行为可重复观察；`session_crons` 是否包含 `ScheduleWakeup` 可确定。不通过：`--resume` 不恢复 `CronCreate` 作业，或恢复行为不可重复；此时 `cron` 条目的 `survives_resume` 取假，存在自唤醒条目时不以挂起为目的销毁，`L_self_wake` 只取冻结与快照两档；`session_crons` 不包含 `ScheduleWakeup` 时，`wakeup` 条目只按工具调用维护，不参与 `session_crons` 对账。 |
+| `--resume` 之后此前的后台任务（后台 shell、后台子代理、workflow）与 `Monitor` 的去留，以及续接后收到的 `task_notification`（[REF-claude-agent-sdk-typescript](references.md)） | I9 中“无后台作业”与“自唤醒条目都随续接恢复”的判定，以及“回合被中断”通知的内容 | 通过：续接后此前的后台任务与 `Monitor` 都已终止，续接后的后台任务集合从空集起算；此前任务的结局以可识别的方式呈现（带终止状态的 `task_notification`，或会话记录中的中断标记），且不重复通知已在进程退出前结束的任务。不通过：续接后旧任务仍出现在任务集合中而没有对应的执行体，或旧任务的结局不可识别；此时驱动器把续接前已存在的任务标识排除出后台作业，并在“回合被中断”通知中列出中断时存活的后台任务。 |
+| 非交互模式（`-p`）下长 MCP 调用自动转后台的消息序列：占位 `tool_result` 的内容、`task_notification.tool_use_id` 与真实结果的到达方式；超时的 shell 命令自动转后台的同类序列（[REF-claude-agent-sdk-typescript](references.md)、[REF-claude-code-env-vars](references.md)） | 平台 MCP 阻塞型 `wait_for` 与 `sleep_until` 被转后台时的转换；第三方 MCP 调用转后台后的后台作业登记 | 通过：非交互模式下会自动转后台，占位 `tool_result` 可识别，`task_notification` 携带原调用的 `tool_use_id`，并在真实结果到达时发出。不通过：非交互模式下不自动转后台，或占位与通知无法关联到原调用；不自动转后台时平台 MCP 阻塞调用沿用临近冻结上限时的转换语义，不需另行处理；无法关联时驱动器把未关联的 MCP 后台任务按 `task_id` 计入后台作业，平台 MCP 服务器在调用时长达到自动转后台阈值之前主动返回转换结果。 |
+| 非特权 Pod 的 `/sys/fs/cgroup` 挂载属性与 PSI 文件可读性；节点冻结代理对 50 个进程的进程树的冻结与解冻时延；`SIGSTOP` 降级路径的收敛轮数（[REF-linux-cgroup-v2](references.md)、[REF-linux-psi](references.md)） | `Freeze{cgroup}` 的实现与 L0 活动度采集 | 通过：PSI 文件可读；该进程树可被冻结与解冻，解冻后满足决策完成到可接收 p95 < 100 ms 与事件到达至可接收 p95 < 200 ms；`SIGSTOP` 降级在有限轮内收敛且不残留 T 态进程。不通过：cgroup 不可写或时延超出目标；此时 k8s 提供者只保留 `Freeze{signal}` 短冻结，或把冻结路径移出该环境。 |
+| 非特权沙箱中 `/proc/<pid>/wchan`、`/proc/<pid>/stat`、`/proc/net/tcp` 与 `/proc/net/tcp6` 的可读性；`wchan` 的符号名是否可见 | 静止证据中定时睡眠的识别（`timed_sleepers`）；入站数据唤醒中冻结确认时的接收队列检查，含两端都在 Agent 进程树内的回环连接的排除 | 通过：看守进程能读取 Agent 进程的 `wchan` 并得到 `nanosleep`、`hrtimer` 一类符号名，能读取 `starttime`，能读取 `rx_queue` 并按套接字 inode 关联到 Agent 进程，能按回环连接的对端地址找到对端套接字并按其 inode 判定持有者是否属于 Agent 进程树。不通过：任一文件不可读，或 `wchan` 只返回 0；此时定时睡眠一律视为忙，冻结确认时不做接收队列检查，改为解冻后短暂观察。 |
+| PSI 的 `cpu.pressure` 与 `io.pressure` 中 `some` 行 `total` 累计值的更新粒度，及其与活动度采样间隔、`Q_quiet` 的匹配（[REF-linux-psi](references.md)）；Claude Code 空闲（回合边界、无后台作业）时 `agent` 子 cgroup 的 `cpu.stat` 中 `usage_usec` 的增长基线，及其与 `U_quiet` 的匹配（[REF-linux-cgroup-v2](references.md)） | 静止证据中的 PSI 静默判定与 CPU 用量判据，`Q_quiet` 与 `U_quiet` 的取值 | 通过：Agent 进程树静止期间相邻样本差为零；Agent 进程树出现 CPU 或 I/O 停滞时，差值在一个采样间隔内变为非零；`total` 的更新粒度不粗于采样间隔；Claude Code 空闲期间任一静止窗内 `usage_usec` 的增量不超过 `U_quiet` 乘以窗口时长。不通过：静止期间出现非零差值，或停滞发生后差值滞后多个采样间隔才出现；此时把采样间隔上调到实测更新粒度以上，按实测滞后上调 `Q_quiet`；静止期间的非零差值来自可识别的固定噪声时，PSI 静默判定改为样本差不超过实测噪声上限。Claude Code 空闲期间静止窗内 `usage_usec` 的增量超过 `U_quiet` 乘以窗口时长时，按实测基线上调 `U_quiet`，或静止证据改以连续多个窗口判定 CPU 用量。 |
+| 原地缩小 CPU request 的生效时延；节点 CPU 分配 80% 时放大进入 `Deferred` 的比例与持续时间；agent-sandbox 控制器是否回滚 Pod 的 `resources`（[REF-k8s-in-place-pod-resize](references.md)） | `InPlaceResize` 能力，以及冻结是否真正释放调度额度 | 通过：缩小立即生效且不触发重建；节点 CPU 分配 80% 时 `Deferred` 的比例与持续时间可度量并落在设计可接受范围；控制器不回滚 `resources`。不通过：控制器回滚，或缩小不释放调度额度；此时从能力集中移除 `InPlaceResize`，冻结只释放用量、不释放 request。 |
+| 定制 seccomp profile（Localhost，以 RuntimeDefault 为起点）与 AppArmor 或 SELinux profile 下，Claude Code 负载与已声明第三方 MCP 服务器的兼容性，含 Claude Code 自带 Bash 沙箱所需的 user namespace | 沙箱 Pod 安全基线的 seccomp 白名单与 LSM 规则；不以移除系统调用换取约束 | 通过：一个完整回合的启动、LLM 请求、Bash 沙箱、文件读写、子代理、workflow 与第三方 MCP 调用在 profile 下完成，无 `EPERM` 或被 LSM 拒绝，Agent 功能所需系统调用可逐项列出。不通过：某项系统调用或 LSM 规则阻断 Agent 功能；此时把该系统调用保留进白名单，并由 AppArmor 或 SELinux 收窄其可达的高危子系统，不降低 Agent 能力。 |
+| `claude -p --resume` 冷启动分布：会话记录文件为 1、10、50 MB，CPU request 为 250m 与 2 核，二进制在镜像内与共享文件系统上，外联黑洞与 RST，MCP 初始化耗时（无头模式文档） | 销毁重建 p95 < 10 s 与 p95 < 20 s 的目标、`T_nofreeze` 与预热池容量 | 通过：预热池认领 p95 < 10 s，共享文件系统冷启动 p95 < 20 s，分布可按会话记录文件大小与 CPU 规格解释。不通过：启动期外联或 MCP 初始化使 p95 超出目标；此时把对应耗时计入 `T_nofreeze` 与抖动预算，并按实测补充前置时间重算预热池容量。 |
+| agent-sandbox 认领时延（单个与 100 并发）与池补充前置时间 L；共享文件系统的 `mkdir`、`chown`、`fsync` 时延与 `root_squash` 行为；块存储 `attach` 在 50 与 200 并发下的时延（[REF-agent-sandbox](references.md)） | 预热池容量公式、冷启动目标与工作区隔离实现 | 通过：100 并发认领满足 p95 < 10 s，池补充前置时间 L 可测；共享文件系统的 `mkdir`、`chown`、`fsync` 支持 I9 的持久化确认，`root_squash` 行为与工作区设计一致；块存储 `attach` 时延与目标一致。不通过：并发认领显著劣化，或 `root_squash` 阻止目录创建；此时池按分片扩容，或改由看守进程 `seteuid` 后创建目录。 |
+| Substrate 试点：以官方 v1.0.0 镜像与预编译 `kubectl-ate` 部署；看守进程作 PID 1 在 gVisor 下驱动 Claude Code；约 500 MB actor 的 Suspend 与 Resume 时延与快照大小；同步快照与对象存储上传完成时延；经路由器 `/wake` 唤醒；EgressPolicy 占位符注入；S3 插件；`parked-request-budget`；编译测试类负载；MEMORY 快照恢复后的时钟与旧连接；`CRASHED` 后的 `RevertActor` 恢复；`/tmp` 与 `/dev/shm` tmpfs、capability 白名单与 `/proc` 可读性；外部 CSI 卷；`durableDir` 退化配置；经出口网关注入 actor JWT 的[引导接口](glossary.md)领取，以及从[模板快照](glossary.md)恢复的 actor 以 `actor-name` 变化触发领取（[REF-substrate](references.md)） | Substrate 提供者的 go 与 no-go | 通过：阶段 0 的 go 判定全部满足。不通过：任一阻断项无法成立且无补偿路径；此时第一版只交付 k8s 提供者，Substrate 提供者顺延。 |
+| Substrate actor 的网络前提：uid 非 0 的出站是否只到回环；对离开内部网络的目的地，非 TCP 出站是否除 DNS 查询外不可用（UDP 静默丢弃，其他非 TCP/UDP 以 ICMP unreachable 拒绝）；DNS 中继能否对有出口策略的 actor 只应答 EgressPolicy 所列主机与控制面主机、其余返回 NXDOMAIN 且不递归解析；actor 网络是否 IPv4-only（[REF-substrate](references.md)） | Substrate 路径的出口边界；任一项不成立时 Substrate 路径不上线 | 通过：在 actor 内以 UDP 探测、ICMP 探测与 DNS 查询实测，UDP 无响应并最终超时，其他非 TCP 收到 ICMP unreachable，DNS 查询名不出沙箱，NXDOMAIN 可观察且中继无上游递归，IPv4 地址可用。不通过：任一约束无法由 Substrate 或部署实施；此时 Substrate 路径不上线，第一版只交付 k8s 提供者。 |
+| Substrate 出口网关的请求层一致性与 CA 轮换：`https` 规则在连接层要求 SNI 匹配规则、请求层要求内层 `Host` 等于 `:authority`；`tls_passthrough` 规则是否要求 SNI 等于规则主机并显式列端口；带 ECH 的 ClientHello 如何处理；CA 轮换能否保留不短于快照保留期上限的新旧 CA 同时受信重叠期（[REF-substrate](references.md)） | 出口一致性与 CA 运行时投射；不通过时 Substrate 路径不上线 | 通过：构造 `Host` 与 `:authority` 不一致、ECH ClientHello 与轮换期旧 CA 连接，网关分别返回 403、按实测结论处理 ECH、接受旧 CA，拒绝以 `atenet.router.route.duration{outcome=denied}` 可观察；`T_ca_overlap` 可配置且不短于快照保留期上限。不通过：任一情形无法核对；此时 Substrate 路径不上线，或按实测缩小 Substrate 的适用范围。 |
 
 ## 当前验证结论
 
-验证环境为 macOS arm64、Docker Desktop Linux 容器（cgroup v2）、Kubernetes 1.36.4 与 Claude Code 2.1.318；没有在目标 Linux/k8s 集群或 Substrate 上完成端到端实测。下表的「通过」表示机制、官方文档与本机实验相互印证，不是目标环境验收。
+验证环境为 macOS arm64、Docker Desktop Linux 容器（cgroup v2）、Kubernetes 1.36.4 与 Claude Code 2.1.318；没有在目标 Linux/k8s 集群或 Substrate 上完成端到端实测。下表的“通过”表示机制、官方文档与本机实验相互印证，不是目标环境验收。
 
 | 事项 | 结论 | 已确立 | 仍需目标环境实测 |
 | --- | --- | --- | --- |
@@ -54,11 +54,11 @@
 | 预热池与工作区时延 | 部分证实 | agent-sandbox 文档给出 burst 约 300 claims/s、p90 ≤ 200 ms、持续每池 70～85/s、Pod 冷启动约 42～50 s p50；`root_squash` 将 uid 0 映射为 65534 | 单次与 100 并发认领 p95、池补充 L、RWX `mkdir/chown/fsync`、50/200 并发 attach |
 | Substrate 试点 | 部分证实 | v1.0.0 官方镜像与预编译 `kubectl-ate` 可安装；控制面在本地 kind 集群完成 rollout；PID 1、MEMORY 快照、`/wake`、`parked-request-budget`、EgressPolicy、S3 插件与 `durableDir` 在文档与源码中存在 | actor 创建与领取、500 MB Suspend/Resume、同步快照、外部 CSI、gVisor 下无 Docker、旧 TCP 连接、`CRASHED` 后的 `RevertActor`、go/no-go |
 
-结论对设计的修改已写入 [suspendpolicy](design/modules/design-suspendpolicy.md) 的 MCP 传输上限与 `F_cap`、[Claude Code 驱动器](design/modules/warden/design-warden-driver-claude-code.md) 的续接与 MCP 超时、[warden](design/modules/warden/design-warden.md) 的 per-cgroup PSI 与 `cgroup.events`、[sandboxprovider k8s](design/modules/sandboxprovider/design-sandboxprovider-k8s.md) 的缩放不跨 Pod 重建保留与 [sandboxprovider substrate](design/modules/sandboxprovider/design-sandboxprovider-substrate.md) 的试点前提。
+结论带来的设计修改已写入 [suspendpolicy](design/modules/design-suspendpolicy.md) 的 MCP 传输上限与 `F_cap`、[Claude Code 驱动器](design/modules/warden/design-warden-driver-claude-code.md) 的续接与 MCP 超时、[warden](design/modules/warden/design-warden.md) 的 per-cgroup PSI 与 `cgroup.events`、[sandboxprovider k8s](design/modules/sandboxprovider/design-sandboxprovider-k8s.md) 的缩放不跨 Pod 重建保留与 [sandboxprovider substrate](design/modules/sandboxprovider/design-sandboxprovider-substrate.md) 的试点前提。
 
 ## 分阶段实施路线
 
-阶段以技术门槛划分。每阶段的「交付物」是该阶段结束时必须存在且可观察的能力，「进入下一阶段的条件」是下一阶段开始前必须成立的观察结果。
+阶段以技术门槛划分。每阶段的“交付物”是该阶段结束时必须存在且可观察的能力，“进入下一阶段的条件”是下一阶段开始前必须成立的观察结果。
 
 ### 阶段 0：底座能力验证
 
@@ -82,14 +82,14 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 | 恢复后状态 | MEMORY 快照恢复后客户机时钟可校正，旧 TCP 连接可被察觉并断开，本地代理按 `request_id` 取回在途请求的已完成响应 |
 | 负载兼容 | 编译测试类负载在 gVisor 下的开销与无 Docker 的影响可度量，不阻断 Claude Code 驱动 |
 
-任一判定项不成立且无补偿路径为 no-go。no-go 时第一版只交付 k8s 提供者，Substrate 提供者顺延；能力分层与策略只在能力集内选择机制的设计不变（[ADR-capability-tiered-suspension](adr/adr-capability-tiered-suspension.md)）。
+任一判定项不成立且无补偿路径为 no-go。no-go 时第一版只交付 k8s 提供者，Substrate 提供者顺延；能力分层、策略只在能力集内选择机制，这一设计不变（[ADR-capability-tiered-suspension](adr/adr-capability-tiered-suspension.md)）。
 
 进入阶段 1 的条件：
 
-- Substrate 的 go 或 no-go 结论已确定，并反映为第一版交付的提供者范围。
-- k8s 冻结路径的 cgroup 挂载属性与 PSI 可读性、原地缩放、认领与工作区时延均得到通过结论或明确的回退路径。
+- Substrate 的 go 或 no-go 结论已确定，并体现为第一版交付的提供者范围。
+- k8s 冻结路径的 cgroup 挂载属性与 PSI 可读性、原地缩放、认领与工作区时延均已有通过结论或明确的回退路径。
 - 沙箱 Pod 安全基线的定制 seccomp 与 LSM profile 在 Claude Code 负载与已声明第三方 MCP 服务器上通过，或已按实测调整白名单且不降低 Agent 能力。
-- Claude Code 的冻结与续接行为、MCP 超时、托管设置生效均得到通过结论或明确的回退路径：MCP 超时一项已判定不通过，回退路径为按 MCP 传输类型重算 `F_cap`，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果；`F_stream`、`F_cap` 与 `T_nofreeze` 的取值已确定或已触发设计更新。
+- Claude Code 的冻结与续接行为、MCP 超时、托管设置生效均已有通过结论或明确的回退路径：MCP 超时一项已判定不通过，回退路径为按 MCP 传输类型重算 `F_cap`，并让 `wait_for` 在冻结临近上限时返回已转为订阅的结果；`F_stream`、`F_cap` 与 `T_nofreeze` 的取值已确定或已触发设计更新。
 
 ### 阶段 1：最小挂起恢复闭环
 
@@ -129,7 +129,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 交付物：
 
-- 预测性恢复：首 token 与「正在输入」信号触发提前恢复，首 token 到达后按已等待时长重估剩余等待。
+- 预测性恢复：首 token 与“正在输入”信号触发提前恢复，首 token 到达后按已等待时长重估剩余等待。
 - 通用 HTTP 加轮询型外部系统接入。
 - 冻结态内存压力下的升级梯。
 
@@ -143,7 +143,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 交付物：
 
-- 控制面循环驱动器：经 `ToolExec` 使用沙箱，向runcontroller发出与进程驱动器相同的事件序列。
+- 控制面循环驱动器：经 `ToolExec` 使用沙箱，向 `runcontroller` 发出与进程驱动器相同的事件序列。
 - 多租户配额与优先级：`tenant` 维度从保留字段变为执行约束。
 
 阶段完成的观察结果：
@@ -153,13 +153,13 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 ### 等待意图的分步落地
 
-等待意图按下列意图阶段逐步启用。前提是阶段 1 的 Claude Code 驱动器、平台 MCP 服务器与 GitHub 连接器已交付；意图阶段与阶段 2～4 并行，不改变这些阶段的门槛。进入下一意图阶段的条件以下列指标表达：
+等待意图按下列阶段逐步启用。前提是阶段 1 的 Claude Code 驱动器、平台 MCP 服务器与 GitHub 连接器已交付；意图阶段与阶段 2～4 并行，不改变这些阶段的门槛。进入下一意图阶段的条件以下列指标表达：
 
 - 可转订阅的前台等待占比：分类为 `waiting` 且命中等待签名的前台工具调用时长，在全部前台工具调用时长中的占比，按外部系统与签名分组。
 - 自报误差：Agent 自报的 `agent_expected_ms` 与实际等待时长的相对误差分布，以及实际等待落在自报值 ±50% 以内的命中率。
 - 提示转化率：被采纳的情境提示在全部情境提示中的比例；订阅建议之后 `N_adopt` 个回合内出现同一关联对象或同一 `event_type` 的 `subscribe_event`，纯定时建议之后 `N_adopt` 个回合内出现 `sleep_until`，计为采纳。
 - 挂起收益：情境提示开启组与关闭组之间 `idle_while_scheduled_ratio`、回合边界销毁占比与冻结总时长的差异。
-- 误提示率：情境提示所依据的签名匹配经抽样复核并非该签名对应等待的比例。
+- 误提示率：情境提示所依据的签名匹配中，经抽样复核确认并非该签名对应等待的比例。
 
 #### 意图阶段 A：只观测
 
@@ -174,7 +174,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 - 真实负载上，可转订阅的前台等待占比可按外部系统与签名度量；占比为零的外部系统不进入情境提示。
 - 误提示率可按抽样复核度量，并低于为进入情境提示设定的阈值。
-- 同一负载下，单一条件门控、静止证据与 I9 前置检查的判定结果与关闭意图解析时一致。
+- 同一负载下，单一条件门控、静止证据与 I9 前置检查的判定结果与未启用意图解析时一致。
 
 #### 意图阶段 B：契约与自报
 
@@ -182,7 +182,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 
 - 平台 MCP 服务器的 `instructions` 与 `SubagentStart` 契约注入，载体按技术验证清单的结论选定。
 - `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`agent_expected_ms` 的上报。
-- 意图接入 `suspendpolicy`：等待时长预测纳入 Agent 自报与签名先验，`policy_state` 记录自报的历史命中情况用于置信度校准；回合意图为 `completed` 时宽限期取 `G_turn_grace_done`，等待预测取「回合完成」先验行。
+- 意图接入 `suspendpolicy`：等待时长预测纳入 Agent 自报与签名先验，`policy_state` 记录自报的历史命中情况用于置信度校准；回合意图为 `completed` 时宽限期取 `G_turn_grace_done`，等待预测取“回合完成”先验行。
 
 进入意图阶段 C 的条件：
 
@@ -201,7 +201,7 @@ Substrate 试点的 go 判定如下，全部满足为 go：
 进入意图阶段 D 的条件：
 
 - 提示转化率与挂起收益可度量；实验组相对对照组的 `idle_while_scheduled_ratio` 下降，回合边界销毁占比上升，误提示率不高于阈值。转化率长期过低或挂起收益没有改善时，按 [ADR-wait-intent-as-soft-input](adr/adr-wait-intent-as-soft-input.md) 的失效条件处理，`intent.hints` 保持关闭。
-- 规则与签名判为 `unknown` 的前台与后台调用时长占比可度量，其中经抽样复核为等待的部分足以抵偿分类请求的成本。
+- 规则与签名判为 `unknown` 的前台与后台调用时长占比可度量，其中经抽样复核判定为等待的部分足以抵偿分类请求的成本。
 
 #### 意图阶段 D：宿主侧分类与出口流量形态识别（可选）
 

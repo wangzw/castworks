@@ -2,11 +2,11 @@
 
 控制面循环驱动器是 [Agent 驱动器接口](../../../glossary.md)的定义者与实现之一，与[沙箱](../../../glossary.md)内的[进程驱动器](../../../glossary.md)共用同一接口。其实现运行在控制面，以链接进 `runcontroller` 进程的库形式存在，运行平台原生 Agent 的模型循环；第一版只定义该接口。它不拥有协议信封与重放、运行实例状态机、挂起决策、沙箱生命周期与 `ToolExec` 的沙箱侧实现；这些分别归 `agentprotocol`、`runcontroller`、`suspendpolicy`、`sandboxprovider` 与看守进程。心智模型：接口是两种循环共用的插座，进程驱动器把 Claude Code 进程插进去，控制面循环驱动器把一个运行在控制面的模型循环插进去，沙箱对控制面循环驱动器只是工具执行器（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
-文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义与并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
+文档较长，第一次阅读按以下顺序：核心概念、职责、外部接口契约、走查、回合生命周期、输入翻译、事件输出、挂起与恢复、`ToolExec` 的使用；术语表、依赖、UML 图、核心数据结构、错误与失败语义、并发与事务边界作为参考，在核对接口操作、字段或失败路径时查阅。
 
 ## 核心概念
 
-本模块围绕两种循环共用的 Agent 驱动器接口组织：接口把 Agent 循环与 `runcontroller` 之间的交互固定为同一套契约，循环位置不改变 `runcontroller` 看到的事件、投递与挂起恢复语义。沙箱内的进程驱动器驱动 Claude Code 进程，本模块的控制面循环驱动器在控制面运行平台原生 Agent 的模型循环；两者实现同一接口，[收件箱](../../../glossary.md)、游标与[唤醒谓词](../../../glossary.md)共用一套规则。控制面循环把沙箱只当工具执行器，不假定其中存在 Agent 进程、会话文件或 hook；实现形式是链接进 `runcontroller` 进程的库，`ToolExec` 帧沿该运行实例已有的[出站流](../../../glossary.md)往返。系统需要这个机制：控制面循环因此不持有[运行实例令牌](../../../glossary.md)，也不建立第二条协议会话；平台原生 Agent 的循环不必打包进沙箱镜像，新增一种循环不改变 `runcontroller`、`suspendpolicy` 或协议消息。
+本模块围绕两种循环共用的 Agent 驱动器接口组织：接口把 Agent 循环与 `runcontroller` 之间的交互固定为同一套契约，循环位置不改变 `runcontroller` 看到的事件、投递与挂起恢复语义。沙箱内的进程驱动器驱动 Claude Code 进程，本模块的控制面循环驱动器在控制面运行平台原生 Agent 的模型循环；两者实现同一接口，[收件箱](../../../glossary.md)、游标与[唤醒谓词](../../../glossary.md)共用一套规则。控制面循环只把沙箱当作工具执行器，不假定其中存在 Agent 进程、会话文件或 hook；实现形式是链接进 `runcontroller` 进程的库，`ToolExec` 帧沿该运行实例已有的[出站流](../../../glossary.md)往返。系统需要这个机制：控制面循环因此不持有[运行实例令牌](../../../glossary.md)，也不建立第二条协议会话；平台原生 Agent 的循环不必打包进沙箱镜像，新增一种循环不改变 `runcontroller`、`suspendpolicy` 或协议消息。
 
 ## 职责
 
@@ -108,7 +108,7 @@ type DriverState struct {
 
 ### 对 `runcontroller` 的事件
 
-两种驱动器使用同一套 `AgentEvent` 种类与字段，由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。`self_wake_changed{entries, crons_synced}` 只由存在[自唤醒源](../../../glossary.md)的驱动器发出（[Claude Code 驱动器](design-warden-driver-claude-code.md)）；控制面循环没有会话内定时等自唤醒源，定时只经 `timer_requested` 登记，控制面循环驱动器不产生该事件，运行实例的自唤醒集合因而为空，`runcontroller` 不为其发出 `StartAgent`。`intent_observed` 只由解析等待意图的驱动器发出（Claude Code 驱动器）；控制面循环的阻塞点由 `WaitDeclared` 显式声明，控制面循环驱动器不产生该事件。`subscription_created` 与 `wait_started` 的 `agent_expected_ms` 只取 Agent 经工具参数 `expected_wait` 自报的预计等待时长，没有自报时为空，与 `predicted_ms` 分开上报。
+两种驱动器使用同一套 `AgentEvent` 种类与字段，由 `agentprotocol` 定义。下表按接口操作列出触发点；控制面循环没有原生 `session_state_changed` 时，以回合结束作为等价信号并发出 `state_changed{idle}`，事件种类不变。`self_wake_changed{entries, crons_synced}` 只由存在[自唤醒源](../../../glossary.md)的驱动器发出（[Claude Code 驱动器](design-warden-driver-claude-code.md)）。控制面循环没有会话内定时等自唤醒源，定时只经 `timer_requested` 登记，控制面循环驱动器不产生该事件，运行实例的自唤醒集合因而为空，`runcontroller` 不为其发出 `StartAgent`。`intent_observed` 只由解析等待意图的驱动器发出（Claude Code 驱动器）；控制面循环的阻塞点由 `WaitDeclared` 显式声明，控制面循环驱动器不产生该事件。`subscription_created` 与 `wait_started` 的 `agent_expected_ms` 只取 Agent 经工具参数 `expected_wait` 自报的预计等待时长，没有自报时为空，与 `predicted_ms` 分开上报。
 
 | 事件 | 触发点 | 约束 |
 | --- | --- | --- |
@@ -127,7 +127,7 @@ type DriverState struct {
 
 回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，`intent_observed` 按 `(ref_kind, ref)` 以后到者覆盖先到者，重复与乱序不改变结果。
 
-`WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经宿主 `runcontroller` 注入的事件入口提交声明，由宿主调用 `RunService.DeclareWait`，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等；条件种类与 `runcontroller` 的 `declared_kind` 闭集一致（`llm`、`timer`、`approval`、`wait_for`），`scope=run` 时只取 `approval`、`wait_for`、`timer`；`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
+`WaitDeclared` 的生产者是 L2 协作式 Agent 的驱动器。控制面循环驱动器在循环进入一个可持久化的阻塞点时，经宿主 `runcontroller` 注入的事件入口提交声明，由宿主调用 `RunService.DeclareWait`，字段与 `agentprotocol` 的 `WaitDeclared` 相同（`wait_id`、`scope`、`conditions`、`deadline`、`safe_to`），以 `wait_id` 幂等。条件种类与 `runcontroller` 的 `declared_kind` 闭集一致（`llm`、`timer`、`approval`、`wait_for`），`scope=run` 时只取 `approval`、`wait_for`、`timer`；`timer` 条件必须引用同范围且存在的定时器。沙箱内运行 L2 Agent 的进程驱动器经看守进程的出站流发送同一消息。第一版托管的 Claude Code 属于 L1，不发送 `WaitDeclared`；该消息与接口为 L2 保留。
 
 ### `Deliver` 的翻译规则
 
@@ -180,7 +180,7 @@ type DriverState struct {
 
 ### 稳定性承诺
 
-- 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出，`intent_observed` 只由解析等待意图的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集与挂起/恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
+- 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出，`intent_observed` 只由解析等待意图的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集、挂起与恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
 - `ToolExec` 的操作集合对控制面循环稳定；新增操作须同时修改看守进程主文档、本模块与 `agentprotocol`。
 - 接口变更须同时覆盖进程驱动器与控制面循环驱动器，并以同一套契约测试约束；事件种类变化另须提升协议版本。
 
@@ -195,7 +195,7 @@ type DriverState struct {
 - 循环状态的持久化：位置由实现选定，约束是跨代可读、在恢复点同步写入，并与工作区或控制面持久化同寿命；恢复句柄经 `Deliver.resume_session_id` 与 `SuspendReady.SessionID` 传递。
 - 控制面循环的模型调用：在控制面执行，上游与凭据由实现该循环的模块决定；不经过看守进程的本地代理。
 
-方向约束：本模块只依赖 `agentprotocol`；`ToolExecClient` 与事件入口由宿主 `runcontroller` 注入，本模块不引用 `runcontroller` 导出的接口或类型。`runcontroller` 以库的形式链接本模块并调用 Agent 驱动器接口，对应模块依赖图中 `runcontroller` 到 `warden` 的边，该边只及于本模块。新增一种驱动器实现不改变本模块的接口，只增加一个实现面。把控制面循环驱动器部署为独立进程需要另行定义受限的驱动器身份与会话，第一版不做。
+方向约束：本模块只依赖 `agentprotocol`；`ToolExecClient` 与事件入口由宿主 `runcontroller` 注入，本模块不引用 `runcontroller` 导出的接口或类型。`runcontroller` 以库的形式链接本模块并调用 Agent 驱动器接口，对应模块依赖图中 `runcontroller` 到 `warden` 的边，该边只及于本模块。新增一种驱动器实现不改变本模块的接口，只增加一个实现。把控制面循环驱动器部署为独立进程需要另行定义受限的驱动器身份与会话，第一版不做。
 
 ## UML 图
 
@@ -266,7 +266,7 @@ sequenceDiagram
     W-->>R: ReadyToSuspend
 ```
 
-图固定控制面循环与沙箱之间的边界：循环在控制面运行并链接进 `runcontroller`，沙箱只执行工具；`ToolExec` 帧经看守进程已认证的出站流往返，输出按偏移续传；驱动器不持有令牌，也不建立第二条会话。挂起准备由驱动器先停循环、确认后台作业为空并持久化循环状态，看守进程再确认沙箱侧静默；后台作业未结束时驱动器返回 `Busy` 语义的错误，不为挂起终止作业。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
+图固定控制面循环与沙箱之间的边界：循环在控制面运行并链接进 `runcontroller`，沙箱只执行工具；`ToolExec` 帧经看守进程已认证的出站流往返，输出按偏移续传；驱动器不持有令牌，也不建立第二条会话。挂起准备由驱动器先停止循环、确认后台作业为空并持久化循环状态，看守进程再确认沙箱侧静默；后台作业未结束时驱动器返回 `Busy` 语义的错误，不为挂起终止作业。沙箱内没有 Agent 进程，因此 `ReadyToSuspend.session_id` 不来自沙箱内的进程，恢复句柄由循环状态与 `Deliver.resume_session_id` 承载。
 
 ## 核心数据结构
 
@@ -343,7 +343,7 @@ sequenceDiagram
 
 一个回合从 `Feed` 返回 `fed=true` 开始，到恢复点结束。回合进行中只有一次模型调用与零到多次工具调用；工具调用可以并行，但 `turn_ended` 必须晚于全部 `tool_ended`。回合结束的条件由驱动器实现定义：控制面循环没有原生 `idle` 信号时，以模型调用完成、无待决工具调用且无待处理输入作为等价条件。
 
-同一时刻只有一个回合。回合进行中收到的 `next_user_message` 追加到循环状态，在当前回合结束后作为下一条输入处理；`Deliver` 的 `fed` 报告本批是否已喂入，未喂入时 `TurnID` 为空。循环自行开始的回合（例如后台任务触发）`turn_started.delivery_id` 为空，仍按同一生命周期结束。
+同一时刻只有一个回合。回合进行中收到的 `next_user_message` 追加到循环状态，在当前回合结束后作为下一条输入处理；`Deliver` 的 `fed` 报告本批是否已喂入，未喂入时 `TurnID` 为空。循环自行开始的回合（例如后台任务触发），其 `turn_started.delivery_id` 为空，仍按同一生命周期结束。
 
 ### 输入翻译
 
@@ -406,7 +406,7 @@ sequenceDiagram
 
 ## 并发与事务边界
 
-控制面循环驱动器不参与看守进程的数据库事务；它的持久化边界是循环状态的同步写入与 `ToolExec` 记录的终态。运行实例状态的权威仍在控制面 PostgreSQL，接口只提交事件与喂入结果。
+控制面循环驱动器不参与看守进程的数据库事务；它的持久化边界是循环状态的同步写入与 `ToolExec` 记录的终态。运行实例状态仍以控制面 PostgreSQL 为准，接口只提交事件与喂入结果。
 
 - **每运行实例单实例**：同一运行实例同一代只有一个循环驱动器实例；`Feed` 串行调用，回合不并发。
 - **事件顺序**：回合内事件的 `event_seq` 在同一回合内单调；`turn_started` 先于工具与等待事件，`turn_ended` 最后；回合外事件不带 `event_seq`，按事件流的发出顺序交付；事件流是单写者。

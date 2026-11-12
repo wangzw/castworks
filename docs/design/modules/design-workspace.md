@@ -6,7 +6,7 @@
 
 ## 核心概念
 
-工作区租约是每个运行实例在控制面唯一的一行租约记录，也是工作区写权限的唯一依据。工作区跨代挂载进每一[代](../../glossary.md)沙箱，挂载本身不阻止多个沙箱同时写入；运行实例重建时，旧代与新代的沙箱可能短暂并存。只有持有租约的看守进程可以写；续约、接管与释放都以租约行的条件更新判定，持有者不匹配、租约已释放或已到期时写入被拒绝。租约同时规定换手条件：新代接管必须等旧租约到期，或等[沙箱提供者](../../glossary.md)确认旧沙箱已删除，使「旧代已不再运行」成为可判定的事实，而不是重建路径上的假设。
+工作区租约是每个运行实例在控制面唯一的一行租约记录，也是工作区写权限的唯一依据。工作区跨代挂载进每一[代](../../glossary.md)沙箱，挂载本身不阻止多个沙箱同时写入；运行实例重建时，旧代与新代的沙箱可能短暂并存。只有持有租约的看守进程可以写；续约、接管与释放都以租约行的条件更新判定，持有者不匹配、租约已释放或已到期时写入被拒绝。租约同时规定换手条件：新代接管必须等旧租约到期，或等[沙箱提供者](../../glossary.md)确认旧沙箱已删除，使“旧代已不再运行”成为可判定的事实，而不是重建路径上的假设。
 
 ## 职责
 
@@ -18,7 +18,7 @@
 - **拒绝非持有者写入**：以租约的 `lease_id`、代与 `holder` 为 CAS 条件，并以 `holder_jkt` 核对续约的持有证明，使同一运行实例在同一时刻只有一个可写沙箱；持有者不匹配、持有证明无效、租约已释放或已到期时拒绝续约与文件写入（[ADR-generation-fencing](../../adr/adr-generation-fencing.md)、[ADR-run-token-audience-and-holder-binding](../../adr/adr-run-token-audience-and-holder-binding.md)）。
 - **确认持久化**：在销毁沙箱前按持久化语义执行持久化确认；`sync` 等待工作区写入的 fsync 完成，`on_suspend` 等待同步挂起的对象存储上传完成；确认失败时不产生可销毁的结论。
 - **报告持久化语义**：把绑定的 `durability` 随租约建立、接管与查询返回；`runcontroller` 从 `CreateLease`、`TakeoverLease` 的返回与 `GetLease` 的查询取得并持久化，控制面据此选择销毁前的确认方式，不自行推断。
-- **提供沙箱外文件访问**：以文件访问接口接收 `humanchannel` 的读取请求，携带已认证用户、绑定到运行实例与用户的[接入票据](../../glossary.md)，并原样转发到看守进程的文件 API；按存储模式直接读取导出或经入站路由到达看守进程；文件访问可能唤醒快照态或销毁态的沙箱。
+- **提供沙箱外文件访问**：以文件访问接口接收 `humanchannel` 的读取请求，请求携带已认证用户与绑定到运行实例和用户的[接入票据](../../glossary.md)，并原样转发到看守进程的文件 API；按存储模式直接读取导出或经入站路由到达看守进程；文件访问可能唤醒快照态或销毁态的沙箱。
 - **提供文件 API**：在看守进程内提供列表、读取、下载与流式读取，路径限定在运行实例子目录内，按[接入票据](../../glossary.md)、看守进程持有的[运行实例令牌](../../glossary.md)、代与[实时接入](../../glossary.md)状态鉴权；写入与上传由 `ToolExec` 的文件写在租约持有者内执行，读写都不绕过租约持有者。
 - **施加隔离与配额**：以运行实例 uid、`no_new_privs`、清空 capability bounding set、目录权限 0700 与挂载根 0711、每运行实例目录配额、`no_root_squash` 或 `seteuid` 创建方式，把工作区限制在该运行实例子目录内；`no_root_squash` 只为[节点挂载代理](../../glossary.md)以 root 创建运行实例子目录所需；认领过的预热 Pod 不回收复用。
 - **固定工作区布局**：在运行实例子目录内固定 Agent 状态目录、[投递意图日志](../../glossary.md)与已初始化标记的位置，使各代沙箱以逐字一致的路径挂载并以该路径为 Agent 的 cwd；这些状态不放在 rootfs。
@@ -186,7 +186,7 @@ type ConfirmResult struct {
 - `Mode=suspend_upload` 用于 `on_suspend` 语义：由销毁路径在沙箱提供者的同步挂起返回之后调用，核对 `durableDir` 的上传完成标记并返回确认时刻；上传失败返回暂时性错误。
 - `Mode` 与绑定的 `durability` 不符时返回不可重试错误；调用方必须以租约返回的 `durability` 选择模式，不自行推断。
 - 确认以 `(run_id, generation, lease_id)` 幂等；重复确认返回同一结果，不重复上传。`SuspendID` 只用于审计与重试关联，不是幂等键的一部分。
-- 确认失败不产生「工作区已持久化」的结论：`fsync` 失败时看守进程不得发出 `ReadyToSuspend`；`suspend_upload` 失败时销毁路径不得把沙箱判定为已销毁，`runcontroller` 不进入 `Suspended`。
+- 确认失败不产生“工作区已持久化”的结论：`fsync` 失败时看守进程不得发出 `ReadyToSuspend`；`suspend_upload` 失败时销毁路径不得把沙箱判定为已销毁，`runcontroller` 不进入 `Suspended`。
 
 ### 文件 API
 
@@ -276,7 +276,7 @@ type ReadCapability struct {
 - `Capability` 报告绑定的读取能力：`external_csi` 的导出在可直接读取时 `Direct` 为真；`shared_fs` 只挂载在沙箱节点池、控制面没有该挂载，`block` 为 RWO 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级读取接口，三者的 `Direct` 均为假。`Direct` 为假时 `RequiresFileAttach` 为真。
 - `humanchannel` 在调用前校验用户身份、项目归属与[项目角色](../../glossary.md)，写入 `file` 接入事实并签发接入票据；本模块校验运行实例、代与绑定的归属，不信任调用方传入的路径根。读取方法（`List`、`Read`、`Stream`）要求 `Ticket` 非空并原样转发。
 - 直接读取沿用文件 API 的路径解析：以运行实例子目录为根逐段解析，拒绝 `..`、绝对路径与指向根外的符号链接，越界返回 `ErrPathOutsideWorkspace`。读取在 `Direct` 为真且沙箱无需参与时直接读取存储导出；其余情形经沙箱提供者的入站路由转发到当前代看守进程的文件 API，必要时唤醒沙箱。写入与上传不走直接导出，由 `ToolExec` 的文件写在租约持有者内执行。
-- 接入票据由 `humanchannel` 经 `secrets.IssueAccessTicket` 签发，`workspace` 不持有签名密钥，只原样转发；经看守进程的读取由看守进程验签，直接读取的授权由唯一调用方 `humanchannel` 的 SPIFFE 身份与其在调用前完成的项目角色判定承担（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)）。
+- 接入票据由 `humanchannel` 经 `secrets.IssueAccessTicket` 签发，`workspace` 不持有签名密钥，只原样转发；经看守进程的读取由看守进程验签，直接读取的授权由唯一调用方 `humanchannel` 的 SPIFFE 身份与其在调用前完成的项目角色判定保证（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)）。
 - 接口只提供读；下载与流式读取由文件 API 承担；写入与上传由 `ToolExec` 的文件写承担，不经过沙箱外读取接口，使所有写操作经过租约持有者。
 
 ## 依赖
@@ -285,7 +285,7 @@ type ReadCapability struct {
 
 - **PostgreSQL**：保存绑定记录、租约行与释放墓碑；租约的建立、接管、续约、持有者清空与释放都在数据库事务内以条件 UPDATE 完成。
 - **RWX 共享文件系统**：k8s 提供者的默认工作区承载，例如 CephFS、JuiceFS、NFS 或 EFS 类。挂载根只由[节点挂载代理](../../glossary.md)在节点上挂载，不进入任何沙箱 Pod 与预热 Pod；Pod 以 CSI 内联临时卷 `castworks-workspace` 挂载工作区挂载路径（`Binding.MountPath`，各代逐字一致），`mountPropagation: HostToContainer`。预热池与认领由 SandboxWarmPool 与 SandboxClaim 承担（[REF-agent-sandbox](../../references.md)）。
-- **RWO 块存储**：k8s 提供者的退化配置，有节点或可用区亲和，不能预绑定预热池；挂接与强制分离存在等待，重建时延高于共享文件系统。
+- **RWO 块存储**：k8s 提供者的退化配置，有节点或可用区亲和，不能预绑定预热池；挂接与强制分离需要等待，重建时延高于共享文件系统。
 - **Substrate actor 卷**：actor 只接受 `durableDir`、`external`、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷。`external` 即外部 CSI 卷，每 actor 一卷；`durableDir` 在挂起时上传对象存储。
 - **对象存储**：承载 `durableDir` 的上传数据；同步挂起上传完成后，工作区才可被判定为持久化。
 - **沙箱提供者的入站路由**：运行时把沙箱外文件访问转发到当前代看守进程的文件 API；k8s 路径为 `wake-router`，Substrate 路径为路由器。本模块不区分路由实现。
@@ -451,7 +451,7 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 2. k8s 提供者优先选择 `shared_fs`：共享文件系统无卷挂接步骤、无节点亲和，预热 Pod 在创建时获得空白挂载点，认领时节点挂载代理执行 `Ensure` 并把运行实例子目录绑定挂载进去。`shared_fs` 不可用时选择 `block`，绑定携带节点或可用区亲和；块存储不能预绑定预热池，认领与重建都受挂接等待约束。
 3. Substrate 提供者优先选择 `external_csi`：每 actor 一卷，写穿持久、崩溃不丢，内容不进快照、`Revert` 不回滚；外部 CSI 不可用时选择 `durable_dir`，持久化语义变为 `on_suspend`，绑定时即写入，运行中不切换。
 4. 存储模式在绑定时固定。已绑定 `external_csi` 的运行实例在运行中遇到 CSI 不可用时，提供者错误向上返回，`sandboxprovider` 的预配或恢复按自身规则失败；本模块不静默退化为 `durable_dir`，因为退化会改变持久化语义与安全点的判定。
-5. 退化配置的补偿由绑定携带：`durable_dir` 的回合边界销毁一律使用同步挂起，上传完成才返回；回合中崩溃按「回合被中断」重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失。
+5. 退化配置的补偿由绑定携带：`durable_dir` 的回合边界销毁一律使用同步挂起，上传完成才返回；回合中崩溃按“回合被中断”重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失。
 
 ### 工作区租约的建立、续约与接管
 
@@ -520,21 +520,21 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 
 ### 块存储的亲和与 attach 限制
 
-- `block` 是 k8s 提供者的退化配置。RWO 卷只限制挂接节点，不阻止同节点多个 Pod 或旧代沙箱写入，因此块存储仍由工作区租约串行化写者，不能替代租约。
+- `block` 是 k8s 提供者的退化配置。RWO 卷只限制挂接节点，不阻止同节点多个 Pod 或旧代沙箱写入，因此块存储的写入仍由工作区租约串行化，不能替代租约。
 - 绑定携带节点或可用区亲和；`sandboxprovider` 据此把沙箱调度到可挂接该卷的节点。预热池不能在创建时预绑定块存储，认领与重建都要等待挂接。
 - 并发挂接超过存储后端上限时，Pod 启动等待；非正常卸载后，存储控制器在超时后强制分离。预配与恢复的截止时间覆盖这段等待，超时按沙箱提供者的失败路径处理。
 - 块存储的重建时延高于共享文件系统；冷启动重建的性能目标按块存储路径单独定义，本模块不改变该目标，也不在运行中把块存储切换为共享文件系统。
 
 ### Agent 状态目录、投递意图日志与已初始化标记
 
-- `CLAUDE_CONFIG_DIR` 指向 `<run_id>/.platform/agent-config/`，Claude Code 的 `projects/<project>/<session-id>.jsonl` 随之位于工作区，跨代保留；各代沙箱的 cwd 逐字一致，使工具相对路径与会话记录稳定，`--resume` 按 `session_id` 查找而不依赖 cwd，`--continue` 才以 cwd 为作用域；`cleanupPeriodDays` 不小于工作区保留期（[REF-claude-code-settings](../../references.md)）。
+- `CLAUDE_CONFIG_DIR` 指向 `<run_id>/.platform/agent-config/`，Claude Code 的 `projects/<project>/<session-id>.jsonl` 随之位于工作区，跨代保留。各代沙箱的 cwd 逐字一致，使工具相对路径与会话记录稳定，`--resume` 按 `session_id` 查找而不依赖 cwd，`--continue` 才以 cwd 为作用域；`cleanupPeriodDays` 不小于工作区保留期（[REF-claude-code-settings](../../references.md)）。
 - 投递意图日志位于 `<run_id>/.platform/deliveries.jsonl`；`accepted{seq}` 在喂给 Agent 之前同步写入，`consumed{seq, turn_id}` 在观察到回合开始后同步写入，重建后由控制面从消费位置重投，看守进程按日志去重。
 - 已初始化标记位于 `<run_id>/.platform/initialized`；看守进程在首次初始化完成后写入，重建后读取。标记不放在 rootfs，避免销毁重建后重复初始化。
 - 这些路径由绑定与看守进程共同固定；`workspace` 保证目录存在与权限，`warden` 保证写入时机与 fsync。`runcontroller` 只要求销毁前持久化完成，不读取内容。
 
 ## 错误与失败语义
 
-失败的处置由租约的条件更新与代比较、操作前校验、墓碑拒绝、绑定时的退化以及持久化确认组合表达；操作前校验覆盖路径、配额与权限。下表列出已明确处置路径的失败，各行是举例。
+失败的处置由租约的条件更新与代比较、操作前校验、墓碑拒绝、绑定时的退化以及持久化确认组合而成；操作前校验覆盖路径、配额与权限。下表列出已明确处置路径的失败，各行是举例。
 
 | 失败 | 检测 | 行为 | 调用方可见 |
 | --- | --- | --- | --- |

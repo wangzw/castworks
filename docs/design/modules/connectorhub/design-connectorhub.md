@@ -1,6 +1,6 @@
 # connectorhub
 
-`connectorhub` 坐在控制面，是外部系统与[运行实例](../../../glossary.md)之间的唯一入口。它拥有[外部系统定义](../../../glossary.md)、[连接器](../../../glossary.md)实例、[连接器事件日志](../../../glossary.md)、[订阅](../../../glossary.md)登记与订阅状态、[完成条件目录](../../../glossary.md)、[出口策略](../../../glossary.md)与[沙箱侧配置](../../../glossary.md)的生成与推送、[工具接入声明](../../../glossary.md)、[等待签名](../../../glossary.md)与项目绑定配置的装载与校验，以及 k8s 路径的平台出口代理子模块；它不执行第三方操作，不拥有[收件箱](../../../glossary.md)、[唤醒信号](../../../glossary.md)与运行实例状态，不拥有人类通道、LLM 流量、[沙箱](../../../glossary.md)生命周期与 Agent 的[等待意图](../../../glossary.md)。本模块向运行实例交付外部事件只有订阅完成事件一种形态，文档围绕连接器事件日志与订阅这对机制组织。
+`connectorhub` 位于控制面，是外部系统与[运行实例](../../../glossary.md)之间的唯一入口。它拥有[外部系统定义](../../../glossary.md)、[连接器](../../../glossary.md)实例、[连接器事件日志](../../../glossary.md)、[订阅](../../../glossary.md)登记与订阅状态、[完成条件目录](../../../glossary.md)、[出口策略](../../../glossary.md)与[沙箱侧配置](../../../glossary.md)的生成与推送、[工具接入声明](../../../glossary.md)、[等待签名](../../../glossary.md)与项目绑定配置的装载与校验，以及 k8s 路径的平台出口代理子模块；它不执行第三方操作，不拥有[收件箱](../../../glossary.md)、[唤醒信号](../../../glossary.md)与运行实例状态，不拥有人类通道、LLM 流量、[沙箱](../../../glossary.md)生命周期与 Agent 的[等待意图](../../../glossary.md)。本模块向运行实例交付的外部事件只有订阅完成事件一种形态，文档围绕连接器事件日志与订阅这对机制组织。
 
 心智模型：webhook 先落盘再应答，订阅登记先回溯再等待；正确性不依赖事件与登记谁先到达（I2）；事件与订阅都带项目，匹配只发生在同一项目之内。
 
@@ -21,7 +21,7 @@
 - **完成条件目录维护**：维护事件类型到 `verify` 的映射，供订阅按事件类型查找状态核对方式；目录属于事件语义，不绑定具体操作。
 - **订阅登记与回溯匹配**：接收带运行实例令牌的订阅登记，校验外部系统与关联键中的项目归属键取值都属于该运行实例的项目，在同一事务写入带 `project_id` 的订阅行，并按关联键回溯匹配本项目的连接器事件日志；把命中的事件认领给订阅，返回 `sub_id` 与 `since_cursor`；登记不因订阅数量或登记速率被拒绝，越过软阈值只计数告警。
 - **完成条件核对与合成完成事件**：对声明完成条件的订阅按 `events.completions` 中的 `verify` 核对外部对象当前状态；对象已处于终态时立即合成完成事件，不等待后续 webhook（I2）。
-- **状态式轮询**：按外部系统定义的轮询周期核对活动订阅所指外部对象的当前状态，只产生完成事件，不产生普通事件，兜底丢失或乱序的 webhook；同一项目内引用同一外部对象的订阅合并为一次核对，跨运行实例轮转调度，每运行实例与每项目的核对次数受每周期预算约束，凭据换取按运行实例、外部系统与认证方法每周期复用一次，使对外部系统与 `secrets` 的调用量与合并后的对象数和运行实例数成正比，不随订阅数放大。
+- **状态式轮询**：按外部系统定义的轮询周期核对活动订阅所指外部对象的当前状态，只产生完成事件，不产生普通事件，兜底丢失或乱序的 webhook。同一项目内引用同一外部对象的订阅合并为一次核对，跨运行实例轮转调度，每运行实例与每项目的核对次数受每周期预算约束，凭据换取按运行实例、外部系统与认证方法每周期复用一次，使对外部系统与 `secrets` 的调用量与合并后的对象数和运行实例数成正比，不随订阅数放大。
 - **订阅完成事件投递**：把订阅完成事件经[汇入契约](../../../glossary.md)写入收件箱，`event_id` 由订阅与[终态取值](../../../glossary.md)派生，`dedup_key` 由订阅与外部事件标识派生，原始负载以附件引用表达，载荷不超过 `S_max`；按每运行实例令牌桶限速发出，超出部分保持待投递，不丢弃。
 - **去重**：以内容派生的 `dedup_key` 与收件箱唯一索引兜底同一完成事件的重复写入与内容相同的重复 webhook，以 `delivery_id` 唯一兜底 webhook 重发，以 `once` 订阅的状态 CAS 裁决 webhook 与状态式轮询的并发完成，以认领记录与完成事件投递记录的唯一键兜底 `until_cancelled` 的重复。
 - **订阅对账扫描**：按配置的扫描周期重新匹配归属订阅所在项目的留存事件，为命中且对该事件尚无认领记录的活动订阅补写认领，按每运行实例投递速率重投 `pending` 的完成事件投递记录，取消运行实例已终态的活动订阅，并把 `timeout_at` 已到期且仍为 `active` 的订阅置为 `expired` 并写入超时完成事件；以认领记录、投递记录的唯一键与订阅状态 CAS 幂等。
@@ -170,7 +170,7 @@ wait_signatures:
 
 定义在装载时校验。闭集外取值、缺失必填字段、`inject.host` 或 `host_modes.host` 不在 `upstreams` 中、`inject.auth_method` 不在 `auth.methods` 中、`passthrough` 主机声明注入规则、`pinned_hosts` 的主机不在 `upstreams` 中或对应通道不是 `passthrough` 或存在注入规则、`identity_keys` 为空或不是 `correlation_keys` 的子集、带 `webhook` 事件源的定义缺少 `events.project_binding` 或其不属于 `correlation_keys`、`plaintext_hosts` 的主机不在 `upstreams` 中或与 `pinned_hosts` 重叠、`completions[].event` 为空或 `verify` 不成对时，该定义不装载，其 webhook 路径返回未找到。等待签名逐条校验，校验规则见[等待签名](#等待签名)；不通过的签名不装载，不影响定义的其余部分。定义变更后，新登记使用新定义；已登记订阅保留登记时的 `dedup_spec`，不因字段路径变化而改变去重结果；出口策略与沙箱侧配置按新定义重新生成并推送。
 
-认证方法决定项目凭据在外部系统中代表的账号，即[凭据主体](../../../glossary.md)：`personal_access_token` 的凭据主体是令牌持有人，`github_app_installation` 的凭据主体是该 GitHub App 的机器人账号。凭据主体记录在 `secrets` 凭据对象的 `principal` 字段中，本模块不保存。外部系统与人类通道并用时（例如 GitHub 同时承载 Issue 评论通道），Agent 能以注入的项目凭据代该主体发言，因此 [humanchannel](../design-humanchannel.md) 拒绝该主体在本项目通道中发出的消息与审批决定；部署为项目凭据使用独立的机器账号，项目凭据若使用某[审批人](../../../glossary.md)的个人访问令牌，该审批人在对应通道的决定被拒绝。
+认证方法决定项目凭据在外部系统中代表的账号，即[凭据主体](../../../glossary.md)：`personal_access_token` 的凭据主体是令牌持有人，`github_app_installation` 的凭据主体是该 GitHub App 的机器人账号。凭据主体记录在 `secrets` 凭据对象的 `principal` 字段中，本模块不保存。外部系统与人类通道并用时（例如 GitHub 同时承载 Issue 评论通道），Agent 能以注入的项目凭据代该主体发言，因此 [humanchannel](../design-humanchannel.md) 拒绝该主体在本项目通道中发出的消息与审批决定；部署为项目凭据使用独立的机器账号。项目凭据若使用某[审批人](../../../glossary.md)的个人访问令牌，该审批人在对应通道的决定被拒绝。
 
 ### 项目绑定配置
 
@@ -242,7 +242,7 @@ type EgressPolicySink interface {
 - `Modes` 是各主机的网络通道，同一修订的 `Modes` 也进入沙箱侧配置。`EgressPolicySink` 的适配层只把 `EgressPolicy` 序列化为 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#与-connectorhub-的出口策略接口) `EgressPolicyDocument` 的 `Policy`，沙箱提供者不解释其内容；沙箱侧配置不随出口策略推送，见[沙箱侧配置推送](#沙箱侧配置推送)。
 - 推送以 `connectorhub` 的 SPIFFE 身份调用 `sandboxprovider` 的 `PutEgressPolicy`，`sandboxprovider` 只接受该身份的调用。推送以运行实例幂等，`Revision` 递增；沙箱提供者在预配与认领沙箱时按代落地，并把推送的更新同步到该运行实例尚未撤销的代。按代撤销由 `runcontroller` 的 `revoke_egress` 效果驱动，本模块不撤销出口策略。
 - Substrate 路径把出口策略映射为以（运行实例，代）为键的 `EgressPolicy`，以 `replaceHeaders` 替换占位符（[REF-substrate](../../../references.md)）；k8s 路径由 `sandboxprovider` 的 k8s 子模块落地为平台出口代理配置与 NetworkPolicy，k8s 路径的按代撤销为空操作。代理的鉴权、替换与转发细节见[平台出口代理（k8s 路径）](design-connectorhub-egress.md)。
-- 推送遇到沙箱提供者不可达或超时时，沙箱提供者保留上一次成功推送的出口策略，本模块按运行实例与 `Revision` 重试；运行实例已释放时的释放墓碑拒绝为确定性，不重试；新代预配前以已保存的出口策略落地，未列入的主机仍被拒绝。
+- 推送遇到沙箱提供者不可达或超时时，沙箱提供者保留上一次成功推送的出口策略，本模块按运行实例与 `Revision` 重试；运行实例已释放时，释放墓碑拒绝是确定性的，不重试；新代预配前以已保存的出口策略落地，未列入的主机仍被拒绝。
 
 ### 沙箱侧配置推送
 
@@ -363,7 +363,7 @@ type AllowedHostsView struct {
 - 附件存储：保存超过 `S_max` 的原始负载；存储实现由部署配置决定，接口约束见附件取回一节。
 - 运行时调用方：[看守进程](../../../glossary.md)的本地代理、透明拦截器与平台 MCP 服务器调用本模块：本地代理经 CONNECT 或 HTTP 前置、透明拦截器经 CONNECT 调用平台出口代理，只到面向沙箱的端点 `egress`，携带 `egress` 受众的运行实例令牌；平台 MCP 服务器经 HTTP 调用，只到面向沙箱的端点 `connector`，携带 `connectorhub` 受众的运行实例令牌。这是运行时调用，不是代码依赖，不出现在模块依赖图中。
 
-架构不变量 I1 要求全部外部系统流量经托管侧，I6 约束沙箱内的凭据与 Agent 进程可达的端点（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)、[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）；I2 要求订阅登记回溯匹配并核对对象当前状态；I7 要求出口请求与订阅登记按代校验（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本模块的依赖方向满足这些约束。`llmgateway` 依赖本模块的出口策略查询接口 `EgressPolicyQuery`，是被依赖方向，方向为 `llmgateway → connectorhub`；本模块不依赖 `llmgateway`，不调用它。
+架构不变量 I1 要求全部外部系统流量经托管侧，I6 约束沙箱内的凭据与 Agent 进程可达的端点（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)、[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）；I2 要求订阅登记回溯匹配并核对对象当前状态；I7 要求出口请求与订阅登记按代校验（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）。本模块的依赖方向满足这些约束。`llmgateway` 依赖本模块的出口策略查询接口 `EgressPolicyQuery`，依赖方向为 `llmgateway → connectorhub`；本模块不依赖 `llmgateway`，不调用它。
 
 ## UML 图
 
@@ -704,7 +704,7 @@ sequenceDiagram
 | `claimed_at` | time | 非空 | 认领时刻 |
 | `terminal` | string | 可空 | 认领时确定的终态取值；事件尚未构造完成事件时为空 |
 
-认领记录是 `(sub_id, delivery_id)` 唯一的事实来源；连接器事件日志的 `claimed_by_sub` 由它投影，去重、审计与订阅对账扫描都以它为准。
+认领记录是 `(sub_id, delivery_id)` 唯一的事实源；连接器事件日志的 `claimed_by_sub` 由它投影，去重、审计与订阅对账扫描都以它为准。
 
 | 字段 | 类型 | 约束 | 含义 |
 | --- | --- | --- | --- |
@@ -799,7 +799,7 @@ sequenceDiagram
 4. 计算项目归属：取原始负载中 `events.project_binding` 所指字段的值，按 `correlation_normalization` 规范化，`project_ids` 为项目绑定配置中 `system` 相同且 `values` 含该取值的全部项目。字段缺失或没有项目声明该取值时 `project_ids` 为空：事件照常落盘，不参与任何匹配，计数 `connector_event_unbound` 并审计。
 5. 以 `(system, delivery_id)` 插入连接器事件日志，`project_ids` 与日志行同一事务写入。唯一键冲突表示重复投递，返回 200，不重复写入、不重复匹配。
 6. 提交事务后返回 200。
-7. 匹配活动订阅：在事件 `project_ids` 所含项目内，以 `(system, project_id, 关联键路径, 规范化值)` 定位候选订阅，逐条应用 `filter` 与 `completes_on`，以 `(sub_id, delivery_id)` 认领；`project_ids` 为空的事件跳过本步。`once` 订阅通过状态 CAS 完成；`until_cancelled` 订阅保持 `active`，每条命中事件各自构造完成事件并各写一条 `pending` 投递记录。投递记录提交后按「完成事件构造与投递」的每运行实例令牌桶发出，令牌桶无余量的记录保持 `pending`，由订阅对账扫描按速率重投。
+7. 匹配活动订阅：在事件 `project_ids` 所含项目内，以 `(system, project_id, 关联键路径, 规范化值)` 定位候选订阅，逐条应用 `filter` 与 `completes_on`，以 `(sub_id, delivery_id)` 认领；`project_ids` 为空的事件跳过本步。`once` 订阅通过状态 CAS 完成；`until_cancelled` 订阅保持 `active`，每条命中事件各自构造完成事件并各写一条 `pending` 投递记录。投递记录提交后按“完成事件构造与投递”的每运行实例令牌桶发出，令牌桶无余量的记录保持 `pending`，由订阅对账扫描按速率重投。
 8. 未命中任何订阅的事件留在连接器事件日志中，按 `R_event_log` 保存。
 
 webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部订阅做扫描。匹配失败不回滚已返回的 200；连接器事件日志保留，由状态式轮询与订阅对账扫描重驱动。
@@ -815,11 +815,11 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 5. 以发起核对的运行实例换取的凭据调用只读的 `verify.api`，取得外部对象当前状态；结果扇出到本周期引用该对象的全部订阅，包括同一项目其他运行实例的订阅。
 6. 状态属于 `verify.terminal` 时，对每个引用该对象的订阅各自以 CAS 把 `active` 置为 `completed`，确定 `terminal`，构造完成事件，写入 `pending` 投递记录后按每运行实例令牌桶投递。
 7. 状态不属于 `verify.terminal` 时不写任何事件；核对不可达时按退避重试并计数。
-8. 轮询不写连接器事件日志，不产生普通事件；它只产生完成事件，字段按「完成事件构造与投递」的规则构造。
+8. 轮询不写连接器事件日志，不产生普通事件；它只产生完成事件，字段按“完成事件构造与投递”的规则构造。
 
-每个周期的 `verify.api` 调用数与合并后的核对对象数成正比，并受 `verify_budget_per_run`、`verify_budget_per_project` 约束；凭据换取次数与 `secrets` 审计写入与本周期涉及的运行实例数成正比，与订阅数无关；结果扇出与引用订阅数成正比，只是本模块内的 CAS。同一 `once` 订阅的 webhook 完成与轮询完成由状态 CAS 裁决，只有一个成功；失败的一方不写完成事件与投递记录。
+每个周期的 `verify.api` 调用数与合并后的核对对象数成正比，并受 `verify_budget_per_run`、`verify_budget_per_project` 约束；凭据换取次数与 `secrets` 审计写入次数都与本周期涉及的运行实例数成正比，与订阅数无关；结果扇出与引用订阅数成正比，只是本模块内的 CAS。同一 `once` 订阅的 webhook 完成与轮询完成由状态 CAS 裁决，只有一个成功；失败的一方不写完成事件与投递记录。
 
-订阅对账扫描按配置的扫描周期纠正以下差异：仍在活动订阅匹配窗口内的留存事件按与回溯匹配相同的判定重新匹配，只匹配 `project_ids` 包含订阅 `project_id` 的事件，为命中且对该事件尚无认领记录的活动订阅补写认领；`pending` 的完成事件投递记录按 `event_id` 与 `dedup_key`、每运行实例令牌桶的速率重投；活动订阅经 `Generations.Current` 检查，运行实例终态或不存在时置 `cancelled`，覆盖没有完成事件也不参与状态式轮询的 `until_cancelled` 订阅；`timeout_at` 已到期且仍为 `active` 的订阅按「订阅取消与超时」的规则 CAS 置 `expired` 并写入超时完成事件。各纠正分别以认领记录的 `(sub_id, delivery_id)`、投递记录的 `(sub_id, dedup_key)` 与订阅状态 CAS 幂等；每次纠正计数，差异数计入 `subscription_reconcile_diff` 指标。该扫描不读取 `runcontroller` 的表，只调用其代查询接口。
+订阅对账扫描按配置的扫描周期纠正以下差异：仍在活动订阅匹配窗口内的留存事件按与回溯匹配相同的判定重新匹配，只匹配 `project_ids` 包含订阅 `project_id` 的事件，为命中且对该事件尚无认领记录的活动订阅补写认领；`pending` 的完成事件投递记录按 `event_id` 与 `dedup_key`、每运行实例令牌桶的速率重投；活动订阅经 `Generations.Current` 检查，运行实例终态或不存在时置 `cancelled`，覆盖没有完成事件也不参与状态式轮询的 `until_cancelled` 订阅；`timeout_at` 已到期且仍为 `active` 的订阅按“订阅取消与超时”的规则 CAS 置 `expired` 并写入超时完成事件。各纠正分别以认领记录的 `(sub_id, delivery_id)`、投递记录的 `(sub_id, dedup_key)` 与订阅状态 CAS 幂等；每次纠正计数，差异数计入 `subscription_reconcile_diff` 指标。该扫描不读取 `runcontroller` 的表，只调用其代查询接口。
 
 ### 完成事件构造与投递
 
@@ -843,7 +843,7 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 
 1. **投递层**：连接器事件日志以 `(system, delivery_id)` 唯一，吸收 webhook 发送方的重发。
 2. **认领层**：`(sub_id, delivery_id)` 唯一，保证同一订阅对同一投递只认领一次。
-3. **收件箱层**：`(run_id, dedup_key)` 唯一，吸收同一完成事件的重复写入（`AppendInbox` 的退避重试与订阅对账扫描的重投），也吸收 `delivery_id` 不同但内容相同的重复 webhook；webhook 与状态式轮询对同一 `once` 订阅的并发完成只由状态层裁决，两条路径的 `dedup_key` 按「完成事件构造与投递」的派生规则互不相同，本层不参与该裁决。
+3. **收件箱层**：`(run_id, dedup_key)` 唯一，吸收同一完成事件的重复写入（`AppendInbox` 的退避重试与订阅对账扫描的重投），也吸收 `delivery_id` 不同但内容相同的重复 webhook；webhook 与状态式轮询对同一 `once` 订阅的并发完成只由状态层裁决，两条路径的 `dedup_key` 按“完成事件构造与投递”的派生规则互不相同，本层不参与该裁决。
 4. **状态层**：`once` 订阅的状态 CAS 保证并发完成只有一个成功者；`until_cancelled` 的每次完成由认领记录与完成事件投递记录的唯一键保证同一外部事件只投递一次；`once` 的迟到事件在状态已 `completed` 后丢弃并审计。
 
 `dedup_key` 由 `dedup_spec` 的字段值派生，`dedup_spec` 是登记时的副本。外部系统定义改变去重字段后，已登记订阅仍按旧副本计算。同一 `dedup_key` 对应不同内容时，先写入者胜出，后到者丢弃并审计。
@@ -960,7 +960,7 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 
 去重依赖以下唯一索引：连接器事件日志的 `(system, delivery_id)`；认领记录的 `(sub_id, delivery_id)`；完成事件投递记录的 `(sub_id, dedup_key)`；收件箱的 `(run_id, dedup_key)`，由 `runcontroller` 维护。索引冲突按幂等命中处理，不产生重复行。
 
-对 `once` 订阅，webhook 匹配与状态式轮询的竞态由订阅状态 CAS 裁决：两者都从 `active` 出发，只有一个能把状态改为 `completed`；失败的一方不构造完成事件，连接器事件日志中的记录仍保留。订阅登记与 webhook 匹配的竞态按关联键串行化：登记事务对其 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 建立咨询锁，匹配事务对事件 `correlation` 的每一对建立咨询锁，两组按同一字典序加锁以避免死锁；子集订阅与超集事件因而至少共享一把锁。也可退化为按 `system` 的粗粒度咨询锁。登记事务提交后重扫 `append_seq >= since_cursor` 且本订阅尚无认领记录的匹配事件。订阅对账扫描按周期重新匹配仍在连接器事件日志保留期内的事件，为命中且对该事件尚无认领记录的活动订阅补写认领，作为兜底；最坏纠正时延不超过一个扫描周期。
+对 `once` 订阅，webhook 匹配与状态式轮询的竞态由订阅状态 CAS 裁决：两者都从 `active` 出发，只有一个能把状态改为 `completed`；失败的一方不构造完成事件，连接器事件日志中的记录仍保留。订阅登记与 webhook 匹配的竞态按关联键串行化：登记事务对其 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 建立咨询锁，匹配事务对事件 `correlation` 的每一对建立咨询锁，两组按同一字典序加锁以避免死锁；子集订阅与超集事件因而至少共享一把锁。也可回退为按 `system` 的粗粒度咨询锁。登记事务提交后重扫 `append_seq >= since_cursor` 且本订阅尚无认领记录的匹配事件。订阅对账扫描按周期重新匹配仍在连接器事件日志保留期内的事件，为命中且对该事件尚无认领记录的活动订阅补写认领，作为兜底；最坏纠正时延不超过一个扫描周期。
 
 对 `once` 订阅，订阅超时与完成同时发生时，CAS 只允许一个成功：完成先成功则超时不再写事件；超时先成功则后续 webhook 作为已终止订阅的事件丢弃并审计。`until_cancelled` 订阅的匹配与超时以订阅行锁串行，超时先提交则后续匹配看到 `expired` 并丢弃。订阅取消与完成同时发生时，取消先成功则完成事件不写入；完成先成功则取消不改写订阅状态，已记录的完成事件保留。
 

@@ -1,6 +1,6 @@
 # castworks 设计文档
 
-castworks 是托管 AI Agent 环境。完整的第三方 Agent（托管的 Agent 为 Claude Code）作为进程运行在挂载持久化工作区的沙箱内；托管环境在 Agent 等待 LLM、外部系统或人类时挂起沙箱以释放计算资源，并在依赖解除后恢复，以同时达到计算资源利用率与响应延迟目标。
+castworks 是托管 AI Agent 环境。完整的第三方 Agent 以进程形式运行在挂载持久化工作区的沙箱内，托管的 Agent 为 Claude Code；托管环境在 Agent 等待 LLM、外部系统或人类时挂起沙箱以释放计算资源，并在依赖解除后恢复，以同时达到计算资源利用率与响应延迟目标。
 
 ## 索引
 

@@ -1,12 +1,12 @@
 # humanchannel
 
-`humanchannel` 是控制面中唯一面向用户的入口，也是事件源模块之一。平台界面只调用它；聊天界面、即时通讯与 Issue 评论的人类输入经它进入[运行实例](../../glossary.md)的[收件箱](../../glossary.md)。用户以部署对接的 IdP（OIDC）认证；即时通讯与 Issue 评论的外部账号经[外部身份关联](../../glossary.md)落到平台用户。本模块按[项目角色](../../glossary.md)执行用户授权，判定[审批人](../../glossary.md)资格，排除本项目[凭据主体](../../glossary.md)与通道机器人发出的消息与审批决定，读取并转义呈现待决审批内容，为终端与文件访问签发[接入票据](../../glossary.md)，并把终端连接与[工作区](../../glossary.md)文件读取登记为[实时接入](../../glossary.md)。它不拥有收件箱与状态机，不执行审批 hook（[REF-claude-code-hooks](../../references.md)），不落地[出口策略](../../glossary.md)。心智模型：人类侧的动作先被校验与规范化，再成为与外部系统事件相同的收件箱事件与运行实例事实，`runcontroller` 据这些持久化事实唤醒、投递与决策；Agent 进程从不直接接触 `humanchannel`。
+`humanchannel` 是控制面中唯一面向用户的入口，也是事件源模块之一。平台界面只调用它；聊天界面、即时通讯与 Issue 评论的人类输入经它进入[运行实例](../../glossary.md)的[收件箱](../../glossary.md)。用户以部署对接的 IdP（OIDC）认证；即时通讯与 Issue 评论的外部账号经[外部身份关联](../../glossary.md)落到平台用户。本模块按[项目角色](../../glossary.md)执行用户授权，判定[审批人](../../glossary.md)资格，排除本项目[凭据主体](../../glossary.md)与通道机器人发出的消息与审批决定，读取并转义呈现待决审批内容，为终端与文件访问签发[接入票据](../../glossary.md)，并把终端连接与[工作区](../../glossary.md)文件读取登记为[实时接入](../../glossary.md)。它不拥有收件箱与状态机，不执行审批 hook（[REF-claude-code-hooks](../../references.md)），不落地[出口策略](../../glossary.md)。心智模型：人类侧的动作先经校验与规范化，再成为与外部系统事件相同的收件箱事件与运行实例事实，`runcontroller` 据这些持久化事实唤醒、投递与决策；Agent 进程从不直接接触 `humanchannel`。
 
 文档较长，不宜顺序通读。第一次阅读按以下顺序：核心概念、职责、外部接口契约、UML 图、走查、消息摄入与去重、审批决定的读取、呈现与写入、实时接入的写入与到期、终端接入、界面文件访问的接入门控；核心数据结构、错误与失败语义、并发与事务边界作为参考，在核对具体字段或交错序列时查阅。
 
 ## 核心概念
 
-实时接入把「人是否在场」表达为运行实例上的一条事实。平台界面会话活跃、终端已连接或界面正在经[沙箱](../../glossary.md)读取工作区文件时，本模块写入带有效期的接入事实，并以单调递增的来源序号续写；有效期让控制面知道人何时离开，来源序号让控制面区分续写、重报与迟到的上报。`runcontroller` 依据这条事实在人在场期间只[冻结](../../glossary.md)、不销毁沙箱，全部接入失效后回到异步回合制（[ADR-turn-boundary-destroy](../../adr/adr-turn-boundary-destroy.md)）；没有它，系统无法判断一个[挂起](../../glossary.md)的运行实例是否正等着人操作。
+实时接入把“人是否在场”表达为运行实例上的一条事实。平台界面会话活跃、终端已连接或界面正在经[沙箱](../../glossary.md)读取工作区文件时，本模块写入带有效期的接入事实，并以单调递增的来源序号续写；有效期让控制面知道人何时离开，来源序号让控制面区分续写、重报与迟到的上报。`runcontroller` 依据这条事实在人在场期间只[冻结](../../glossary.md)、不销毁沙箱，全部接入失效后回到异步回合制（[ADR-turn-boundary-destroy](../../adr/adr-turn-boundary-destroy.md)）；没有它，系统无法判断一个[挂起](../../glossary.md)的运行实例是否正等着人操作。
 
 用户授权以单一入口为前提。平台界面只调用 `humanchannel`；本模块完成 OIDC 认证与外部身份关联，按 IdP 组声明映射出的项目角色判定每个操作是否允许，再以自身 SPIFFE 身份（[REF-spiffe](../../references.md)）调用 `runcontroller` 与 `workspace`，并在请求中传递已认证的用户。下游只记录传入的用户并写审计，不重复判定项目成员资格。审批决定只有审批人可以提交；待决审批内容由 `runcontroller` 保存并经 `GetPendingApproval` 提供，本模块转义呈现，并以[审批内容摘要](../../glossary.md)把决定绑定到审批人所见的内容（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)、[ADR-approval-bound-to-tool-input](../../adr/adr-approval-bound-to-tool-input.md)）。
 
@@ -17,16 +17,16 @@
 职责穷举如下，每条先写本模块执行的动作，再写产生的结果或边界。
 
 - **用户身份认证与外部身份关联**：平台界面用户以部署对接的 IdP 的 OIDC 身份认证；即时通讯与 Issue 评论的外部账号按 `(channel, external_account)` 查 `identity_link`，落到唯一平台用户。未关联的外部身份不产生任何事件，只计数 `unlinked_identity_rejected` 并写审计。
-- **项目角色授权**：把 IdP 组声明按部署配置 `project_role_mapping` 映射为项目角色闭集 `member`、`approver`、`admin`，按缓存不超过 `T_role_cache`；对每个用户操作按权限矩阵判定，越权请求不产生收件箱事件、不建立接入。
+- **项目角色授权**：把 IdP 组声明按部署配置 `project_role_mapping` 映射为项目角色闭集 `member`、`approver`、`admin`，缓存不超过 `T_role_cache`；对每个用户操作按权限矩阵判定，越权请求不产生收件箱事件、不建立接入。
 - **提供面向用户的 `UserService`**：方法闭集为 `CreateRun`、`GetRun`（含准入状态）、`EndRun`、`ResolveRun`、`ListFiles`、`ReadFile`、`StreamFile`、`ListApprovals`、`GetApproval`、`SubmitApproval`、`AttachTerminal`；以 `humanchannel` SPIFFE 身份调用 `runcontroller` 与 `workspace`，并在请求中传递已认证用户，下游不重复判定成员资格。
 - **判定审批人资格与排除凭据主体**：审批人取[运行实例创建者](../../glossary.md)或持有 `approver` 角色的用户；经 `secrets.ListCredentialPrincipals` 取本项目凭据主体，拒绝外部账号等于任一凭据主体或本模块自身通道机器人的消息与审批决定，计数并写审计；部署为项目凭据使用独立的机器账号，项目凭据使用某审批人的个人令牌时，该审批人在对应通道的决定被拒绝。部署配置 `approval_second_factor` 为可选加固，取值闭集为 `none`、`ui_confirm`、`signed_callback`、`oob_code`，缺省 `none`，开启后审批决定另需附带 Agent 取不到的因子。
 - **读取与呈现待决审批内容**：以 `GetPendingApproval` 与 `ListPendingApprovals` 读取 `runcontroller` 保存的工具名、工具输入、截断预览、摘要与大小；呈现时转义控制字符、双向文本控制符与终端转义序列，完整展示或明示截断并提供完整查看，标明内容由 Agent 产生；把审批人所见内容的[审批内容摘要](../../glossary.md)写入决定。
 - **消息摄入与适配**：接收聊天界面、即时通讯与 Issue 评论的原始请求，完成身份、角色与归属校验，把每个输入规范化为收件箱事件（`kind=message`），填充 `Actor`、`occurred_at` 与由通道消息标识派生的 `event_id`、`dedup_key`，经[汇入契约](../../glossary.md)调用 `AppendInbox` 写入；重复投递命中同一 `dedup_key`，不产生重复事件。
 - **审批决定写入**：接收人类对权限询问的决定，决定携带标识 `id`、`correlation.permission_id`、`allow | deny`、可选的 `updatedInput` 与审批人所见内容的摘要；校验决定标识、`permission_id`、决定取值、审批人资格与该摘要，以 `permission_id` 与决定标识共同派生唯一 `dedup_key`，以 `kind=approval_decision` 写入收件箱，`correlation` 携带 `permission_id` 与 `input_hash`。权限询问是否仍处于等待由 `runcontroller` 的定向投递匹配判定，本模块只读取审批内容，不判定等待状态。同一 `permission_id` 的另一决定且决定标识不同时，本模块在写入前拒绝并审计。
-- **在线与「正在输入」信号**：维护平台界面会话的活跃状态，以 `ui_session` 接入通道写入接入事实；活跃状态由用户活动或心跳判定，空闲超过短于 `TTL` 的空闲超时后写接入值为假，会话打开而长时间无操作不视为实时接入。把界面产生的「正在输入」事件作为[预测性恢复](../../glossary.md)提示经 `SetRunFact{wake_hint}` 写入，载荷为 `WakeHint{Generation, Origin, RequestID}`，`Origin` 取 `ui`，是否据此提前恢复由 `suspendpolicy` 批准。活跃状态不改变运行实例状态，只约束挂起决策。
+- **在线与“正在输入”信号**：维护平台界面会话的活跃状态，以 `ui_session` 接入通道写入接入事实；活跃状态由用户活动或心跳判定，空闲时长超过一个短于 `TTL` 的空闲超时后写接入值为假，会话打开而长时间无操作不视为实时接入。把界面产生的“正在输入”事件作为[预测性恢复](../../glossary.md)提示经 `SetRunFact{wake_hint}` 写入，载荷为 `WakeHint{Generation, Origin, RequestID}`，`Origin` 取 `ui`，是否据此提前恢复由 `suspendpolicy` 批准。活跃状态不改变运行实例状态，只约束挂起决策。
 - **实时接入状态**：为 `ui_session`、`terminal`、`file` 接入通道写入 `SetRunFact{live_attach}` 事实，给出 `Channel`、`Attached`、`TTL` 与单调递增的 `SourceSeq`；接入期间按小于 `TTL` 的周期续写，该通道无其他有效连接时写接入值为假，进程重启后以更大的 `SourceSeq` 重报仍有效的接入。`runcontroller` 据此唤醒、取消挂起或约束挂起决策；本模块不判定挂起机制。
 - **终端接入**：用户身份与项目角色校验通过（运行实例创建者或 `admin`）后写入 `terminal` 接入事实，按 `RunService.Get` 返回的状态决定直接转发或以退避轮询等待进入 `active`，再申请 `channel=terminal` 的接入票据，以 `run_id` 与运行实例的当前代（[代](../../glossary.md)）为目标经入站路由建立到看守进程 `/terminal` 的双向流，并在请求头 `x-castworks-access-ticket` 携带票据；流内字节不在本模块解析，该通道无其他有效连接时写接入值为假。
-- **界面文件访问的接入门控**：`ListFiles`、`ReadFile` 与 `StreamFile` 完成身份与项目角色校验（任一项目角色）后写入 `file` 接入事实，按终端相同的条件等待运行实例可接收；每次读取前申请 `channel=file` 的接入票据，放进 `workspace` 的 `FileAccess` 请求的 `Ticket`；`workspace` 把票据原样转发到 `/files`，经看守进程的读取由看守进程验签；直接读取以本模块的 SPIFFE 身份与调用前完成的项目角色判定授权。文件内容不经过本模块。
+- **界面文件访问的接入门控**：`ListFiles`、`ReadFile` 与 `StreamFile` 完成身份与项目角色校验（任一项目角色）后写入 `file` 接入事实，按与终端相同的条件等待运行实例可接收；每次读取前申请 `channel=file` 的接入票据，放进 `workspace` 的 `FileAccess` 请求的 `Ticket`；`workspace` 把票据原样转发到 `/files`，经看守进程的读取由看守进程验签；直接读取以本模块的 SPIFFE 身份与调用前完成的项目角色判定授权。文件内容不经过本模块。
 - **附件存放与取回**：超过 [`S_max`](design-runcontroller.md)（`runcontroller` 的单批载荷上限，3 MiB）的载荷由本模块存放，收件箱事件载荷只携带附件引用（可取回的 URI、内容哈希与字节数）；附件取回在[面向沙箱的端点](../../glossary.md) `human` 上提供，以 `humanchannel` 受众的运行实例令牌与代查询校验请求方。
 - **通道侧状态维护**：保存外部身份关联、通道绑定、人类消息与决定的去重记录、接入会话与附件对象；以本地记录重驱动未完成的汇入写入，保证至少一次写入而不产生重复事件。
 
@@ -144,7 +144,7 @@ type WakeHint struct {
 
 - 本模块以 `humanchannel` SPIFFE 身份经 mTLS 调用上述方法；`InboxEvent.Source` 与 `RunFact.Source` 由 `runcontroller` 按对端身份写入，请求中的同名值被忽略；`Actor` 只在对端为 `humanchannel` 时接受且必填。
 - `AppendInbox` 以 `(run_id, dedup_key)` 幂等；命中且关联键（`permission_id`）与 `input_hash` 都相同时返回已分配的序号，本模块按成功处理并停止重试；命中而关联键不同时按不可重试冲突拒绝并审计，不写第二行。不可重试错误丢弃并审计；暂时性错误以同一 `dedup_key` 退避重试。
-- `SetRunFact{live_attach}` 只接受更大的 `SourceSeq`；接入值为真的实时接入事实以写入时刻加 `LiveAttach.TTL` 为有效期，接入值为假的事实没有有效期。`SetRunFact{wake_hint}` 以 `Origin=ui` 写入，按 `(run_id, generation, origin, request_id)` 幂等；`request_id` 由界面为每次「正在输入」事件给出，同一次事件的重复上报复用同一值，不同输入事件使用新值。
+- `SetRunFact{live_attach}` 只接受更大的 `SourceSeq`；接入值为真的实时接入事实以写入时刻加 `LiveAttach.TTL` 为有效期，接入值为假的事实没有有效期。`SetRunFact{wake_hint}` 以 `Origin=ui` 写入，按 `(run_id, generation, origin, request_id)` 幂等；`request_id` 由界面为每次“正在输入”事件给出，同一次事件的重复上报复用同一值，不同输入事件使用新值。
 - 汇入契约是写入收件箱事件与运行实例事实的唯一入口，`runcontroller` 不反向调用本模块（[ADR-wait-on-durable-inbox](../../adr/adr-wait-on-durable-inbox.md)）。
 
 ### 控制面服务与代查询
@@ -223,7 +223,7 @@ type AttachmentStore interface {
 
 ### 终端与文件访问的入站转发
 
-终端与文件访问不以代码依赖进入 `warden` 或 `sandboxprovider`。本模块以 `run_id` 与当前代为目标，经沙箱提供者的入站路由到达该代看守进程的 `/terminal` 与 `/files`；k8s 提供者的入站路由与 Substrate 路由器在接口之后，本模块不区分提供者。入站路由原样转发请求头 `x-castworks-access-ticket`；终端由本模块直接携带，文件读取由本模块放进 `FileAccess` 请求的 `Ticket`，`workspace` 转发到 `/files`。转发是运行时调用，不出现在模块依赖图中。
+终端与文件访问不通过代码依赖到达 `warden` 或 `sandboxprovider`。本模块以 `run_id` 与当前代为目标，经沙箱提供者的入站路由到达该代看守进程的 `/terminal` 与 `/files`；k8s 提供者的入站路由与 Substrate 路由器在接口之后，本模块不区分提供者。入站路由原样转发请求头 `x-castworks-access-ticket`；终端由本模块直接携带，文件读取由本模块放进 `FileAccess` 请求的 `Ticket`，`workspace` 转发到 `/files`。转发是运行时调用，不出现在模块依赖图中。
 
 ## 依赖
 
@@ -470,7 +470,7 @@ sequenceDiagram
 
 ### 审批决定的读取、呈现与写入
 
-1. 校验决定标识、`permission_id`、决定取值与审批人资格；`allow` 可带 `updatedInput`，`deny` 可带 `message`。本模块拒绝缺少 `permission_id`、决定取值越出闭集、提交者不是审批人、或 `approval_second_factor` 开启时缺少相应因子的请求。
+1. 校验决定标识、`permission_id`、决定取值与审批人资格；`allow` 可带 `updatedInput`，`deny` 可带 `message`。本模块拒绝缺少 `permission_id`、决定取值越出闭集、提交者不是审批人，或 `approval_second_factor` 开启时缺少相应因子的请求。
 2. 调用 `GetPendingApproval(run_id, permission_id)` 读取权威内容；行不存在或已关闭时拒绝并提示该审批已结束。
 3. 呈现 `ToolInput`；`InputSize` 超过 `S_tool_input`（1 MiB）时呈现 `ToolInputPreview` 并明示截断，摘要仍取对完整输入计算的 `InputHash`。呈现前转义控制字符、双向文本控制符与终端转义序列，并标明内容由 Agent 产生；界面通道以完整摘要回传，文本通道以不少于 12 个十六进制字符的摘要前缀回传。
 4. 以 `GetPendingApproval` 返回的 `InputHash` 核对审批人所见内容：界面通道核对完整值，文本通道按前缀匹配展开为完整值；不一致时拒绝写入、提示刷新并写审计。
@@ -486,7 +486,7 @@ sequenceDiagram
 3. 连接关闭时该行转 `detached`；该通道的有效连接计数归零时才写 `Attached=false` 与更大的 `SourceSeq`。
 4. 超过 `TTL` 未续写时，`runcontroller` 的到期守卫以 `SourceSeq` 未变且已过期为条件把 `run_fact` 改写为未接入；本模块的到期扫描把该通道的 `attach_session` 行转 `expired`。`humanchannel` 之后以更大的 `SourceSeq` 重报时，事实回到接入。
 5. 进程重启后，`humanchannel` 读取 `attach_session` 中仍有效的接入，以更大的 `SourceSeq` 重报全部接入；超过 `TTL` 未续写的会话按过期处理，不再重报。
-6. 通道差异：`ui_session` 只约束挂起决策，不唤醒快照态与销毁态，也不中止进行中的挂起尝试；`terminal` 与 `file` 的接入唤醒快照态与销毁态，并中止进行中的快照或销毁尝试。该差异由 `runcontroller` 执行，本模块只写入通道标识。
+6. 通道差异：`ui_session` 只约束挂起决策，不唤醒快照态与销毁态，也不中止进行中的挂起尝试；`terminal` 与 `file` 的接入唤醒快照态与销毁态，并中止进行中的快照或销毁尝试。该差异由 `runcontroller` 落实，本模块只写入通道标识。
 
 ### 终端接入
 
@@ -501,7 +501,7 @@ sequenceDiagram
 ### 界面文件访问的接入门控
 
 1. 平台界面的 `ListFiles`、`ReadFile` 与 `StreamFile` 请求完成 OIDC 认证与项目角色校验，任一项目角色可读；不符时拒绝越权请求。
-2. 调用 `RunService.Get` 判定运行实例能否接收；运行实例已终态时拒绝，其余情形按终端相同的条件确定是否需要等待。
+2. 调用 `RunService.Get` 判定运行实例能否接收；运行实例已终态时拒绝，其余情形按与终端相同的条件确定是否需要等待。
 3. 写入 `file` 接入事实，`Attached=true`、`TTL` 与递增的 `SourceSeq`；可直接接收时立即应答界面，需要恢复时以退避轮询 `Get` 等到运行实例可接收后应答界面。
 4. 每次 `List`、`Read` 或 `Stream` 调用前申请 `channel=file` 的接入票据，把票据放进 `workspace` 的 `FileAccess` 请求的 `Ticket`，请求同时携带运行实例、代与已认证用户；`workspace` 把票据原样转发到 `/files`，经看守进程的读取由看守进程验签；直接读取以本模块的 SPIFFE 身份与调用前完成的项目角色判定授权。
 5. 读取期间本模块按小于 `TTL` 的周期续写 `file` 接入事实；该读取会话结束时转 `detached`，该通道的有效连接计数归零时写 `Attached=false`。
@@ -521,7 +521,7 @@ sequenceDiagram
 - 默认模式为异步回合制：没有接入事实，人类消息与审批决定经收件箱唤醒运行实例；审批可经 `defer` 推迟到回合边界。
 - 任一接入通道写入接入值为真的接入事实时，运行实例进入实时接入：`runcontroller` 与 `suspendpolicy` 在实时接入有效期间只冻结、不销毁，也不发起新的快照或销毁尝试。`ui_session` 的差异仅在于不唤醒快照态与销毁态、不中止进行中的挂起尝试；`terminal` 与 `file` 另唤醒快照态与销毁态并中止进行中的尝试。
 - 全部接入通道关闭或到期后，运行实例回到异步回合制；`humanchannel` 不保存模式标志，模式由 `runcontroller` 从接入事实推导。
-- 「正在输入」只作为预测性恢复提示，不替代接入事实；是否提前恢复由 `suspendpolicy` 批准。
+- “正在输入”只作为预测性恢复提示，不替代接入事实；是否提前恢复由 `suspendpolicy` 批准。
 
 ## 错误与失败语义
 
@@ -591,7 +591,7 @@ sequenceDiagram
 | 审批人资格与凭据主体排除 | 未实现 | — |
 | 审批内容读取、转义呈现与摘要绑定 | 未实现 | — |
 | 审批决定写入 | 未实现 | — |
-| 在线与「正在输入」信号 | 未实现 | — |
+| 在线与“正在输入”信号 | 未实现 | — |
 | 实时接入状态 | 未实现 | — |
 | 终端接入 | 未实现 | — |
 | 接入票据申请 | 未实现 | — |

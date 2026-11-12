@@ -66,7 +66,7 @@
 
 ## 外部接口契约
 
-看守进程对外的可调用面为：与控制面的协议消息、平台 MCP 工具、托管 hook、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；托管 hook 的输出形态受 Claude Code hook 契约约束，对 Claude Code 驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
+看守进程对外的可调用接口为：与控制面的协议消息、平台 MCP 工具、托管 hook、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；托管 hook 的输出形态受 Claude Code hook 契约约束，对 Claude Code 驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
 
 ### 与控制面的协议
 
@@ -106,7 +106,7 @@
 | 流式输出 | 按输出偏移续传一次执行或后台作业的标准输出与标准错误 |
 | 后台作业 | 列出、查询与终止由 exec 启动的后台作业；未结束的作业计入后台作业集合，使回合边界不构成安全点 |
 
-帧格式与关联由 [agentprotocol](../design-agentprotocol.md) 的 `ToolExecRequest`、`ToolExecResponse`、`ToolExecData` 与 `ToolExecCancel` 定义，操作语义由 [design-warden-driver-native.md](design-warden-driver-native.md) 定义；本模块承诺上表的操作语义、路径边界与鉴权边界。`ToolExec` 帧不建立第二条协议会话，不参与投递与状态机。`Shutdown` 与 `Fenced` 到达时，在途执行与后台作业按终止语义处理，不再接受新的 `ToolExec` 请求。
+帧格式与关联由 [agentprotocol](../design-agentprotocol.md) 的 `ToolExecRequest`、`ToolExecResponse`、`ToolExecData` 与 `ToolExecCancel` 定义，操作语义由 [design-warden-driver-native.md](design-warden-driver-native.md) 定义；本模块保证上表的操作语义、路径边界与鉴权边界。`ToolExec` 帧不建立第二条协议会话，不参与投递与状态机。`Shutdown` 与 `Fenced` 到达时，在途执行与后台作业按终止语义处理，不再接受新的 `ToolExec` 请求。
 
 ### 文件 API 与回环代理端点
 
@@ -134,7 +134,7 @@
 
 平台不向 Agent 暴露冻结上限的具体数值；Agent 按下列规则选择等待方式。这组规则常驻：平台 MCP 服务器的 `instructions` 与工具描述承载它，`SubagentStart` hook 把它注入子代理；平台不以拒绝、阻塞或让对话继续的方式强制这些规则（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 
-- 短等待用 `wait_for`。平台在临近冻结上限或该调用被 Agent 自动转到后台时自动转为订阅，返回「已转为订阅，请结束本回合」；Agent 收到该结果必须结束回合，不得重试 `wait_for`。
+- 短等待用 `wait_for`。平台在临近冻结上限或该调用被 Agent 自动转到后台时自动转为订阅，返回“已转为订阅，请结束本回合”；Agent 收到该结果必须结束回合，不得重试 `wait_for`。
 - 长等待或不确定时长直接调用 `subscribe_event` 并结束回合。订阅属于运行实例，不绑定工具调用；事件到达后经收件箱在下一回合投递，沙箱可在等待期间挂起。
 - 需要继续当前工作可以登记订阅后继续当前回合，事件留到下一回合处理。
 - 需要人类输入时结束回合；人类回复经收件箱作为下一回合输入。
@@ -146,7 +146,7 @@
 
 per-server timeout 配置为 `F_cap(approval / wait_for)` 加安全余量，且不得大于 MCP 传输上限；`MCP_TOOL_TIMEOUT` 的默认值约 28 小时，不构成冻结上限，实际约束是 HTTP 首字节 60 s、HTTP idle 300 s 加 30 s 检查粒度与 stdio idle 1800 s 加 30 s 检查粒度；`F_cap(timer)` 由 `suspendpolicy` 按传输类型与等待种类独立定义。工具调用的开始与结束由 Agent 驱动器翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`。新增平台工具改变闭集，须同时修改 `connectorhub` 或 `humanchannel` 的对应接口、驱动器的超时预算与本模块文档；第三方工具不进入此表，经工具接入声明与出口代理接入。
 
-Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 只是占位，真实结果随带 `tool_use_id` 的 `task_notification` 到达，并由 Claude Code 注入的任务通知回合交给 Agent（[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)）。Agent 驱动器把占位 `tool_result` 照常翻译为 `tool_ended{call_id}`，并在进程内通知平台 MCP 服务器该调用已转到后台。平台 MCP 的阻塞型 `wait_for` 与阻塞型 `sleep_until` 被转到后台时，平台 MCP 服务器立即以转换结果结束该调用：`wait_for` 返回「已转为订阅」与 `sub_id`，`sleep_until` 先转为运行实例范围定时器，再返回「已转为定时」；转换语义与临近冻结上限时相同，订阅事件与定时到期都经收件箱在之后的回合投递。第三方 MCP 调用被转到后台后作为后台作业计入 `bg_jobs`，结果随 `task_notification` 到达。看守进程不设置、也不改动 MCP 自动转后台相关的环境变量。
+Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 只是占位，真实结果随带 `tool_use_id` 的 `task_notification` 到达，并由 Claude Code 注入的任务通知回合交给 Agent（[REF-claude-agent-sdk-typescript](../../../references.md)、[REF-claude-code-env-vars](../../../references.md)）。Agent 驱动器把占位 `tool_result` 照常翻译为 `tool_ended{call_id}`，并在进程内通知平台 MCP 服务器该调用已转到后台。平台 MCP 的阻塞型 `wait_for` 与阻塞型 `sleep_until` 被转到后台时，平台 MCP 服务器立即以转换结果结束该调用：`wait_for` 返回“已转为订阅”与 `sub_id`，`sleep_until` 先转为运行实例范围定时器，再返回“已转为定时”；转换语义与临近冻结上限时相同，订阅事件与定时到期都经收件箱在之后的回合投递。第三方 MCP 调用被转到后台后作为后台作业计入 `bg_jobs`，结果随 `task_notification` 到达。看守进程不设置、也不改动 MCP 自动转后台相关的环境变量。
 
 ### 托管 hook
 
@@ -160,7 +160,7 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 | `Stop` | `last_assistant_message` 用于回合意图分类；其余输入的用途见 Claude Code 驱动器 | 空输出 |
 | `SubagentStop` | 见 Claude Code 驱动器 | 空输出 |
 
-输出约束：这些 hook 的输出只含 `hookSpecificOutput.additionalContext` 或为空，不含 `decision`、`continue` 与权限决定字段，退出码恒为 0。`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，`PostToolUse` 的退出码 2 会把标准错误作为反馈交给模型，两者都不使用；`PreToolUse` 的拒绝与询问只用于审批（含查询失败时的拒绝），不用于等待意图，`UserPromptSubmit` 不输出等待相关内容。`PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 出现在工具结果旁，模型在下一次模型请求时读到，情境提示因而只影响下一次等待，当下这一次等待由静止冻结、入站数据唤醒与 `sleep` 到期时刻兜住；`SubagentStart` 的 `additionalContext` 在子代理开始时出现。`additionalContext` 上限为 10000 字符：情境提示不超过 600 字符，`SubagentStart` 注入的规则不超过该上限。情境提示的触发条件、内容与频率归 [Claude Code 驱动器](design-warden-driver-claude-code.md)，本模块只承诺上述输出形态。
+输出约束：这些 hook 的输出只含 `hookSpecificOutput.additionalContext` 或为空，不含 `decision`、`continue` 与权限决定字段，退出码恒为 0。`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，`PostToolUse` 的退出码 2 会把标准错误作为反馈交给模型，两者都不使用；`PreToolUse` 的拒绝与询问只用于审批（含查询失败时的拒绝），不用于等待意图，`UserPromptSubmit` 不输出等待相关内容。`PostToolUse` 与 `PostToolBatch` 的 `additionalContext` 出现在工具结果旁，模型在下一次模型请求时读到，情境提示因而只影响下一次等待，当下这一次等待由静止冻结、入站数据唤醒与 `sleep` 到期时刻兜住；`SubagentStart` 的 `additionalContext` 在子代理开始时出现。`additionalContext` 上限为 10000 字符：情境提示不超过 600 字符，`SubagentStart` 注入的规则不超过该上限。情境提示的触发条件、内容与频率归 [Claude Code 驱动器](design-warden-driver-claude-code.md)，本模块只保证上述输出形态。
 
 ### 入站端点
 
@@ -612,7 +612,7 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 
 所指事件已观察到时，查询的耗时目标为 10 ms 以内；等待对应事件时最多再加 `T_hook_sync`。二进制对查询设截止时间，取该 hook 的 `timeout` 减 30 s；`PreToolUse` 的截止时间晚于驱动器待决审批记录的 `deadline`，驱动器在 `deadline` 到达时应答拒绝，二进制因而总在自身截止之前收到应答，先后关系见 [Claude Code 驱动器](design-warden-driver-claude-code.md)的审批路径。IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析时，二进制按查询失败处理并计数，输出按 hook 区分：
 
-- `PreToolUse`（审批）输出拒绝，`permissionDecision` 为 `deny`，原因为「平台审批暂不可用」，不放行。
+- `PreToolUse`（审批）输出拒绝，`permissionDecision` 为 `deny`，原因为“平台审批暂不可用”，不放行。
 - 其余托管 hook（`PostToolUse`、`PostToolUseFailure`、`PostToolBatch`、`SubagentStart`、`Stop`、`SubagentStop` 与 `UserPromptSubmit`）以空输出、退出码 0 退出，不提示、不拒绝、不阻塞工具调用。
 
 hook 二进制随 Agent 进程树冻结，冻结期间未完成的查询在解冻后继续，驱动器对迟到的查询按当时的状态应答。
@@ -635,7 +635,7 @@ hook 二进制随 Agent 进程树冻结，冻结期间未完成的查询在解�
 
 ### DRAIN 处置
 
-收到 `Resumed{drain=true}` 后，看守进程按 `suspend_id` 幂等记录 DRAIN 标志。已处于等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即返回终止等待的结果：审批以「需人工批准，批准后以消息通知」拒绝；`wait_for` 返回「已转为订阅，请结束本回合」；阻塞型 `sleep_until` 先转为运行实例范围定时器，再返回「已转为定时，请结束本回合」。之后发起的阻塞型 `sleep_until` 仍照常发出 `wait_started{kind=timer}`，但定时范围变为运行实例范围。
+收到 `Resumed{drain=true}` 后，看守进程按 `suspend_id` 幂等记录 DRAIN 标志。已处于等待的与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即返回终止等待的结果：审批以“需人工批准，批准后以消息通知”拒绝；`wait_for` 返回“已转为订阅，请结束本回合”；阻塞型 `sleep_until` 先转为运行实例范围定时器，再返回“已转为定时，请结束本回合”。之后发起的阻塞型 `sleep_until` 仍照常发出 `wait_started{kind=timer}`，但定时范围变为运行实例范围。
 
 DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周期重发 `Resumed{drain=true}`，看守进程只按 `suspend_id` 幂等处理，不中断回合、不销毁沙箱。LLM 等待由本地代理回放跑完本次请求到回合末。
 
@@ -653,14 +653,14 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 以挂起为目的的销毁时进程树中存在 Agent 主进程与已声明的第三方 MCP 服务器进程之外的进程 | 回 `Busy`；不终止这些进程，由控制面在 `retry_after` 之后复评 |
 | 以挂起为目的的销毁时，`fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目中存在 `survives_resume=false` 的项 | 回 `Busy`；不取消、不改写 Agent 的定时；`fire_at` 早于 `self_wake_cutoff` 的过期自唤醒条目不参与该检查 |
 | `conn.inbound` 发出时出站流不可用 | 消息留在重放缓冲，重连后随重放送达；同一 `freeze_id` 不另生成第二条 |
-| `PreToolUse` 的查询失败（IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析） | 二进制输出拒绝，`permissionDecision` 为 `deny`，原因为「平台审批暂不可用」，并计数；不放行该工具调用 |
+| `PreToolUse` 的查询失败（IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析） | 二进制输出拒绝，`permissionDecision` 为 `deny`，原因为“平台审批暂不可用”，并计数；不放行该工具调用 |
 | `PreToolUse` 之外的托管 hook 查询失败（原因同上） | 二进制以空输出、退出码 0 退出并计数；不提示、不拒绝、不阻塞工具调用，`SubagentStart` 未注入规则时子代理仍可从工具描述读到同一组规则 |
 | 托管 hook IPC 端点的对端认证不通过（可执行文件不是托管策略设置中注册的托管 hook 二进制，或父进程不是 Agent 主进程） | 端点拒绝该连接的查询，计数并告警，不把内容交给驱动器；二进制按查询失败处理 |
 | 托管 hook 查询未通过一次性核对（所指事件不满足接受条件，例如驱动器未观察到该事件、该调用已决定，或同一事件标识已接受过） | 端点拒绝该查询，计数并告警，不交给驱动器应答；二进制按查询失败处理 |
 | `expected_wait` 无法解析 | 按未填写处理，`agent_expected_ms` 为空并计数；调用照常执行，不向 Agent 返回错误 |
 | `wait_signatures` 中某项的 `match.command` 正则无法编译 | 跳过该项并计数，其余项照常生效 |
 | 宿主侧分类请求失败或超时 | 驱动器保持规则分类结果，不重试；不上报 `llm.request.failed`，转发侧的处置见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求) |
-| 平台 MCP 阻塞型调用被 Agent 自动转到后台 | 立即以转换结果结束该调用：`wait_for` 返回「已转为订阅」与 `sub_id`，`sleep_until` 先转为运行实例范围定时器再返回「已转为定时」；结果随 `task_notification` 到达 Agent |
+| 平台 MCP 阻塞型调用被 Agent 自动转到后台 | 立即以转换结果结束该调用：`wait_for` 返回“已转为订阅”与 `sub_id`，`sleep_until` 先转为运行实例范围定时器再返回“已转为定时”；结果随 `task_notification` 到达 Agent |
 | `AdoptAgent` 被拒绝或不可达（节点冻结代理核验不通过、套接字不可连接或调用超时） | 该进程保持停止态，不继续执行；按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报：Agent 主进程按启动失败上报 `turn_ended{agent_exited=true}`，控制面计入 `start_failures`；`/terminal` 返回 503，不建立 shell；`ToolExec.exec` 以执行启动失败应答；计数并告警 |
 | `/terminal` 或 `/files` 的接入票据缺失或校验不通过（`alg`、`typ`、`kid`、签名、`aud`、`run_id`、`generation`、`channel`、有效期或 `jti` 任一项） | 返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；已接受过的 `jti` 再次出现时同样拒绝 |
 | 入站连接的来源为回环地址或本 Pod 地址 | 拒绝该连接，不进入任何端点的处理 |
@@ -683,7 +683,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 领取请求没有到达引导接口（出口默认拒绝、actor 没有 EgressPolicy 时出口网关返回 403、连接失败或超时），或得到引导接口错误码之外的状态码（例如 Substrate 出口网关返回的 403、500） | 退避重试，与 404 相同；Substrate 构建模板快照的 actor 停在等待领取的状态 |
 | 预热认领的 `/wake` 通知未送达 | 由退避领取兜底，领取延迟不超过退避上限 30 s |
 | `SandboxConfig` 内容无法解析 | 保留上一次成功应用的配置并计数；从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的两个开关均关闭处理，并启动 Agent 主进程 |
-| 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递「回合被中断」；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径下 kubelet 在同一 Pod 内重启容器时，新的看守进程领取得到 409，停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建 |
+| 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递“回合被中断”；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径下 kubelet 在同一 Pod 内重启容器时，新的看守进程领取得到 409，停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建 |
 | 快照恢复后时钟跳变 | 以 `Resumed.wall_clock_now` 校时，再通知驱动器；恢复期间的超时以校时后的时钟计算 |
 | MCP 传输定时器（首字节、idle）或 per-server timeout 到期 | 工具返回错误结果，不无限占用回合；阻塞型等待已转为订阅或定时时按转换结果返回 |
 

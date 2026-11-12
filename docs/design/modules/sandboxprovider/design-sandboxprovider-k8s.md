@@ -2,20 +2,20 @@
 
 k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现之一，把主文档定义的提供者接口基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../../../references.md)）落到 Kubernetes，文档围绕冻结作用域这一机制组织。它不决定何时挂起、不维护[运行实例](../../../glossary.md)状态机、不生成出口策略、不拥有[工作区](../../../glossary.md)绑定。心智模型：Sandbox CR 是跨代保留的外壳，Pod 是某一[代](../../../glossary.md)的执行载体，[节点冻结代理](../../../glossary.md)只冻结 Pod 内的 Agent 进程树，[看守进程](../../../glossary.md)与探针始终运行（[ADR-dual-sandbox-providers](../../../adr/adr-dual-sandbox-providers.md)）。
 
-文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射、RBAC、引导认证与沙箱 Pod 安全基线、走查、冻结与解冻、销毁与重建、预热池与认领、网络强制层与平台出口代理、入站路由；术语表、节点冻结代理与[节点挂载代理](../../../glossary.md)的契约、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义与并发与事务边界留到最后，按墓碑与幂等规则自测迟到调用。
+文档较长，不宜顺序通读。第一次阅读依次取：核心概念、职责、外部接口契约中的接口映射、RBAC、引导认证与沙箱 Pod 安全基线、走查、冻结与解冻、销毁与重建、预热池与认领、网络强制层与平台出口代理、入站路由；术语表、节点冻结代理与[节点挂载代理](../../../glossary.md)的契约、依赖、UML 图与核心数据结构作为核对字段与调用顺序的参考；错误与失败语义、并发与事务边界留到最后，按墓碑与幂等规则自测迟到调用。
 
 ## 核心概念
 
-本子模块的机制是[冻结](../../../glossary.md)作用域：k8s 路径上的[沙箱](../../../glossary.md)不是一个整体，而是三层可分别处置的载体。Sandbox CR 是跨代保留的外壳，以 `spec.operatingMode` 决定是否重建 Pod，与之配套的 PVC 与 Service 同样跨代保留；Pod 是某一[代](../../../glossary.md)的执行载体，带代标注与 UID；容器内的 Agent 子 cgroup 才是实际被冻结的进程树。冻结只落在子 cgroup，是因为[看守进程](../../../glossary.md)留在父 cgroup 且必须始终可运行：冻结期间它应答探针、续约[工作区租约](../../../glossary.md)并维持[出站流](../../../glossary.md)，控制面因此可以探测沙箱就绪并经出站流驱动解冻与投递。外壳与 Pod 分离，则让[挂起](../../../glossary.md)与重建各自独立：挂起只停 Agent 进程树、保留 Pod，[销毁重建](../../../glossary.md)只换 Pod、保留外壳与[工作区](../../../glossary.md)。两者合起来，系统才能在不结束[运行实例](../../../glossary.md)的前提下释放计算资源（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
+本子模块的机制是[冻结](../../../glossary.md)作用域：k8s 路径上的[沙箱](../../../glossary.md)不是一个整体，而是三层可分别处置的载体。Sandbox CR 是跨代保留的外壳，以 `spec.operatingMode` 决定是否重建 Pod，与之配套的 PVC 与 Service 同样跨代保留；Pod 是某一[代](../../../glossary.md)的执行载体，带代标注与 UID；容器内的 Agent 子 cgroup 才是实际被冻结的进程树。冻结只落在子 cgroup，是因为[看守进程](../../../glossary.md)留在父 cgroup 且必须始终可运行：冻结期间它应答探针、续约[工作区租约](../../../glossary.md)并维持[出站流](../../../glossary.md)，控制面因此可以探测沙箱就绪并经出站流驱动解冻与投递。外壳与 Pod 分离，使[挂起](../../../glossary.md)与重建各自独立：挂起只停 Agent 进程树、保留 Pod，[销毁重建](../../../glossary.md)只换 Pod、保留外壳与[工作区](../../../glossary.md)。两者合起来，系统才能在不结束[运行实例](../../../glossary.md)的前提下释放计算资源（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
 
 ## 职责
 
 职责穷举如下，每条先写本子模块执行的动作，再写产生的结果或边界；通用幂等、墓碑与能力协商语义见主文档，本条只写 k8s 提供者层的落地方式。能力集合是闭合集合，本子模块声明 `Freeze{cgroup}`、`Freeze{signal}`、`Destroy`、`WarmPool` 与 `InPlaceResize`，不声明 `Snapshot` 与 `EgressInject`（[ADR-capability-tiered-suspension](../../../adr/adr-capability-tiered-suspension.md)）。
 
-- **Sandbox CR 生命周期**：把预配、认领、整代销毁与按运行实例释放映射为 Sandbox CR、Pod、PVC 与 Service 的操作；`spec.operatingMode` 在 `Running` 与 `Suspended` 之间切换，`Suspended` 使控制器不再重建 Pod，本子模块按 Pod UID 前置条件删除 Pod、保留 PVC 与 Service，`Running` 重建 Pod；返回携带被删除代的销毁确认。
+- **Sandbox CR 生命周期**：把预配、认领、整代销毁与按运行实例释放映射为 Sandbox CR、Pod、PVC 与 Service 的操作；`spec.operatingMode` 在 `Running` 与 `Suspended` 之间切换，`Suspended` 使控制器不再重建 Pod，本子模块按 Pod UID 前置条件删除 Pod、保留 PVC 与 Service，`Running` 重建 Pod；返回携带被删除的代的销毁确认。
 - **按代销毁与删除前置条件**：在 Pod 上记录其所属代，删除 Pod 以 Pod UID 为前置条件；整代销毁在返回确认之前写入创建墓碑，拒绝该代及更早代的预配、认领与快照恢复；单个销毁只作用于调用携带的 `(generation, sandbox_id)`。
 - **节点冻结代理**：在沙箱节点池以特权 DaemonSet 运行，经容器运行时自行解析 Pod 与容器的 cgroup 路径，不接受调用方给出的路径，在容器 cgroup 下维护子 cgroup `agent`，以写 `agent/cgroup.freeze` 执行冻结与解冻；`Freeze`、`Thaw` 只接受 `sandboxprovider` 的 SPIFFE 调用并按 Pod 归属与代授权；经按 Pod 的 Unix 域套接字接受看守进程的 `AdoptAgent`，把停止态的进程移入同一容器的 `agent` 子 cgroup；看守进程留在父 cgroup，探针只配置在看守进程上（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)、[REF-linux-cgroup-v2](../../../references.md)）。
-- **节点挂载代理与工作区绑定挂载**：在沙箱节点池以特权 DaemonSet 运行[节点挂载代理](../../../glossary.md)（CSI 节点插件），在节点上挂载共享文件系统的挂载根，为沙箱 Pod 与预热 Pod 发布工作区卷；冷启动 Pod 在卷发布时、预热 Pod 在认领时经 `BindWorkspace` 执行 `Ensure` 并把该运行实例的子目录绑定挂载进 Pod；挂载根不进入任何 Pod，`BindWorkspace` 只接受 `sandboxprovider` 的 SPIFFE 调用（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）。
+- **节点挂载代理与工作区绑定挂载**：在沙箱节点池以特权 DaemonSet 运行[节点挂载代理](../../../glossary.md)（CSI 节点插件），在节点上挂载共享文件系统的挂载根，为沙箱 Pod 与预热 Pod 发布工作区卷；冷启动 Pod 在卷发布时经 `NodePublishVolume`、预热 Pod 在认领时经 `BindWorkspace` 执行 `Ensure` 并把该运行实例的子目录绑定挂载进 Pod；挂载根不进入任何 Pod，`BindWorkspace` 只接受 `sandboxprovider` 的 SPIFFE 调用（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）。
 - **冻结与解冻的提供者侧执行**：按 `freeze_id` 执行 `Freeze{cgroup}` 与 `Thaw`，返回冻结确认时刻；同一 `freeze_id` 的迟到冻结与迟到缩小被冻结墓碑拒绝；`Freeze{signal}` 由看守进程执行，本子模块只声明能力。
 - **原地缩放**：以 `pods/resize` 子资源缩小与放大 CPU request；沙箱 Pod 从创建起为 Burstable（request 小于 limit），容器的 `resizePolicy` 为 `NotRequired`，原始 CPU request 保存在 Pod 注解中；缩小在冻结之后执行，放大与解冻并行；放大进入 `Deferred` 时经 `ResizeStatus` 暴露实际状态（[REF-k8s-in-place-pod-resize](../../../references.md)）。
 - **预热池**：维护 SandboxWarmPool 与 SandboxClaim；预热 Pod 只带空的工作区挂载点，认领时由节点挂载代理绑定运行实例子目录；认领的 Pod 不回收复用；池空时认领返回池空，恢复退化为冷启动。
@@ -23,7 +23,7 @@ k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现
 - **引导认证与领取通知**：为沙箱 Pod 与预热 Pod 配置不绑定任何 RBAC 权限、不自动挂载默认令牌的专用 ServiceAccount，并以投射卷挂载 audience 为 `castworks-bootstrap` 的 ServiceAccount 令牌（[REF-k8s-service-accounts](../../../references.md)）；为[引导接口](../../../glossary.md)提供 k8s 路径的认证，以 `TokenReview` 校验该令牌并按 Pod UID 查[引导记录](design-sandboxprovider.md#术语表)；`Provision` 在观察到该代 Pod 创建之后按其 UID 写入引导记录，`Claim` 在写 Pod 注解、调用 `BindWorkspace` 并写入引导记录之后经 wake-router 调用该 Pod 的 `/wake` 通知看守进程领取。结果是首个运行实例令牌组与 `lease_id` 只经引导接口交给看守进程，令牌不进入提供者的任何持久记录。
 - **网络强制层与出口配置**：落地 NetworkPolicy，对全部协议默认拒绝出口，只放行到[面向沙箱的端点](../../../glossary.md)（`stream`、`bootstrap`、`lease`、`llm`、`connector`、`human`、`egress`）地址与端口的 TCP，不放行集群 DNS 的 53 端口、节点冻结代理与节点挂载代理；入站只放行 kubelet 探针与 wake-router 到 80 端口；把 `sandbox_facing_endpoints` 中的主机名与固定地址写进 Pod 模板的 `hostAliases`，看守进程不依赖集群 DNS；向平台出口代理下发按运行实例的出口策略配置；逐请求代校验由平台出口代理完成。
 - **入站路由**：wake-router 对全部入口以 SPIFFE mTLS 认证调用方，`/terminal` 只接受 `humanchannel`，`/files`（看守进程文件 API）只接受 `workspace`，`/wake` 只接受 `sandboxprovider`；对 `/terminal` 与 `/files` 原样转发请求头 `x-castworks-access-ticket`，由看守进程校验[接入票据](../../../glossary.md)；按沙箱单飞，受全局停泊上限约束，以 200 ms 周期探测看守进程的 `/readyz`，未就绪或超过停泊预算时返回 503 与 `Retry-After`；事件投递与 `ToolExec` 帧都不经该路由；`ToolExec` 帧随看守进程的出站流往返，不新增沙箱入站端点。
-- **恢复触发**：冻结态由 `Thaw` 解冻，以 `Thawed` 为完成观察；销毁态把 Sandbox CR 的 `spec.operatingMode` 改回 `Running` 重建 Pod，或从预热池认领，以看守进程重连并发送新代 `Hello` 为完成观察；事件驱动的恢复由控制面直调提供者。
+- **恢复触发**：冻结态由 `Thaw` 解冻，以 `Thawed` 为完成观察；销毁态把 Sandbox CR 的 `spec.operatingMode` 改回 `Running` 重建 Pod，或从预热池认领，以看守进程重连并发送新代 `Hello` 为完成观察；事件驱动的恢复由控制面直接调用提供者。
 - **串行化与幂等**：同一运行实例的冻结、解冻、销毁与预配按到达顺序串行；以 `freeze_id`、`(run_id, generation, attempt_id)`、`(run_id, generation)` 与 `(generation, sandbox_id)` 幂等；重复调用返回首次结果。
 
 ### 非职责
@@ -90,7 +90,7 @@ k8s 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者实现
 | `TokenReview`（`authentication.k8s.io`） | `create` | 引导接口校验沙箱 Pod 的投射 ServiceAccount 令牌 |
 | `ValidatingAdmissionPolicy`、`ValidatingAdmissionPolicyBinding`（`admissionregistration.k8s.io`） | `get`、`list` | 启动自检确认沙箱命名空间已安装强制沙箱 Pod 安全基线的准入策略 |
 
-`pods/resize` 的 `patch` 权限、Pod 为 Burstable 与容器 `resizePolicy=NotRequired` 是 `InPlaceResize` 的启动自检项；任一不满足时提供者在启动时判定该能力不可用，`Capabilities` 返回 `InPlaceResize=false`，`suspendpolicy` 因而不选择 `FREEZE_SHRINK`。提供者不在声明能力之后静默降级。沙箱 Pod 安全基线的准入策略由部署安装，提供者不创建也不修改它，只以只读权限在启动时自检，规则见[沙箱 Pod 安全基线](#沙箱-pod-安全基线)。集群必须允许特权 DaemonSet，节点冻结代理需要访问容器运行时的 cgroup 信息，节点冻结代理与节点挂载代理以各自的 ServiceAccount 只读读取本节点 Pod 及其注解；这些前提见依赖与部署前提。
+`pods/resize` 的 `patch` 权限、Pod 为 Burstable 与容器 `resizePolicy=NotRequired` 是 `InPlaceResize` 的启动自检项；任一不满足时提供者在启动时判定该能力不可用，`Capabilities` 返回 `InPlaceResize=false`，`suspendpolicy` 因而不选择 `FREEZE_SHRINK`。提供者声明能力之后不静默降级。沙箱 Pod 安全基线的准入策略由部署安装，提供者不创建也不修改它，只以只读权限在启动时自检，规则见[沙箱 Pod 安全基线](#沙箱-pod-安全基线)。集群必须允许特权 DaemonSet，节点冻结代理需要访问容器运行时的 cgroup 信息，节点冻结代理与节点挂载代理以各自的 ServiceAccount 只读读取本节点 Pod 及其注解；这些前提见依赖与部署前提。
 
 ### 引导认证
 
@@ -140,7 +140,7 @@ type NodeFreezeAgent interface {
 }
 ```
 
-`Freeze` 在子 cgroup `agent` 存在时写入 `cgroup.freeze=1` 并返回确认时刻；子 cgroup 不存在或 Pod 已删除时返回确定性错误。`Thaw` 写入 `cgroup.freeze=0`；目标已不存在时返回可区分的未找到错误，提供者映射为「沙箱不存在」的确定性失败，重复解冻幂等。代理按节点批量处理冻结与解冻，按节点 CPU 余量分批解冻，批处理的顺序不改变单个 `freeze_id` 的幂等结果。`AdoptAgent` 把一个停止态进程移入同一容器的 `agent` 子 cgroup，核验规则见下节。
+`Freeze` 在子 cgroup `agent` 存在时写入 `cgroup.freeze=1` 并返回确认时刻；子 cgroup 不存在或 Pod 已删除时返回确定性错误。`Thaw` 写入 `cgroup.freeze=0`；目标已不存在时返回可区分的未找到错误，提供者映射为“沙箱不存在”的确定性失败，重复解冻幂等。代理按节点批量处理冻结与解冻，按节点 CPU 余量分批解冻，批处理的顺序不改变单个 `freeze_id` 的幂等结果。`AdoptAgent` 把一个停止态进程移入同一容器的 `agent` 子 cgroup，核验规则见下节。
 
 ### 节点冻结代理的调用方认证与目标授权
 
@@ -186,7 +186,7 @@ type NodeMountAgent interface {
 wake-router 是控制面之外的独立进程，只提供以下入口：`/terminal` 转发到当前代看守进程的终端端点，`/files` 转发到看守进程的文件 API，`/wake` 转发到被认领预热 Pod 的看守进程。它不承载事件投递；事件驱动的恢复由控制面调用提供者完成。路由对每个请求的约束如下：
 
 - 路由器对全部入口以 SPIFFE mTLS 认证调用方：`/terminal` 只接受 `humanchannel`，`/files` 只接受 `workspace`，`/wake` 只接受 `sandboxprovider`；非 SPIFFE 对端、身份不符或路径不符的请求以 403 拒绝并写审计，不转发。
-- 用户授权由 `humanchannel` 完成，并以接入票据携带到看守进程：路由器对 `/terminal` 与 `/files` 原样转发请求头 `x-castworks-access-ticket`，不解析、不改写；看守进程验签并核对运行实例、代与接入通道后才建立终端或读取文件，票据缺失或无效时看守进程返回 401，路由器原样返回。
+- 用户授权由 `humanchannel` 完成，并由接入票据携带到看守进程：路由器对 `/terminal` 与 `/files` 原样转发请求头 `x-castworks-access-ticket`，不解析、不改写；看守进程验签并核对运行实例、代与接入通道后才建立终端或读取文件，票据缺失或无效时看守进程返回 401，路由器原样返回。
 - 请求按 `sandbox_id` 定位当前代沙箱；沙箱处于冻结态时直接转发到看守进程，不触发解冻；处于销毁态时直接返回 503。
 - 同一沙箱同一时刻只保留一个唤醒探测与一个在途入站请求，其余请求进入停泊队列；停泊总量受全局上限约束，超过上限时返回 503。
 - 路由器以 200 ms 周期探测看守进程的 `/readyz`；就绪后转发停泊请求，未就绪超过停泊预算时返回 503 与 `Retry-After`。
@@ -196,7 +196,7 @@ wake-router 是控制面之外的独立进程，只提供以下入口：`/termin
 
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本子模块依赖基础层的 `workspace` 与 `agentprotocol`，经主文档的引导接口依赖 `secrets`，以及 k8s 提供者层的控制器、运行时、认证 API、路由与代理；本子模块不依赖 `runcontroller`、`suspendpolicy` 与 `connectorhub`。
 
-- `workspace`：在预配与认领时调用绑定接口取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自 `ProvisionRequest`，不来自绑定，写入引导记录后经引导接口交给看守进程；k8s 提供者优先使用 RWX 共享文件系统，块存储为降级配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。共享文件系统由节点挂载代理在每个节点的挂载根上挂载一次，挂载根不进入任何 Pod；冷启动在卷发布时、认领时经 `BindWorkspace` 绑定运行实例子目录；块存储不能预绑定预热池，绑定携带节点或可用区亲和。本子模块不持有租约，续约与接管由 `workspace` 与看守进程完成。
+- `workspace`：在预配与认领时调用绑定接口取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自 `ProvisionRequest`，不来自绑定，写入引导记录后经引导接口交给看守进程；k8s 提供者优先使用 RWX 共享文件系统，块存储为降级配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。共享文件系统由节点挂载代理在每个节点的挂载根上挂载一次，挂载根不进入任何 Pod；冷启动在卷发布时绑定运行实例子目录，认领经 `BindWorkspace` 绑定运行实例子目录；块存储不能预绑定预热池，绑定携带节点或可用区亲和。本子模块不持有租约，续约与接管由 `workspace` 与看守进程完成。
 - `secrets`：经主文档的引导接口调用 `secrets.IssueRunToken(run_id, generation, instance_jkt)`，在领取时签发按受众划分的首个令牌组，令牌不持久化；本子模块只提供投射令牌的 `TokenReview` 校验。
 - `agentprotocol`：销毁态重建以看守进程发送 `Hello` 为观察，解冻以 `Thawed` 为观察；入站路由使用 `/readyz`、`/terminal`、`/files` 与 `/wake`；`/readyz` 是就绪探针，不以领取为条件，`/terminal` 由 `humanchannel`、`/files` 由 `workspace` 经路由调用并携带接入票据，`/wake` 是预热认领之后提供者经路由发出的领取通知。入站端点不承载事件内容，投递只在出站流上进行。
 - agent-sandbox 控制器：管理 Sandbox、SandboxClaim 与 SandboxWarmPool 的生命周期；`spec.operatingMode=Suspended` 使控制器不再重建 Pod，本子模块随后按 Pod UID 前置条件删除 Pod、保留 PVC 与 Service，改回 `Running` 重建 Pod。控制器若对现存 Pod 的 `resources` 做对账回滚，提供者按 `ResizeRecord` 的目标值重新提交 `pods/resize` 并对账实际 request；`ResizeStatus` 报告实际值。
@@ -381,7 +381,7 @@ flowchart TD
 
 1. `runcontroller` 在效果记录提交后调用 `Provision` 或 `Claim`，请求携带 `run_id`、`generation`、`attempt_id`、`lease_id` 与工作区绑定；`attempt_id` 取 `resume_id`。请求不携带运行实例令牌，首个令牌由引导接口在领取时签发。
 2. 提供者先检查创建墓碑与释放墓碑：代不大于该运行实例最近整代销毁的代，或释放墓碑已存在时，返回确定性拒绝，不创建 Sandbox 或 Pod。
-3. 提供者调用 `workspace` 的绑定接口，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自请求并写入引导记录。共享文件系统模式返回 `sync`；块存储降级配置携带节点或可用区亲和，绑定不能预绑定预热池。
+3. 提供者调用 `workspace` 的绑定接口，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自请求并写入引导记录。共享文件系统模式返回 `sync`；块存储降级配置携带节点或可用区亲和，不能预绑定预热池。
 4. 新建路径创建 Sandbox CR，`spec.operatingMode` 为 `Running`，Pod 模板写入代标注、`castworks.io/run-id` 与 `castworks.io/run-uid`，工作区卷属性携带 `run_id`、`generation`、`run_uid`、`quota_bytes`，节点挂载代理在卷发布时执行 `Ensure` 并发布运行实例子目录；观察到 Pod 创建之后按其 UID 写入引导记录。认领路径发起 SandboxClaim，认领顺序固定为：写 Pod 注解 `castworks.io/run-id` 与 `castworks.io/run-uid`，调用节点挂载代理 `BindWorkspace`，绑定成功后按该 Pod 的 UID 写入引导记录，再经 wake-router 调用该 Pod 的 `/wake` 作为领取通知，不等待其返回，`/wake` 调用失败由看守进程的退避领取兜底。两条路径都在 Pod 创建时写入代标注与缩容基线注解；看守进程以停止态创建 Agent 主进程后，经按 Pod 的套接字以 `AdoptAgent` 只提交 pid，由节点冻结代理核验后移入子 cgroup `agent`。
 5. 提供者按 `run_id` 保存出口策略，并在预配与认领时写入平台出口代理配置与 NetworkPolicy；配置作用于该运行实例的 Pod 与平台出口代理。按代放行由平台出口代理按运行实例令牌逐请求校验代、终态与作废状态完成，本子模块不为每代维护独立的放行副本。
 6. 提供者在创建或认领之前持久化以 `(run_id, generation, attempt_id)` 为键的占有记录，或把该键标注到预热 Pod 上使认领可按同一键重放；创建与认领按该键执行，重驱动识别已认领的 Pod 而不重复认领；引导记录只在该 Pod UID 尚无记录时插入，重驱动遇到已存在的记录时不改写，`claimed` 不由真改回假。完成后补全 `OperationRecord` 并返回 `SandboxHandle`。看守进程随后携带实例公钥经引导接口领取令牌组与 `lease_id`，以持有证明首次续约工作区租约并发送 `Hello`；提供者不等待 `Hello`，也不把 `Hello` 作为预配成功的前提。同一 `(run_id, generation, attempt_id)` 的重复调用返回首次结果。
@@ -400,7 +400,7 @@ flowchart TD
 ### 销毁与重建
 
 1. 整代销毁：`Destroy(run_id, generation)` 把 Sandbox CR 的 `spec.operatingMode` 置为 `Suspended`，删除该代 Pod、保留 PVC 与 Service；在返回确认之前写入创建墓碑，拒绝该代及更早代的预配、认领与快照恢复，写入之后删除该代的引导记录；确认携带被删除的代，证明该代此后不再出现 Pod。
-2. 删除前置条件：Pod 上记录其所属代，删除以 Pod UID 为前置条件。旧代 Pod 的迟到删除因 UID 不匹配而失败并返回幂等成功；新代 Pod 的 UID 不同，不会被旧代删除删除。正确性由携带的代与 UID 前置条件给出，不依赖调用的到达顺序。
+2. 删除前置条件：Pod 上记录其所属代，删除以 Pod UID 为前置条件。旧代 Pod 的迟到删除因 UID 不匹配而失败并返回幂等成功；新代 Pod 的 UID 不同，不会被旧代删除命中。正确性由携带的代与 UID 前置条件给出，不依赖调用的到达顺序。
 3. 单个销毁：`DestroySandbox(generation, sandbox_id)` 只删除调用携带的代与沙箱标识对应的 Pod，并删除以该 Pod UID 为键的引导记录，不删除更新的代及其引导记录；目标不存在时返回成功。单个销毁不写创建墓碑，因为它不证明该代不再出现 Pod。
 4. 重建：`runcontroller` 调用 `Provision` 新建 Sandbox，或把同一 Sandbox CR 的 `spec.operatingMode` 改回 `Running`，或调用 `Claim` 从预热池认领。提供者在 `Provision` 路径上观察到新 Pod 创建之后、在 `Claim` 路径上发出 `/wake` 通知之前，按 Pod UID 写入新代的引导记录；新 Pod 携带新代标注；看守进程领取令牌组与 `lease_id` 之后以持有证明重连并发送新代 `Hello`。旧代令牌在代递增时失效，旧代 Pod 即使仍然存活也会被判失效。
 5. 按运行实例释放：`ReleaseRun(run_id)` 先写释放墓碑，再删除 Sandbox CR、Service、PVC 与该运行实例的引导记录，此后拒绝该运行实例的一切创建。释放幂等；释放之前的整代销毁确认仍可作为工作区租约接管的 `proof`。
@@ -419,11 +419,11 @@ flowchart TD
 
 ### 入站路由
 
-wake-router 对全部入口以 SPIFFE mTLS 认证调用方，只服务 `humanchannel` 发起的 `/terminal`、`workspace` 发起的 `/files` 与 `sandboxprovider` 发起的 `/wake`；事件投递只在看守进程外连控制面的出站流上进行，不进入该路由。请求按 `sandbox_id` 定位当前代沙箱：沙箱处于冻结态时直接转发到看守进程，不触发解冻；处于销毁态时直接返回 503，不触发重建；重建由控制面按恢复准入完成。同一沙箱同一时刻只保留一个唤醒探测与一个在途请求，其余请求进入停泊队列；停泊总量受全局上限约束。路由器以 200 ms 周期探测 `/readyz`，就绪后转发停泊请求；超过停泊预算或队列已满时返回 503 与 `Retry-After`。用户授权由 `humanchannel` 完成，并以接入票据携带到看守进程：路由器对 `/terminal` 与 `/files` 原样转发请求头 `x-castworks-access-ticket`，不解析票据，由看守进程验签并核对运行实例、代与接入通道；身份不符的调用方被路由器以 403 拒绝。`/wake` 只接受调用方身份为 `sandboxprovider` 的请求，只在预热认领之后作为领取通知发出，不触发解冻或重建。`/terminal` 与 `/files` 期间，`humanchannel` 写入实时接入事实，`runcontroller` 据此只冻结不销毁。
+wake-router 对全部入口以 SPIFFE mTLS 认证调用方，只服务 `humanchannel` 发起的 `/terminal`、`workspace` 发起的 `/files` 与 `sandboxprovider` 发起的 `/wake`；事件投递只在看守进程外连控制面的出站流上进行，不进入该路由。请求按 `sandbox_id` 定位当前代沙箱：沙箱处于冻结态时直接转发到看守进程，不触发解冻；处于销毁态时直接返回 503，不触发重建；重建由控制面按恢复准入完成。同一沙箱同一时刻只保留一个唤醒探测与一个在途请求，其余请求进入停泊队列；停泊总量受全局上限约束。路由器以 200 ms 周期探测 `/readyz`，就绪后转发停泊请求；超过停泊预算或队列已满时返回 503 与 `Retry-After`。用户授权由 `humanchannel` 完成，并随接入票据传到看守进程：路由器对 `/terminal` 与 `/files` 原样转发请求头 `x-castworks-access-ticket`，不解析票据，由看守进程验签并核对运行实例、代与接入通道；身份不符的调用方被路由器以 403 拒绝。`/wake` 只接受调用方身份为 `sandboxprovider` 的请求，只在预热认领之后作为领取通知发出，不触发解冻或重建。`/terminal` 与 `/files` 期间，`humanchannel` 写入实时接入事实，`runcontroller` 据此只冻结不销毁。
 
 ### 恢复触发
 
-冻结态的恢复由 `Thaw` 完成，节点冻结代理清除 `agent/cgroup.freeze`，看守进程不重新创建，出站流保持或重连。销毁态的恢复由 `Provision` 新建 Pod、把 Sandbox CR 的 `operatingMode` 改回 `Running`，或由 `Claim` 从预热池认领；看守进程经引导接口领取令牌组与 `lease_id` 之后以持有证明重连并发送新代 `Hello`。冻结态以 `Thawed` 为完成观察，销毁态以代匹配的 `Hello` 为完成观察；`EstimateResume` 返回提供者侧的恢复时延估计，`runcontroller` 把它与排队位置一起用于 `AdmissionState.EstimatedResume`。事件驱动的恢复由控制面直调提供者，不经 wake-router。
+冻结态的恢复由 `Thaw` 完成，节点冻结代理清除 `agent/cgroup.freeze`，看守进程不重新创建，出站流保持或重连。销毁态的恢复由 `Provision` 新建 Pod、把 Sandbox CR 的 `operatingMode` 改回 `Running`，或由 `Claim` 从预热池认领；看守进程经引导接口领取令牌组与 `lease_id` 之后以持有证明重连并发送新代 `Hello`。冻结态以 `Thawed` 为完成观察，销毁态以代匹配的 `Hello` 为完成观察；`EstimateResume` 返回提供者侧的恢复时延估计，`runcontroller` 把它与排队位置一起用于 `AdmissionState.EstimatedResume`。事件驱动的恢复由控制面直接调用提供者，不经 wake-router。
 
 ## 错误与失败语义
 
@@ -434,7 +434,7 @@ wake-router 对全部入口以 SPIFFE mTLS 认证调用方，只服务 `humancha
 | 节点冻结代理不可达或写 `cgroup.freeze` 失败 | 暂时性；`runcontroller` 以同一 `freeze_id` 重驱动，提供者返回首次确认或重新执行；冻结未生效时沙箱保持运行，不进入 `Suspended` |
 | 冻结已写入而确认丢失 | 重复 `Freeze` 以同一 `freeze_id` 返回首次 `frozen_at`，不重复写 cgroup；解冻之后到达的同一标识冻结被冻结墓碑拒绝 |
 | 解冻超时或节点冻结代理不可达 | 暂时性；提供者返回错误，`runcontroller` 以同一 `freeze_id` 重驱动；看守进程未上报 `Thawed` 超过重驱动上限时按沙箱丢失转入重建路径 |
-| `Freeze`、`Thaw` 的目标授权不通过（Pod 不在本节点或沙箱命名空间、缺沙箱标签、代标注不等于请求、容器不属于该 Pod） | 确定性；节点冻结代理不写 cgroup，提供者把它映射为「沙箱不存在」的确定性失败；调用方身份不是 `sandboxprovider` 时为不可重试的未授权错误并写审计 |
+| `Freeze`、`Thaw` 的目标授权不通过（Pod 不在本节点或沙箱命名空间、缺沙箱标签、代标注不等于请求、容器不属于该 Pod） | 确定性；节点冻结代理不写 cgroup，提供者把它映射为“沙箱不存在”的确定性失败；调用方身份不是 `sandboxprovider` 时为不可重试的未授权错误并写审计 |
 | `AdoptAgent` 被拒绝或不可达 | 看守进程不让该进程执行，按退避重试；重试耗尽时回收这个尚未开始执行的进程，按 Agent 启动失败（`/terminal` 为终端建立失败）上报；对端或目标核验不通过时代理不移动进程并计数 |
 | 节点挂载代理不可达或绑定失败 | 暂时性；`Provision` 与 `Claim` 按同一幂等键重试，`BindWorkspace` 以 `(pod_uid, run_id)` 幂等；引导记录在绑定成功前不写入，看守进程的领取得到 404 并退避重试 |
 | 绑定目标授权不通过（Pod 不在本节点或沙箱命名空间、注解或代标注与请求不符、Pod 已绑定其他运行实例） | 确定性；节点挂载代理不挂载，提供者返回确定性错误，不写引导记录 |
@@ -454,7 +454,7 @@ wake-router 对全部入口以 SPIFFE mTLS 认证调用方，只服务 `humancha
 | 预热认领之后的 `/wake` 调用失败 | `Claim` 照常返回，不重试 `/wake`；看守进程按退避领取兜底，领取延迟不超过退避上限 30 s |
 | NetworkPolicy 未由集群网络实施，或未覆盖 UDP 与 ICMP | 部署前提不满足；提供者不以其他机制降级，出口控制失去对面向沙箱的端点之外地址与非 TCP 协议的 L3/L4 强制；init 容器 `uid-egress-filter` 的按 uid 规则仍使非 root uid 只到回环，但看守进程自身的出站不再受 NetworkPolicy 约束 |
 
-提供者不把能力缺失暴露为运行时错误：`Snapshot` 与 `RestoreSnapshot` 不在能力集内，调用以参数非法拒绝；`suspendpolicy` 不为此提供者选择快照。删除确认、快照撤销与释放的重复调用都返回首次结果，调用方据此区分「已完成」与「未执行」。
+提供者不把能力缺失暴露为运行时错误：`Snapshot` 与 `RestoreSnapshot` 不在能力集内，调用以参数非法拒绝；`suspendpolicy` 不为此提供者选择快照。删除确认、快照撤销与释放的重复调用都返回首次结果，调用方据此区分“已完成”与“未执行”。
 
 ## 并发与事务边界
 
