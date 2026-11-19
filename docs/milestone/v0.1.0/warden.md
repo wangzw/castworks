@@ -38,6 +38,7 @@ claude -p --output-format stream-json --input-format stream-json --verbose --dan
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | `1` |
 | `DISABLE_AUTOUPDATER` | `1` |
 | `HOME` | Claude Code 运行用户的主目录 |
+| `PATH` | actor 模式为镜像里的固定 `PATH`（与 Dockerfile 的 `ENV PATH` 一致），本地模式为看守进程启动时的 `PATH` |
 
 只注入上表中的变量，看守进程自己的环境变量不传给 Claude Code。
 
