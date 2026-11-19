@@ -27,14 +27,16 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 
 ## 组成
 
-| 组成部分 | 内容 |
+| 组成部分 | 运行位置与内容 |
 | --- | --- |
-| 控制面进程 | 一个进程，包含 `runcontroller`、`sandboxprovider` 与 `humanchannel` 的 HTTP API，部署在 `castworks-system` 命名空间 |
-| PostgreSQL | 保存运行实例与收件箱 |
-| 命令行 | 调用控制面 HTTP API |
-| actor 镜像 | 看守进程与 Claude Code，只构建 arm64 |
+| 控制面进程 | 开发机上的普通进程，包含 `runcontroller`、`sandboxprovider` 与 `humanchannel` 的 HTTP API |
+| PostgreSQL | 开发机上的 docker 容器，保存运行实例与收件箱；测试也使用它 |
+| 命令行 | 在开发机上运行，调用控制面 HTTP API |
+| actor 镜像 | 看守进程与 Claude Code，只构建 arm64，由 Substrate 运行 |
 
-设计中这些模块是各自独立的进程，v0.1.0 把它们合进一个进程，模块之间仍按[模块依赖图](../../design/architecture.md#模块依赖图)的方向调用。
+只有 actor 运行在集群里，控制面不构建镜像，也不部署进集群。设计中这些模块是各自独立的进程，v0.1.0 把它们合进一个进程，模块之间仍按[模块依赖图](../../design/architecture.md#模块依赖图)的方向调用。
+
+看守进程也能在开发机上作为普通进程运行，直接连接本机的控制面，用于调试协议与 Claude Code 的驱动，不必每次构建镜像、创建 actor。挂起与恢复只能在 Substrate 上测试。
 
 ## 各模块的范围
 
@@ -48,7 +50,7 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 | `humanchannel` | 控制面 HTTP API 与命令行：创建运行实例、发消息、查看输出、结束运行实例 | 界面、OIDC 认证、项目角色、即时通讯与 Issue 评论、审批、终端与文件访问 |
 | `llmgateway` | 不实现，Claude Code 直接连接 Anthropic | 全部 |
 | `connectorhub` | 不实现 | 全部 |
-| `secrets` | 不实现，LLM 密钥存放在 `castworks-system` 的 k8s Secret 中 | 全部 |
+| `secrets` | 不实现，LLM 密钥存放在开发机上控制面读取的本地文件中 | 全部 |
 | `workspace` | 不实现，Claude Code 的工作目录就在 actor 自己的文件系统中，随快照保存 | 全部 |
 
 ## 消息与挂起并发时不丢消息
@@ -64,7 +66,7 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 Substrate 把 actor 的全部 TCP 出站送到出口网关，EgressPolicy 没有放行的连接一律拒绝；没有 EgressPolicy 的 actor 连域名解析都得不到应答（[REF-substrate](../../references.md)）。因此控制面为每个 actor 创建 EgressPolicy，只放行两类出站：
 
 - `api.anthropic.com:443` 以 `tls_passthrough` 规则透传，出口网关不终止 TLS，Claude Code 不需要信任出口网关的 CA。
-- 控制面的 gRPC 端口以 `http` 规则放行，看守进程与控制面之间是明文 gRPC（h2c）。
+- 控制面的 gRPC 端口以 `http` 规则放行，看守进程与控制面之间是明文 gRPC（h2c）。actor 的域名解析只应答出口策略中列出的主机，所以控制面在集群里以一个不带 selector 的 Service 出现，例如 `castworks-dev.castworks-system.svc`，它的 Endpoints 指向开发机的地址；规则中的主机就是这个 Service 名。
 
 Claude Code 以 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 运行，不发出遥测一类的非必要流量。演示任务只在 actor 本地读写文件，不访问其他主机。
 
@@ -77,12 +79,13 @@ Substrate 的新 actor 默认从[模板快照](../../glossary.md)恢复，模板
 v0.1.0 只保留以下三项：
 
 - Substrate 自带的 gVisor 隔离。
-- 控制面 API 只在集群内可达，Service 为 ClusterIP，本机经 `kubectl port-forward` 访问。
+- 控制面的 HTTP API 只监听开发机的 `127.0.0.1`。
 - LLM 密钥不进代码仓库，不打进镜像。
 
 以下让步在生产环境中都不可接受：
 
 - LLM 密钥由控制面在 `Hello` 的应答中交给看守进程，看守进程以环境变量 `ANTHROPIC_API_KEY` 交给 Claude Code，Agent 能读到它。
+- 控制面的 gRPC 端口监听开发机的网卡地址，集群 Pod 与内网中的其他机器都能连接。
 - 控制面 API、看守进程与控制面之间都不做认证。
 - 没有审批流程，Claude Code 以跳过权限确认的模式运行，全部工具调用直接执行。
 
@@ -100,9 +103,11 @@ v0.1.0 只保留以下三项：
 
 ## 开发环境需求
 
-v0.1.0 只需要开发集群上的以下条件：
+v0.1.0 需要以下条件：
 
-- `castworks-system` 命名空间中的 PostgreSQL。
+- 开发机上能运行 docker，用于 PostgreSQL。
 - 镜像仓库中可推送的 castworks 路径。
-- atespace `castworks-dev`，以及在其中持有 `editor` 角色、供控制面调用 ate-api 的 ServiceAccount。
+- atespace `castworks-dev`，以及在其中持有 `editor` 角色的 ServiceAccount。控制面以 `kubectl create token` 为它签发的令牌，经端口转发调用 ate-api。
+- 命名空间 `castworks-system` 中一个不带 selector 的 Service 及其 Endpoints，指向开发机的地址与控制面的 gRPC 端口。
+- 从 actor 经出口网关到开发机地址的网络可达。这一条要在实现之前最先验证；不可达时，控制面改为部署进集群。
 - 镜像内的 Claude Code 版本固定，不自动更新。
