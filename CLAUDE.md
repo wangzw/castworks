@@ -24,6 +24,7 @@ Supplements the `commit-convention` skill.
 - `glossary`: `docs/glossary.md`
 - `references`: `docs/references.md`
 - `roadmap`: `docs/roadmap.md`
+- `milestone`: `docs/milestone/`
 - `faq`: `docs/faq/`
 - `repo`: `CLAUDE.md`, `.markdownlint.jsonc` and other repository-level configuration
 
