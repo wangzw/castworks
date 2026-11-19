@@ -1,0 +1,41 @@
+#!/bin/sh
+# fake-claude stands in for Claude Code in the quota-free acceptance dry run.
+#
+# It speaks the subset of the stream-json protocol that warden drives:
+#
+#   - a system init message with a top-level session_id on startup;
+#   - for every user message on stdin, a system/session_state_changed(running)
+#     message, an assistant message, a result message with
+#     queued_turn_count=0, and a system/session_state_changed(idle) message.
+#
+# The state changes are system messages with subtype session_state_changed, as
+# the Agent SDK emits them and as warden's Claude Code driver parses them.
+#
+# It never contacts the network and never consumes quota. Arguments passed by
+# warden are accepted and ignored; the user text is echoed back so the test
+# can recognize each turn.
+set -eu
+
+session_id="fake-session-$$"
+
+printf '{"type":"system","subtype":"init","session_id":"%s","model":"fake-claude","tools":[]}\n' "$session_id"
+
+prefix='"content":"'
+suffix='"}}'
+
+while IFS= read -r line; do
+	[ -z "$line" ] && continue
+
+	text="$line"
+	case "$line" in
+	*"$prefix"*)
+		text=${line#*"$prefix"}
+		text=${text%"$suffix"}
+		;;
+	esac
+
+	printf '{"type":"system","subtype":"session_state_changed","state":"running","session_id":"%s"}\n' "$session_id"
+	printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]},"session_id":"%s"}\n' "$text" "$session_id"
+	printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","queued_turn_count":0,"session_id":"%s"}\n' "$text" "$session_id"
+	printf '{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"%s"}\n' "$session_id"
+done

@@ -1,5 +1,10 @@
 version: "2"
 
+run:
+  build-tags:
+    - acceptance
+    - integration
+
 linters:
   default: standard
   enable:

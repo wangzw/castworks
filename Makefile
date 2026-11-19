@@ -110,7 +110,6 @@ db-down:
 # actor 镜像只构建 linux/arm64。actor-image 只打本地标签，供镜像冒烟使用；
 # actor-image-push 在干净的工作树上推送按提交短 SHA 命名的镜像，标准输出
 # 最后一行为 <仓库>@sha256:<arm64 镜像清单 digest>，不含多平台索引。
-ACTOR_IMAGE ?= castworks/actor:dev
 ACTOR_IMAGE_REPO ?= registry.zhanwei.wang/castworks/actor
 
 .PHONY: actor-image actor-image-push
@@ -132,3 +131,63 @@ actor-image-push:
 
 actor-image-smoke: actor-image
 	images/actor/smoke.sh --image $(ACTOR_IMAGE)
+
+# Real-environment acceptance. These targets stay outside test-integration:
+# they need the developer machine, an LLM credential, and for the substrate
+# steps a cluster. Run them in order, and only after the upstream units are
+# merged. The tests themselves carry the acceptance build tag, so make test
+# and make test-integration never compile them.
+
+# The image names and paths come from the command line: none of them has a
+# default here. ACTOR_IMAGE is the actor image under test, and each target
+# that needs it checks it before starting anything.
+CREDENTIAL_FILE ?=
+CLAUDE_BIN ?=
+KUBE_CONTEXT ?=
+
+.PHONY: acceptance-dryrun acceptance-clean check-database-url
+
+ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
+
+# -run takes a Go regexp; "|" is alternation. It is not grep's "\|". Every
+# alternative is anchored at both ends so a test whose name starts with
+# another name is not selected.
+check-database-url:
+	@if [ -z "$$CASTWORKS_TEST_DATABASE_URL" ]; then \
+		echo "CASTWORKS_TEST_DATABASE_URL is not set; run make db-up and export it" >&2; \
+		exit 1; \
+	fi
+
+# The acceptance test targets below run go test through `tee` and keep its exit
+# status in a file. A "-run" pattern that matches no test makes go test exit 0
+# with only a warning, which would report a green acceptance run that never
+# ran; the recipe fails unless the verbose output contains at least one
+# "=== RUN" line. The subshell records the status because the pipeline's own
+# status would be tee's, and /bin/sh has no PIPESTATUS. Each target keeps its
+# full verbose output under /tmp/castworks-acceptance/ with a UTC timestamp in
+# the name, so a finished run can be read after the fact and consecutive runs
+# do not overwrite each other.
+
+acceptance-dryrun: check-jobs check-database-url
+	@mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-dryrun-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestDryRun$$|^TestSnapshotSizeUnit$$|^TestChildProcessIsolation$$|^TestCleanupSavesActorBeforeEnd$$|^TestStopRecordedProcessMatchesExecutablePath$$|^TestWaitLoggedAddrReadsEveryLog$$|^TestDoSetsJSONContentTypeOnBodylessPost$$|^TestFakeClaudeEmitsSessionStateEvents$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-dryrun: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
+
+acceptance-clean: check-jobs
+	@mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-clean-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestClean$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-clean: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
