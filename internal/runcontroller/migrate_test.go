@@ -22,6 +22,14 @@ func migratedPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// templatePool returns a fresh database copied from the "runcontroller"
+// template, which has the migrations applied once per process. Tests that
+// exercise Migrate itself use migratedPool instead.
+func templatePool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	return pgtest.NewPoolFromTemplate(t, "runcontroller", Migrate)
+}
+
 func testTimestamp() time.Time {
 	return time.Now().UTC().Truncate(time.Microsecond)
 }

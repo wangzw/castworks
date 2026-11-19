@@ -59,10 +59,7 @@ func e2eConfig() runcontroller.Config {
 func newE2E(t *testing.T, cfg runcontroller.Config) *e2eHarness {
 	t.Helper()
 
-	pool := pgtest.NewPool(t)
-	if err := runcontroller.Migrate(t.Context(), pool); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
+	pool := pgtest.NewPoolFromTemplate(t, "runcontroller", runcontroller.Migrate)
 
 	h := &e2eHarness{
 		t:        t,

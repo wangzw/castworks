@@ -13,7 +13,7 @@ import (
 
 func newTestStore(t *testing.T) (*store, *pgxpool.Pool) {
 	t.Helper()
-	pool := migratedPool(t)
+	pool := templatePool(t)
 	return newStore(pool), pool
 }
 

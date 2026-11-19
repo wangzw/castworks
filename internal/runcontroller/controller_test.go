@@ -80,10 +80,7 @@ func newHarness(t *testing.T, cfg runcontroller.Config) *harness {
 func newHarnessWithProvider(t *testing.T, cfg runcontroller.Config, wrap func(sandboxprovider.Provider) sandboxprovider.Provider) *harness {
 	t.Helper()
 
-	pool := pgtest.NewPool(t)
-	if err := runcontroller.Migrate(t.Context(), pool); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
+	pool := pgtest.NewPoolFromTemplate(t, "runcontroller", runcontroller.Migrate)
 	provider := fakeprovider.New(t)
 	clock := fakeclock.New(testEpoch)
 	var controllerProvider sandboxprovider.Provider = provider
