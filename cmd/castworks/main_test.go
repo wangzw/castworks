@@ -369,20 +369,3 @@ func TestConnectionErrorNamesServer(t *testing.T) {
 		t.Errorf("stderr = %q, want it to contain the server address %q", stderr, addr)
 	}
 }
-
-func TestPlaceholderCommands(t *testing.T) {
-	for _, name := range []string{"get", "watch"} {
-		t.Run(name, func(t *testing.T) {
-			code, stdout, stderr := runCLI(t, "run", name, "run-1")
-			if code != 1 {
-				t.Fatalf("exit code = %d, want 1 (stderr %q)", code, stderr)
-			}
-			if stdout != "" {
-				t.Errorf("stdout = %q, want empty", stdout)
-			}
-			if !strings.Contains(stderr, "not implemented") {
-				t.Errorf("stderr = %q, want a not implemented message", stderr)
-			}
-		})
-	}
-}
