@@ -189,7 +189,7 @@ wait_signatures:
 
 - `id`：在定义内唯一，`(system, id)` 标识一条签名；驱动器的提示频率与采纳判定按它归并，同一类等待在定义变更前后保持同一 `id`。
 - `match.command`：对 Bash 命令全文求值的正则，Claude Code 中取 Bash 工具输入的 `command`（[REF-claude-code-hooks](../../../references.md)）；未锚定时按子串匹配。正则按线性时间求值，不允许反向引用与环视；命名分组写作 `(?P<name>...)`，供 `correlation` 引用。
-- `match.request`：`{host, method, path_regex}`，按出口请求的目标主机、请求方法与请求路径（不含查询串）匹配；`host` 必须属于该定义的 `access.upstreams`，`path_regex` 的约束与 `match.command` 相同。沙箱侧对经 CONNECT 的请求只看到目标主机，请求路径只在终止 TLS 或解析明文请求的出口路径上可见，沙箱内的驱动器只对 `Monitor` 工具输入中的 URL 按 `host` 与 `path_regex` 匹配；出口流量上的路径级匹配是出口代理的可选能力（见[平台出口代理的扩展点](design-connectorhub-egress.md#扩展点)），提供条件见[实施路线与技术验证](../../../roadmap.md)。
+- `match.request`：`{host, method, path_regex}`，按出口请求的目标主机、请求方法与请求路径（不含查询串）匹配；`host` 必须属于该定义的 `access.upstreams`，`path_regex` 的约束与 `match.command` 相同。沙箱侧对经 CONNECT 的请求只看到目标主机，请求路径只在终止 TLS 或解析明文请求的出口路径上可见，沙箱内的驱动器只对 `Monitor` 工具输入中的 URL 按 `host` 与 `path_regex` 匹配；出口流量上的路径级匹配是出口代理的可选能力（见[平台出口代理的扩展点](design-connectorhub-egress.md#扩展点)），提供条件见[技术验证](../../../milestone/verification.md)。
 - `event_type`：必须属于事件目录对该外部系统投影的事件类型（`events.completions[].event` 与 `events.sources[].event_types` 的并集），与 `EventDescriptor.Event` 的取值规则一致；订阅建议中的事件类型因而总能经 `list_events` 查到。
 - `correlation`：关联键字段路径到提取模板的映射；模板由字面文本与 `${name}` 组成，`${name}` 引用 `match` 中的命名分组。键必须属于 `events.correlation_keys`，且至少包含一个[关联键身份键](../../../glossary.md)；提取值作为订阅建议中 `subscribe_event` 的 `correlation`，订阅登记时按 `correlation_normalization` 规范化。运行时某个被引用的分组未捕获时省略该键；省略后不含关联键身份键时，该次命中只作分类，不给订阅建议。
 - `prior`：`{p25, p50, p90}`，该类等待的时长先验，进入等待时长预测，不替代平台给出的单点预测。
