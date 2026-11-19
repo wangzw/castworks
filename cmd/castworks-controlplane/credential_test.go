@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wangzw/castworks/internal/runcontroller"
+	"github.com/wangzw/castworks/pkg/runcontroller"
 )
 
 // credentialFakeToken is a distinctive value planted in files whose error

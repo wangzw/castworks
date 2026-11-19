@@ -36,12 +36,12 @@ gen:
 	$(BUF) generate
 
 # gen-check generates into a fresh temporary directory and compares that output
-# with the committed *.pb.go files under api. It never regenerates in place, so
-# a generation failure or a mismatch leaves the committed files untouched and
-# the module still compiles. The comparison runs in both directions: every
-# generated file must be committed and identical, and every committed *.pb.go
-# must still be produced, so a file left behind by a deleted or renamed proto
-# cannot survive and be missed.
+# with the committed *.pb.go files under pkg. It never regenerates in
+# place, so a generation failure or a mismatch leaves the committed files
+# untouched and the module still compiles. The comparison runs in both
+# directions: every generated file must be committed and identical, and every
+# committed *.pb.go must still be produced, so a file left behind by a deleted
+# or renamed proto cannot survive and be missed.
 gen-check:
 	@if [ "$$($(BUF) --version)" != "$(BUF_VERSION)" ]; then \
 		echo "buf $(BUF_VERSION) is required; found:" >&2; \
@@ -51,24 +51,24 @@ gen-check:
 	tmp="$$(mktemp -d)"; \
 	trap 'rm -rf "$$tmp"' EXIT INT TERM HUP; \
 	if ! $(BUF) generate --output "$$tmp"; then \
-		echo "gen-check: buf generate failed; the committed files under api are unchanged" >&2; \
+		echo "gen-check: buf generate failed; the committed files under pkg/agentprotocol are unchanged" >&2; \
 		exit 1; \
 	fi; \
 	status=0; \
-	for generated in $$(find "$$tmp/api" -name '*.pb.go' -type f); do \
-		rel="$${generated#$$tmp/api/}"; \
-		if [ ! -f "api/$$rel" ]; then \
-			echo "generated but not committed: api/$$rel" >&2; \
+	for generated in $$(find "$$tmp/pkg" -name '*.pb.go' -type f); do \
+		rel="$${generated#$$tmp/pkg/}"; \
+		if [ ! -f "pkg/$$rel" ]; then \
+			echo "generated but not committed: pkg/$$rel" >&2; \
 			status=1; \
-		elif ! cmp -s "$$generated" "api/$$rel"; then \
-			echo "generated output differs: api/$$rel" >&2; \
+		elif ! cmp -s "$$generated" "pkg/$$rel"; then \
+			echo "generated output differs: pkg/$$rel" >&2; \
 			status=1; \
 		fi; \
 	done; \
-	for committed in $$(find api -name '*.pb.go' -type f); do \
-		rel="$${committed#api/}"; \
-		if [ ! -f "$$tmp/api/$$rel" ]; then \
-			echo "committed but no longer generated: api/$$rel" >&2; \
+	for committed in $$(find pkg -name '*.pb.go' -type f); do \
+		rel="$${committed#pkg/}"; \
+		if [ ! -f "$$tmp/pkg/$$rel" ]; then \
+			echo "committed but no longer generated: pkg/$$rel" >&2; \
 			status=1; \
 		fi; \
 	done; \

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wangzw/castworks/internal/humanchannel/api"
+	"github.com/wangzw/castworks/pkg/humanchannel/api"
 )
 
 // cliTimeout bounds every command line invocation in a test. A command that

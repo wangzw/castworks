@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/wangzw/castworks/internal/humanchannel/api"
+	"github.com/wangzw/castworks/pkg/humanchannel/api"
 )
 
 // dash stands in for a value that is absent: an empty substate, a turn that

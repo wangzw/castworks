@@ -23,10 +23,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
-	agentprotocolv1 "github.com/wangzw/castworks/api/agentprotocol/v1"
-	"github.com/wangzw/castworks/internal/humanchannel/api"
-	"github.com/wangzw/castworks/internal/runcontroller"
 	"github.com/wangzw/castworks/internal/testutil/pgtest"
+	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
+	"github.com/wangzw/castworks/pkg/humanchannel/api"
+	"github.com/wangzw/castworks/pkg/runcontroller"
 )
 
 // smokeShutdownTimeout is the --shutdown-timeout the smoke tests pass. The

@@ -5,9 +5,9 @@ package main
 import (
 	"log/slog"
 
-	"github.com/wangzw/castworks/internal/warden/agent"
-	"github.com/wangzw/castworks/internal/warden/claudecode"
-	"github.com/wangzw/castworks/internal/warden/pid1"
+	"github.com/wangzw/castworks/pkg/warden/agent"
+	"github.com/wangzw/castworks/pkg/warden/claudecode"
+	"github.com/wangzw/castworks/pkg/warden/pid1"
 )
 
 // 编译期断言：PID 1 回收器与默认的 cmd.Wait 实现都满足 agent.ProcessRunner。

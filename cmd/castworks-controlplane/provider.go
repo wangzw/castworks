@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/wangzw/castworks/internal/sandboxprovider"
-	"github.com/wangzw/castworks/internal/sandboxprovider/localprovider"
-	"github.com/wangzw/castworks/internal/sandboxprovider/substrate"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
+	"github.com/wangzw/castworks/pkg/sandboxprovider/localprovider"
+	"github.com/wangzw/castworks/pkg/sandboxprovider/substrate"
 )
 
 // newProvider 按 --provider 构造沙箱提供者。local 用不碰集群的本地提供者，

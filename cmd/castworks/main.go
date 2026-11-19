@@ -45,8 +45,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/wangzw/castworks/internal/humanchannel/api"
-	"github.com/wangzw/castworks/internal/humanchannel/client"
+	"github.com/wangzw/castworks/pkg/humanchannel/api"
+	"github.com/wangzw/castworks/pkg/humanchannel/client"
 )
 
 // environment is what the process gives a command: the injected streams, the

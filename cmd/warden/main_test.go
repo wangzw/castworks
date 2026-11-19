@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	agentprotocolv1 "github.com/wangzw/castworks/api/agentprotocol/v1"
-	"github.com/wangzw/castworks/internal/agentprotocol"
+	"github.com/wangzw/castworks/pkg/agentprotocol"
+	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
 	"google.golang.org/grpc"
 )
 

@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wangzw/castworks/internal/sandboxprovider"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
 
 const (

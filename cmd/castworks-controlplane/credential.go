@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/wangzw/castworks/internal/runcontroller"
+	"github.com/wangzw/castworks/pkg/runcontroller"
 )
 
 // maxCredentialFileSize is the largest LLM credential file the control plane

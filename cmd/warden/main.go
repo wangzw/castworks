@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/wangzw/castworks/internal/warden/claudecode"
-	"github.com/wangzw/castworks/internal/warden/controlstream"
-	"github.com/wangzw/castworks/internal/warden/identity"
-	"github.com/wangzw/castworks/internal/warden/readyz"
+	"github.com/wangzw/castworks/pkg/warden/claudecode"
+	"github.com/wangzw/castworks/pkg/warden/controlstream"
+	"github.com/wangzw/castworks/pkg/warden/identity"
+	"github.com/wangzw/castworks/pkg/warden/readyz"
 )
 
 // shutdownTimeout 是入口关停 Claude Code 的上限。关停升级本身最长 15 s

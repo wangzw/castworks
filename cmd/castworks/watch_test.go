@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wangzw/castworks/internal/humanchannel/client"
+	"github.com/wangzw/castworks/pkg/humanchannel/client"
 )
 
 // pollStep is one response the fake polling server sends.

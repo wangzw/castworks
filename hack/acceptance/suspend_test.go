@@ -37,8 +37,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/wangzw/castworks/internal/sandboxprovider"
 	"github.com/wangzw/castworks/internal/testutil/pgtest"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
 
 const (

@@ -1,7 +1,10 @@
 version: v2
 
 modules:
-  - path: api
+  # pkg/ is the module root so the proto keeps its module-relative path,
+  # agentprotocol/v1/agentprotocol.proto. The wire name (agentprotocol.v1) and
+  # the RPC full names therefore stay unchanged.
+  - path: pkg
 
 lint:
   use:

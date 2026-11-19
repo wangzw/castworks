@@ -15,9 +15,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/wangzw/castworks/internal/humanchannel"
-	"github.com/wangzw/castworks/internal/runcontroller"
-	"github.com/wangzw/castworks/internal/sandboxprovider"
+	"github.com/wangzw/castworks/pkg/humanchannel"
+	"github.com/wangzw/castworks/pkg/runcontroller"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
 
 const (

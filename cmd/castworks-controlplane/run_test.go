@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/wangzw/castworks/internal/sandboxprovider"
 	"github.com/wangzw/castworks/internal/testutil/pgtest"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
 
 // unreachableDatabaseURL points at a closed port with a distinctive password.

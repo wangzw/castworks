@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wangzw/castworks/internal/runcontroller"
+	"github.com/wangzw/castworks/pkg/runcontroller"
 )
 
 // --provider 的两个取值。

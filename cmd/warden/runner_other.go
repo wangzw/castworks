@@ -5,8 +5,8 @@ package main
 import (
 	"log/slog"
 
-	"github.com/wangzw/castworks/internal/warden/agent"
-	"github.com/wangzw/castworks/internal/warden/claudecode"
+	"github.com/wangzw/castworks/pkg/warden/agent"
+	"github.com/wangzw/castworks/pkg/warden/claudecode"
 )
 
 // 编译期断言：默认的 cmd.Wait 实现满足 agent.ProcessRunner。

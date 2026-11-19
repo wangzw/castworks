@@ -5,7 +5,7 @@
 // The go criterion measures snapshot restore with an actor holding about
 // 500 MB of written memory. TestBallastSuspendResume provisions one actor from
 // the ballast image in hack/acceptance/ballast and runs five snapshot/restore
-// cycles directly through internal/sandboxprovider/substrate, without a
+// cycles directly through sandboxprovider/substrate, without a
 // control plane and without spending LLM quota. Each cycle records the
 // snapshot and restore durations, the snapshot size, the snapshot generation
 // and the resident set size; after every restore the same process must still
@@ -60,8 +60,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wangzw/castworks/internal/sandboxprovider"
-	"github.com/wangzw/castworks/internal/sandboxprovider/substrate"
+	"github.com/wangzw/castworks/pkg/sandboxprovider"
+	"github.com/wangzw/castworks/pkg/sandboxprovider/substrate"
 )
 
 const (

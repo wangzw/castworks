@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wangzw/castworks/internal/runcontroller"
+	"github.com/wangzw/castworks/pkg/runcontroller"
 )
 
 var _ runcontroller.Clock = (*Clock)(nil)

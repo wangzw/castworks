@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/wangzw/castworks/internal/humanchannel/client"
+	"github.com/wangzw/castworks/pkg/humanchannel/client"
 )
 
 // watchPollInterval is the delay between two watch polls. It is a variable so
