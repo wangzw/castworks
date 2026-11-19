@@ -17,7 +17,7 @@ v0.1.0 中，看守进程在 actor 里作为 PID 1 运行，维持到控制面�
 | actor 模式 | `systemInfo` 卷投射的 `/run/ate/actor-name` 文件 | 环境变量 `CASTWORKS_CONTROL_PLANE`，取不带 selector 的 Service 的全限定名加端口 | 演示场景与挂起恢复测试 |
 | 本地模式 | 命令行参数 `--run-id` | 命令行参数 `--control-plane`，例如 `127.0.0.1:9090` | 在开发机上调试协议与 Claude Code 的驱动 |
 
-两种方式的代码路径只在身份与地址的来源上不同。本地模式下看守进程不是 PID 1，Claude Code 以当前用户运行。
+两种方式的代码路径只在身份与地址的来源上不同。本地模式下看守进程不是 PID 1，Claude Code 以当前用户运行，主目录取命令行参数 `--home` 指定的目录，工作目录与 stream-json 记录文件都在其下，不使用开发者自己的主目录。
 
 ## 身份
 
