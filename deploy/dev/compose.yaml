@@ -1,0 +1,25 @@
+name: castworks-dev
+
+services:
+  postgres:
+    # PostgreSQL 18 is the current stable major; pin the exact patch release.
+    image: postgres:18.7
+    environment:
+      POSTGRES_USER: castworks
+      POSTGRES_PASSWORD: castworks
+      POSTGRES_DB: castworks_test
+      # The 18 image moved the default data directory. Pin PGDATA so the
+      # named volume below is the one the server initializes and uses.
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U castworks -d castworks_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  postgres-data:

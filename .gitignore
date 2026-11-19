@@ -1,0 +1,24 @@
+# Go build output
+/castworks
+/castworks-controlplane
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage files. Name the files explicitly rather than using coverage.*,
+# which also matches source files such as coverage.go.
+/coverage.out
+/coverage.html
+*.coverprofile
+*.cov
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code worktrees
+.claude/worktrees/
