@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"ses-3","claude_code_version":"2.1.328","cwd":"/home/agent/work","tools":[],"mcp_servers":[],"model":"claude-sonnet-5","permissionMode":"bypassPermissions","slash_commands":[],"output_style":"default","skills":[],"plugins":[],"uuid":"u-init"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]},"parent_tool_use_id":null,"session_id":"ses-3","uuid":"u-assistant-1"}
+{"type":"result","subtype":"success","result":"working","is_error":false,"num_turns":1,"stop_reason":null,"session_id":"ses-3","queued_turn_count":1,"uuid":"u-result-1"}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"ses-3","uuid":"u-idle-1"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]},"parent_tool_use_id":null,"session_id":"ses-3","uuid":"u-assistant-2"}
+{"type":"result","subtype":"success","result":"done","is_error":false,"num_turns":2,"stop_reason":null,"session_id":"ses-3","queued_turn_count":0,"uuid":"u-result-2"}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"ses-3","uuid":"u-idle"}
