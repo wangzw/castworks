@@ -10,3 +10,29 @@
 - glossary: docs/glossary.md
 - references: docs/references.md
 - language: zh-CN
+
+## Commit Convention
+
+Supplements the `commit-convention` skill.
+
+### Scopes
+
+- `architecture`: `docs/design/architecture.md`
+- a module name: that module's documents. The module table in `docs/design/README.md` is the authority. Grouped modules use the group name: `warden`, not `driver-claude-code`; `sandboxprovider`, not `k8s`.
+- `design`: cross-cutting changes
+- `adr`: `docs/adr/`
+- `glossary`: `docs/glossary.md`
+- `references`: `docs/references.md`
+- `roadmap`: `docs/roadmap.md`
+- `faq`: `docs/faq/`
+- `repo`: `CLAUDE.md`, `.markdownlint.jsonc` and other repository-level configuration
+
+### Types
+
+- `docs` is the default.
+- Correcting a wrong, contradictory or broken statement, contract or check in a document is `fix`, not `docs`.
+- `feat` and `perf` are not used until an implementation exists.
+
+### Rules
+
+- A change is breaking only when it removes or renames something another document or an implementation consumes: a protocol field, an RPC, a state name, an invariant, or a glossary term used by an interface.
