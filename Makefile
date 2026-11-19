@@ -98,8 +98,11 @@ gate: check-jobs gen-check lint test
 test-integration: check-jobs
 	$(GO) test -tags integration -p $(JOBS) -parallel $(JOBS) ./...
 
+# 测试连 postgres-test，开发机上运行的控制面连 postgres。两者用途的区别见
+# deploy/dev/README.md。测试读取的连接串示例：
+#   postgres://castworks:castworks@127.0.0.1:55433/castworks_test?sslmode=disable
 db-up:
-	$(COMPOSE) up -d --wait postgres
+	$(COMPOSE) up -d --wait postgres postgres-test
 
 db-down:
 	$(COMPOSE) down

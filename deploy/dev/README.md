@@ -41,6 +41,23 @@ setup.sh 可重复执行：清单用 `kubectl apply` 更新，已存在的 atesp
 
 teardown.sh 先确认 atespace 中没有 actor 与模板，再删除 atespace；访问策略随 atespace 在同一事务中删除，不单独先删。随后删除命名空间内的对象与命名空间本身。atespace 中仍有 actor 或模板时脚本以非零状态退出，不会连带删除它们。
 
+## 测试数据库
+
+`deploy/dev/compose.yaml` 定义两个 PostgreSQL 服务，镜像版本、凭据与库名都相同，只有端口、数据位置与用途不同：
+
+| 服务 | 端口 | 数据 | 用途 |
+| --- | --- | --- | --- |
+| `postgres` | `127.0.0.1:55432` | 命名卷 `postgres-data`，持久 | 开发机上运行的控制面使用；控制面在挂起状态下重启后仍要读回数据，依赖这里的持久性 |
+| `postgres-test` | `127.0.0.1:55433` | tmpfs，容器停止后清空 | 单元测试专用；关闭 `fsync`、`full_page_writes`、`synchronous_commit`，让建库和删库触发的 checkpoint 不再写机械盘 |
+
+测试从环境变量 `CASTWORKS_TEST_DATABASE_URL` 读取连接串，示例值：
+
+```sh
+export CASTWORKS_TEST_DATABASE_URL='postgres://castworks:castworks@127.0.0.1:55433/castworks_test?sslmode=disable'
+```
+
+`make db-up` 同时启动两个服务并等到健康检查通过，`make db-down` 一起停止。`postgres-test` 的数据只在内存里，测试建删库不会影响 `postgres` 中控制面使用的数据。
+
 ## 资源
 
 | 文件 | 对象 | 用途 |

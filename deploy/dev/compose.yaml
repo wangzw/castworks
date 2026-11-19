@@ -21,5 +21,38 @@ services:
       timeout: 5s
       retries: 30
 
+  postgres-test:
+    # Tests use a separate server so creating and dropping one database per
+    # test does not touch the persistent data on the mechanical disk. The
+    # image, credentials and database name match postgres, so the same
+    # connection-string template works with only the port changed.
+    image: postgres:18.7
+    environment:
+      POSTGRES_USER: castworks
+      POSTGRES_PASSWORD: castworks
+      POSTGRES_DB: castworks_test
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:55433:5432"
+    # The data directory lives in RAM and is discarded with the container.
+    tmpfs:
+      - /var/lib/postgresql/data
+    # Dropping a database forces a checkpoint. These settings keep that
+    # checkpoint cheap: a test database is disposable, so losing the last
+    # transactions on a crash is acceptable.
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U castworks -d castworks_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
 volumes:
   postgres-data:
