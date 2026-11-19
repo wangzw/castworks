@@ -24,3 +24,18 @@
 | REF-anthropic-streaming | Streaming Messages（Claude API 文档） | Claude Messages API 的服务器发送事件流格式，含内容事件与 ping 保活事件 | <https://platform.claude.com/docs/en/build-with-claude/streaming> | anthropic-version 2023-06-01 |
 | REF-spiffe | SPIFFE | 工作负载身份标准：SPIFFE ID 与可验证身份文档（SVID） | <https://spiffe.io/docs/latest/spiffe-about/overview/> | — |
 | REF-envoy | Envoy Proxy 文档 | 云原生服务代理，提供 CONNECT 终止、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 过滤器 | <https://www.envoyproxy.io/docs/envoy/latest/> | — |
+| REF-kagent | kagent（kagent-dev/kagent） | 开源的 Kubernetes Agent 平台，以 Harness 资源声明 Agent，可运行在 Agent Substrate 之上，覆盖会话、回合边界的挂起与恢复、出口凭据替换 | <https://github.com/kagent-dev/kagent> | v1.0.1 |
+| REF-claude-managed-agents | Claude Managed Agents | Anthropic 的托管 Agent 服务文档，覆盖 Agent、环境、会话与事件，含会话状态、沙箱检查点、工具确认与自托管沙箱 | <https://platform.claude.com/docs/en/managed-agents/overview> | managed-agents-2026-04-01 |
+| REF-bedrock-agentcore-runtime | Amazon Bedrock AgentCore Runtime | AWS 的 Agent 托管运行时文档，覆盖每会话 microVM、会话状态、空闲超时、`/ping` 健康状态与会话存储 | <https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-sessions.html> | — |
+| REF-foundry-hosted-agents | Hosted agents in Foundry Agent Service | Microsoft Foundry 的托管 Agent 文档，覆盖每会话隔离的沙箱、会话与计算实例的生命周期、`$HOME` 持久化与空闲超时 | <https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/hosted-agents> | — |
+| REF-open-inspect | Open-Inspect（open-inspect/background-agents） | 开源的后台编码 Agent 系统，控制面运行在 Cloudflare，沙箱由可替换的后端提供 | <https://github.com/open-inspect/background-agents> | main |
+| REF-cullenmcdermott-sandbox | sandbox（cullenmcdermott/sandbox） | 开源的命令行工具，基于 kubernetes-sigs/agent-sandbox 在远端集群运行编码 Agent，覆盖会话的挂起与恢复 | <https://github.com/cullenmcdermott/sandbox> | main |
+| REF-e2b | E2B 文档 | 沙箱服务的官方文档，覆盖沙箱的暂停、自动暂停与自动恢复 | <https://docs.e2b.dev/sandbox/persistence> | — |
+| REF-daytona | Daytona 文档 | 沙箱服务的官方文档，覆盖沙箱状态、自动停止与归档 | <https://www.daytona.io/docs/en/sandboxes> | — |
+| REF-blaxel | Blaxel Sandboxes 文档 | 沙箱服务的官方文档，覆盖待机模式及其保留的状态 | <https://docs.blaxel.ai/Sandboxes/Overview> | — |
+| REF-sprites | The Design & Implementation of Sprites | Fly.io 对 Sprites 的设计说明，覆盖虚拟机隔离、以对象存储为后端的持久存储、自动休眠与检查点 | <https://fly.io/blog/design-and-implementation/> | — |
+| REF-aliyun-agent-sandbox | 阿里云 Agent Sandbox 概述 | 阿里云容器计算服务的 Agent Sandbox 产品文档，覆盖 MicroVM 隔离、内存状态的休眠与唤醒、Sandbox 自定义资源 | <https://help.aliyun.com/zh/cs/user-guide/agent-sandbox/> | — |
+| REF-cube-sandbox | Cube Sandbox（TencentCloud/CubeSandbox） | 开源的沙箱服务，基于 RustVMM 与 KVM，覆盖 MicroVM 隔离、空闲暂停、请求唤醒与跨节点恢复 | <https://github.com/TencentCloud/CubeSandbox> | v0.8.0 |
+| REF-opensandbox | OpenSandbox（opensandbox-group/OpenSandbox） | 开源的沙箱平台，以统一的沙箱 API 对接 Docker 与 Kubernetes 运行时，覆盖按后端区分的暂停与恢复 | <https://github.com/opensandbox-group/OpenSandbox> | release-1.2.1 |
+| REF-cloudflare-sandbox | Cloudflare Sandbox SDK 文档 | 沙箱 SDK 的官方文档，覆盖沙箱的生命周期与休眠后的状态 | <https://developers.cloudflare.com/sandbox/concepts/sandboxes/> | 0.x |
+| REF-sandbox-agent | Sandbox Agent（rivet-dev） | 开源的沙箱内服务进程与 SDK，以统一接口驱动多种编码 Agent，覆盖会话、权限请求、会话持久化与会话恢复 | <https://rivet.dev/sandbox-agent/docs/> | v0.5.6 |

@@ -26,3 +26,7 @@ castworks 是托管 AI Agent 环境。完整的第三方 Agent 以进程形式�
 ## 对照
 
 - [与 Google AX 的对照](../faq/castworks-vs-google-ax.md)：需求与设计上的重合度分析；AX 见 [REF-google-ax](../references.md)。
+- [与同类项目的对照](../faq/castworks-vs-similar-projects.md)：按托管完整 Agent、可挂起沙箱与沙箱内的 Agent 驱动层分组，对照挂起触发、挂起后保留的状态与恢复触发。对照的项目：
+  - 托管完整 Agent：kagent（[REF-kagent](../references.md)）、Claude Managed Agents（[REF-claude-managed-agents](../references.md)）、Amazon Bedrock AgentCore Runtime（[REF-bedrock-agentcore-runtime](../references.md)）、Foundry hosted agents（[REF-foundry-hosted-agents](../references.md)）、Open-Inspect（[REF-open-inspect](../references.md)）、cullenmcdermott/sandbox（[REF-cullenmcdermott-sandbox](../references.md)）。
+  - 可挂起沙箱：E2B（[REF-e2b](../references.md)）、Daytona（[REF-daytona](../references.md)）、Blaxel（[REF-blaxel](../references.md)）、Sprites（[REF-sprites](../references.md)）、阿里云 Agent Sandbox（[REF-aliyun-agent-sandbox](../references.md)）、Cube Sandbox（[REF-cube-sandbox](../references.md)）、OpenSandbox（[REF-opensandbox](../references.md)），以及作为反例的 Cloudflare Sandbox SDK（[REF-cloudflare-sandbox](../references.md)）。
+  - 沙箱内的 Agent 驱动层：Sandbox Agent（[REF-sandbox-agent](../references.md)）。
