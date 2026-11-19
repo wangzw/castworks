@@ -103,3 +103,22 @@ db-up:
 
 db-down:
 	$(COMPOSE) down
+
+# actor 镜像只构建 linux/arm64。actor-image 只打本地标签，供镜像冒烟使用；
+# actor-image-push 在干净的工作树上推送按提交短 SHA 命名的镜像，标准输出
+# 最后一行为 <仓库>@sha256:<arm64 镜像清单 digest>，不含多平台索引。
+ACTOR_IMAGE ?= castworks/actor:dev
+ACTOR_IMAGE_REPO ?= registry.zhanwei.wang/castworks/actor
+
+.PHONY: actor-image actor-image-push
+
+actor-image:
+	images/actor/build.sh --tag $(ACTOR_IMAGE)
+
+actor-image-push:
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "actor-image-push: 工作树不干净，提交或清理后再推送" >&2; \
+		git status --porcelain >&2; \
+		exit 1; \
+	fi
+	images/actor/build.sh --push --tag $(ACTOR_IMAGE_REPO):$$(git rev-parse --short HEAD)
