@@ -11,6 +11,13 @@
 - references: docs/references.md
 - language: zh-CN
 
+## Code Layout
+
+- Each module's code lives in `pkg/` in a directory named after the module. The module table in `docs/design/README.md` is the authority; grouped modules use the group name (`warden`, not `driver-claude-code`; `sandboxprovider`, not `k8s`).
+- A module's external protocol definitions and their generated code live in a version subdirectory of that module's directory, such as `pkg/agentprotocol/v1/`.
+- `internal/` holds only test helpers that belong to no module.
+- Executable programs live in `cmd/`.
+
 ## Commit Convention
 
 Supplements the `commit-convention` skill.
@@ -25,7 +32,7 @@ Supplements the `commit-convention` skill.
 - `references`: `docs/references.md`
 - `milestone`: `docs/milestone/`
 - `faq`: `docs/faq/`
-- a module name for that module's code as well: `runcontroller`, `agentprotocol`, `warden`, `sandboxprovider`, `humanchannel`
+- a module name for that module's code as well, located at `pkg/<module>`: `runcontroller`, `agentprotocol`, `warden`, `sandboxprovider`, `humanchannel`
 - `controlplane`: `cmd/castworks-controlplane`
 - `cli`: `cmd/castworks`
 - `deploy`: `deploy/`
