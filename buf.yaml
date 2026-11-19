@@ -1,0 +1,15 @@
+version: v2
+
+modules:
+  - path: api
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # The design fixes the service name as AgentStream; it is not a *Service.
+    - SERVICE_SUFFIX
+    # The stream types are fixed as WardenFrame and ControlFrame, not
+    # ConnectRequest and ConnectResponse.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
