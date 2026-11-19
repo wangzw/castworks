@@ -139,17 +139,20 @@ actor-image-smoke: actor-image
 # and make test-integration never compile them.
 
 # The image names and paths come from the command line: none of them has a
-# default here. ACTOR_IMAGE is the actor image under test, and each target
-# that needs it checks it before starting anything.
+# default here. ACTOR_IMAGE is the actor image under test and ACTOR_COMMIT is
+# the commit that image was built from; a run that records provenance refuses
+# to start without the latter. Each target checks the values it needs before
+# starting anything.
 # BALLAST_IMAGE is the image the memory-ballast test provisions. It is
 # required on its own and does not default to ACTOR_IMAGE.
 CREDENTIAL_FILE ?=
 CLAUDE_BIN ?=
 KUBE_CONTEXT ?=
+RUN ?=
 
-.PHONY: acceptance-dryrun acceptance-local acceptance-substrate acceptance-ballast acceptance-clean check-database-url
+.PHONY: acceptance-dryrun acceptance-local acceptance-substrate acceptance-suspend acceptance-ballast acceptance-clean check-database-url
 
-ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
+ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_ACTOR_COMMIT="$(ACTOR_COMMIT)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
 
 # -run takes a Go regexp; "|" is alternation. It is not grep's "\|". Every
 # alternative is anchored at both ends so a test whose name starts with
@@ -174,7 +177,7 @@ acceptance-dryrun: check-jobs check-database-url
 	@mkdir -p /tmp/castworks-acceptance; \
 	log=/tmp/castworks-acceptance/acceptance-dryrun-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
 	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
-	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestDryRun$$|^TestSnapshotSizeUnit$$|^TestBallastStatsUnit$$|^TestChildProcessIsolation$$|^TestCleanupSavesActorBeforeEnd$$|^TestStopRecordedProcessMatchesExecutablePath$$|^TestWaitLoggedAddrReadsEveryLog$$|^TestDoSetsJSONContentTypeOnBodylessPost$$|^TestFakeClaudeEmitsSessionStateEvents$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestDryRun$$|^TestSnapshotSizeUnit$$|^TestBallastStatsUnit$$|^TestChildProcessIsolation$$|^TestCleanupSavesActorBeforeEnd$$|^TestStopRecordedProcessMatchesExecutablePath$$|^TestWaitLoggedAddrReadsEveryLog$$|^TestDoSetsJSONContentTypeOnBodylessPost$$|^TestFakeClaudeEmitsSessionStateEvents$$|^TestSuspendParsesReplies$$|^TestSuspendFileProof$$|^TestSuspendProvenanceUsesActorCommit$$|^TestSuspendAllocatedComparison$$|^TestSuspendRunStateWatcher$$|^TestMeasureSnapshotTracker$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-dryrun: the -run pattern matched no test; failing instead of reporting success" >&2; \
@@ -223,6 +226,31 @@ acceptance-substrate: check-jobs check-database-url
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-substrate: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
+
+acceptance-suspend: check-jobs check-database-url
+	@if [ -z "$(CREDENTIAL_FILE)" ]; then \
+		echo "CREDENTIAL_FILE is not set; run make acceptance-suspend JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(ACTOR_IMAGE)" ]; then \
+		echo "ACTOR_IMAGE is not set; run make acceptance-suspend JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(ACTOR_COMMIT)" ]; then \
+		echo "ACTOR_COMMIT is not set; run make acceptance-suspend JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(RUN)" ]; then run='^TestSuspendResume$$'; else run='^TestSuspendResume$$/^$(RUN)$$'; fi; \
+	mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-suspend-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 90m -run "$$run" ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-suspend: the -run pattern matched no test; failing instead of reporting success" >&2; \
 		exit 1; \
 	fi; \
 	exit "$$status"
