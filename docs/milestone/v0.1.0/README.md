@@ -68,7 +68,7 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 Substrate 把 actor 的全部 TCP 出站送到出口网关，EgressPolicy 没有放行的连接一律拒绝；没有 EgressPolicy 的 actor 连域名解析都得不到应答（[REF-substrate](../../references.md)）。因此控制面为每个 actor 创建 EgressPolicy，只放行两类出站：
 
 - `api.anthropic.com:443` 以 `tls_passthrough` 规则透传，出口网关不终止 TLS，Claude Code 不需要信任出口网关的 CA。
-- 控制面的 gRPC 端口以 `http` 规则放行，看守进程与控制面之间是明文 gRPC（h2c）。actor 的域名解析只应答出口策略中列出的主机，所以控制面在集群里以一个不带 selector 的 Service 出现，全限定名为 `castworks-dev.castworks-system.svc.cluster.local`，它的 Endpoints 指向开发机的地址；规则与看守进程拨号都使用这个全限定名，见 [sandboxprovider](sandboxprovider.md#网络)。
+- 控制面的 gRPC 端口以 `http` 规则放行，看守进程与控制面之间是明文 gRPC（h2c）。actor 的域名解析只应答出口策略中列出的主机，所以控制面在集群里以一个不带 selector 的 Service 出现，全限定名为 `castworks-dev.castworks-system.svc.cluster.local`，它的 EndpointSlice 指向开发机的地址；规则与看守进程拨号都使用这个全限定名，见 [sandboxprovider](sandboxprovider.md#网络)。
 
 Claude Code 以 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 运行，不发出遥测一类的非必要流量。两种 LLM 凭据下 Claude Code 是否只访问 `api.anthropic.com`，在实现顺序第 4 步的本地运行中观察确认；需要其他主机时加入出口策略。演示任务只在 actor 本地读写文件，不访问其他主机。
 
@@ -122,6 +122,6 @@ v0.1.0 需要以下条件：
 - 镜像仓库中可推送的 castworks 路径。
 - atespace `castworks-dev`；ServiceAccount `castworks-system/sandboxprovider`，在 `castworks-dev` 的访问策略中持有 `editor` 角色。控制面以 TokenRequest 为它签发令牌，经端口转发调用 ate-api，所以开发机的 kubeconfig 需要 `ate-system` 中的端口转发权限，以及 ClusterTrustBundle 的读取权限。
 - 命名空间 `castworks-system` 中的 gVisor WorkerPool，带标签 `castworks.dev/pool: castworks`，单个 worker 的资源上限至少容纳一个 2 CPU、2 GiB 的 actor。
-- 命名空间 `castworks-system` 中不带 selector 的 Service `castworks-dev` 及其 Endpoints，指向开发机的地址与控制面的 gRPC 端口 9090。
+- 命名空间 `castworks-system` 中不带 selector 的 Service `castworks-dev` 及其 EndpointSlice，指向开发机的地址与控制面的 gRPC 端口 9090。
 - 从 actor 经出口网关到开发机地址的网络可达。这一条要在实现之前最先验证；不可达时，控制面改为部署进集群。
 - 镜像内的 Claude Code 版本固定，不自动更新。
