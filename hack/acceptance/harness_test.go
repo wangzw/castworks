@@ -671,6 +671,14 @@ type suspension struct {
 	RestoreMS  *int64    `json:"restore_ms"`
 	HelloMS    *int64    `json:"hello_ms"`
 	Error      string    `json:"error"`
+
+	// HelloAt and RestoreReturnedAt do not come from the run detail. They are
+	// read from the suspension table, because a null hello_ms alone cannot
+	// tell a Hello that arrived before RestoreSnapshot returned from one that
+	// never arrived, and the hello_at that was recorded still has to be
+	// checked against the moment the restore returned.
+	HelloAt           *time.Time `json:"-"`
+	RestoreReturnedAt *time.Time `json:"-"`
 }
 
 // runDetail mirrors GET /v1/runs/{run_id}.

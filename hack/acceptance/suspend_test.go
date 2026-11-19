@@ -3,9 +3,11 @@
 // Suspend/resume acceptance: the milestone demo, ten cycles of
 // suspend/resume, and a control plane restart while a run is suspended.
 //
-// The control plane runs with --provider substrate and --suspend, leaving
-// --idle-grace, --scan-period and --hello-timeout at their defaults (30s, 5s
-// and 60s). Each scenario creates its own database through pgtest.
+// The control plane runs with --provider substrate and --suspend. The test
+// passes --idle-grace and --scan-period explicitly from the constants below,
+// so the idle assertion measures against the configuration actually in use,
+// and leaves --hello-timeout at its default (60s). Each scenario creates its
+// own database through pgtest.
 //
 // This file also carries the orchestration helpers it needs. They are prefixed
 // with "suspend" so they stay out of the way of the other acceptance steps,
@@ -34,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wangzw/castworks/internal/sandboxprovider"
 	"github.com/wangzw/castworks/internal/testutil/pgtest"
 )
@@ -75,6 +78,13 @@ const (
 	suspendTurnTimeout      = 10 * time.Minute
 	suspendStateTimeout     = 5 * time.Minute
 	suspendCPStopTimeout    = 30 * time.Second
+
+	// suspendIdleGrace is G_idle and suspendScanPeriod is P_scan. The test
+	// passes both to the control plane instead of relying on its built-in
+	// defaults, so the idle assertion in suspendAwaitSuspension compares the
+	// observed gap against the configuration the process was actually given.
+	suspendIdleGrace  = 30 * time.Second
+	suspendScanPeriod = 5 * time.Second
 
 	// suspendLongHold is how long the run stays suspended before the wake
 	// message, so the guest clock and the old connections have a long freeze
@@ -246,11 +256,19 @@ func runSuspendDemo(t *testing.T, parent context.Context, credentialPath, actorI
 			m.addNote("the second message produced no observed resuming state")
 		}
 	}
-	suspendCheckSuspensionComplete(t, second.Suspensions, 1)
+	suspendAttachSuspensionTimes(ctx, t, h, runID, second.Suspensions)
+	if early := suspendCheckSuspensionComplete(t, second.Suspensions, 1); early > 0 {
+		m.addNote("%d suspension(s) received Hello before RestoreSnapshot returned; hello_ms is unmeasured for those", early)
+	}
 
 	afterResume := suspendAwaitAllocatedAbove(ctx, h, baseline)
 	m.WorkerAllocatedAfterResume = &afterResume
-	suspendCheckCLIGet(t, h.suspendGetCLI(ctx, runID))
+	report := h.suspendGetCLI(ctx, runID)
+	suspendCheckCLIGet(t, report)
+	// The milestone's demo says the turn output is echoed to the command
+	// line. Read the second turn's output back through "run get" and require
+	// the random values that only its reply carries.
+	suspendCheckCLITurnOutput(t, report, 2, fileContent, passphrase)
 	m.Connections = suspendConnectionObservations(ctx, h, actor)
 
 	h.saveActorState(ctx, actor)
@@ -333,10 +351,17 @@ func runSuspendTenCycles(t *testing.T, parent context.Context, credentialPath, a
 		previousTurn = observed
 	}
 
-	if len(detail.Turns) != suspendCycles+1 {
-		t.Fatalf("acceptance: run has %d turns, want %d", len(detail.Turns), suspendCycles+1)
+	// Count only after the idle run has suspended again. A redelivery still
+	// in flight would start another turn after the last message's turn ended;
+	// the scanner reaches this suspension only after G_idle plus at most one
+	// scan period, by which point every message has been processed. The
+	// suspension check above stays on the ten cycle records read before this
+	// last, unscored suspension.
+	final := suspendAwaitSuspensionCount(ctx, h, runID, suspendCycles+1)
+	if len(final.Turns) != suspendCycles+1 {
+		t.Fatalf("acceptance: run has %d turns after the idle suspend, want %d", len(final.Turns), suspendCycles+1)
 	}
-	for i, observed := range detail.Turns {
+	for i, observed := range final.Turns {
 		if observed.IsError {
 			t.Fatalf("acceptance: turn %d is an error: %q", i+1, observed.Output)
 		}
@@ -344,7 +369,11 @@ func runSuspendTenCycles(t *testing.T, parent context.Context, credentialPath, a
 			t.Fatalf("acceptance: turn %d has not ended", i+1)
 		}
 	}
-	suspendCheckSuspensionComplete(t, detail.Suspensions, suspendCycles)
+	suspendCheckTurnInboxCorrespondence(ctx, t, h, runID, final)
+	suspendAttachSuspensionTimes(ctx, t, h, runID, detail.Suspensions)
+	if early := suspendCheckSuspensionComplete(t, detail.Suspensions, suspendCycles); early > 0 {
+		m.addNote("%d suspension(s) received Hello before RestoreSnapshot returned; hello_ms is unmeasured for those", early)
+	}
 
 	m.Connections = suspendConnectionObservations(ctx, h, actor)
 
@@ -435,7 +464,10 @@ func runSuspendRestartWhileSuspended(t *testing.T, parent context.Context, crede
 			m.addNote("the message after the restart produced no observed resuming state")
 		}
 	}
-	suspendCheckSuspensionComplete(t, second.Suspensions, 1)
+	suspendAttachSuspensionTimes(ctx, t, h, runID, second.Suspensions)
+	if early := suspendCheckSuspensionComplete(t, second.Suspensions, 1); early > 0 {
+		m.addNote("%d suspension(s) received Hello before RestoreSnapshot returned; hello_ms is unmeasured for those", early)
+	}
 
 	m.Connections = suspendConnectionObservations(ctx, h, actor)
 
@@ -531,7 +563,10 @@ func runSuspendLongSuspension(t *testing.T, parent context.Context, credentialPa
 			m.addNote("the message after the long hold produced no observed resuming state")
 		}
 	}
-	suspendCheckSuspensionComplete(t, second.Suspensions, 1)
+	suspendAttachSuspensionTimes(ctx, t, h, runID, second.Suspensions)
+	if early := suspendCheckSuspensionComplete(t, second.Suspensions, 1); early > 0 {
+		m.addNote("%d suspension(s) received Hello before RestoreSnapshot returned; hello_ms is unmeasured for those", early)
+	}
 
 	m.Connections = suspendConnectionObservations(ctx, h, actor)
 	m.Timeline = suspendLongTimeline(ctx, t, h, actor, second.Suspensions[0], holdMS, sentAt)
@@ -593,6 +628,8 @@ func suspendControlPlaneArgs(credentialPath, actorImage, kubeContext string) []s
 		"--llm-credential-file", credentialPath,
 		"--substrate-image", actorImage,
 		"--suspend",
+		"--idle-grace", suspendIdleGrace.String(),
+		"--scan-period", suspendScanPeriod.String(),
 	}
 	if kubeContext != "" {
 		args = append(args, "--substrate-context", kubeContext)
@@ -747,8 +784,80 @@ func suspendAwaitSuspension(ctx context.Context, h *harness, m *suspendScenarioM
 		h.t.Fatalf("acceptance: %v (last read error: %v)", err, lastErr)
 	}
 
+	suspendRequireIdleGrace(h.t, detail.Suspensions[len(detail.Suspensions)-1], previous)
 	m.setSuspensions(detail)
 	m.markSuspensionDetected(len(detail.Suspensions)-1, time.Now().UTC(), previous)
+	return detail
+}
+
+// suspendIdleGraceMismatch returns why the idle-grace check failed, or "" when
+// it passed. The first pass criterion's timing form is: the run reaches a turn
+// boundary, waits at least G_idle, and only then starts the suspension. The
+// scanner may notice the idle run up to P_scan late, so the observed gap is
+// G_idle plus at most one scan period; anything shorter means the suspension
+// began before the idle grace expired.
+func suspendIdleGraceMismatch(record suspension, previous *turn) string {
+	if previous == nil {
+		return ""
+	}
+	if previous.EndedAt == nil {
+		return fmt.Sprintf("cannot check the idle grace: the turn before suspension %s has not ended",
+			record.StartedAt.UTC().Format(time.RFC3339))
+	}
+	idle := record.StartedAt.Sub(*previous.EndedAt)
+	if idle < suspendIdleGrace {
+		return fmt.Sprintf("suspension started at %s, %s after the previous turn ended at %s; want an idle of at least G_idle %s (the control plane was started with --idle-grace %s)",
+			record.StartedAt.UTC().Format(time.RFC3339), idle,
+			previous.EndedAt.UTC().Format(time.RFC3339), suspendIdleGrace, suspendIdleGrace)
+	}
+	return ""
+}
+
+// suspendRequireIdleGrace asserts the idle grace and fails with the mismatch
+// description.
+func suspendRequireIdleGrace(t *testing.T, record suspension, previous *turn) {
+	t.Helper()
+	if mismatch := suspendIdleGraceMismatch(record, previous); mismatch != "" {
+		t.Fatal("acceptance: " + mismatch)
+	}
+}
+
+// suspendAwaitSuspensionCount waits until the run is suspended with at least
+// want complete suspension records. TenCycles uses it after the last turn: the
+// extra suspension proves the run reached an idle boundary and gives any
+// duplicate delivery a scan period in which to show up as a further turn.
+// Unlike suspendAwaitSuspension it records nothing in the measurement, because
+// this suspension follows the ten cycles the criterion counts.
+func suspendAwaitSuspensionCount(ctx context.Context, h *harness, runID string, want int) runDetail {
+	h.t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, suspendStateTimeout)
+	defer cancel()
+
+	var detail runDetail
+	var lastErr error
+	err := waitFor(waitCtx, fmt.Sprintf("run %s to reach %d suspension records", runID, want), func() (bool, error) {
+		current, err := h.getRun(waitCtx, runID)
+		if err != nil {
+			lastErr = err
+			return false, nil
+		}
+		if current.State == "failed" {
+			return false, fmt.Errorf("run %s failed: %s", runID, current.FailureReason)
+		}
+		detail = current
+		for i, record := range current.Suspensions {
+			if record.Error != "" {
+				return false, fmt.Errorf("suspension %d failed: %s", i+1, record.Error)
+			}
+		}
+		if current.State != suspendStateSuspended || len(current.Suspensions) < want {
+			return false, nil
+		}
+		return current.Suspensions[want-1].SnapshotMS != nil, nil
+	})
+	if err != nil {
+		h.t.Fatalf("acceptance: %v (last read error: %v)", err, lastErr)
+	}
 	return detail
 }
 
@@ -1328,24 +1437,256 @@ func suspendRequireSuspensionHealth(t *testing.T, records []suspension, want int
 	}
 }
 
-func suspendCheckSuspensionComplete(t *testing.T, records []suspension, want int) {
+// suspendSuspensionCompleteProblem returns the first reason a suspension
+// record is incomplete, or "" when it is complete. A record with a null
+// hello_ms is still complete when hello_at is set, but only if that hello_at
+// really precedes restore_returned_at: Hello arrived before RestoreSnapshot
+// returned, so there was no return moment to measure from. A record with
+// neither hello_ms nor hello_at means no Hello was ever accepted. A hello_at
+// that is not before restore_returned_at should have measured hello_ms, so a
+// null hello_ms then contradicts the recorded times. Both are failures.
+func suspendSuspensionCompleteProblem(record suspension) string {
+	switch {
+	case record.SnapshotMS == nil:
+		return "has no snapshot_ms"
+	case record.RestoreMS == nil:
+		return "has no restore_ms"
+	case record.HelloMS == nil && record.HelloAt == nil:
+		return "has neither hello_ms nor hello_at"
+	case record.HelloMS == nil:
+		if record.RestoreReturnedAt == nil {
+			return "has hello_at but no restore_returned_at to compare it with"
+		}
+		if !record.HelloAt.Before(*record.RestoreReturnedAt) {
+			return fmt.Sprintf(
+				"records hello_at %s at or after restore_returned_at %s; hello_ms should have been measured",
+				record.HelloAt.UTC().Format(time.RFC3339Nano),
+				record.RestoreReturnedAt.UTC().Format(time.RFC3339Nano))
+		}
+	}
+	return ""
+}
+
+// suspendCheckSuspensionComplete fails on the first record that is incomplete
+// and requires the expected number of records. A Hello that arrived before
+// RestoreSnapshot returned is counted separately and logged, not treated as a
+// failure. The returned count is the number of records in that group.
+func suspendCheckSuspensionComplete(t *testing.T, records []suspension, want int) int {
 	t.Helper()
 	if len(records) != want {
 		t.Fatalf("acceptance: run has %d suspension records, want %d", len(records), want)
 	}
+	helloBeforeRestore := 0
 	for i, record := range records {
 		if record.Error != "" {
 			t.Fatalf("acceptance: suspension %d has error %q", i+1, record.Error)
 		}
-		switch {
-		case record.SnapshotMS == nil:
-			t.Fatalf("acceptance: suspension %d has no snapshot_ms", i+1)
-		case record.RestoreMS == nil:
-			t.Fatalf("acceptance: suspension %d has no restore_ms", i+1)
-		case record.HelloMS == nil:
-			t.Fatalf("acceptance: suspension %d has no hello_ms", i+1)
+		if problem := suspendSuspensionCompleteProblem(record); problem != "" {
+			t.Fatalf("acceptance: suspension %d %s", i+1, problem)
+		}
+		if record.HelloMS == nil {
+			helloBeforeRestore++
+			t.Logf("acceptance: suspension %d received Hello before RestoreSnapshot returned; hello_at is recorded and hello_ms is unmeasured", i+1)
 		}
 	}
+	if helloBeforeRestore > 0 {
+		t.Logf("acceptance: %d of %d suspensions received Hello before the restore returned; hello_ms has %d samples",
+			helloBeforeRestore, len(records), len(records)-helloBeforeRestore)
+	}
+	return helloBeforeRestore
+}
+
+// suspendAttachSuspensionTimes fills each record's hello_at and
+// restore_returned_at from the suspension table. The run detail omits both
+// fields, so the records read over HTTP cannot tell a Hello that arrived
+// before RestoreSnapshot returned from one that never arrived, nor check that
+// a recorded hello_at really precedes the restore's return. The table is read
+// in the same order as the run detail and only for the records given, because
+// a scenario may have started a further suspension after reading the detail.
+func suspendAttachSuspensionTimes(ctx context.Context, t *testing.T, h *harness, runID string, records []suspension) {
+	t.Helper()
+	if len(records) == 0 {
+		return
+	}
+	if h.database == "" {
+		t.Fatalf("acceptance: harness has no database URL; cannot read hello_at and restore_returned_at")
+	}
+	pool, err := pgxpool.New(ctx, h.database)
+	if err != nil {
+		t.Fatalf("acceptance: open the run database: %v", err)
+	}
+	defer pool.Close()
+
+	rows, err := pool.Query(ctx,
+		`SELECT hello_at, restore_returned_at FROM suspension WHERE run_id = $1 ORDER BY started_at ASC, seq ASC LIMIT $2`,
+		runID, len(records))
+	if err != nil {
+		t.Fatalf("acceptance: read suspension records for run %s: %v", runID, err)
+	}
+	defer rows.Close()
+
+	seen := 0
+	for rows.Next() {
+		var helloAt, restoreReturnedAt *time.Time
+		if err := rows.Scan(&helloAt, &restoreReturnedAt); err != nil {
+			t.Fatalf("acceptance: scan suspension row: %v", err)
+		}
+		records[seen].HelloAt = helloAt
+		records[seen].RestoreReturnedAt = restoreReturnedAt
+		seen++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("acceptance: read suspension records for run %s: %v", runID, err)
+	}
+	if seen != len(records) {
+		t.Fatalf("acceptance: the database has %d suspension records for run %s, the run detail has %d",
+			seen, runID, len(records))
+	}
+}
+
+// suspendInboxMessage is one inbox row: the text the human sent and its
+// position in the order the run assigned.
+type suspendInboxMessage struct {
+	Seq  int64
+	Text string
+}
+
+// suspendTurnRecord is the delivery bookkeeping the run detail does not
+// expose: which delivery started the turn and what the turn replied.
+type suspendTurnRecord struct {
+	TurnID     string
+	DeliveryID string
+	Output     string
+	IsError    bool
+}
+
+// suspendExpectedCounterMessages lists the texts the TenCycles scenario sends,
+// in inbox order.
+func suspendExpectedCounterMessages() []string {
+	messages := make([]string, 0, suspendCycles+1)
+	messages = append(messages, suspendCounterInitialPrompt())
+	for k := 1; k <= suspendCycles; k++ {
+		messages = append(messages, suspendCounterCyclePrompt(k))
+	}
+	return messages
+}
+
+// suspendCheckTurnInboxCorrespondence reads the inbox and turn tables from the
+// control plane's database and requires a one-to-one correspondence: the
+// inbox holds each message exactly once, every turn was started by a distinct
+// delivery, and each turn's reply names the counter state only its own message
+// produces. Comparing counts alone would miss a message delivered twice and
+// another dropped.
+func suspendCheckTurnInboxCorrespondence(ctx context.Context, t *testing.T, h *harness, runID string, detail runDetail) {
+	t.Helper()
+	if h.database == "" {
+		t.Fatalf("acceptance: harness has no database URL; cannot compare turns with the inbox")
+	}
+	pool, err := pgxpool.New(ctx, h.database)
+	if err != nil {
+		t.Fatalf("acceptance: open the run database: %v", err)
+	}
+	defer pool.Close()
+
+	inbox := make([]suspendInboxMessage, 0, suspendCycles+1)
+	rows, err := pool.Query(ctx, `SELECT inbox_seq, text FROM inbox WHERE run_id = $1 ORDER BY inbox_seq`, runID)
+	if err != nil {
+		t.Fatalf("acceptance: read inbox for run %s: %v", runID, err)
+	}
+	for rows.Next() {
+		var message suspendInboxMessage
+		if err := rows.Scan(&message.Seq, &message.Text); err != nil {
+			rows.Close()
+			t.Fatalf("acceptance: scan inbox row: %v", err)
+		}
+		inbox = append(inbox, message)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("acceptance: read inbox for run %s: %v", runID, err)
+	}
+	rows.Close()
+
+	turns := make([]suspendTurnRecord, 0, suspendCycles+1)
+	rows, err = pool.Query(ctx,
+		`SELECT turn_id, delivery_id, output, is_error FROM turn WHERE run_id = $1 ORDER BY started_at ASC, turn_id ASC`, runID)
+	if err != nil {
+		t.Fatalf("acceptance: read turns for run %s: %v", runID, err)
+	}
+	for rows.Next() {
+		var record suspendTurnRecord
+		if err := rows.Scan(&record.TurnID, &record.DeliveryID, &record.Output, &record.IsError); err != nil {
+			rows.Close()
+			t.Fatalf("acceptance: scan turn row: %v", err)
+		}
+		turns = append(turns, record)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("acceptance: read turns for run %s: %v", runID, err)
+	}
+	rows.Close()
+
+	if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch != "" {
+		t.Fatalf("acceptance: %s", mismatch)
+	}
+}
+
+// suspendTurnInboxMismatch returns the first place the inbox and the turns
+// fail to correspond one-to-one, or "" when they do. The inbox holds each
+// message exactly once, every turn was started by a distinct delivery, and
+// each turn's reply names the counter state only its own message produces.
+// Comparing counts alone would miss a message delivered twice and another
+// dropped, so the check walks both lists.
+func suspendTurnInboxMismatch(inbox []suspendInboxMessage, turns []suspendTurnRecord, detail runDetail) string {
+	expected := suspendExpectedCounterMessages()
+	if len(inbox) != len(expected) {
+		return fmt.Sprintf("inbox has %d messages, want %d", len(inbox), len(expected))
+	}
+	for i, message := range inbox {
+		if message.Seq != int64(i+1) {
+			return fmt.Sprintf("inbox message %d has seq %d, want %d", i+1, message.Seq, i+1)
+		}
+		if message.Text != expected[i] {
+			return fmt.Sprintf("inbox message %d is not the prompt the scenario sent:\n got: %q\nwant: %q",
+				i+1, message.Text, expected[i])
+		}
+	}
+
+	if len(turns) != len(inbox) {
+		return fmt.Sprintf("run has %d turns for %d inbox messages, want one turn per message", len(turns), len(inbox))
+	}
+	// The scenario sends message k only after turn k ended and waits for turn
+	// k+1, so turns sorted by start time line up with inbox_seq order. The
+	// reply's counter value then ties each turn to its message.
+	deliveryToInbox := make(map[string]int64, len(turns))
+	apiTurnIDs := make(map[string]bool, len(detail.Turns))
+	for _, observed := range detail.Turns {
+		apiTurnIDs[observed.TurnID] = true
+	}
+	for i, record := range turns {
+		if !apiTurnIDs[record.TurnID] {
+			return fmt.Sprintf("turn %s (%d) in the database is missing from the run detail", record.TurnID, i+1)
+		}
+		if record.DeliveryID == "" {
+			return fmt.Sprintf("turn %s (%d) has no delivery_id; every turn here starts from a human message",
+				record.TurnID, i+1)
+		}
+		if previous, ok := deliveryToInbox[record.DeliveryID]; ok {
+			return fmt.Sprintf("delivery_id %q started both inbox message %d and inbox message %d; each message must be delivered once",
+				record.DeliveryID, previous, inbox[i].Seq)
+		}
+		deliveryToInbox[record.DeliveryID] = inbox[i].Seq
+		if record.IsError {
+			return fmt.Sprintf("turn %s (%d) is an error: %q", record.TurnID, i+1, record.Output)
+		}
+		count, last, ok := suspendParseCountLast(record.Output)
+		if !ok || count != i+1 || last != strconv.Itoa(i) {
+			return fmt.Sprintf("turn %s should answer inbox message %d (count=%d, last=%d), but its output says count=%d last=%q:\n%s",
+				record.TurnID, inbox[i].Seq, i+1, i, count, last, record.Output)
+		}
+	}
+	return ""
 }
 
 // suspendCheckCLIGet checks the human-facing "run get" output: exactly one
@@ -1358,6 +1699,62 @@ func suspendCheckCLIGet(t *testing.T, output string) {
 	for _, field := range []string{"snapshot_ms", "restore_ms", "hello_ms"} {
 		if strings.Contains(output, field+" -") {
 			t.Fatalf("acceptance: run get shows an empty %s:\n%s", field, output)
+		}
+	}
+}
+
+// suspendCLITurnHeader matches the unindented header "run get" prints for a
+// turn. Output lines are indented by two spaces, so a model reply cannot be
+// mistaken for a header.
+var suspendCLITurnHeader = regexp.MustCompile(`^turn (\d+)  `)
+
+// suspendCLITurnBlock returns the output lines "run get" printed for turn
+// index (1-based) and whether the report contained that turn at all. Output
+// lines are indented, so the unindented header is not part of the block.
+func suspendCLITurnBlock(report string, index int) (string, bool) {
+	var block strings.Builder
+	current := 0
+	found := false
+	for _, line := range strings.Split(report, "\n") {
+		if match := suspendCLITurnHeader.FindStringSubmatch(line); match != nil {
+			if n, err := strconv.Atoi(match[1]); err == nil {
+				current = n
+				found = found || n == index
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "suspensions:") {
+			current = 0
+			continue
+		}
+		if current == index {
+			block.WriteString(line)
+			block.WriteByte('\n')
+		}
+	}
+	return block.String(), found
+}
+
+// suspendCheckCLITurnOutput requires "run get" to have printed turn index's
+// output. The markers are random values generated for this demo, so finding
+// them proves the text came from the turn's reply rather than from the report's
+// state and timing lines. The comparison ignores case, the same rule
+// suspendFileProofMismatches uses for the file digest: the reply's values are
+// hex and base36, which the parsers accept in either case, so a report must not
+// fail here only because it uppercased a value that the file check accepted.
+func suspendCheckCLITurnOutput(t *testing.T, report string, index int, markers ...string) {
+	t.Helper()
+	block, found := suspendCLITurnBlock(report, index)
+	if !found {
+		t.Fatalf("acceptance: run get printed no turn %d:\n%s", index, report)
+	}
+	for _, marker := range markers {
+		if marker == "" {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(block), strings.ToLower(marker)) {
+			t.Fatalf("acceptance: run get turn %d output does not contain the random marker %q:\n%s",
+				index, marker, report)
 		}
 	}
 }
@@ -1688,6 +2085,224 @@ func suspendMeasureAndAttachSnapshot(ctx context.Context, h *harness, m *suspend
 		return
 	}
 	m.attachSnapshot(index, measurement)
+}
+
+// TestSuspendCheckSuspensionComplete covers the completeness rules at the
+// record level. A Hello that arrived before RestoreSnapshot returned leaves
+// hello_ms unmeasured but records hello_at, so the record is complete and is
+// counted separately. A record with neither hello_ms nor hello_at means no
+// Hello was ever accepted and must fail, and a hello_at that is not before
+// restore_returned_at contradicts the missing hello_ms, so it must fail too.
+func TestSuspendCheckSuspensionComplete(t *testing.T) {
+	startedAt := time.Date(2026, 11, 19, 6, 30, 0, 0, time.UTC)
+	snapshotMS := int64(1200)
+	restoreMS := int64(3400)
+	restoreReturnedAt := startedAt.Add(15 * time.Second)
+
+	t.Run("hello before restore", func(t *testing.T) {
+		helloAt := startedAt.Add(10 * time.Second)
+		records := []suspension{{
+			StartedAt:  startedAt,
+			SnapshotMS: &snapshotMS,
+			RestoreMS:  &restoreMS,
+			// HelloMS stays nil: the restore had not returned when Hello
+			// arrived, so there was no return moment to measure from.
+			HelloAt:           &helloAt,
+			RestoreReturnedAt: &restoreReturnedAt,
+		}}
+		if early := suspendCheckSuspensionComplete(t, records, 1); early != 1 {
+			t.Fatalf("hello-before-restore records counted = %d, want 1", early)
+		}
+	})
+
+	t.Run("hello after restore", func(t *testing.T) {
+		helloMS := int64(850)
+		records := []suspension{{
+			StartedAt:  startedAt,
+			SnapshotMS: &snapshotMS,
+			RestoreMS:  &restoreMS,
+			HelloMS:    &helloMS,
+		}}
+		if early := suspendCheckSuspensionComplete(t, records, 1); early != 0 {
+			t.Fatalf("hello-before-restore records counted = %d, want 0", early)
+		}
+	})
+
+	t.Run("neither hello_ms nor hello_at", func(t *testing.T) {
+		record := suspension{
+			StartedAt:         startedAt,
+			SnapshotMS:        &snapshotMS,
+			RestoreMS:         &restoreMS,
+			RestoreReturnedAt: &restoreReturnedAt,
+		}
+		if problem := suspendSuspensionCompleteProblem(record); problem == "" {
+			t.Fatal("a record with neither hello_ms nor hello_at was accepted as complete")
+		}
+	})
+
+	t.Run("hello_at at restore return", func(t *testing.T) {
+		helloAt := restoreReturnedAt
+		record := suspension{
+			StartedAt:         startedAt,
+			SnapshotMS:        &snapshotMS,
+			RestoreMS:         &restoreMS,
+			HelloAt:           &helloAt,
+			RestoreReturnedAt: &restoreReturnedAt,
+		}
+		if problem := suspendSuspensionCompleteProblem(record); problem == "" {
+			t.Fatal("hello_at equal to restore_returned_at was accepted with a null hello_ms")
+		}
+	})
+
+	t.Run("hello_at after restore return", func(t *testing.T) {
+		helloAt := restoreReturnedAt.Add(time.Second)
+		record := suspension{
+			StartedAt:         startedAt,
+			SnapshotMS:        &snapshotMS,
+			RestoreMS:         &restoreMS,
+			HelloAt:           &helloAt,
+			RestoreReturnedAt: &restoreReturnedAt,
+		}
+		if problem := suspendSuspensionCompleteProblem(record); problem == "" {
+			t.Fatal("hello_at after restore_returned_at was accepted with a null hello_ms")
+		}
+	})
+
+	t.Run("hello_at without restore return", func(t *testing.T) {
+		helloAt := startedAt.Add(10 * time.Second)
+		record := suspension{
+			StartedAt:  startedAt,
+			SnapshotMS: &snapshotMS,
+			RestoreMS:  &restoreMS,
+			HelloAt:    &helloAt,
+		}
+		if problem := suspendSuspensionCompleteProblem(record); problem == "" {
+			t.Fatal("a hello_at that cannot be compared with restore_returned_at was accepted")
+		}
+	})
+}
+
+// TestSuspendIdleGrace covers the first pass criterion's timing form at the
+// record level: the gap between the previous turn's ended_at and the
+// suspension's started_at must be at least G_idle.
+func TestSuspendIdleGrace(t *testing.T) {
+	endedAt := time.Date(2026, 11, 19, 6, 30, 0, 0, time.UTC)
+	previous := &turn{EndedAt: &endedAt}
+
+	t.Run("exactly the idle grace", func(t *testing.T) {
+		record := suspension{StartedAt: endedAt.Add(suspendIdleGrace)}
+		if mismatch := suspendIdleGraceMismatch(record, previous); mismatch != "" {
+			t.Fatalf("idle grace mismatch = %q, want none", mismatch)
+		}
+	})
+
+	t.Run("longer than the idle grace", func(t *testing.T) {
+		record := suspension{StartedAt: endedAt.Add(2 * suspendIdleGrace)}
+		if mismatch := suspendIdleGraceMismatch(record, previous); mismatch != "" {
+			t.Fatalf("idle grace mismatch = %q, want none", mismatch)
+		}
+	})
+
+	t.Run("shorter than the idle grace", func(t *testing.T) {
+		record := suspension{StartedAt: endedAt.Add(suspendIdleGrace - time.Millisecond)}
+		if mismatch := suspendIdleGraceMismatch(record, previous); mismatch == "" {
+			t.Fatal("a suspension that started before G_idle expired was accepted")
+		}
+	})
+
+	t.Run("previous turn has not ended", func(t *testing.T) {
+		record := suspension{StartedAt: endedAt.Add(time.Hour)}
+		if mismatch := suspendIdleGraceMismatch(record, &turn{}); mismatch == "" {
+			t.Fatal("an unended previous turn was accepted")
+		}
+	})
+
+	t.Run("no previous turn", func(t *testing.T) {
+		if mismatch := suspendIdleGraceMismatch(suspension{}, nil); mismatch != "" {
+			t.Fatalf("idle grace mismatch = %q, want none", mismatch)
+		}
+	})
+}
+
+// TestSuspendTurnInboxCorrespondence covers the one-to-one check at the record
+// level. Equal totals are not enough: one message can be delivered twice while
+// another is dropped, so the check must walk the deliveries and the replies.
+func TestSuspendTurnInboxCorrespondence(t *testing.T) {
+	texts := suspendExpectedCounterMessages()
+	inbox := make([]suspendInboxMessage, len(texts))
+	for i, text := range texts {
+		inbox[i] = suspendInboxMessage{Seq: int64(i + 1), Text: text}
+	}
+	counterOutput := func(i int) string {
+		return fmt.Sprintf("count=%d\nlast=%d", i+1, i)
+	}
+	// build returns one turn per inbox message, in order, and the matching run
+	// detail. The reply's counter value names the position, so a turn and its
+	// message line up unless a test changes one of them.
+	build := func() ([]suspendTurnRecord, runDetail) {
+		turns := make([]suspendTurnRecord, len(inbox))
+		detail := runDetail{Turns: make([]turn, len(inbox))}
+		for i := 0; i < len(inbox); i++ {
+			turnID := fmt.Sprintf("turn-%d", i+1)
+			turns[i] = suspendTurnRecord{
+				TurnID:     turnID,
+				DeliveryID: fmt.Sprintf("delivery-%d", i+1),
+				Output:     counterOutput(i),
+			}
+			detail.Turns[i] = turn{TurnID: turnID}
+		}
+		return turns, detail
+	}
+
+	t.Run("one turn per message", func(t *testing.T) {
+		turns, detail := build()
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch != "" {
+			t.Fatalf("mismatch = %q, want none", mismatch)
+		}
+	})
+
+	t.Run("a delivery starts two turns", func(t *testing.T) {
+		turns, detail := build()
+		// Totals still match: one message was delivered twice and another never
+		// got its own delivery.
+		turns[1].DeliveryID = turns[0].DeliveryID
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch == "" {
+			t.Fatal("a delivery that started two turns was accepted")
+		}
+	})
+
+	t.Run("a message has no turn", func(t *testing.T) {
+		turns, detail := build()
+		turns = turns[:len(turns)-1]
+		detail.Turns = detail.Turns[:len(detail.Turns)-1]
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch == "" {
+			t.Fatal("an inbox message without a turn was accepted")
+		}
+	})
+
+	t.Run("a turn answers another message", func(t *testing.T) {
+		turns, detail := build()
+		turns[4].Output = counterOutput(1)
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch == "" {
+			t.Fatal("a turn whose reply names another message's counter state was accepted")
+		}
+	})
+
+	t.Run("a turn is missing from the run detail", func(t *testing.T) {
+		turns, detail := build()
+		detail.Turns = append(detail.Turns[:3], detail.Turns[4:]...)
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch == "" {
+			t.Fatal("a database turn missing from the run detail was accepted")
+		}
+	})
+
+	t.Run("an inbox message is not the prompt sent", func(t *testing.T) {
+		turns, detail := build()
+		inbox[2].Text = "different prompt"
+		if mismatch := suspendTurnInboxMismatch(inbox, turns, detail); mismatch == "" {
+			t.Fatal("an inbox message that the scenario did not send was accepted")
+		}
+	})
 }
 
 // TestSuspendParsesReplies covers the reply shapes the model returns for the
