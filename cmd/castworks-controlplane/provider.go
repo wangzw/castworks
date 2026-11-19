@@ -2,9 +2,38 @@ package main
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/wangzw/castworks/internal/sandboxprovider"
+	"github.com/wangzw/castworks/internal/sandboxprovider/localprovider"
 	"github.com/wangzw/castworks/internal/sandboxprovider/substrate"
 )
+
+// newProvider 按 --provider 构造沙箱提供者。local 用不碰集群的本地提供者，
+// substrate 用 substrate.New；后者的 ctx 只约束初始化。
+func newProvider(ctx context.Context, cfg *Config) (sandboxprovider.Provider, error) {
+	switch cfg.Provider {
+	case ProviderLocal:
+		return localprovider.New(), nil
+	case ProviderSubstrate:
+		provider, err := newSubstrateProvider(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		return provider, nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q", cfg.Provider)
+	}
+}
+
+// closeProvider 释放提供者。本地提供者没有需要释放的资源，只有实现了 Close
+// 的提供者（Substrate）需要关闭。
+func closeProvider(provider sandboxprovider.Provider) error {
+	if closer, ok := provider.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
 
 // substrateProviderConfig 把 --substrate-* 六个参数逐一映射为 substrate.Config。
 // 映射不做补全：--substrate-kubeconfig 与 --substrate-context 为空串时保持空串，
