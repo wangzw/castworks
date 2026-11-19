@@ -64,6 +64,7 @@ stateDiagram-v2
     active --> ended: End
     suspended --> ended: End
     provisioning --> failed: Provision 失败
+    provisioning --> failed: 等待 Hello 超时
     resuming --> failed: 恢复失败或等待 Hello 超时
     active --> failed: Claude Code 退出
 ```
@@ -81,7 +82,7 @@ stateDiagram-v2
    - `last_turn` 对应的回合尚未记录结果时，补记结果。
    - 状态为 `suspending` 或 `suspended` 时，只登记这条流，不改变状态。
    - 应答 `HelloAck`，携带控制面配置的 LLM 凭据及其种类，见 [agentprotocol](agentprotocol.md)。
-3. 恢复时，从 `RestoreSnapshot` 返回起等待 `Hello`，等满 `T_hello` 仍未收到则转 `failed`。
+3. 恢复时，从 `RestoreSnapshot` 返回起等待 `Hello`；预配时，从 `Provision` 返回起等待 `Hello`。等满 `T_hello` 仍未收到则转 `failed`。
 
 ### 投递
 
@@ -128,7 +129,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `G_idle` | 30 s | 回合边界空闲多久之后挂起 |
 | `P_scan` | 5 s | 挂起扫描的周期 |
-| `T_hello` | 60 s | 恢复后等待 `Hello` 的上限 |
+| `T_hello` | 60 s | `provisioning` 与 `resuming` 等待 `Hello` 的上限 |
 
 ## 与设计的差异
 
