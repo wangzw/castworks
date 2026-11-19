@@ -370,12 +370,16 @@ func transitionHello(cur machineState, e evHello, env machineEnv) (machineResult
 	case StateProvisioning, StateActive, StateResuming:
 		if cur.State == StateResuming {
 			now := env.Now
-			var helloMS int64
+			upd := updateSuspension{helloAt: &now}
+			// hello_ms measures RestoreSnapshot's return to Hello. When Hello
+			// arrives first there is no return moment to measure from, so the
+			// column stays NULL; recording 0 would claim an immediate restore.
 			if env.Suspension != nil && env.Suspension.RestoreReturnedAt != nil &&
 				!now.Before(*env.Suspension.RestoreReturnedAt) {
-				helloMS = now.Sub(*env.Suspension.RestoreReturnedAt).Milliseconds()
+				helloMS := now.Sub(*env.Suspension.RestoreReturnedAt).Milliseconds()
+				upd.helloMS = &helloMS
 			}
-			effects = append(effects, updateSuspension{helloAt: &now, helloMS: &helloMS})
+			effects = append(effects, upd)
 		}
 
 		switch e.phase {

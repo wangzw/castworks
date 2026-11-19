@@ -348,7 +348,11 @@ func (c *Controller) applyEvent(
 				if err != nil {
 					return err
 				}
-				slot, err := target.reserve(frame, e.through)
+				// The reserved position must be the last inbox_seq actually in
+				// the frame, not the rule's full through: inboxRange may cut
+				// the batch at maxDeliverBytes, and the warden echoes the
+				// frame's through_seq in Accepted.
+				slot, err := target.reserve(frame, messages[len(messages)-1].Seq)
 				if err != nil {
 					if !errors.Is(err, errStreamClosed) {
 						return err
