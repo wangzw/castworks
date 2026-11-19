@@ -701,7 +701,7 @@ graph LR
 | `connectorhub` `EgressPolicyQuery` | `AllowedHosts` | `llmgateway` |
 | `connectorhub`（`connector`） | 事件目录、订阅登记、`GET /attachments/{attachment_id}` | 看守进程：`connectorhub` 受众令牌 |
 | `connectorhub` webhook 接收 | webhook 端点 | 外部系统，按签名校验 |
-| `llmgateway`（`llm`） | `POST /v1/messages`、`GET /v1/requests/{request_id}` | 看守进程：`llmgateway` 受众令牌 |
+| `llmgateway`（`llm`） | `POST /v1/messages`、`GET /castworks/v1/requests/{request_id}` | 看守进程：`llmgateway` 受众令牌 |
 | `humanchannel`（`human`） | 附件取回 | 看守进程：`humanchannel` 受众令牌 |
 | `humanchannel` | `UserService` 与消息通道适配器 | 人类用户：OIDC 身份或已关联的外部身份 |
 | 平台出口代理（`egress`） | 监听端口 | 看守进程：`egress` 受众令牌（`Proxy-Authorization`） |
@@ -719,13 +719,13 @@ graph LR
 
 图与按方法授权表不表达的约束穷举如下。
 
-- **运行实例令牌**（[ADR-run-token-audience-and-holder-binding](../adr/adr-run-token-audience-and-holder-binding.md)）：`secrets.IssueRunToken(ctx, runID, generation, instanceJKT) (IssuedTokenSet, error)` 一次签发同 `run_id`、同 `generation`、同 `exp`、同 `cnf.jkt`、按受众各一张的令牌组 `IssuedTokenSet{Tokens map[RunTokenAudience]string, ExpiresAt time.Time}`；载荷为 `{run_id, generation, aud, exp, cnf{jkt}}`，JOSE 头部为 `{kid, alg}`，受众闭集为 `aud ∈ {runcontroller, llmgateway, connectorhub, humanchannel, egress}`（类型 `RunTokenAudience`）。令牌组只由看守进程持有：首组经引导接口一次性领取，此后经出站流上的 `TokenRotate` 轮换，轮换不改变 `cnf.jkt`。看守进程按接收方取用对应受众的令牌：`Hello.resume_token` 取 `runcontroller` 令牌，本地代理发往 LLM 网关的 `x-castworks-run-token` 取 `llmgateway` 令牌，本地代理与透明拦截器的 `Proxy-Authorization: Bearer` 取 `egress` 令牌，平台 MCP 服务器对 `connectorhub` 取 `connectorhub` 令牌、对 `humanchannel` 附件取回取 `humanchannel` 令牌。接收方以 `secrets.VerifyRunToken(ctx, token, aud RunTokenAudience) (VerifyResult, error)` 校验，`VerifyResult{RunID, Generation, ExpiresAt, Expired, InstanceJKT}`，令牌的 `aud` 不等于期望受众时返回 `ErrInvalidToken`；各接收方只以自身受众调用（`runcontroller` 取 `runcontroller`，`llmgateway` 取 `llmgateway`，`connectorhub` 取 `connectorhub`，`egress-proxy` 取 `egress`，`humanchannel` 取 `humanchannel`），`secrets` 按调用方身份限定可校验的受众；`ExchangeCredential` 中携带的令牌按调用方的受众（`llmgateway`、`egress`）校验。令牌在签名、过期时间、`run_id` 与受众校验通过，令牌中的代等于运行实例当前代，运行实例未进入终态，本代未作废时有效。Agent 进程不持有任何令牌：它的 LLM 流量只能到达本地代理（`ANTHROPIC_BASE_URL` 指向回环地址），它的外部系统流量经本地代理或透明拦截器前置到出口代理，由所经组件附加对应受众的令牌。
+- **运行实例令牌**（[ADR-run-token-audience-and-holder-binding](../adr/adr-run-token-audience-and-holder-binding.md)）：`secrets.IssueRunToken(ctx, runID, generation, instanceJKT) (IssuedTokenSet, error)` 一次签发同 `run_id`、同 `generation`、同 `exp`、同 `cnf.jkt`、按受众各一张的令牌组 `IssuedTokenSet{Tokens map[RunTokenAudience]string, ExpiresAt time.Time}`；载荷为 `{run_id, generation, aud, exp, cnf{jkt}}`，JOSE 头部为 `{kid, alg}`，受众闭集为 `aud ∈ {runcontroller, llmgateway, connectorhub, humanchannel, egress}`（类型 `RunTokenAudience`）。令牌组只由看守进程持有：首组经引导接口一次性领取，此后经出站流上的 `TokenRotate` 轮换，轮换不改变 `cnf.jkt`。看守进程按接收方取用对应受众的令牌：`Hello.resume_token` 取 `runcontroller` 令牌，本地代理发往 LLM 网关的 `x-castworks-run-token` 取 `llmgateway` 令牌，本地代理与透明拦截器的 `Proxy-Authorization: Bearer` 取 `egress` 令牌，平台 MCP 服务器对 `connectorhub` 取 `connectorhub` 令牌、对 `humanchannel` 附件取回取 `humanchannel` 令牌。接收方以 `secrets.VerifyRunToken(ctx, token, aud RunTokenAudience) (VerifyResult, error)` 校验，`VerifyResult{RunID, Generation, ExpiresAt, Expired, InstanceJKT}`，令牌的 `aud` 不等于期望受众时返回 `ErrInvalidToken`；各接收方只以自身受众调用（`runcontroller` 取 `runcontroller`，`llmgateway` 取 `llmgateway`，`connectorhub` 取 `connectorhub`，`egress-proxy` 取 `egress`，`humanchannel` 取 `humanchannel`），`secrets` 按调用方身份限定可校验的受众；`ExchangeCredential` 中携带的令牌按调用方的受众（`llmgateway`、`egress`）校验。令牌在签名、过期时间、`run_id` 与受众校验通过，令牌中的代等于运行实例当前代，运行实例未进入终态，本代未作废时有效。Agent 进程不持有任何令牌：它的 LLM 流量只能到达本地代理（默认经本地 DNS 与透明拦截器，启用 LLM 基地址时直接发往回环地址），它的外部系统流量经透明拦截器或本地代理前置到出口代理，由所经组件附加对应受众的令牌。
 - **控制面内部调用**（[ADR-control-plane-call-authentication](../adr/adr-control-plane-call-authentication.md)）：控制面服务、平台出口代理与提供者层组件之间的每条调用以 SPIFFE 工作负载身份做 mTLS，身份的信任域取部署配置 `spiffe_trust_domain`；Substrate 出口网关与 Substrate 路由器使用 Substrate 信任域中的身份，按部署白名单登记。控制面内部接口与提供者层组件的接口只在内部监听器上提供：内部监听器只接受 mTLS 对端，且对端身份在按方法授权表的允许集合内；不接受非 SPIFFE 对端，不对沙箱网段开放。调用方声明的来源类字段一律由服务端按对端身份写入（`InboxEvent.Source`、`RunFact.Source`、`SourceLease.Module`），请求中的同名值被忽略；`Actor` 只在对端为 `humanchannel` 时接受且必填。
 - **面向沙箱的端点**：看守进程调用的控制面端点由部署配置 `sandbox_facing_endpoints` 给出，每个条目给出 `{host, port, addr}`，与内部监听器使用不同的主机名与端口，且都要求 Agent 进程不持有的凭据。条目闭集如下：
   - `stream`：`runcontroller` 出站流（gRPC），要求 `runcontroller` 受众令牌、`workspace_lease_id` 与持有证明；
   - `bootstrap`：`sandboxprovider` 引导接口 `POST /v1/bootstrap/claim`，使用独立主机名，要求 k8s 投射 ServiceAccount 令牌或 Substrate actor JWT；
   - `lease`：`workspace` 的 `RenewLease`，要求 `lease_id`、代与持有证明；
-  - `llm`：`llmgateway` 的 `POST /v1/messages` 与 `GET /v1/requests/{request_id}`，要求 `llmgateway` 受众令牌；
+  - `llm`：`llmgateway` 的 `POST /v1/messages` 与 `GET /castworks/v1/requests/{request_id}`，要求 `llmgateway` 受众令牌；
   - `connector`：`connectorhub` 的事件目录、订阅登记与 `GET /attachments/{attachment_id}`，要求 `connectorhub` 受众令牌；
   - `human`：`humanchannel` 的附件取回，要求 `humanchannel` 受众令牌；
   - `egress`：平台出口代理监听端口，只用于 k8s 路径，要求 `egress` 受众令牌（`Proxy-Authorization`）。
@@ -779,7 +779,7 @@ PostgreSQL 是运行实例状态的唯一事实源，事实源的划分见逻辑
 
 **沙箱提供者操作按代校验、串行且幂等。** 对同一运行实例的 `Suspend`、`Resume`、`Destroy` 不并发；每个过渡态携带 `suspend_id` 或 `resume_id` 与截止时间，对账器以同一标识重驱动时沙箱提供者返回与首次相同的结果。整代销毁与单个销毁（参数为 `(generation, sandbox_id)`）都携带代，只作用于该代的沙箱实例，不作用于更新的代；新代沙箱不会被迟到执行的旧代销毁删除，依据是按代的销毁语义，而不是调用的到达顺序。整代销毁之后，沙箱提供者拒绝该代及更早代的沙箱创建，按运行实例释放之后拒绝该运行实例的一切创建，迟到到达的预配不会在删除确认或资源释放之后再创建沙箱或运行实例级资源。预配与恢复在调用沙箱提供者之前于运行实例行锁内复核运行实例未终态，代与尝试标识未变，完成事务的校验失败（调用期间显式结束、降级或代递增已提交）且提供者结果含 `sandbox_id` 时，同一事务写入销毁该沙箱的效果记录；执行者在提供者返回之后、完成事务之前崩溃时遗留的沙箱，由对账器按提供者列举结果回收（[ADR-generation-fencing](../adr/adr-generation-fencing.md)）。
 
-**恢复准入队列。** `WakeQueued` 的放行由恢复准入控制：按机制（解冻、快照恢复、预热池认领、冷启动重建）独立限速；按唤醒原因排定优先级，次序为实时接入、异步人类回复、审批、LLM 完成、外部事件、定时、[预测性恢复](../glossary.md)，同级 FIFO，对排队时长超过老化阈值的请求提升优先级；预热池容量按比例保留给实时接入与异步人类回复；低优先级的准入速率不超过 LLM 网关当前可用并发；节点冻结代理按节点 CPU 余量分批解冻。并发型限额（例如冷启动并发）按占用恢复槽位的运行实例计数，是近似上限：不同副本同时放行时彼此的计数不可见，超出量不超过同时执行放行的所有者副本数。各机制的限速值、并发上限、老化阈值与保留比例由 [suspendpolicy](modules/design-suspendpolicy.md) 定义（[ADR-single-recovery-admission](../adr/adr-single-recovery-admission.md)）。
+**恢复准入队列。** `WakeQueued` 的放行由恢复准入控制：按机制（解冻、快照恢复、预热池认领、冷启动重建）独立限速；按唤醒原因排定优先级，次序为实时接入、异步人类回复、审批、LLM 完成、外部事件、定时、[预测性恢复](../glossary.md)，同级 FIFO，对排队时长超过老化阈值的请求提升优先级；预热池容量按比例保留给实时接入与异步人类回复；低优先级的准入速率不超过按 LLM 网关部署容量配置的常量；节点冻结代理按节点 CPU 余量分批解冻。并发型限额（例如冷启动并发）按占用恢复槽位的运行实例计数，是近似上限：不同副本同时放行时彼此的计数不可见，超出量不超过同时执行放行的所有者副本数。各机制的限速值、并发上限、老化阈值与保留比例由 [suspendpolicy](modules/design-suspendpolicy.md) 定义（[ADR-single-recovery-admission](../adr/adr-single-recovery-admission.md)）。
 
 **看守进程内部并发。** 看守进程在冻结期间继续运行的职责与本地代理按请求选定模式的规则见模块间调用关系。Agent 驱动器以 Claude Code 报告的后台任务集合登记后台作业（含后台子代理与 workflow），后台作业存活时运行实例不以挂起为目的销毁，冻结只在静止证据成立时发生。
 

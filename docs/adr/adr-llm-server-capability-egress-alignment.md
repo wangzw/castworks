@@ -37,7 +37,7 @@ Claude Code 的 WebFetch 在客户端执行，其流量经本地代理或[透明
 - `web_search` 放行并审计，部署可配置其域过滤。
 - `container` 只接受本运行实例此前响应中出现过的容器标识。
 - 允许主机由[连接器](../glossary.md)的出口策略查询接口 `EgressPolicyQuery.AllowedHosts` 提供。
-- 网关只暴露 `POST /v1/messages` 与 `GET /v1/requests/{request_id}`。
+- 网关只暴露 `POST /v1/messages` 与 `GET /castworks/v1/requests/{request_id}`。
 
 ## 后果
 

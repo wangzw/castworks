@@ -58,7 +58,7 @@
 | 内容事件 | content event | warden 本地代理 | SSE 流中除 `ping` 外的全部事件，携带模型输出或流的结构信息（[REF-anthropic-streaming](../../../references.md)）。 |
 | 保活事件 | keepalive event | warden 本地代理 | SSE 流中的 `ping` 事件；不携带内容，缓存模式下唯一向 Agent 转发的事件。 |
 | 客户端看门狗 | client watchdog | warden 本地代理 | Claude Code 的流式空闲超时；未收到任何内容时中止请求并重发一次，已收到部分内容时保留截断结果（[REF-claude-code-network-config](../../../references.md)）。 |
-| 本地回放缓存 | local replay cache | warden 本地代理 | 本地代理按 `(run_id, generation, request_hash)` 保存的上游响应或进行中的上游流；权威回放条目归 `llmgateway`。 |
+| 本地回放缓存 | local replay cache | warden 本地代理 | 本地代理按 `(run_id, generation, request_hash)` 保存的上游响应或进行中的上游流；失败的条目不应答新的逻辑请求；权威回放条目归 `llmgateway`。 |
 
 ## 外部接口契约
 
@@ -84,10 +84,13 @@
 
 | 请求 | 携带 | 响应与处置 |
 | --- | --- | --- |
-| `POST /v1/messages` | `x-castworks-run-token`（`llmgateway` 受众令牌）、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头（剥离其中的 `x-castworks-purpose`）；宿主侧分类请求另带 `x-castworks-purpose: classifier` | 终态条目直接返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；`request_id` 跨代复用返回 `422`；服务端能力越界返回 `400` 或 `403`；上游流为 SSE |
-| `GET /v1/requests/{request_id}` | 同一运行实例的 `llmgateway` 受众令牌 | `200` 返回终态条目；`202` 仍在途；`403` 归属不符；`404` 条目缺失或已过保留期；`409` 由另一实例持有 |
+| `POST /v1/messages` | `x-castworks-run-token`（`llmgateway` 受众令牌）、`x-castworks-request-id`、`x-castworks-request-hash`、`x-castworks-mode`，以及 Agent 的 Anthropic 请求头（剥离其中的 `x-castworks-purpose`）；宿主侧分类请求另带 `x-castworks-purpose: classifier` | 同一 `request_id` 的终态条目或仍具判重资格的已完成条目按其上游状态码返回；`in_flight` 且由同一网关实例持有返回 `202`；由另一实例持有返回 `409`；`request_id` 已被占用或属于登记失败、已被回收的尝试时返回 `422`；服务端能力越界返回 `400` 或 `403`；上游流为 SSE |
+| `GET /castworks/v1/requests/{request_id}` | 同一运行实例的 `llmgateway` 受众令牌 | `200` 返回终态条目，`x-castworks-upstream-status` 给出上游状态码，条目保存的上游响应头随附；`202` 仍在途；`403` 归属不符；`404` 条目缺失或已过保留期；`409` 由另一实例持有 |
+| 辅助端点：方法与路径列入网关 `llm_endpoint_allowlist` 的请求 | 只带 `x-castworks-run-token`，Agent 的方法、路径、查询串、请求头与请求体原样转发（剥离 `x-castworks-purpose`） | 上游的状态码、响应头与响应体原样返回；网关不登记在途请求、不写回放条目，规则见 [llmgateway](../design-llmgateway.md#辅助端点转发) |
 
-`202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。`422` 只表示 `request_id` 与运行实例内已有行冲突，本地代理重新生成 `request_id`、保持同一 `request_hash` 与模式后重发，不执行取回；`request_hash` 与唯一索引使重发仍命中同一逻辑请求。
+`202` 与 `409` 都不新建上游调用。本地代理在 `202` 时挂接已有的本地上游流或退避后再次取回；在 `409` 时不向上游重发，退避后取回。`422` 只表示 `request_id` 不能再用于这次请求，本地代理重新生成 `request_id`、保持同一 `request_hash` 与模式后重发，不执行取回；`request_hash` 与网关的判重索引使重发仍命中同一逻辑请求的在途行或已完成条目。
+
+回放条目按保存的上游状态码交付：`200` 取回与 `POST` 命中已有条目时，本地代理以 `x-castworks-upstream-status` 与随附的上游响应头作为交给 Agent 的状态码与响应头，上游的 `4xx` 与 `5xx` 因而按原样交付，带 `retry-after` 的失败保留退避依据。响应带 `x-castworks-error-source: gateway` 时是网关自身产生的错误，本地代理照常交还 Agent，不重发。
 
 本地代理不解析 LLM 请求体，透传 Agent 的 Anthropic 请求头（剥离分类标记）；请求体顶层 `tools`、`mcp_servers`、`container` 字段与 `anthropic-beta` 请求头的服务端能力治理统一由 `llmgateway` 执行，规则见 [llmgateway](../design-llmgateway.md#服务端能力治理)（[ADR-llm-server-capability-egress-alignment](../../../adr/adr-llm-server-capability-egress-alignment.md)）。网关因服务端能力越界返回的 `400` 或 `403` 不访问上游、不写 `llm_failed`，本地代理按客户端错误把响应交还 Agent，上报 `llm.request.failed{reason=admission_failed}`，不重发、不建立本地回放条目。
 
@@ -128,7 +131,7 @@
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway` 与出口代理的调用是运行时 HTTP 调用，不是代码依赖。
 
 - `agentprotocol`：请求事件的信封、消息类型、发送顺序与重放；本地代理只实现事件内容与时序。
-- `llmgateway`：面向沙箱的端点 `llm` 上 `POST /v1/messages` 与 `GET /v1/requests/{request_id}` 的请求头（`x-castworks-run-token` 取 `llmgateway` 受众令牌）、状态码与回放取回语义，服务端能力治理及其 `400`、`403` 拒绝，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号，也不为它续租事件源实例租约；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- `llmgateway`：面向沙箱的端点 `llm` 上 `POST /v1/messages` 与 `GET /castworks/v1/requests/{request_id}` 的请求头（`x-castworks-run-token` 取 `llmgateway` 受众令牌）、状态码与回放取回语义，服务端能力治理及其 `400`、`403` 拒绝，宿主侧分类请求沿用同一契约并另带分类标记，网关按该标记不登记在途请求事实、不写唤醒信号，也不为它续租事件源实例租约；凭据换取、代校验、在途请求表与回放存储归该模块（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - 出口代理：CONNECT 与 HTTP 前置的目标、运行实例身份与凭据占位符语义，以及授权主机与内层 `Host`、SNI 的一致性核对；k8s 路径为 `connectorhub` 的平台出口代理（面向沙箱的端点 `egress`，以 `egress` 受众令牌鉴权），Substrate 路径为 Substrate 出口网关。
 - Claude Code 的网络行为：流式空闲看门狗在未收到内容时中止并重发一次，已收到部分内容时保留截断结果（[REF-claude-code-network-config](../../../references.md)）。
 - Anthropic Messages API 的 SSE 格式：内容事件与 `ping` 保活事件的区分（[REF-anthropic-streaming](../../../references.md)）。
@@ -172,7 +175,7 @@ stateDiagram-v2
     Failed --> [*]
 ```
 
-状态闭集为 `selected`、`passthrough`、`hold`、`aborted`、`delivering`、`completed` 与 `failed`。冻结不是独立状态：`passthrough` 与 `hold` 都可以在冻结期间保持，区别只在内容事件是否已转发给 Agent。`aborted` 表示客户端连接已断开而上游可能仍在途；模式在重发时不变，重发不产生新的逻辑请求。`selected` 在上游连接失败或准入失败时直接进入 `failed`；`aborted` 在上游正常结束且无重发时进入 `completed`。`failed` 是终态，客户端之后的重发按新逻辑请求处理，除非本地回放缓存仍有可用条目。
+状态闭集为 `selected`、`passthrough`、`hold`、`aborted`、`delivering`、`completed` 与 `failed`。冻结不是独立状态：`passthrough` 与 `hold` 都可以在冻结期间保持，区别只在内容事件是否已转发给 Agent。`aborted` 表示客户端连接已断开而上游可能仍在途；模式在重发时不变，重发不产生新的逻辑请求。`selected` 在上游连接失败或准入失败时直接进入 `failed`；`aborted` 在上游正常结束且无重发时进入 `completed`。`failed` 是终态，客户端之后的相同请求按新逻辑请求处理：本地代理生成新的 `request_id`，本地回放缓存中的失败条目不应答新的逻辑请求，网关同样不以失败条目吸收它，重试因而重新访问上游。
 
 ### 与 Agent、网关、出口代理的时序图
 
@@ -308,6 +311,8 @@ sequenceDiagram
 
 分类结果同时以该连接的 Agent 侧端点（即本地代理所接受连接的对端地址与端口，等于 Agent 套接字的本地地址与端口）为键写入观测记录的 `conn_purpose`：按外部系统请求处理的记为 `external`，按 LLM 请求处理的记为 `llm`。透明拦截器交入的连接以拦截器所接受连接的对端地址与端口为键，记为 `llm`。同一连接上的后续请求重新分类时覆盖该记录，记录因而反映最近一次请求的用途，Agent 侧未读的响应字节属于这一请求；外部系统主机的 CONNECT 建立隧道后该连接只转发隧道字节，记录保持 `external`，LLM 主机的 CONNECT 建立隧道后记录保持 `llm`。连接关闭时删除记录。看守进程只在冻结确认时的接收队列检查中按端点查询该记录。
 
+按 LLM 请求处理的请求再按方法与路径分为生成请求与辅助请求，路径匹配不含查询串：`POST /v1/messages` 是生成请求，走模式选择、单次回放与请求事件；其余方法与路径都是辅助请求，只附 `x-castworks-run-token` 后原样转发到 `llmgateway`，由网关按其 `llm_endpoint_allowlist` 放行或返回 `404`。辅助请求不生成 `request_id` 与 `request_hash`，不选模式，不进入本地回放缓存，不上报 `llm.request.*`，不更新 `llm_last_request_at` 与 `llm_last_retryable_failure_at`；网关返回的状态码与响应原样交还 Agent，本地代理不重发。辅助请求的连接在 `conn_purpose` 中仍记为 `llm`。`/castworks/` 前缀下的路径是网关自有接口，Agent 的请求落在这一前缀下时本地代理返回 `404`，不转发。
+
 LLM 请求的请求体原样转发，不解析模型、消息或工具字段；服务端工具、`mcp_servers`、`container` 与 `anthropic-beta` 的治理由 `llmgateway` 执行，见[网关与出口代理的上游契约](#网关与出口代理的上游契约)。`request_hash` 对影响上游结果的请求体计算，同一逻辑请求的重发得到相同值；具体摘要算法不属于跨模块契约，网关只要求同一请求得到同一值。外部系统请求的请求体与请求头原样转发，本地代理不解析协议内容。
 
 绝对 URI 的 HTTP 请求在分类之后、建立上游连接之前做目的地一致性核对：`Host` 头必须等于 URI 中的主机，比较时主机名大小写不敏感，端口按 scheme 的默认端口规范化（`http` 省略端口即 80）。不一致时立即返回 403，计数 `egress_destination_mismatch`，不转发、不建立上游连接；出口代理只按 URI 主机鉴权，这一核对使转发出去的请求不能借 `Host` 头指向另一个目的地。CONNECT 请求不携带内层请求，隧道内 TLS 的 SNI 与 `Host` 由出口代理核对。
@@ -380,7 +385,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | `passthrough`，已转发内容 | Claude Code 保留截断结果且不重发；本地代理结束请求，释放本地缓冲，上游由网关继续到终态 |
 | 重发命中本地回放缓存 | 挂接同一条目，不发起第二次上游请求，不重复上报 `started` |
 | 重发未命中本地缓存 | 以同一 `request_hash`、同一 `request_id` 再次 `POST`；网关按唯一索引返回终态条目、`202`、`409`，或 `422`（`request_id` 冲突，重新生成后重发），都不新建上游调用 |
-| 网关返回 `409` | 不由本地代理重发上游，退避后 `GET /v1/requests/{request_id}` 取回 |
+| 网关返回 `409` | 不由本地代理重发上游，退避后 `GET /castworks/v1/requests/{request_id}` 取回 |
 
 单次回放的保证是同一 `(run_id, generation, request_hash)` 至多产生一次上游调用，不限制同一响应的交付次数；本地回放条目在请求关闭前可被多次重发命中，交付内容一致。
 
@@ -394,7 +399,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 
 快照恢复保留看守进程内存，请求记录与 `forwarded_seq` 随快照恢复；到网关的上游连接在快照时已断开。恢复后看守进程先校时、断开 Agent 进程的旧 TCP 连接，再通知本地代理与驱动器。本地代理对每个非终态请求执行：
 
-1. 以 `llmgateway` 受众令牌调用 `GET /v1/requests/{request_id}`。
+1. 以 `llmgateway` 受众令牌调用 `GET /castworks/v1/requests/{request_id}`。
 2. `200` 返回终态条目：按请求记录中的 `mode` 与 `forwarded_seq` 续传。`passthrough` 从 `forwarded_seq` 之后继续直刷；`hold` 把尚未交付的内容事件一次性交付，`ping` 可重复转发。
 3. `202` 表示条目仍在途：本地代理不重发上游，退避后再次取回。
 4. `403`、`404` 或超过保留期的条目：本地代理上报 `llm.request.failed`，按失败释放请求。
@@ -440,7 +445,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 
 1. 令牌过期或临近到期且未收到 `TokenRotate` 时不排队，直接按失败返回。
 2. 生成新的 `request_id` 与 `request_hash`，附 `llmgateway` 受众令牌与平台请求头，`x-castworks-mode` 取 `passthrough`，`x-castworks-purpose` 取 `classifier`，以 `POST /v1/messages` 发往 `llmgateway`；同一代内请求体相同的分类请求命中网关的回放条目，不产生第二次上游调用。
-3. 终态条目直接返回驱动器；`202` 与 `409` 在截止时间内退避后以 `GET /v1/requests/{request_id}` 取回；`422` 重新生成 `request_id` 后重发；截止时间到期或其余失败按失败返回，不重试。
+3. 终态条目直接返回驱动器；`202` 与 `409` 在截止时间内退避后以 `GET /castworks/v1/requests/{request_id}` 取回；`422` 重新生成 `request_id` 后重发；截止时间到期或其余失败按失败返回，不重试。
 4. 全程不上报 `llm.request.*`，不更新 `llm_last_request_at` 与 `llm_last_retryable_failure_at`，不写 `conn_purpose`、`ext_conns`、请求记录与本地回放缓存。
 
 分类请求只携带驱动器交来的请求体，不读取工作区文件，也不附加 Agent 的请求头；它与 Agent 的请求不共享上游连接。冻结期间看守进程继续运行，分类请求照常进行；快照恢复后在途的分类请求按失败返回，不按 `request_id` 取回；销毁重建时在途的分类请求随沙箱丢弃，不计入看守进程侧安全点复核的外部在途连接。`llmgateway` 按分类标记不经 `SetRunFact{inflight_request}` 登记在途请求事实、不写 `llm_completed` 或 `llm_failed`，也不让它参与事件源实例租约：网关只在本实例存在 Agent 请求（`purpose=agent`）的在途事实时调用 `RenewSourceLease`，分类请求在网关内的跟踪按网关自身的超时处理（见 [llmgateway](../design-llmgateway.md#凭据换取与在途登记)）。分类请求因此不影响 I9 预检中的“本代无在途请求”，不进入阻塞条件与静止证据，网关实例失联时也没有为它合成的唤醒信号，本地代理在取回失败或截止时间到期时按失败返回驱动器。`Fenced` 或 `Shutdown` 到达时停止接受新的分类请求，在途的按失败返回。
@@ -463,11 +468,13 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | 占位符未被替换 | 请求头含占位符但没有匹配规则时出口代理返回 403；`tls_passthrough` 档不解析请求头，占位符可能原样到达上游 |
 | 网关不可达或连接被拒 | 上报 `llm.request.failed`；向 Agent 返回错误；不建立本地回放条目 |
 | 网关返回 `400` 或 `403`，含服务端能力越界（服务端工具或 `anthropic-beta` 不在允许清单、外联域与允许主机的交集为空、`mcp_servers` 主机不在允许主机内、`container` 不属于本运行实例） | 按客户端错误把响应交还 Agent，上报 `llm.request.failed{reason=admission_failed}`；不重发、不建立本地回放条目 |
-| 网关返回 `401` 或 `503` | `401` 失败并上报；`503`（含允许主机查询失败）按退避重试，重试耗尽后失败 |
-| 上游返回错误或流中断 | 网关提交失败回放条目并写 `llm_failed`；本地代理上报 `llm.request.failed`；已到达的内容按模式交付或丢弃 |
+| 网关返回 `401` 或 `503` | `401` 失败并上报；`503`（含允许主机查询失败与网关停机排空）按退避重试，重试耗尽后失败；带 `x-castworks-error-source: gateway` 且属于部署或身份配置错误的 `503` 不随重试恢复，重试耗尽后按原响应交还 Agent，响应体写明原因 |
+| 上游返回错误或流中断 | 网关提交失败回放条目并写 `llm_failed`；本地代理上报 `llm.request.failed`；已到达的内容按模式交付或丢弃；本地回放缓存移除该条目 |
+| 上游失败之后 Agent 以相同请求体重试 | 按新逻辑请求处理：生成新的 `request_id`，不命中本地回放缓存中的失败条目；网关的失败行不具判重资格，另行登记并访问上游 |
+| 生成请求之外的 LLM 请求（辅助请求） | 只附令牌后转发；网关放行时原样交还上游的响应，返回 `404` 时原样交还 Agent；都不上报 `llm.request.*`，不重发 |
 | 网关返回 `202` | 不新建上游调用；挂接已有本地上游流，或退避后取回 |
 | 网关返回 `409` | 不重发上游；退避后取回条目 |
-| 网关返回 `422` | `request_id` 与运行实例内已有行冲突；重新生成 `request_id`，保持 `request_hash` 与模式后重发，不取回 |
+| 网关返回 `422` | `request_id` 不能再用于这次请求（已被另一请求占用，或属于登记失败、已被回收的尝试）；重新生成 `request_id`，保持 `request_hash` 与模式后重发，不取回 |
 | 客户端在未收到内容时中止 | 状态转 `aborted`，上游继续；重发按 `request_hash` 命中同一逻辑请求 |
 | 客户端在 `passthrough` 已收到内容后中止 | 不重发；本地代理结束请求，上游由网关继续到终态 |
 | 冻结到达 `F_stream` 或 `F_cap(llm)` | 由 `runcontroller` 解冻或升级；本地代理不改变模式，继续按原模式处理后续事件 |
@@ -477,7 +484,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | Agent 的 LLM 请求携带 `x-castworks-purpose` | 转发前剥离该请求头，按 Agent 的 LLM 请求照常选定模式、上报 `llm.request.*` 并更新观测；网关照常登记在途请求事实 |
 | 周期性连接误判（周期性遥测、镜像访问等） | 只影响作为软输入的等待意图；不触发 `conn.inbound`，不参与安全点复核 |
 | 令牌过期且未收到 `TokenRotate` | 新请求排队，不向网关转发；排队请求在客户端超时后失败；已准入请求继续 |
-| 网关失联 | 先按 `request_id` 调用 `GET /v1/requests/{request_id}`：`200` 按回放交付并补发 `llm.request.completed`；`404` 或超过保留期才上报 `llm.request.failed`；`202` 与 `409` 退避后再次取回；网关不可达期间不新建上游调用 |
+| 网关失联 | 先按 `request_id` 调用 `GET /castworks/v1/requests/{request_id}`：`200` 按回放交付并补发 `llm.request.completed`；`404` 或超过保留期才上报 `llm.request.failed`；`202` 与 `409` 退避后再次取回；网关不可达期间不新建上游调用 |
 | 取回返回 `404` | 上报 `llm.request.failed`；Agent 以新的逻辑请求重试，本地代理不自行重发上游 |
 | 外部目标未被出口策略放行 | 立即返回错误，不建立上游连接，不黑洞 |
 | `Fenced` 或 `Shutdown{graceful=false}` | 停止接受新请求，排队请求按失败返回；在途上游连接按看守进程的终止语义处理 |
@@ -493,7 +500,7 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 - **模式不可变**：`mode` 在 `selected` 状态写入后只读；冻结、解冻、重发与令牌轮换都不改写它。
 - **上游连接归属**：每个请求持有自己的上游连接；冻结期间连接保持打开，解冻与重发不重建已存在的连接。请求之间不共享上游连接。
 - **事件顺序**：同一逻辑请求的 `started`、`first_token`、`completed` 或 `failed` 按该顺序至多各一次；事件写入看守进程的出站流是串行的，跨请求的相对顺序不做保证。
-- **本地回放缓存**：按 `replay_key` 加锁；同一键的创建、追加与交付串行；不同键之间并发。缓存条目在请求关闭或保留期到期后释放。
+- **本地回放缓存**：按 `replay_key` 加锁；同一键的创建、追加与交付串行；不同键之间并发。条目以失败结束时立即从索引移除，同一键的后续请求不再命中它；缓存条目在请求关闭或保留期到期后释放。
 - **令牌快照**：令牌组替换以原子引用完成；每个新请求读取一次当前令牌组中对应受众的令牌，已有请求不重新读取。替换与排队队列的操作串行。
 - **观测记录**：两个时刻以原子写更新，看守进程采样时读取最新值；`inbound_freeze_id` 由看守进程以原子引用设置与清空，各连接协程读取其快照后通知，连接协程之间不加锁，`conn.inbound` 的至多一次由看守进程的冻结执行记录保证。`conn_purpose` 的每个键只由接受该连接的协程写入与删除，看守进程以并发安全的读取查询；冻结确认时 Agent 进程树已冻结，不会发出新请求，查询期间记录不因 Agent 的新请求而改变。
 - **周期性连接记录**：`conn_starts` 与 `periodic_conns` 按 `(host, 归属对象)` 加锁；归属解析在独立协程中进行，完成后于锁内追加时刻并判定，对驱动器的通知在锁外发出，按同一键的判定顺序发出；不同键之间并发。归属解析与连接转发并发，解析未完成或失败不影响转发。
@@ -524,6 +531,8 @@ LLM 请求转发到 `llmgateway` 时，本地代理设置平台请求头（`x-ca
 | 模式选择与直通转发 | 未实现 | — |
 | 缓存模式与保活转发 | 未实现 | — |
 | 本地回放缓存与重发命中 | 未实现 | — |
+| 生成请求与辅助请求的分类 | 未实现 | — |
+| 按上游状态码与响应头交付回放 | 未实现 | — |
 | 请求事件上报 | 未实现 | — |
 | 令牌轮换期间排队 | 未实现 | — |
 | 快照恢复后按 `request_id` 取回 | 未实现 | — |
