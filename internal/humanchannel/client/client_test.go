@@ -502,11 +502,25 @@ func TestAPIErrorEveryMethod(t *testing.T) {
 func TestTransportError(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	baseURL := srv.URL
-	srv.Close()
+	// 服务端劫持连接后直接关闭，不写任何响应，客户端读取响应时必然遇到
+	// EOF。不能依赖“关闭服务端之后端口不可连”：端口可能被并行测试复用，
+	// 请求偶尔会打到别的服务端并成功。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("ResponseWriter does not implement http.Hijacker")
+			return
+		}
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
 
-	c, err := New(baseURL, nil)
+	c, err := New(srv.URL, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -517,6 +531,10 @@ func TestTransportError(t *testing.T) {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		t.Errorf("error = %v (%T), want a transport error, not *APIError", err, err)
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Errorf("error = %v (%T), want *url.Error", err, err)
 	}
 }
 
