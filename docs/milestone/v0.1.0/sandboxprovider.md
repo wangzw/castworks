@@ -31,9 +31,9 @@ actor 名为 `cw-<run_id>`，在 atespace `castworks-dev` 中创建。Substrate 
 | `containers[0].name` | `warden` | |
 | `containers[0].image` | castworks 镜像，按 `name@sha256:…` 写 digest | Substrate 要求镜像带 digest |
 | `containers[0].env` | `CASTWORKS_CONTROL_PLANE=castworks-dev.castworks-system.svc.cluster.local:9090` | 看守进程的控制面地址，见[网络](#网络) |
-| `containers[0].volume_mounts` | `system_info` 卷挂在 `/run/ate` | |
+| `containers[0].volume_mounts` | 卷 `system-info` 挂在 `/run/ate` | |
 | `containers[0].wakeup_probe` | `http_get`，端口 8081，路径 `/readyz` | `ResumeActor` 以它判断 actor 就绪 |
-| `volumes` | `system_info`，`actor_metadata` 把 `ACTOR_METADATA_FIELD_NAME` 写到 `actor-name` | 看守进程从 `/run/ate/actor-name` 读出 actor 名 |
+| `volumes` | 名为 `system-info`、类型字段为 `system_info` 的卷，`actor_metadata` 把 `ACTOR_METADATA_FIELD_NAME` 写到 `actor-name` | 看守进程从 `/run/ate/actor-name` 读出 actor 名；Substrate 按 DNS 标签校验卷名，不接受下划线 |
 | `resources.limits` | CPU 2000 millicores，内存 2 GiB | 初始值，按 Claude Code 的实测占用调整 |
 | `snapshot_config.preferred_fidelity` | MEMORY | 快照保存进程内存与根文件系统的写入 |
 | `snapshot_config.golden_snapshot_config.mode` | `GOLDEN_SNAPSHOT_MODE_DISABLED` | 见下文 |
