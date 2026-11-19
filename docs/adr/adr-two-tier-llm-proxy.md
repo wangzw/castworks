@@ -35,7 +35,7 @@ LLM 网关必须持有真实凭据、校验代、限流、计费、审计，并�
 - 客户端中止并重发时必须按 `(run_id, generation, request_hash)` 命中单次回放缓存，不得向上游发起第二次请求。
 - LLM 网关必须持久化在途请求与已完成响应，按 `request_id` 提供取回；网关实例失联时，控制面必须为其在途请求合成失败唤醒信号。
 - 本地代理必须处理令牌轮换；令牌过期或临近到期时，收到 `TokenRotate` 之前不得向网关转发请求。
-- 必须把 Agent 的 LLM 基地址配置为指向本地代理；运行实例令牌的持有与沙箱出口约束见 [ADR-host-owns-external-wake-sources](adr-host-owns-external-wake-sources.md)。
+- 必须使 Agent 的 LLM 请求到达本地代理，引流途径见 [ADR-transparent-interception-by-default](adr-transparent-interception-by-default.md)；运行实例令牌的持有与沙箱出口约束见 [ADR-host-owns-external-wake-sources](adr-host-owns-external-wake-sources.md)。
 
 承担的代价穷举如下：
 

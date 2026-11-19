@@ -38,10 +38,12 @@
 | Agent 驱动器接口 | Agent Driver interface | 两种循环共用的唯一翻译层，规定协议事件、投递、挂起与恢复语义，进程驱动器与控制面循环驱动器各自实现 |
 | 进程驱动器 | process driver | Agent 驱动器接口在沙箱内的实现，以无头协议（stream-json）驱动完整第三方 Agent（Claude Code），在同一代沙箱内保持 Agent 进程跨回合存活，并以恢复句柄续接会话 |
 | 控制面循环驱动器 | control-plane loop driver | Agent 驱动器接口在控制面内的实现，运行平台原生 Agent 的模型循环，经看守进程的 `ToolExec` 接口使用沙箱，不假定沙箱内存在 Agent 进程 |
-| 本地代理 | local proxy | 看守进程内不被冻结的 HTTP 代理，中继 Agent 进程按 LLM 基地址与代理环境变量发给本地代理的出站 HTTP 流量：LLM 请求转发到 LLM 网关，外部系统请求以 CONNECT 或 HTTP 前置转发到出口代理；本地 DNS 指向的 `mitm` 与 `passthrough` 主机连接由透明拦截器接收，不经本地代理 |
-| 本地 DNS | local DNS | 看守进程在沙箱内提供的域名解析，依据出口策略中各主机的网络通道，把 `mitm` 与 `passthrough` 主机解析到回环地址上的透明拦截器 |
-| 透明拦截器 | transparent interceptor | 看守进程内与本地代理并列、不被冻结的回环组件，接收本地 DNS 指向它的连接，按 SNI 识别目标，并以附运行实例身份的 CONNECT 隧道把原始 TLS 字节转给出口代理，不终止 TLS |
-| 网络通道 | network channel | 外部系统定义中按主机选择的沙箱出站方式，取值闭集为 `proxy`、`mitm`、`passthrough`：`proxy` 只依赖代理环境变量进入本地代理，`mitm` 与 `passthrough` 由本地 DNS 把主机指向透明拦截器 |
+| 本地代理 | local proxy | 看守进程内不被冻结的 HTTP 代理：处理 Agent 进程的 LLM 请求并转发到 LLM 网关，把按代理环境变量到达的外部系统请求以 CONNECT 或 HTTP 前置转发到出口代理。LLM 请求默认由透明拦截器终止 TLS 后交入，启用 LLM 基地址或代理环境变量时由 Agent 进程直接发给本地代理；本地 DNS 指向的 `mitm` 与 `passthrough` 主机连接由透明拦截器接收，不经本地代理 |
+| LLM 主机 | LLM host | Agent 驱动器声明的、其 Agent 在默认网络配置下发送 LLM 请求的目的主机 |
+| 拦截 CA | interception CA | 看守进程为每个沙箱实例生成的证书签发者，只为 LLM 主机签发证书，用于在沙箱内终止 Agent 发往 LLM 主机的 TLS；私钥只在看守进程的内存中，证书并入沙箱的合并信任库 |
+| 本地 DNS | local DNS | 看守进程在沙箱内提供的域名解析，把 LLM 主机以及出口策略中网络通道为 `mitm` 与 `passthrough` 的主机解析到回环地址上的透明拦截器 |
+| 透明拦截器 | transparent interceptor | 看守进程内与本地代理并列、不被冻结的回环组件，接收本地 DNS 指向它的连接并按 SNI 识别目标：LLM 主机的连接以拦截 CA 签发的证书终止 TLS，明文请求交给本地代理；外部系统主机的连接以附运行实例身份的 CONNECT 隧道把原始 TLS 字节转给出口代理，不终止 TLS |
+| 网络通道 | network channel | 外部系统定义中按主机选择的沙箱出站方式，取值闭集为 `proxy`、`mitm`、`passthrough`，未声明时取 `mitm`：`proxy` 只依赖代理环境变量进入本地代理，`mitm` 与 `passthrough` 由本地 DNS 把主机指向透明拦截器 |
 | LLM 网关 | LLM gateway | 控制面中代理 LLM 调用的服务：凭据换取、代校验、在途跟踪、回放存储、限流计费 |
 | 直通模式 | passthrough | 本地代理在 LLM 请求开始时一次性选定的转发模式之一：逐条向 Agent 转发上游 SSE 事件；LLM 网关按同一事件顺序转发，模式不改变 LLM 网关的转发行为 |
 | 缓存模式 | hold | 本地代理在 LLM 请求开始时一次性选定的转发模式之一：缓冲内容事件、只向 Agent 转发 `ping` 保活事件，解冻后一次性交付；LLM 网关仍按同一事件顺序转发并保存回放 |

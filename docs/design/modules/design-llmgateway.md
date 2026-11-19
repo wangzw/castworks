@@ -27,7 +27,7 @@
 
 非职责举例如下，判定标准为职责清单之外、由其他模块拥有的事实与机制。
 
-- **不做 MITM**：不拦截 Agent 的其他出站 TLS 流量；外部系统的凭据占位符替换归 `connectorhub` 的出口代理。
+- **不拦截 Agent 的出站连接**：Agent 发往 [LLM 主机](../../glossary.md)的连接由看守进程的[透明拦截器](../../glossary.md)在沙箱内终止 TLS，本模块只接受本地代理转来的请求（[ADR-transparent-interception-by-default](../../adr/adr-transparent-interception-by-default.md)）；外部系统流量不经本模块，其凭据占位符替换归 `connectorhub` 的出口代理。
 - **不生成出口策略**：允许主机由 `connectorhub` 生成与落地；本模块只经其出口策略查询接口读取允许主机，用于服务端能力治理。
 - **不决定何时冻结、快照或销毁**：[挂起](../../glossary.md)决策归 `suspendpolicy`，状态转移与执行归 `runcontroller` 与 `sandboxprovider`。
 - **不持有沙箱**：不创建、销毁、[冻结](../../glossary.md)或恢复沙箱，不读取沙箱内进程状态。

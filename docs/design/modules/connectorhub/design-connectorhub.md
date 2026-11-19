@@ -139,7 +139,7 @@ wait_signatures:
 | `auth.methods` | string[] | 非空；每种认证方法在 `auth.secret_schema` 中有一个 JSON Schema；认证方法决定凭据在外部系统中的主体，见表后说明 |
 | `auth.secret_schema` | map[string]JSONSchema | 认证方法到凭据结构的映射；凭据本身不写入定义 |
 | `auth.token_minting` | object | 短期凭据的 `ttl` 与 `scopes`；由 `secrets` 使用 |
-| `access.mode` | string | 闭集 `proxy`、`mitm`、`passthrough`；该外部系统默认的网络通道 |
+| `access.mode` | string | 可选，闭集 `proxy`、`mitm`、`passthrough`；该外部系统默认的网络通道，省略时取 `mitm`（[ADR-transparent-interception-by-default](../../../adr/adr-transparent-interception-by-default.md)） |
 | `access.upstreams` | string[] | 非空，只含主机名；出口策略的允许主机集合，未列入的主机默认拒绝 |
 | `access.host_modes` | `{host, mode}[]` | 可选；按主机覆盖 `access.mode`，`host` 必须属于 `upstreams`，`mode` 取同一闭集 |
 | `access.inject` | InjectRule[] | 每条为 `{host, header, placeholder, auth_method, scopes}`；`host` 必须属于 `upstreams`，`auth_method` 必须属于 `auth.methods`，`scopes` 可选、为空时沿用 `token_minting.scopes` 或凭据对象的授权范围；只替换请求头 |
@@ -628,7 +628,7 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | `name` | string | 唯一 | 外部系统标识，连接器实例、连接器事件日志与订阅的命名空间 |
 | `auth` | object | `methods` 非空，每种方法有 `secret_schema` | 认证方法与短期凭据签发参数 |
-| `access` | object | `mode` 属于 `proxy`、`mitm`、`passthrough`，`upstreams` 非空；`plaintext_hosts` 属于 `upstreams` 且不与 `pinned_hosts` 重叠 | 网络通道、出口允许主机、占位符注入规则、明文主机与 git 重写 |
+| `access` | object | `mode` 省略或属于 `proxy`、`mitm`、`passthrough`，`upstreams` 非空；`plaintext_hosts` 属于 `upstreams` 且不与 `pinned_hosts` 重叠 | 网络通道、出口允许主机、占位符注入规则、明文主机与 git 重写 |
 | `events` | object | `correlation_keys`、`identity_keys`、`dedup_key`、`ordering.occurred_at` 非空；带 `webhook` 事件源时 `project_binding` 非空且属于 `correlation_keys` | webhook 与 poll 事件源及 webhook 产生的事件类型、关联键、[关联键身份键](../../../glossary.md)、[项目归属键](../../../glossary.md)、规范化、完成条件目录、去重键与时间字段 |
 | `wait_signatures` | WaitSignature[] | 可选；逐条校验，不通过的签名不装载 | [等待签名](../../../glossary.md)：匹配规则、事件类型、关联键提取模板与时长先验 |
 | `credential_scope` | string | 连接器实例字段 | 项目作用域的凭据授权范围；凭据由 `secrets` 换取 |
@@ -853,7 +853,7 @@ webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部
 出口策略的输入是运行实例可用的外部系统定义集合。可用集合由该运行实例的项目作用域凭据授权决定，本模块不扩大授权范围。对每个定义，取其 `access.upstreams`、`access.mode`、`access.host_modes`、`access.inject`、`access.plaintext_hosts` 与 `access.git`：
 
 - `AllowedHosts` 是所有定义 `upstreams` 的并集。未列入的主机默认拒绝；本地代理与透明拦截器对未放行目标立即拒绝而不是黑洞。
-- `Modes` 是各定义 `access.mode` 与 `access.host_modes` 的展开，`host_modes` 覆盖默认；`Modes` 同时进入沙箱侧配置，经 `runcontroller` 推送给看守进程，看守进程的本地 DNS 与透明拦截器据此选择通道。
+- `Modes` 是各定义 `access.mode` 与 `access.host_modes` 的展开，`access.mode` 省略时按 `mitm` 展开，`host_modes` 覆盖默认；`Modes` 同时进入沙箱侧配置，经 `runcontroller` 推送给看守进程，看守进程的本地 DNS 与透明拦截器据此选择通道，并只在其中存在 `proxy` 主机时为 Agent 进程树注入代理环境变量。
 - `Inject` 是所有定义 `inject` 的并集，每条为 `{host, header, placeholder, system, auth_method, scopes}`；`system` 取定义名，`auth_method` 与 `scopes` 取注入规则，`scopes` 为空时由 `secrets` 按 `token_minting.scopes` 或凭据对象授权范围解析；只替换已有请求头，缺头不注入。
 - `Git` 存在 `reverse_proxy_rewrite` 时，git 客户端的目标主机重写为平台 git 代理，git 的 Basic 或 Bearer 头由出口路径注入；`system`、`auth_method` 与 `scopes` 同样随规则携带。
 - `PlaintextHosts` 是所有定义 `plaintext_hosts` 的并集，是 `AllowedHosts` 的子集。出口路径只对这些主机的明文 HTTP 请求注入凭据；其他主机的携带占位符的明文请求被拒绝并审计，真实凭据只在 TLS 连接上注入。

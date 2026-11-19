@@ -33,7 +33,7 @@
 
 各子模块有独立文档，模块文档只固定边界。
 
-- **本地代理**：看守进程内不被冻结的 HTTP 代理，终止 Agent 使用代理变量发出的 LLM 与外部系统 HTTP 连接，附加对应受众的运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)，由透明拦截器接收这些连接并以出口代理为上游。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。本地代理另按主机与归属对象识别周期性连接供意图解析使用，并把 Agent 驱动器的宿主侧分类请求附分类标记转发到 `llmgateway`，对来自 Agent 进程的请求剥离该标记。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
+- **本地代理**：看守进程内不被冻结的 HTTP 代理，处理 Agent 进程的 LLM 请求与按代理变量到达的外部系统请求，附加对应受众的运行实例令牌后转发到 `llmgateway` 或出口代理，按请求选择[直通模式](../../../glossary.md)或[缓存模式](../../../glossary.md)，并在快照与销毁路径下按 `request_id` 取回已完成响应。与它并列的[本地 DNS](../../../glossary.md)把 [LLM 主机](../../../glossary.md)以及 `mitm` 与 `passthrough` 主机解析到同样并列的[透明拦截器](../../../glossary.md)：透明拦截器以[拦截 CA](../../../glossary.md)签发的证书终止 LLM 主机的 TLS，把明文连接交给本地代理，其余连接以出口代理为上游；Agent 进程默认不读到 LLM 基地址与代理变量（[ADR-transparent-interception-by-default](../../../adr/adr-transparent-interception-by-default.md)）。本地代理还记录最近一次 LLM 请求与最近一次可重试失败的时刻，并按连接记录用途（LLM 或外部转发），供冻结确认时的接收队列检查排除 LLM 连接；冻结期间本地代理与透明拦截器在非 LLM 上游连接上读到载荷字节时通知看守进程发出 `conn.inbound`。本地代理另按主机与归属对象识别周期性连接供意图解析使用，并把 Agent 驱动器的宿主侧分类请求附分类标记转发到 `llmgateway`，对来自 Agent 进程的请求剥离该标记。它们都与 Agent 进程树冻结无关，细节见 [design-warden-llmproxy.md](design-warden-llmproxy.md)（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - **Claude Code 驱动器**：以无头 `stream-json` 协议驱动 Claude Code，把回合、工具、权限询问与等待翻译为协议事件，按 Claude Code 的后台任务集合维护后台作业，镜像会话内定时、工具超时与 `Monitor` 截止等自唤醒条目，解析等待意图并发出 `intent_observed`、决定情境提示，把投递翻译为原生输入，并管理会话续接、`StartAgent` 启动与退出。细节见 [design-warden-driver-claude-code.md](design-warden-driver-claude-code.md)（[REF-claude-code-headless](../../../references.md)）。
 - **控制面循环驱动器**：控制面循环驱动器使用 `ToolExec` 的接口与语义，不假定沙箱内存在 Agent 进程，不产生自唤醒条目事件，也不产生 `intent_observed`：它的阻塞点由 `WaitDeclared` 显式声明。细节见 [design-warden-driver-native.md](design-warden-driver-native.md)（[ADR-dual-agent-loop-location](../../../adr/adr-dual-agent-loop-location.md)）。
 
@@ -51,7 +51,7 @@
 - 协议信封、序列化、重放与按 `(generation, msg_seq)` 去重的规则归 `agentprotocol`；看守进程只声明每条消息的沙箱侧效果。
 - LLM 凭据换取、在途请求与回放存储归 `llmgateway`；外部系统定义、订阅、[连接器事件日志](../../../glossary.md)、出口策略与沙箱侧配置的生成、工具接入声明的装载与校验归 `connectorhub`；人类会话、身份与审批决定归 `humanchannel`。看守进程只发起附运行实例令牌的运行时 HTTP 调用。
 - Agent 会话记录的内容归 Agent 自身；看守进程只保证状态目录位于工作区内，并在[安全点](../../../glossary.md)要求持久化完成。
-- 出口的凭据替换与默认拒绝归出口代理；本地代理不做 MITM，不替换凭据。
+- 出口的凭据替换与默认拒绝归出口代理；本地代理与透明拦截器只终止 LLM 主机的 TLS，不终止外部系统主机的 TLS，不替换凭据。
 
 ## 术语表
 
@@ -112,7 +112,7 @@
 
 文件 API 为界面提供工作区文件的读取，包括列目录与读文件，入站路径为 `/files`（agentprotocol 常量 `PathFiles`）；路径限定在运行实例子目录内，请求由 `workspace` 经入站路由转发到达，按[接入票据](../../../glossary.md)（`channel=file`）与实时接入状态鉴权。看守进程核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。票据的校验规则见[入站端点](#入站端点)。文件 API 不提供事件通道。
 
-本地代理监听回环地址，是 Agent 进程使用代理变量的 LLM 与外部系统 HTTP 出口；`mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器。Agent 不持有令牌，本地代理在转发时附加对应受众的运行实例令牌：LLM 请求附 `llmgateway` 令牌转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理，k8s 路径上两者对平台出口代理都附 `egress` 令牌。本地代理与透明拦截器都不做 MITM，不替换凭据，TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
+本地代理监听回环地址，处理 Agent 进程的 LLM 请求与按代理变量到达的外部系统请求；LLM 主机以及 `mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器，LLM 主机的连接由透明拦截器终止 TLS 后交给本地代理。Agent 不持有令牌，本地代理在转发时附加对应受众的运行实例令牌：LLM 请求附 `llmgateway` 令牌转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理，k8s 路径上两者对平台出口代理都附 `egress` 令牌。本地代理与透明拦截器不终止外部系统主机的 TLS，不替换凭据，这些主机的 TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
 ### 平台 MCP 工具
 
@@ -456,7 +456,7 @@ sequenceDiagram
 | 6 | 收到 `Thaw{suspend_id=s-8}` | 关闭上游载荷检测；读到 `frozen=0` 后上报 `Thawed{suspend_id=s-8}`，记录 `thawed=true` |
 | 7 | 收到 `Resumed{suspend_id=s-8, drain=false}` | `curl` 从套接字缓冲读到 1730 字节，继续处理事件流 |
 
-走查确认入站数据唤醒的结论。步骤 3 只检查 `c-5`：LLM 连接与平台 MCP 连接即使留有未读字节也不触发，它们的进展由 `llm.*` 事件与定向投递表达；进程树中若还有两端都属于 Agent 进程树的回环连接（例如后台作业启动的本地服务与其客户端之间的连接），步骤 3 同样排除，它们不是外部输入，其进展由活动度判据负责。`conn.inbound` 在步骤 4 发出且只发出一次，步骤 5 的后续载荷不产生第二条消息；控制面据此写唤醒信号并恢复运行实例，规则见 [runcontroller](../design-runcontroller.md)。看守进程不终止 TLS，无法判断这 1420 字节是业务数据还是 TLS 层的保活帧，误唤醒按普通唤醒处理。冻结期间字节照常转发，不丢弃、不改写，解冻后由 Agent 自行读取。看守进程在整个过程中不终止 `t-2`。
+走查确认入站数据唤醒的结论。步骤 3 只检查 `c-5`：LLM 连接与平台 MCP 连接即使留有未读字节也不触发，它们的进展由 `llm.*` 事件与定向投递表达；进程树中若还有两端都属于 Agent 进程树的回环连接（例如后台作业启动的本地服务与其客户端之间的连接），步骤 3 同样排除，它们不是外部输入，其进展由活动度判据负责。`conn.inbound` 在步骤 4 发出且只发出一次，步骤 5 的后续载荷不产生第二条消息；控制面据此写唤醒信号并恢复运行实例，规则见 [runcontroller](../design-runcontroller.md)。看守进程不终止外部系统主机的 TLS，无法判断这 1420 字节是业务数据还是 TLS 层的保活帧，误唤醒按普通唤醒处理。冻结期间字节照常转发，不丢弃、不改写，解冻后由 Agent 自行读取。看守进程在整个过程中不终止 `t-2`。
 
 ### 启动与领取
 
@@ -482,9 +482,19 @@ sequenceDiagram
 
 `mitm` 主机的连接由出口代理以出口 CA 签发的证书终止 TLS，Agent 进程树中的工具必须信任该 CA。出口 CA 的来源按提供者路径区分：k8s 路径的平台 CA 经镜像预置或运行时注入（只读投射卷）；Substrate 路径的出口网关 CA 取自 `systemInfo` 卷 `trustBundle` 数据源的运行时投射，不预置进镜像（[ADR-platform-does-not-execute-external-operations](../../../adr/adr-platform-does-not-execute-external-operations.md)）。
 
-看守进程在工作区之外生成合并信任库 `/run/castworks/trust/ca-bundle.pem`，内容为公共根证书加出口 CA，属主为 root，Agent 只读；生成以写临时文件再原子替换的方式完成，读取方不会读到部分内容。生成时机为领取成功之后、快照恢复之后与投射文件变化时；Agent 主进程、`/terminal` 的 shell 与 `ToolExec.exec` 命令都在首次生成之后启动。看守进程对 Agent 进程树、`ToolExec.exec` 命令与 `/terminal` 的 shell 设置下列环境变量，取值都是该路径：`SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`、`GIT_SSL_CAINFO`、`REQUESTS_CA_BUNDLE`、`CURL_CA_BUNDLE`。工具接入声明中的同名变量覆盖这些值。
+看守进程在工作区之外生成合并信任库 `/run/castworks/trust/ca-bundle.pem`，内容为公共根证书、出口 CA 与[拦截 CA](#拦截-ca) 的证书，属主为 root，Agent 只读；生成以写临时文件再原子替换的方式完成，读取方不会读到部分内容。生成时机为领取成功之后、快照恢复之后与投射文件变化时；Agent 主进程、`/terminal` 的 shell 与 `ToolExec.exec` 命令都在首次生成之后启动。看守进程对 Agent 进程树、`ToolExec.exec` 命令与 `/terminal` 的 shell 设置下列环境变量，取值都是该路径：`SSL_CERT_FILE`、`NODE_EXTRA_CA_CERTS`、`GIT_SSL_CAINFO`、`REQUESTS_CA_BUNDLE`、`CURL_CA_BUNDLE`。工具接入声明中的同名变量覆盖这些值。
 
 CA 轮换按重叠期 `T_ca_overlap` 进行：新 CA 加入信任库不少于 `T_ca_overlap` 之后出口代理才用它签发，旧 CA 在信任库中保留不少于 `T_ca_overlap`；`T_ca_overlap` 不短于快照保留期上限，快照恢复后仍持有旧信任库的进程在重叠期内可以重建连接。轮换之后仍持有不含新 CA 的旧信任库的进程，连接 `mitm` 主机时证书校验失败，按上游 TLS 失败处理。领取时校验 Substrate 出口网关证书所用的 CA 仍按[启动与领取](#启动与领取)的规则在每次领取时读取 `trustBundle`。
+
+### 拦截 CA
+
+看守进程为每个沙箱实例生成拦截 CA，供透明拦截器与本地代理在沙箱内终止 Agent 发往 LLM 主机的 TLS；LLM 主机由 Agent 驱动器声明。
+
+生成时机为领取成功之后、首次生成合并信任库之前：看守进程生成密钥对与自签名的 CA 证书，证书以名称约束限定在 LLM 主机。私钥只保存在看守进程的内存中，不写入文件系统与工作区，不经任何接口离开沙箱；Agent 进程以运行实例 uid 运行，读不到看守进程的内存。领取之前不生成：Substrate 路径的模板快照在领取之前构建，看守进程的内存随模板快照进入新 actor，领取之后生成使各 actor 的拦截 CA 互不相同。
+
+拦截 CA 的证书并入[合并信任库](#出口-ca-信任)。透明拦截器与本地代理按 LLM 主机取得拦截 CA 签发的叶子证书，叶子证书及其私钥同样只在内存中，到期之前由看守进程重新签发。拦截 CA 不为 LLM 主机之外的名字签发证书。
+
+快照恢复的是同一沙箱实例：拦截 CA 的私钥与证书随进程内存恢复，不重新生成，恢复后重新生成的合并信任库包含同一张证书，快照之前已加载信任库的进程继续信任它。销毁重建的新沙箱实例生成新的拦截 CA，Agent 进程随之重新启动并加载新的合并信任库。拦截 CA 证书的有效期不短于快照保留期上限。
 
 ### 进程监督
 
@@ -559,7 +569,7 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 1. 冻结确认时的接收队列检查：遍历 Agent 进程树各进程的 `/proc/<pid>/fd` 收集套接字 inode，读取 `/proc/net/tcp` 与 `/proc/net/tcp6` 并按这些 inode 过滤，再排除不承载外部输入的回环连接，其余套接字中任一 `rx_queue` 非零即视为有未读数据。排除的连接分三类：承载 LLM 请求的连接（Agent 到本地代理 LLM 端点），其进展由 `llm.first_token`、`llm.request.completed` 与 `llm.request.failed` 表达；Agent 与平台 MCP 服务器之间的连接，其进展由定向投递表达；两端都在 Agent 进程树内的回环连接（例如后台作业启动的本地服务与进程树内其客户端之间的连接），其进展由活动度判据负责。判定按以下顺序：对端地址为回环地址的套接字，在 `/proc/net/tcp` 与 `/proc/net/tcp6` 中查找本地地址与对端地址互换的行，该行的 inode 也在已收集的 inode 集合中，即对端套接字同样由 Agent 进程树持有时排除；对端地址为平台 MCP 服务器监听地址的套接字排除；对端地址为本地代理监听地址的套接字，以其本地地址与端口查询本地代理的连接用途记录，用途为 `llm` 的排除，用途为 `external` 或查不到记录的照常检查；其余套接字照常检查，透明拦截器接管的连接属于此类。记录的写入与查询见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。该检查覆盖冻结生效之前已到达、Agent 尚未读取的数据，包括本地代理已写入 Agent 侧外部转发连接（CONNECT 隧道与绝对 URI 转发）的字节；`conn.inbound` 因此只表达来自 Agent 进程树之外的输入。
 2. 冻结期间的上游载荷检测：本地代理的 CONNECT 隧道与 HTTP 前置请求、透明拦截器的拦截连接在上游一侧读到载荷字节时通知看守进程；LLM 请求的上游连接不参与，其数据到达由 `llm.*` 事件表达。连接侧的规则见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
-`freeze_id` 取该冻结尝试的 `suspend_id`。冻结执行记录的 `inbound_reported` 保证每个 `freeze_id` 至多发出一次：两条路径并发触发时只有先完成置位的一方发出，之后到达的载荷不触发发出；消息随出站流的重放送达，重放不构成第二次发出。判定只看读到的载荷字节：TCP 保活等无载荷报文由内核处理，既不进入接收队列也不被用户态读到，不计入；看守进程不终止 TLS，无法区分 TLS 或应用层的保活帧与业务数据，由此产生的误唤醒按普通唤醒处理。冻结期间本地代理与透明拦截器照常转发字节，Agent 未读取的数据由 Agent 侧套接字缓冲承接，解冻后由 Agent 读取；入站数据唤醒不丢弃、不改写数据。控制面以 `conn.inbound` 写唤醒信号并按唤醒谓词恢复运行实例，见 [runcontroller](../design-runcontroller.md)。
+`freeze_id` 取该冻结尝试的 `suspend_id`。冻结执行记录的 `inbound_reported` 保证每个 `freeze_id` 至多发出一次：两条路径并发触发时只有先完成置位的一方发出，之后到达的载荷不触发发出；消息随出站流的重放送达，重放不构成第二次发出。判定只看读到的载荷字节：TCP 保活等无载荷报文由内核处理，既不进入接收队列也不被用户态读到，不计入；看守进程不终止外部系统主机的 TLS，无法区分 TLS 或应用层的保活帧与业务数据，由此产生的误唤醒按普通唤醒处理。冻结期间本地代理与透明拦截器照常转发字节，Agent 未读取的数据由 Agent 侧套接字缓冲承接，解冻后由 Agent 读取；入站数据唤醒不丢弃、不改写数据。控制面以 `conn.inbound` 写唤醒信号并按唤醒谓词恢复运行实例，见 [runcontroller](../design-runcontroller.md)。
 
 复杂度：接收队列检查为 O(P·F + S)，P 为进程数、F 为每个进程的文件描述符数、S 为 `/proc/net/tcp` 与 `/proc/net/tcp6` 的行数；读取时按 `(本地地址, 对端地址)` 建立行索引，对端套接字的查找为 O(1)，连接用途记录按连接端点索引，每个套接字的查询为 O(1)；上游载荷检测为每次读取 O(1)。
 
@@ -664,7 +674,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | `AdoptAgent` 被拒绝或不可达（节点冻结代理核验不通过、套接字不可连接或调用超时） | 该进程保持停止态，不继续执行；按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报：Agent 主进程按启动失败上报 `turn_ended{agent_exited=true}`，控制面计入 `start_failures`；`/terminal` 返回 503，不建立 shell；`ToolExec.exec` 以执行启动失败应答；计数并告警 |
 | `/terminal` 或 `/files` 的接入票据缺失或校验不通过（`alg`、`typ`、`kid`、签名、`aud`、`run_id`、`generation`、`channel`、有效期或 `jti` 任一项） | 返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；已接受过的 `jti` 再次出现时同样拒绝 |
 | 入站连接的来源为回环地址或本 Pod 地址 | 拒绝该连接，不进入任何端点的处理 |
-| 合并信任库生成失败（出口 CA 的投射文件缺失或无法解析） | 保留上一次成功生成的信任库并计数告警；首次生成即失败时只以公共根证书生成信任库，不推迟进程启动，`mitm` 主机的连接按上游 TLS 失败处理；投射文件恢复后重新生成 |
+| 合并信任库生成失败（出口 CA 的投射文件缺失或无法解析） | 保留上一次成功生成的信任库并计数告警；首次生成即失败时只以公共根证书与拦截 CA 的证书生成信任库，不推迟进程启动，`mitm` 主机的连接按上游 TLS 失败处理；投射文件恢复后重新生成 |
 | `SIGSTOP` 扫描超限或截止到期 | 对已停止 PID 发送 `SIGCONT`，记录已解冻，回 `Busy`；不留下部分冻结的进程树 |
 | `CancelSuspend` | 未越过不可撤销点时回 `Busy{reason=cancelled}`；已越过时回 `ReadyToSuspend`，由控制面按迟到应答处理 |
 | 工作区租约无法续约，含 `workspace` 以持有证明不符不可重试地拒绝续约 | 停止工作区写入，冻结或杀死 Agent 进程树，上报 `LeaseLost`；流不可用时重连后补发；持有证明被拒时不重试该次续约 |
@@ -755,4 +765,5 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 实例密钥与持有证明 | 未实现 | — |
 | `AdoptAgent` 停止态启动 | 未实现 | — |
 | 出口 CA 合并信任库 | 未实现 | — |
+| 拦截 CA 的生成与叶子证书签发 | 未实现 | — |
 | 沙箱侧配置应用与重新加载 | 未实现 | — |

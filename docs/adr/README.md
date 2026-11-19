@@ -23,6 +23,7 @@
 | [外部唤醒源与外部流量由托管侧持有，Agent 自唤醒源由托管侧镜像](adr-host-owns-external-wake-sources.md) |
 | [平台不执行第三方操作，只提供出口凭据替换、连接器事件日志与订阅](adr-platform-does-not-execute-external-operations.md) |
 | [LLM 流量经沙箱内本地代理与 LLM 网关两级](adr-two-tier-llm-proxy.md) |
+| [Agent 出站流量默认经透明拦截，基地址与代理变量只作补充](adr-transparent-interception-by-default.md) |
 | [连接器事件与订阅按项目归属键隔离](adr-connector-events-project-scoped.md) |
 | [LLM 上游服务端代发的外联与出口策略同级约束](adr-llm-server-capability-egress-alignment.md) |
 

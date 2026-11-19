@@ -10,7 +10,8 @@
 
 | 事项 | 影响 | 判定标准 |
 | --- | --- | --- |
-| Claude Code 被 `SIGSTOP` 30～600 s 后流式看门狗是否按墙钟计时；自定义 `ANTHROPIC_BASE_URL` 下字节级看门狗的取值（[REF-claude-code-network-config](references.md)） | `F_stream` 与 `F_cap(llm)`，决定直通模式与缓存模式下的冻结上限 | 通过：看门狗按墙钟推进，恢复后客户端行为与未冻结时一致；字节级取值可重复测量且不低于 `F_stream` 所需的安全余量。不通过：看门狗在冻结期间停止推进，或在恢复瞬间误判中止；此时按实测值下调 `F_stream`，直通模式在预测等待超过该值时不做冻结。 |
+| Claude Code 被 `SIGSTOP` 30～600 s 后流式看门狗是否按墙钟计时；默认网络配置（经透明拦截，不设置 `ANTHROPIC_BASE_URL`）与自定义 `ANTHROPIC_BASE_URL` 下字节级看门狗的取值（[REF-claude-code-network-config](references.md)） | `F_stream` 与 `F_cap(llm)`，决定直通模式与缓存模式下的冻结上限 | 通过：看门狗按墙钟推进，恢复后客户端行为与未冻结时一致；字节级取值可重复测量且不低于 `F_stream` 所需的安全余量。不通过：看门狗在冻结期间停止推进，或在恢复瞬间误判中止；此时按实测值下调 `F_stream`，直通模式在预测等待超过该值时不做冻结。 |
+| Claude Code 在默认网络配置下经透明拦截发出 LLM 请求：是否信任合并信任库中的拦截 CA，是否对 LLM 主机固定证书，LLM 请求是否只发往驱动器声明的 LLM 主机 | LLM 请求的默认引流途径，即 Claude Code 驱动器 `llm_access` 的默认值；[ADR-transparent-interception-by-default](adr/adr-transparent-interception-by-default.md) 的失效条件 | 通过：TLS 握手无失败，本地代理观察到 Agent 的 LLM 请求明文，一个完整回合正常完成。不通过：握手失败，或 LLM 请求发往声明之外的主机；握手失败时 `llm_access` 取 `base_url`，主机不全时补全驱动器声明的 LLM 主机。 |
 | `--permission-prompt-tool` 的入参与返回格式；`claude -p --resume <session_id>` 不带 prompt 时的 `defer` 续接行为（[REF-claude-code-hooks](references.md)） | 审批路径：`PreToolUse` 的 `defer`、定向投递与回合边界续接 | 通过：不带 prompt 的续接重新触发 `PreToolUse`，hook 能返回 `allow` 或 `deny` 并改变该次调用结果；入参与返回格式与文档一致。不通过：续接不重新触发 hook，或决定无法生效；此时审批改为 hook 阻塞加冻结，冻结上限取 `F_cap(approval)`。 |
 | `--resume` 面对末尾悬空 `tool_use` 的行为；`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 的实际效果；`session_id` 在续接后是否变化（[REF-claude-code-headless](references.md)） | 降级路径：回合被中断后的重投与恢复句柄 | 通过：悬空 `tool_use` 的续接行为可区分，表现为拒绝或自动续接；被中断回合在该变量开启后自动续接；`session_id` 保持不变，若变化则能从通道观察并以新值更新恢复句柄。不通过：续接静默丢失回合或无法建立会话；此时被中断回合改走新会话加合成摘要的兜底路径。 |
 | 关闭 stdin 后进程退出与会话记录刷盘的先后；`CLAUDE_CONFIG_DIR` 与 cwd 变化对续接的影响（无头模式文档） | 安全点中的工作区持久化确认 | 通过：进程退出时可观察到本回合记录已写入会话记录文件，或存在可等待的刷盘完成判据；cwd 逐字一致且 `CLAUDE_CONFIG_DIR` 位于工作区内时续接成功。不通过：退出后会话记录文件仍缺本回合记录且无判据；此时销毁前改为同步快照上传确认，或改由新会话加合成摘要承接会话状态。 |
@@ -42,7 +43,7 @@
 
 | 事项 | 结论 | 已确立 | 仍需目标环境实测 |
 | --- | --- | --- | --- |
-| 看门狗 | 通过（机制） | 看门狗按单调时钟计时；30 s、120 s 冻结后正常续流；320 s 冻结后在解冻后约 0.35 s 触发中止并重试；自定义 `ANTHROPIC_BASE_URL` 下事件级与字节级默认 300 s。`F_stream=120 s` 安全 | 600 s 端点、cgroup freezer、Substrate VM 挂起、真实网关保活 |
+| 看门狗 | 通过（机制） | 看门狗按单调时钟计时；30 s、120 s 冻结后正常续流；320 s 冻结后在解冻后约 0.35 s 触发中止并重试；自定义 `ANTHROPIC_BASE_URL` 下事件级与字节级默认 300 s。`F_stream=120 s` 安全 | 600 s 端点、cgroup freezer、Substrate VM 挂起、真实网关保活、默认网络配置下看门狗的取值 |
 | `--permission-prompt-tool` 与 defer | 通过 | 参数仍存在但被 `--help` 隐藏；入参 `{tool_name, input, tool_use_id}`，返回单文本块内的 `PermissionResult`；`allow`、`deny`、`updatedInput` 均生效；`defer` 只在 `-p` 单工具回合生效；不带 prompt 的 `--resume` 以同一 `tool_use_id` 再次触发 `PreToolUse` | 并行批次忽略 defer、`tool_deferred_unavailable`、Linux 镜像 |
 | `--resume` 与悬空工具调用 | 部分证实 | 空提示续接对非 defer 悬空 `tool_use` 直接拒绝；`session_id` 默认不变，`--fork-session` 才换新 ID；带提示续接保留被切断调用并合成 `is_error` 的 interrupted `tool_result`，模型可能重试 | `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1` 的运行级自动续接、`MAX_AGE`、工具是否重跑 |
 | 关闭 stdin 与 cwd | 部分证实 | JSONL 在进程退出前已写入，退出后立即可读；`--resume` 跨 cwd 可用，`--continue` 以 cwd 为作用域 | 非 `--bare` 命令、`tool_use`/`tool_result` 回合、Linux 共享文件系统 fsync |

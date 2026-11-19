@@ -14,7 +14,8 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 
 - **启动与保持进程**：以固定命令启动 Claude Code，在回合之间保持同一进程存活，只在 stdin 关闭或进程退出时结束；收到 `StartAgent{resume_session_id}` 时以 `--resume` 启动而不写入任何输入，进程已在运行时不做任何事。结果是同一代沙箱内的会话不需要每回合重建，恢复句柄只在跨代或进程退出后使用，没有投递时会话内定时也有进程承接。
 - **流式输入输出**：以 `stream-json` 读写 stdin 与 stdout，把用户消息、工具结果与权限决定写入 stdin，把 Assistant、User、Result、Session State 与任务消息读出；结果是 Agent 的原生信号成为可解析的事件流。
-- **环境变量注入**：为 Agent 进程设置 `ANTHROPIC_BASE_URL`、`CLAUDE_CONFIG_DIR`、会话状态与后台任务上报相关变量，并注入项目作用域工具接入声明中的凭据占位符环境变量与非秘密配置；结果是 LLM 流量只到达本地代理，会话状态落在[工作区](../../../glossary.md)，第三方工具经占位符使用出口凭据通道，`idle` 只表示主循环空闲。
+- **环境变量注入**：为 Agent 进程设置 `CLAUDE_CONFIG_DIR`、会话状态与后台任务上报相关变量，并注入项目作用域工具接入声明中的凭据占位符环境变量与非秘密配置；LLM 基地址与代理变量默认不设置；结果是 Agent 保持自身的默认网络配置，会话状态落在[工作区](../../../glossary.md)，第三方工具经占位符使用出口凭据通道，`idle` 只表示主循环空闲。
+- **声明 LLM 主机与引流途径**：向看守进程声明 Claude Code 的 [LLM 主机](../../../glossary.md) `api.anthropic.com`，并按部署配置项 `llm_access`（闭集 `intercept`、`base_url`，默认 `intercept`）选择 LLM 请求到达本地代理的途径；结果是默认途径下 LLM 请求经本地 DNS 与[透明拦截器](../../../glossary.md)到达本地代理，`base_url` 只在透明拦截对被托管的 Claude Code 不可用时启用（[ADR-transparent-interception-by-default](../../../adr/adr-transparent-interception-by-default.md)）。
 - **托管策略设置注入**：以工作区之外的托管策略设置文件（Linux 为 `/etc/claude-code/managed-settings.json`，随镜像提供）注入 hooks 与权限设置，并以 `allowManagedHooksOnly` 屏蔽工作区内声明的 hooks。审批用的 `PreToolUse`，对账、旁证与意图解析用的 `Stop`、`SubagentStop` 与 `UserPromptSubmit`，提示用的 `PostToolUse`、`PostToolBatch`（兼作旁证）与 `SubagentStart`，以及核对用的 `PostToolUseFailure`（针对以错误结束的工具调用，输出恒为空）都由看守进程提供的托管 hook 二进制实现，二进制随镜像放在工作区之外；托管策略设置中注册的 hook 命令写成 `exec <托管 hook 二进制路径>` 的形式，Claude Code 经 shell 执行 hook 时 shell 以 `exec` 让位，二进制的父进程为 Agent 主进程。二进制经看守进程的托管 hook IPC 端点向驱动器查询并同步返回，端点以 `SO_PEERCRED` 与一次性事件核对认证查询方，两者都由看守进程执行，一次性核对依据驱动器的已观察事件状态（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)、[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对)）。结果是审批、安全检查与提示不被 Agent 自身的写入改变。
 - **一次性核对的事件状态**：从 stream-json 维护托管 hook 查询的已观察事件状态（已观察的 `tool_use` 与尚未应答的 `tool_use_id`、已结束的批次、回合与子代理的开始与结束窗口、即将开始的回合），供看守进程的托管 hook IPC 端点逐次核对，并把通过核对的事件标识记为已接受；结果是工具命令以 `exec` 运行托管 hook 二进制发出的伪造查询，只能落在已存在、尚未应答的事件上，同一事件标识只接受一次。
 - **回合边界判定**：等待 `session_state_changed: idle` 与 `result.queued_turn_count=0` 都到齐，结合 `result.origin` 区分人类回合与任务通知回合；结果是驱动器只在回合边界发出 `turn_ended`，并向控制面报告回合位置；`queued_turn_count` 不计任务通知，后台作业非空的回合边界不构成安全点。
@@ -454,10 +455,10 @@ claude -p --output-format stream-json --input-format stream-json --verbose [--re
 
 | 环境变量 | 取值 | 作用 |
 | --- | --- | --- |
-| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:<port>` | LLM 请求只到达本地代理；端口由看守进程在启动时选定 |
-| `HTTP_PROXY` | `http://127.0.0.1:<port>` | 外部系统的 HTTP 请求经本地代理以绝对 URI 转发到出口代理 |
-| `HTTPS_PROXY` | `http://127.0.0.1:<port>` | 外部系统的 HTTPS 请求经本地代理以 CONNECT 隧道转发到出口代理 |
-| `NO_PROXY` | `127.0.0.1` | 回环地址的 LLM 请求不经代理，避免回环流量再次进入本地代理 |
+| `ANTHROPIC_BASE_URL` | 默认不设置；`llm_access=base_url` 时为 `http://127.0.0.1:<port>` | 补充途径：LLM 请求直接发给本地代理；端口由看守进程在启动时选定 |
+| `HTTP_PROXY` | 默认不设置；运行实例的网络通道中存在 `proxy` 主机时为 `http://127.0.0.1:<port>` | `proxy` 主机的 HTTP 请求经本地代理以绝对 URI 转发到出口代理 |
+| `HTTPS_PROXY` | 与 `HTTP_PROXY` 同时设置，取值相同 | `proxy` 主机的 HTTPS 请求经本地代理以 CONNECT 隧道转发到出口代理；Agent 自身的 LLM 请求此时同样以 CONNECT 到达本地代理 |
+| `NO_PROXY` | 与 `HTTP_PROXY` 同时设置，取 `127.0.0.1` | 回环地址的请求不经代理，避免回环流量再次进入本地代理 |
 | `CLAUDE_CONFIG_DIR` | 工作区内目录 | 会话记录 `projects/<project>/<session-id>.jsonl` 随工作区持久化 |
 | `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS` | `1` | 产生 `session_state_changed` 的 `idle` 与 `requires_action` |
 | `CLAUDE_CODE_BG_TASKS_REPORT_RUNNING` | `0` | 每个回合结束都报告 `idle`，后台子代理或 workflow 存活时同样如此；`idle` 只表示主循环空闲，会话级后台活动由后台任务集合表达 |
@@ -472,7 +473,7 @@ claude -p --output-format stream-json --input-format stream-json --verbose [--re
 
 工具接入声明可以追加 `GH_TOKEN={{github.token}}`、`GITHUB_PERSONAL_ACCESS_TOKEN={{github.token}}` 这类凭据占位符环境变量与非秘密配置；保留名（`PATH`、`LD_*`、`PYTHONPATH`、`NODE_OPTIONS`、`GIT_CONFIG_*`、`SSH_*`、`HTTP(S)_PROXY`、`NO_PROXY`、`ANTHROPIC_*`、`CLAUDE_*`）被拒绝。`ToolExec.exec` 启动的命令注入同一组变量。看守进程只注入字面占位符，不解析、不换取、不缓存真实凭据。表外的 Claude Code 功能开关一律不设置：后台任务、会话内定时、workflow 与长 MCP 调用的自动转后台保持 Claude Code 的默认行为，驱动器以后台作业登记与自唤醒源镜像观测它们（[ADR-host-owns-external-wake-sources](../../../adr/adr-host-owns-external-wake-sources.md)）。
 
-`ANTHROPIC_BASE_URL` 是 Agent 与本地代理之间唯一的 LLM 配置；Agent 不持有令牌。Agent 的环境变量中不含运行实例令牌或[接入票据](../../../glossary.md)：接入票据只由 `humanchannel` 签发给入站请求，由看守进程在 `/terminal` 与 `/files` 上校验，不经环境变量注入 Agent。`CLAUDE_CONFIG_DIR` 与 cwd 在各代沙箱逐字一致，使工具相对路径与会话记录稳定；`--resume` 按 `session_id` 查找，不依赖 cwd，`--continue` 才以 cwd 为作用域。`cleanupPeriodDays` 不小于工作区保留期。
+`llm_access=intercept` 时，Agent 进程的环境变量中没有指向本地代理的配置，LLM 请求经本地 DNS 与透明拦截器到达本地代理；`llm_access=base_url` 时，`ANTHROPIC_BASE_URL` 是 Agent 与本地代理之间唯一的 LLM 配置。代理变量按 Agent 主进程启动时的沙箱侧配置确定，进程存续期间不变。Agent 不持有令牌。Agent 的环境变量中不含运行实例令牌或[接入票据](../../../glossary.md)：接入票据只由 `humanchannel` 签发给入站请求，由看守进程在 `/terminal` 与 `/files` 上校验，不经环境变量注入 Agent。`CLAUDE_CONFIG_DIR` 与 cwd 在各代沙箱逐字一致，使工具相对路径与会话记录稳定；`--resume` 按 `session_id` 查找，不依赖 cwd，`--continue` 才以 cwd 为作用域。`cleanupPeriodDays` 不小于工作区保留期。
 
 **续接与悬空工具调用。** 空提示续接遇到非 defer 的悬空 `tool_use` 时直接拒绝并中止启动，不重跑该调用。带提示续接则保留被切断的调用，并合成一个 `is_error` 的 interrupted `tool_result` 交回模型，模型可能据此重试；有副作用的调用必须按可能重试设计幂等，不能假设被切断的调用一定被丢弃。启用 `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` 时同时设置最大年龄，避免把过旧的被中断回合当作当前回合自动续接。
 
@@ -578,7 +579,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 任何挂起路径都不终止进程，唯一的例外是第 9 步：已声明的第三方 MCP 服务器（含其子进程）是 Agent 按声明启动的子进程，Agent 正常退出后没有客户端，销毁重建后本来就要重启，驱动器在第 8 步取得退出码之后终止它们，不损失 Agent 的能力。后台作业、残留进程与孤儿进程都不终止，存在时回 `Busy`（第 4、6 步），由 Agent 自行结束。
 
-第 2 步的外部在途连接计数按连接从建立到关闭计算，包含已声明的第三方 MCP 服务器进程经本地代理或透明拦截器持有的连接；本地代理与透明拦截器不终止 TLS，无法区分空闲长连接与在途请求。已声明的第三方 MCP 服务器在回合边界保持外部长连接（空闲连接池或流式订阅）时，第 2 步持续不满足，驱动器回 `Busy`，不为满足检查而提前终止该服务器；运行实例回到 `Active`，`runcontroller` 在 `retry_after` 之后重新调用挂起决策；控制面的 I9 预检不含外部在途连接，连接关闭之前以挂起为目的的销毁不会成功。
+第 2 步的外部在途连接计数按连接从建立到关闭计算，包含已声明的第三方 MCP 服务器进程经本地代理或透明拦截器持有的连接；本地代理与透明拦截器不终止外部系统主机的 TLS，无法区分空闲长连接与在途请求。已声明的第三方 MCP 服务器在回合边界保持外部长连接（空闲连接池或流式订阅）时，第 2 步持续不满足，驱动器回 `Busy`，不为满足检查而提前终止该服务器；运行实例回到 `Active`，`runcontroller` 在 `retry_after` 之后重新调用挂起决策；控制面的 I9 预检不含外部在途连接，连接关闭之前以挂起为目的的销毁不会成功。
 
 检查通过后上报 `ReadyToSuspend{suspend_id, mode=destroy, exited_at, session_id, procs_remaining, ws_write_fds}`。`session_id` 取本代进程使用的会话标识；本代未启动 Agent 进程时取最近一次收到的 `resume_session_id`，都没有时为空。控制面只在非空时落库恢复句柄，落库后才销毁沙箱。
 
