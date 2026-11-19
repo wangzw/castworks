@@ -1,0 +1,17 @@
+# EgressPolicy for the temporary probe actor. It matches the rules that
+# sandboxprovider.md "网络" creates for a real actor: Anthropic TLS is passed
+# through undecrypted, and the control-plane Service name is allowed as
+# cleartext HTTP/2 (h2c). example.com is deliberately absent, which Q4 checks.
+rules:
+- tlsPassthrough:
+    hostnames:
+    - api.anthropic.com
+    ports:
+      numbers:
+      - 443
+- http:
+    hostnames:
+    - castworks-dev.castworks-system.svc.cluster.local
+    ports:
+      numbers:
+      - 9090

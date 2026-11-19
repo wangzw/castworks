@@ -1,0 +1,43 @@
+# Temporary ActorTemplate for the network probe. run.sh substitutes
+# __TEMPLATE__ with cw-<first 12 hex digits of the image digest> and __IMAGE__
+# with registry/name@sha256:<digest>.
+#
+# The template matches sandboxprovider.md "actor 模板": container name warden,
+# wakeup probe on 8081 /readyz, golden snapshots disabled, the castworks gVisor
+# pool, and a 2 CPU / 2 GiB actor.
+metadata:
+  atespace: __ATESPACE__
+  name: __TEMPLATE__
+workerSelector:
+  matchLabels:
+    castworks.dev/pool: castworks
+containers:
+- name: warden
+  image: __IMAGE__
+  env:
+  - name: CASTWORKS_CONTROL_PLANE
+    value: castworks-dev.castworks-system.svc.cluster.local:9090
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 8081
+    timeoutSeconds: 120
+  volumeMounts:
+  - name: system-info
+    mountPath: /run/ate
+resources:
+  limits:
+    cpuMillicores: 2000
+    memoryBytes: 2147483648
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+  goldenSnapshotConfig:
+    mode: GOLDEN_SNAPSHOT_MODE_DISABLED
+volumes:
+- name: system-info
+  systemInfo:
+    dataSources:
+    - actorMetadata:
+        items:
+        - field: ACTOR_METADATA_FIELD_NAME
+          path: actor-name
