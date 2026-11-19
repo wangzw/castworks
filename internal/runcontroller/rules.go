@@ -50,7 +50,12 @@ type machineEvent interface{ isMachineEvent() }
 
 type evAppend struct{ text string }
 
-type evProvisionDone struct{ err error }
+type evProvisionDone struct {
+	// returnedAt is when Provision actually returned. A completion write may
+	// be retried; T_hello must start from the return, not from the retry.
+	returnedAt time.Time
+	err        error
+}
 
 type evHello struct {
 	phase           agentprotocolv1.Phase
@@ -84,7 +89,10 @@ type evSnapshotDone struct {
 
 type evRestoreDone struct {
 	timing sandboxprovider.Timing
-	err    error
+	// returnedAt is when RestoreSnapshot actually returned; see
+	// evProvisionDone.returnedAt.
+	returnedAt time.Time
+	err        error
 }
 
 type evHelloExpire struct{ returnedBefore time.Time }
@@ -189,6 +197,15 @@ func mkResult(s machineState, effects ...machineEffect) machineResult {
 	return machineResult{State: s, Effects: effects}
 }
 
+// eventTime returns the time carried by a completion event, falling back to
+// the rule clock. Events built directly by unit tests leave it unset.
+func eventTime(at time.Time, env machineEnv) time.Time {
+	if at.IsZero() {
+		return env.Now
+	}
+	return at
+}
+
 // transition 计算一次状态转移。它不修改输入，也不访问外部状态。
 //
 // 终态上不允许的外部事件返回 ErrTerminated；协议违例返回
@@ -281,8 +298,9 @@ func transitionProvisionDone(cur machineState, e evProvisionDone, env machineEnv
 	}
 	if e.err == nil {
 		// 成功时写 provision_returned_at，不改状态：状态由 Hello 推进，
-		// Hello 可能早于 Provision 返回。
-		now := env.Now
+		// Hello 可能早于 Provision 返回。时刻取提供者调用实际返回的时刻，
+		// 重试写库不推迟它。
+		now := eventTime(e.returnedAt, env)
 		cur.ProvisionReturnedAt = &now
 		return mkResult(cur), nil
 	}
@@ -584,7 +602,8 @@ func transitionRestoreDone(cur machineState, e evRestoreDone, env machineEnv) (m
 		return mkResult(cur, updateSuspension{err: &msg}), nil
 	}
 	ms := e.timing.Duration.Milliseconds()
-	now := env.Now
+	// 同 Provision：返回时刻随事件携带，重试写库不推迟 T_hello。
+	now := eventTime(e.returnedAt, env)
 	return mkResult(cur, updateSuspension{restoreMS: &ms, restoreReturnedAt: &now}), nil
 }
 

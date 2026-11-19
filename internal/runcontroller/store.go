@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -67,6 +68,55 @@ const suspensionSelectColumns = `seq, started_at, snapshot_ms, snapshot_bytes, `
 // store 是 runcontroller 的存储层。事务之外的只读查询直接使用连接池。
 type store struct {
 	pool *pgxpool.Pool
+
+	// 以下两个钩子只由测试经 export_test.go 安装。
+	//
+	// commitErrorAfterSuccess 在 Commit 成功之后调用；返回非 nil 时 inTx 把
+	// 它当作提交错误返回，用来模拟“提交实际成功却返回错误”。
+	commitErrorAfterSuccess func() error
+	// afterCommitError 在 Commit 返回错误之后、调用方判定结果之前调用，
+	// 用来在报错与判定之间插入另一个事务。
+	afterCommitError func()
+	// commitStatusError 在设置后替代 pg_xact_status 查询并返回错误，用来让
+	// 判定结果的重试全部失败。
+	commitStatusError func() error
+	hookMu            sync.Mutex
+}
+
+func (s *store) setCommitErrorAfterSuccess(fn func() error) {
+	s.hookMu.Lock()
+	s.commitErrorAfterSuccess = fn
+	s.hookMu.Unlock()
+}
+
+func (s *store) commitErrorHook() func() error {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.commitErrorAfterSuccess
+}
+
+func (s *store) setAfterCommitError(fn func()) {
+	s.hookMu.Lock()
+	s.afterCommitError = fn
+	s.hookMu.Unlock()
+}
+
+func (s *store) afterCommitErrorHook() func() {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.afterCommitError
+}
+
+func (s *store) setCommitStatusError(fn func() error) {
+	s.hookMu.Lock()
+	s.commitStatusError = fn
+	s.hookMu.Unlock()
+}
+
+func (s *store) commitStatusErrorHook() func() error {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.commitStatusError
 }
 
 func newStore(pool *pgxpool.Pool) *store {
@@ -83,17 +133,35 @@ type storeTx struct {
 	ctx    context.Context
 	tx     pgx.Tx
 	locked map[string]struct{} // 本事务已经用 lockRun 锁定的运行实例
-	// versions 记录本事务最后一次 updateRun 写入的 version，提交结果不确定
-	// 时用它重读判定事务是否已提交。
-	versions map[string]int64
 }
 
 // commitError 标记 fn 成功但 Commit 返回错误。此时事务是否已提交不确定，
-// 调用方要用新的连接重读 version 判定。
-type commitError struct{ err error }
+// 调用方要用新连接按 txid 查询事务状态判定。
+type commitError struct {
+	txid string
+	err  error
+}
 
 func (e *commitError) Error() string { return e.err.Error() }
 func (e *commitError) Unwrap() error { return e.err }
+
+// commitOutcome 是 pg_xact_status 给出的提交结果。
+type commitOutcome int
+
+const (
+	// commitUnknown 表示重试用尽后仍无法判定。
+	commitUnknown commitOutcome = iota
+	commitAborted
+	commitCommitted
+)
+
+// 提交结果的查询上限：最多 10 次，间隔从 50 ms 起翻倍、上限 1 s，总计约
+// 5.5 s。超过上限仍为 in progress 或查询失败时按 commitUnknown 处理。
+const (
+	commitStatusAttempts     = 10
+	commitStatusInitialDelay = 50 * time.Millisecond
+	commitStatusMaxDelay     = 1 * time.Second
+)
 
 // txTimeout 是一次规则事务的上限。事务使用 context.WithoutCancel 开始的 ctx，
 // 调用方取消不影响已开始的事务，超时由这个上限兜底。
@@ -116,18 +184,74 @@ func (s *store) inTx(ctx context.Context, fn func(tx *storeTx) error) error {
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 
+	// Record the transaction ID before anything else. It is the only reliable
+	// way to decide the outcome when Commit itself returns an error: neither
+	// the connection nor any row version can tell a commit apart from a
+	// rollback after another transaction has changed the row.
+	var txid string
+	if err := tx.QueryRow(txCtx, `SELECT pg_current_xact_id()::text`).Scan(&txid); err != nil {
+		return fmt.Errorf("runcontroller: read transaction id: %w", err)
+	}
+
 	if err := fn(&storeTx{ctx: txCtx, tx: tx, locked: make(map[string]struct{})}); err != nil {
 		return err
 	}
-	if err := tx.Commit(txCtx); err != nil {
-		return &commitError{err: err}
+	commitErr := tx.Commit(txCtx)
+	if commitErr == nil {
+		// A test hook may pretend the commit failed although it succeeded.
+		if hook := s.commitErrorHook(); hook != nil {
+			commitErr = hook()
+		}
+	}
+	if commitErr != nil {
+		if hook := s.afterCommitErrorHook(); hook != nil {
+			hook()
+		}
+		return &commitError{txid: txid, err: commitErr}
 	}
 	return nil
 }
 
-// writtenVersion 返回本事务为 runID 写入的 version，没有写入过为 0。
-func (t *storeTx) writtenVersion(runID string) int64 {
-	return t.versions[runID]
+// commitOutcome asks PostgreSQL whether the transaction with ce.txid
+// committed. "in progress" and query failures are retried a bounded number of
+// times; when the retries run out the outcome is commitUnknown.
+func (s *store) commitOutcome(ce *commitError) commitOutcome {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	delay := commitStatusInitialDelay
+	for attempt := 0; attempt < commitStatusAttempts; attempt++ {
+		var status *string
+		var err error
+		if hook := s.commitStatusErrorHook(); hook != nil {
+			err = hook()
+		} else {
+			err = s.pool.QueryRow(ctx, `SELECT pg_xact_status($1::xid8)`, ce.txid).Scan(&status)
+		}
+		if err == nil && status != nil {
+			switch *status {
+			case "committed":
+				return commitCommitted
+			case "aborted":
+				return commitAborted
+			}
+		}
+		if attempt == commitStatusAttempts-1 {
+			break
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return commitUnknown
+		}
+		if delay < commitStatusMaxDelay {
+			delay *= 2
+			if delay > commitStatusMaxDelay {
+				delay = commitStatusMaxDelay
+			}
+		}
+	}
+	return commitUnknown
 }
 
 // requireLock 确认本事务已经锁定了该运行实例。会读取已有行内容再决定如何
@@ -174,60 +298,32 @@ func (t *storeTx) lockRun(runID string) (runRow, error) {
 	return r, nil
 }
 
-// updateRun 写回 runRow 的全部可变列并把 version 加一，记录本事务写入的值。
-// 调用前必须已用 lockRun 锁定该行；未锁先写返回 errRunNotLocked。行不存在时
-// updateRun 返回 ErrNotFound，但正常路径上 lockRun 已经先把它挡掉。
+// updateRun 写回 runRow 的全部可变列。调用前必须已用 lockRun 锁定该行；
+// 未锁先写返回 errRunNotLocked。行不存在时 updateRun 返回 ErrNotFound，但
+// 正常路径上 lockRun 已经先把它挡掉。
+//
+// 提交结果只按事务状态判定，不再依赖 version 列；该列保留只为兼容已有
+// 数据库，仍然递增但没有任何读取方。
 func (t *storeTx) updateRun(r runRow) error {
 	if err := t.requireLock(r.RunID); err != nil {
 		return err
 	}
-	var version int64
-	err := t.tx.QueryRow(t.ctx, `UPDATE run SET
+	tag, err := t.tx.Exec(t.ctx, `UPDATE run SET
 		state = $2, substate = $3, actor_name = $4, next_inbox_seq = $5,
 		delivered_through = $6, idle_since = $7, provision_returned_at = $8,
 		failure_reason = $9, ended_at = $10, version = version + 1
-	WHERE run_id = $1
-	RETURNING version`,
+	WHERE run_id = $1`,
 		r.RunID, r.State, r.Substate, r.ActorName, r.NextInboxSeq,
 		r.DeliveredThrough, r.IdleSince, r.ProvisionReturnedAt,
 		r.FailureReason, r.EndedAt,
-	).Scan(&version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
-	}
+	)
 	if err != nil {
 		return fmt.Errorf("runcontroller: update run %s: %w", r.RunID, err)
 	}
-	if t.versions == nil {
-		t.versions = make(map[string]int64)
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
 	}
-	t.versions[r.RunID] = version
 	return nil
-}
-
-// runVersion 读取运行实例当前的 version。它用于提交通道返回错误后判定事务
-// 是否其实已经提交。
-func (s *store) runVersion(ctx context.Context, runID string) (int64, error) {
-	var version int64
-	err := s.pool.QueryRow(ctx, `SELECT version FROM run WHERE run_id = $1`, runID).Scan(&version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, ErrNotFound
-	}
-	if err != nil {
-		return 0, fmt.Errorf("runcontroller: read version of %s: %w", runID, err)
-	}
-	return version, nil
-}
-
-// runExists 报告运行实例是否已写入。Create 的提交通道返回错误时，行存在就
-// 说明插入已提交：run_id 随机生成，不会有别的实例插入同一行。
-func (s *store) runExists(ctx context.Context, runID string) (bool, error) {
-	var exists bool
-	if err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM run WHERE run_id = $1)`, runID).Scan(&exists); err != nil {
-		return false, fmt.Errorf("runcontroller: check run %s: %w", runID, err)
-	}
-	return exists, nil
 }
 
 // insertInbox 写入一条收件箱消息。它只新增行，不读取已有行的内容，

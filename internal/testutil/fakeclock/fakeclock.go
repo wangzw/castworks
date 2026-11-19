@@ -67,7 +67,8 @@ func (c *Clock) NewTimer(d time.Duration) runcontroller.Timer {
 		deadline: now.Add(d),
 		ch:       make(chan time.Time, 1),
 	}
-	if !t.deadline.After(now) {
+	fireNow := !t.deadline.After(now)
+	if fireNow {
 		t.fired = true
 	} else {
 		c.timers = append(c.timers, t)
@@ -75,8 +76,10 @@ func (c *Clock) NewTimer(d time.Duration) runcontroller.Timer {
 	c.wake()
 	c.mu.Unlock()
 
-	if t.fired {
+	if fireNow {
 		// The channel is fresh and buffered, so this send cannot block.
+		// Read the local flag rather than t.fired: Advance may already have
+		// taken the lock and written that field.
 		t.ch <- now
 	}
 	return t
