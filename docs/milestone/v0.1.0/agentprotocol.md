@@ -81,7 +81,9 @@ message ControlFrame {
 ## 与设计的差异
 
 - 信封只有 `run_id`。设计中的 `generation`、`msg_seq`、`ack_msg_seq`、`sent_at` 与 `protocol_version` 都不实现：v0.1.0 每个运行实例只有一代，流上不重放，也不协商协议版本。
-- `Hello` 不携带令牌、租约、实例公钥与持有证明，不做认证。
+- `Hello` 不携带令牌、租约、实例公钥与持有证明，不做认证；不实现 `Challenge`，控制面不先发挑战。
+- 不实现 `Fenced`、`Close` 等关闭帧，流的关闭以上文的 gRPC 状态码表达；看守进程到控制面方向也不跨连接重放，`turn_ended` 的丢失由 `Hello.last_turn` 补齐。
+- keepalive 与重连退避取上文的取值，不取设计中的 `T_keepalive`、`T_keepalive_timeout`、`T_reconnect_min` 与 `T_reconnect_max`。
 - `HelloAck.llm_credential` 与 `turn_ended.output` 是设计中没有的字段。前者是安全让步，后者让命令行能显示回合结果。
 - `Deliver` 的投递目标固定为下一条用户消息，批内只有文本。
 - 不实现 `Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`PrepareSuspend`、`Resumed` 等其余消息。挂起由控制面直接调用 Substrate 完成，看守进程不参与，也不知道自己被挂起过。

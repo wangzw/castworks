@@ -23,6 +23,7 @@
 | REF-otel-genai-semconv | OpenTelemetry GenAI semantic conventions | 生成式 AI 调用的追踪、指标与事件属性约定（gen_ai.*） | <https://github.com/open-telemetry/semantic-conventions-genai> | — |
 | REF-anthropic-streaming | Streaming Messages（Claude API 文档） | Claude Messages API 的服务器发送事件流格式，含内容事件与 ping 保活事件 | <https://platform.claude.com/docs/en/build-with-claude/streaming> | anthropic-version 2023-06-01 |
 | REF-spiffe | SPIFFE | 工作负载身份标准：SPIFFE ID 与可验证身份文档（SVID） | <https://spiffe.io/docs/latest/spiffe-about/overview/> | — |
+| REF-rfc8785 | RFC 8785: JSON Canonicalization Scheme (JCS) | IETF 发布的 JSON 规范化方案：字符串转义、按 UTF-16 码元排序对象成员、去除空白与基于 ECMAScript 的数字序列化，供对 JSON 数据做哈希与签名 | <https://www.rfc-editor.org/rfc/rfc8785> | — |
 | REF-envoy | Envoy Proxy 文档 | 云原生服务代理，提供 CONNECT 终止、内部监听器、`ext_authz`、`ext_proc` 与 dynamic forward proxy 过滤器 | <https://www.envoyproxy.io/docs/envoy/latest/> | — |
 | REF-kagent | kagent（kagent-dev/kagent） | 开源的 Kubernetes Agent 平台，以 Harness 资源声明 Agent，可运行在 Agent Substrate 之上，覆盖会话、回合边界的挂起与恢复、出口凭据替换 | <https://github.com/kagent-dev/kagent> | v1.0.1 |
 | REF-claude-managed-agents | Claude Managed Agents | Anthropic 的托管 Agent 服务文档，覆盖 Agent、环境、会话与事件，含会话状态、沙箱检查点、工具确认与自托管沙箱 | <https://platform.claude.com/docs/en/managed-agents/overview> | managed-agents-2026-04-01 |

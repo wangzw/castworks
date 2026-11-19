@@ -33,7 +33,7 @@
 - 看守进程必须是沙箱容器的 PID 1，回收子进程、处理信号并监督 Agent 进程树；Agent 以运行实例 uid 启动，设置 `no_new_privs` 并清空 capability bounding set。
 - 看守进程必须实现 Agent 驱动器接口、本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、活动度采集、租约续约、投递意图日志与出站流；这些职责不能拆分给一个会被冻结或独立重启的进程。
 - 探针只配置在看守进程上：PID 1 是沙箱的稳定入口，k8s 的就绪探针与 PID 1 语义必须落在同一处；探针不能挂在会被冻结或随回合重建的 Agent 进程上。解冻与 preStop 的顺序由冻结粒度决定，见 [ADR-freeze-via-node-agent](adr-freeze-via-node-agent.md)。
-- 看守进程崩溃时，控制面必须按沙箱丢失处理，重建沙箱，并通知 Agent 回合已被中断。
+- 看守进程崩溃或退出时，控制面必须按沙箱丢失处理，重建沙箱，并通知 Agent 回合已被中断。出站流不可恢复时看守进程主动退出，沿用同一路径（[ADR-unrecoverable-stream-failure-rebuilds-sandbox](adr-unrecoverable-stream-failure-rebuilds-sandbox.md)）。
 - 销毁执行前必须把恢复句柄落库；重建后以恢复句柄续接会话。
 - 看守进程留在父 cgroup，Agent 进程树位于节点冻结代理维护的 `agent` 子 cgroup；看守进程以停止态启动 Agent 主进程，并与节点冻结代理协调把它移入该子 cgroup 后再继续（[ADR-freeze-via-node-agent](adr-freeze-via-node-agent.md)）。
 

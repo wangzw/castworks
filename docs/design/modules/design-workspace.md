@@ -19,7 +19,7 @@
 - **确认持久化**：在销毁沙箱前按持久化语义执行持久化确认；`sync` 等待工作区写入的 fsync 完成，`on_suspend` 等待同步挂起的对象存储上传完成；确认失败时不产生可销毁的结论。
 - **报告持久化语义**：把绑定的 `durability` 随租约建立、接管与查询返回；`runcontroller` 从 `CreateLease`、`TakeoverLease` 的返回与 `GetLease` 的查询取得并持久化，控制面据此选择销毁前的确认方式，不自行推断。
 - **提供沙箱外文件访问**：以文件访问接口接收 `humanchannel` 的读取请求，请求携带已认证用户与绑定到运行实例和用户的[接入票据](../../glossary.md)，并原样转发到看守进程的文件 API；按存储模式直接读取导出或经入站路由到达看守进程；文件访问可能唤醒快照态或销毁态的沙箱。
-- **提供文件 API**：在看守进程内提供列表、读取、下载与流式读取，路径限定在运行实例子目录内，按[接入票据](../../glossary.md)、看守进程持有的[运行实例令牌](../../glossary.md)、代与[实时接入](../../glossary.md)状态鉴权；写入与上传由 `ToolExec` 的文件写在租约持有者内执行，读写都不绕过租约持有者。
+- **提供文件 API**：在看守进程内提供列表、读取、下载与流式读取，路径限定在运行实例子目录内，按[接入票据](../../glossary.md)、看守进程持有的[运行实例令牌](../../glossary.md)、代与[实时接入](../../glossary.md)状态鉴权；文件 API 只读，第一版没有面向用户的上传或写入接口；`ToolExec` 的文件写只由控制面循环驱动器使用，在租约持有者内执行，读写都不绕过租约持有者。
 - **施加隔离与配额**：以运行实例 uid、`no_new_privs`、清空 capability bounding set、目录权限 0700 与挂载根 0711、每运行实例目录配额、`no_root_squash` 或 `seteuid` 创建方式，把工作区限制在该运行实例子目录内；`no_root_squash` 只为[节点挂载代理](../../glossary.md)以 root 创建运行实例子目录所需；认领过的预热 Pod 不回收复用。
 - **固定工作区布局**：在运行实例子目录内固定 Agent 状态目录、[投递意图日志](../../glossary.md)与已初始化标记的位置，使各代沙箱以逐字一致的路径挂载并以该路径为 Agent 的 cwd；这些状态不放在 rootfs。
 - **维护释放墓碑**：在显式结束或放弃时以 `ReleaseRunLease` 释放运行实例的租约并留下墓碑；墓碑之后拒绝该 `run_id` 的一切租约创建与接管，迟到执行器无法在释放之后重建租约。
@@ -110,6 +110,7 @@ type LeaseService interface {
     CreateLease(ctx context.Context, runID RunID, generation int, attemptID string) (Lease, error)
     TakeoverLease(ctx context.Context, runID RunID, generation int, attemptID string, proof *DeleteProof) (TakeoverResult, error)
     SetHolderKey(ctx context.Context, runID RunID, leaseID string, generation int, instanceJKT string) error
+    // 持有证明时窗不符时返回可重试错误 proof_time_skew，错误详情携带 server_now（服务端当前时刻）
     RenewLease(ctx context.Context, leaseID string, generation int, sandboxID string, proof HolderProof) error
     HoldLease(ctx context.Context, runID RunID, leaseID string, generation int, until time.Time, holder string) error
     ReleaseLease(ctx context.Context, runID RunID, generation int) error
@@ -119,8 +120,8 @@ type LeaseService interface {
 
 type HolderProof struct {
     InstanceKey json.RawMessage // 实例公钥 JWK
-    IAt         int64           // 签名时刻，Unix 秒
-    Sig         string          // 实例私钥的 Ed25519 签名，base64url
+    IAt         int64           // 签名时刻，Unix 秒；签名文本里取其十进制值
+    Sig         string          // 实例私钥对续约签名文本的 Ed25519 签名，base64url
 }
 
 type Lease struct {
@@ -152,7 +153,7 @@ type LeaseState struct {
 - `CreateLease` 只用于第 1 代，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约时，请求的代必须大于租约的代，否则返回不可重试的代错误；已有未到期且未释放的租约、或运行实例已有墓碑时拒绝。
 - `TakeoverLease` 用于重建，以 `(run_id, generation, attempt_id)` 幂等，`attempt_id` 取 `resume_id`；同一幂等键的重复调用返回首次结果。运行实例已有租约且请求的代不大于 `lease.generation` 时返回不可重试的代错误。运行实例尚无租约时直接建立；旧租约已到期时不需要 `proof`；旧租约未到期时只在 `proof` 是沙箱提供者整代销毁的删除确认、其 `run_id` 等于 `run_id`、且其携带的代等于 `lease.generation` 时接管；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`；其余情形返回旧租约的到期时刻作为 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
 - `SetHolderKey` 由 `sandboxprovider` 在引导接口返回领取响应之前调用，把沙箱实例的公钥指纹登记为租约的 `holder_jkt`。CAS 条件为 `lease_id` 与代匹配、`released=false`、`holder_jkt` 为空或相等；不满足时返回不可重试错误。`CreateLease` 与 `TakeoverLease` 建立的租约 `holder_jkt` 为空。
-- `RenewLease` 由看守进程周期调用，只在面向沙箱的端点 `lease` 上提供。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。调用以 `lease_id`、代与[持有证明](../../glossary.md)认证：`instance_jkt(proof.InstanceKey)` 必须等于 `lease.holder_jkt`，`proof.Sig` 有效且 `|now − proof.IAt| ≤ T_proof_skew`（60 s），否则以不可重试错误拒绝。它不经 `secrets` 校验运行实例令牌，也不以令牌未过期为前提。
+- `RenewLease` 由看守进程周期调用，只在面向沙箱的端点 `lease` 上提供。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。调用以 `lease_id`、代与[持有证明](../../glossary.md)认证：`instance_jkt(proof.InstanceKey)` 必须等于 `lease.holder_jkt`，`proof.Sig` 必须是实例私钥对 UTF-8 文本 `castworks-holder-proof\nrenew\n<lease_id>\n<generation>\n<sandbox_id>\n<iat>` 的有效 Ed25519 签名（`\n` 为换行，`iat` 为十进制 Unix 秒，其余各项取自调用参数），指纹不符或签名无效时以不可重试错误拒绝。续约是没有服务端挑战的一次性调用，以时间戳限制证明的有效期：先核对指纹与签名，再要求 `|now − proof.IAt| ≤ T_proof_skew`（60 s）；时窗不符时以可重试错误 `proof_time_skew` 拒绝，错误详情携带字段 `server_now`（服务端当前时刻），看守进程据此校时后重试：周期续约重试一次，重试仍失败才按无法续约处理；首次续约连续被拒时按可重试错误退避重试，见[看守进程的义务](#工作区租约的建立续约与接管)。它不经 `secrets` 校验运行实例令牌，也不以令牌未过期为前提。
 - `HoldLease` 用于快照期间：以 `lease_id`、代匹配、`released=false` 且持有者为空或等于 `holder` 为 CAS 条件，把到期时刻设为 `until` 并清空持有者；`holder_jkt` 不清空。快照恢复的沙箱以首次续约重新绑定。持有者已是其他沙箱时为空操作。
 - `ReleaseLease` 只在同代沙箱的删除确认之后调用，以 `lease.generation=generation` 为 CAS 条件；租约已被更大的代接管时为空操作。释放把租约标记为已释放并清空持有者，`expires_at` 不变，此后 `RenewLease` 以 CAS 失败返回；释放本身不构成接管条件。
 - `ReleaseRunLease` 用于显式结束与放弃，不论租约的代为何值都释放并留下墓碑；此后该 `run_id` 的 `CreateLease` 与 `TakeoverLease` 一律返回不可重试的墓碑错误。
@@ -190,7 +191,7 @@ type ConfirmResult struct {
 
 ### 文件 API
 
-文件 API 在看守进程内运行，经沙箱提供者的入站路由到达，供 `humanchannel` 经 `workspace` 转发的沙箱外文件访问使用。操作集合是闭集，只提供读取；写入与上传由 `ToolExec` 的文件写承担。
+文件 API 在看守进程内运行，经沙箱提供者的入站路由到达，供 `humanchannel` 经 `workspace` 转发的沙箱外文件访问使用。操作集合是闭集，只提供读取，没有写入与上传操作；`ToolExec` 的文件写只由控制面循环驱动器使用，第一版没有面向用户的上传或写入接口。
 
 ```go
 type FileAPI interface {
@@ -243,8 +244,8 @@ type ListResult struct {
 | `Stream` | 从给定偏移持续读取，供日志与会话记录的断线续传 |
 
 - 路径以运行实例子目录为根逐段解析，拒绝 `..`、绝对路径与指向根外的符号链接；越界返回不可重试的路径错误。
-- `workspace` 把 `FileAccess` 请求中的 `Ticket` 放进请求头 `x-castworks-access-ticket`，经入站路由原样转发。看守进程校验票据的签名、`aud=warden`、`run_id`、代、`channel=file`、有效期与一次性 `jti`（规则见 [agentprotocol](design-agentprotocol.md) 的入站端点契约）；不通过时返回 401、不读文件并计数 `access_ticket_rejected`。看守进程另以自身持有的运行实例令牌核对请求携带的代，并校验当前租约的持有者为自身；读取发生在租约持有者内，不绕过单写者边界。读取要求 `file` 实时接入有效。
-- 文件访问可能唤醒快照态与销毁态的沙箱：`humanchannel` 先写入 `file` 接入事实并签发接入票据，再由 `workspace` 携带票据经入站路由到达文件 API；`ui_session` 接入不唤醒沙箱。
+- `workspace` 把 `FileAccess` 请求中的 `Ticket` 放进请求头 `x-castworks-access-ticket`，经入站路由原样转发。看守进程校验票据的签名、`aud=warden`、`run_id`、代、`channel=file` 与有效期（规则见 [agentprotocol](design-agentprotocol.md) 的入站端点契约）；`channel=file` 的票据在有效期内可用于同一 `sub`、同一 `run_id`、同一代的多次只读请求，看守进程不对它做 `jti` 一次性检查；不通过时返回 401、不读文件并计数 `access_ticket_rejected`。看守进程另以自身持有的运行实例令牌核对请求携带的代，并校验当前租约的持有者为自身；读取发生在租约持有者内，不绕过单写者边界。读取要求 `file` 实时接入有效。
+- 文件访问可能唤醒快照态与销毁态的沙箱：`humanchannel` 先写入 `file` 接入事实并取得接入票据（有效票据复用，剩余有效期不足时重新申请），再由 `workspace` 携带票据经入站路由到达文件 API；`ui_session` 接入不唤醒沙箱。
 - 错误分类：路径越界、接入票据无效、令牌无效、代不匹配、租约非持有者、文件不存在与偏移非法为不可重试；存储暂时不可用为可重试。
 
 ### 沙箱外读取接口
@@ -274,14 +275,14 @@ type ReadCapability struct {
 ```
 
 - `Capability` 报告绑定的读取能力：`external_csi` 的导出在可直接读取时 `Direct` 为真；`shared_fs` 只挂载在沙箱节点池、控制面没有该挂载，`block` 为 RWO 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级读取接口，三者的 `Direct` 均为假。`Direct` 为假时 `RequiresFileAttach` 为真。
-- `humanchannel` 在调用前校验用户身份、项目归属与[项目角色](../../glossary.md)，写入 `file` 接入事实并签发接入票据；本模块校验运行实例、代与绑定的归属，不信任调用方传入的路径根。读取方法（`List`、`Read`、`Stream`）要求 `Ticket` 非空并原样转发。
-- 直接读取沿用文件 API 的路径解析：以运行实例子目录为根逐段解析，拒绝 `..`、绝对路径与指向根外的符号链接，越界返回 `ErrPathOutsideWorkspace`。读取在 `Direct` 为真且沙箱无需参与时直接读取存储导出；其余情形经沙箱提供者的入站路由转发到当前代看守进程的文件 API，必要时唤醒沙箱。写入与上传不走直接导出，由 `ToolExec` 的文件写在租约持有者内执行。
+- `humanchannel` 在调用前校验用户身份、项目归属与[项目角色](../../glossary.md)，写入 `file` 接入事实并取得接入票据；本模块校验运行实例、代与绑定的归属，不信任调用方传入的路径根。读取方法（`List`、`Read`、`Stream`）要求 `Ticket` 非空并原样转发。
+- 直接读取沿用文件 API 的路径解析：以运行实例子目录为根逐段解析，拒绝 `..`、绝对路径与指向根外的符号链接，越界返回 `ErrPathOutsideWorkspace`。读取在 `Direct` 为真且沙箱无需参与时直接读取存储导出；其余情形经沙箱提供者的入站路由转发到当前代看守进程的文件 API，必要时唤醒沙箱。写入不走直接导出；`ToolExec` 的文件写只由控制面循环驱动器使用，在租约持有者内执行。
 - 接入票据由 `humanchannel` 经 `secrets.IssueAccessTicket` 签发，`workspace` 不持有签名密钥，只原样转发；经看守进程的读取由看守进程验签，直接读取的授权由唯一调用方 `humanchannel` 的 SPIFFE 身份与其在调用前完成的项目角色判定保证（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)）。
-- 接口只提供读；下载与流式读取由文件 API 承担；写入与上传由 `ToolExec` 的文件写承担，不经过沙箱外读取接口，使所有写操作经过租约持有者。
+- 接口只提供读，第一版没有面向用户的上传或写入接口；下载与流式读取由文件 API 承担；`ToolExec` 的文件写只由控制面循环驱动器使用，不经过沙箱外读取接口，使所有写操作经过租约持有者。
 
 ## 依赖
 
-依赖方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块是基础层，不依赖 `runcontroller`、`sandboxprovider`、`warden` 与事件源模块。`runcontroller`、`sandboxprovider` 与 `humanchannel` 依赖本模块；本模块对沙箱提供者入站路由、看守进程文件 API 与 `ToolExec` 文件写的调用是运行时调用，不是代码依赖。`workspace` 的节点侧部分链接进[节点挂载代理](../../glossary.md)、沙箱侧部分链接进看守进程，是模块的实现位置，不构成对 `sandboxprovider` 或 `warden` 模块的调用（[ADR-per-run-workspace-mount](../../adr/adr-per-run-workspace-mount.md)）。
+依赖方向与[模块依赖图](../architecture.md#模块依赖图)一致：本模块是基础层，不依赖 `runcontroller`、`sandboxprovider`、`warden` 与事件源模块。`runcontroller`、`sandboxprovider` 与 `humanchannel` 依赖本模块；本模块对沙箱提供者入站路由与看守进程文件 API 的调用是运行时调用，不是代码依赖。`workspace` 的节点侧部分链接进[节点挂载代理](../../glossary.md)、沙箱侧部分链接进看守进程，是模块的实现位置，不构成对 `sandboxprovider` 或 `warden` 模块的调用（[ADR-per-run-workspace-mount](../../adr/adr-per-run-workspace-mount.md)）。
 
 - **PostgreSQL**：保存绑定记录、租约行与释放墓碑；租约的建立、接管、续约、持有者清空与释放都在数据库事务内以条件 UPDATE 完成。
 - **RWX 共享文件系统**：k8s 提供者的默认工作区承载，例如 CephFS、JuiceFS、NFS 或 EFS 类。挂载根只由[节点挂载代理](../../glossary.md)在节点上挂载，不进入任何沙箱 Pod 与预热 Pod；Pod 以 CSI 内联临时卷 `castworks-workspace` 挂载工作区挂载路径（`Binding.MountPath`，各代逐字一致），`mountPropagation: HostToContainer`。预热池与认领由 SandboxWarmPool 与 SandboxClaim 承担（[REF-agent-sandbox](../../references.md)）。
@@ -289,7 +290,7 @@ type ReadCapability struct {
 - **Substrate actor 卷**：actor 只接受 `durableDir`、`external`、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷。`external` 即外部 CSI 卷，每 actor 一卷；`durableDir` 在挂起时上传对象存储。
 - **对象存储**：承载 `durableDir` 的上传数据；同步挂起上传完成后，工作区才可被判定为持久化。
 - **沙箱提供者的入站路由**：运行时把沙箱外文件访问转发到当前代看守进程的文件 API；k8s 路径为 `wake-router`，Substrate 路径为路由器。本模块不区分路由实现。
-- **看守进程**：文件 API 在沙箱侧执行，写入与上传由 `ToolExec` 的文件写在沙箱侧执行；`fsync` 确认由看守进程执行，`on_suspend` 确认在销毁路径执行。看守进程还承担周期续约与 `LeaseLost` 上报，本模块只维护租约本身。
+- **看守进程**：文件 API 在沙箱侧执行，`ToolExec` 的文件写由控制面循环驱动器经出站流发起、在沙箱侧执行；`fsync` 确认由看守进程执行，`on_suspend` 确认在销毁路径执行。看守进程还承担周期续约与 `LeaseLost` 上报，本模块只维护租约本身。
 - **`secrets` 与运行实例令牌**：文件 API 的鉴权由看守进程校验接入票据并以自身持有的运行实例令牌核对代与实时接入状态完成；本模块不持有令牌与接入票据签名密钥，也不校验令牌或票据。
 
 ## UML 图
@@ -378,7 +379,7 @@ sequenceDiagram
     U->>H: 文件请求
     H->>H: 校验用户身份、项目归属与项目角色
     H->>C: 写入 file 接入事实
-    H->>H: secrets.IssueAccessTicket 签发接入票据
+    H->>H: 取得 file 接入票据（有效票据复用，剩余有效期不足时经 secrets.IssueAccessTicket 重新申请）
     C->>C: 必要时按恢复准入唤醒快照态或销毁态的沙箱
     H-->>U: 运行实例可接收后应答
     H->>W: FileAccess.Read（已认证用户、Ticket）
@@ -400,7 +401,7 @@ sequenceDiagram
     H-->>U: 内容或错误
 ```
 
-直接读取分支只用于 `external_csi` 的读，其余读取进入看守进程分支。经看守进程的读取可能唤醒快照态或销毁态的沙箱：`humanchannel` 先校验用户与项目角色、写入 `file` 接入事实并签发票据，`runcontroller` 按恢复准入唤醒；入站路由在 `/readyz` 就绪后转发，不负责 k8s 销毁态沙箱的重建。文件内容经 `humanchannel` 返回界面，不进入收件箱。写入与上传由 `ToolExec` 的文件写经同一租约持有者执行，不经过本时序图的读取路径。入站路由的失败与看守进程的错误分别返回，调用方据错误类别决定重试或向用户呈现。
+直接读取分支只用于 `external_csi` 的读，其余读取进入看守进程分支。经看守进程的读取可能唤醒快照态或销毁态的沙箱：`humanchannel` 先校验用户与项目角色、写入 `file` 接入事实并取得票据，`runcontroller` 按恢复准入唤醒；入站路由在 `/readyz` 就绪后转发，不负责 k8s 销毁态沙箱的重建。文件内容经 `humanchannel` 返回界面，不进入收件箱。`ToolExec` 的文件写只由控制面循环驱动器使用，经同一租约持有者执行，不经过本时序图的读取路径；第一版没有面向用户的上传或写入接口。入站路由的失败与看守进程的错误分别返回，调用方据错误类别决定重试或向用户呈现。
 
 ## 核心数据结构
 
@@ -443,7 +444,7 @@ sequenceDiagram
 
 第 5 步的替代路径：旧租约已到期时 `proof` 可为空；旧租约未到期且 `proof` 为空、不是整代销毁的删除确认或代不匹配时返回 `NotBefore=expires_at`，调用方等待到期后重试，不产生新租约。第 4 步先释放再接管不是必需顺序：第 1 代整代销毁的删除确认也可以直接作为第 5 步的 `proof`，任一顺序都要求 `proof` 的代为租约所属的代。
 
-Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之后：快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)`，持久化结果为 `holder=null`、`holder_jkt=jkt-1`、`expires_at=now+2T_lease`；快照恢复沿用同一沙箱，看守进程以首次续约 `RenewLease(L1, 1, sb-1, proof)` 重新绑定 `holder=sb-1`。k8s 提供者不具备快照能力，不经过这两步；第 2 步起的租约步骤在两个提供者上相同，第 1 步的存储模式按提供者选择，见[绑定与存储模式选择](#绑定与存储模式选择)。
+Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之后：快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)`，持久化结果为 `holder=null`、`holder_jkt=jkt-1`、`expires_at=now+2T_lease`；快照恢复沿用同一沙箱，看守进程以首次续约 `RenewLease(L1, 1, sb-1, proof)` 重新绑定 `holder=sb-1`，续约成功之后才重建出站流并发 `Hello`。k8s 提供者不具备快照能力，不经过这两步；第 2 步起的租约步骤在两个提供者上相同，第 1 步的存储模式按提供者选择，见[绑定与存储模式选择](#绑定与存储模式选择)。
 
 ### 绑定与存储模式选择
 
@@ -456,11 +457,11 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 ### 工作区租约的建立、续约与接管
 
 1. **建立**：第 1 代由 `CreateLease` 建立，`attempt_id` 取 `resume_id`。运行实例已有租约时，请求的代必须大于租约的代，否则返回不可重试的代错误；已有未到期且未释放的租约时返回冲突；已有墓碑时返回墓碑错误。相同 `(run_id, generation, attempt_id)` 的重复调用返回同一 `lease_id` 与 `durability`。
-2. **续约**：看守进程按小于租约有效期的周期调用 `RenewLease`，附以实例私钥生成的持有证明。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`、持有者为空或等于 `sandbox_id`；持有者为空时本次续约绑定持有者。持有证明的实例公钥指纹必须等于 `holder_jkt`，签名与时窗必须有效。持有者不同、持有证明无效、租约已释放或已到期时 CAS 失败，调用方停止写入并按续约失败处理。
+2. **续约**：看守进程按小于租约有效期的周期调用 `RenewLease`，附以实例私钥生成的持有证明。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at > now()`、持有者为空或等于 `sandbox_id`；持有者为空时本次续约绑定持有者。持有证明的实例公钥指纹必须等于 `holder_jkt`，签名与时窗必须有效；时窗不符时以可重试错误 `proof_time_skew` 拒绝，错误详情携带 `server_now`（服务端当前时刻），看守进程校时后重试，周期续约重试一次，首次续约见下文的看守进程的义务。持有者不同、持有证明的指纹或签名无效、租约已释放或已到期时拒绝续约（不可重试），看守进程按无法续约处理，停止写入并执行本地保护动作。
 3. **快照持有**：快照前调用 `HoldLease`，把到期时刻延长到快照保留期可覆盖的范围并清空持有者，`holder_jkt` 保留。清空持有者使快照恢复的沙箱实例以首次续约重新绑定；旧沙箱在快照期间不再执行，迟到的续约由 CAS 的 `expires_at`、持有证明与执行顺序决定，不与快照恢复并发写入。
 4. **接管**：重建时调用 `TakeoverLease`，`attempt_id` 取 `resume_id`。请求的代必须大于当前租约的代，同一幂等键的重复调用除外。运行实例尚无租约时直接建立；旧租约已到期时无需 `proof`；旧租约未到期时只接受沙箱提供者整代销毁的删除确认作为 `proof`，且其 `run_id` 相同、代等于 `lease.generation`；`DestroySandbox` 的单个沙箱删除确认不构成 `proof`；其余返回 `NotBefore`。持有者为空与租约已释放都不构成接管条件。
 5. **查询**：`GetLease` 只对 `runcontroller` 开放，返回 `lease_id`、代、持有者、`holder_jkt`、到期时刻、`durability` 与 `released`。调用方以它核对 `Hello`、判断是否可写与选择持久化确认模式。
-6. **看守进程的义务**：首次续约成功之后才发 `Hello`；在 `expires_at` 减时钟余量之前停止向工作区写入；续约失败时冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。本模块不代为执行这些保护动作。
+6. **看守进程的义务**：首次续约成功之后才发 `Hello`，初次领取之后、快照恢复与长时间冻结之后相同；快照恢复或长时间冻结之后先调用 `RenewLease`，续约因时窗不符而失败时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试、不按无法续约处理，这一步同时完成校时，续约成功、`lease.holder` 恢复为本沙箱之后才重建传输，收到 `Challenge` 并按 `server_now` 再校时，再发 `Hello`（握手细节见 [warden](warden/design-warden.md)）；首次续约以可重试错误失败时，看守进程退避重试，不建立传输；以不可重试错误失败时，看守进程停止工作区写入、冻结 Agent 进程树（初次领取之后 Agent 进程树尚未启动，无进程可冻结），仍建立传输并发送 `Hello`，由 `runcontroller` 以 `HelloAck.fenced{reason=lease}` 应答，看守进程按代失效退出，不上报 `LeaseLost`；在 `expires_at` 减时钟余量之前停止向工作区写入；其余情形下无法续约时冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。本模块不代为执行这些保护动作。
 
 ### 释放与墓碑
 
@@ -510,12 +511,12 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 
 ### 文件访问与文件 API
 
-1. **身份与归属**：`humanchannel` 先校验用户身份、项目归属与项目角色并签发接入票据；`workspace` 校验运行实例存在、代匹配且绑定属于该项目，再决定直接读取导出还是经入站路由。
+1. **身份与归属**：`humanchannel` 先校验用户身份、项目归属与项目角色并取得接入票据；`workspace` 校验运行实例存在、代匹配且绑定属于该项目，再决定直接读取导出还是经入站路由。
 2. **路径解析**：文件 API 以运行实例子目录为根逐段解析相对路径，拒绝 `..`、绝对路径与指向根外的符号链接；目录项不跟随越界链接。
 3. **读取**：`Read` 按偏移与长度返回字节流；`Download` 返回整文件；`Stream` 从给定偏移持续读取，供日志与会话记录的断线续传。读取不修改文件。
-4. **写入与上传**：由 `ToolExec` 的文件写在看守进程内执行，要求当前租约持有者是本沙箱；写入先在同目录写入临时文件，fsync 后原子重命名，上传按幂等键校验配额后原子落盘。文件 API 只提供读取，不承担写与上传。
-5. **唤醒**：快照态与销毁态的沙箱不能直接服务文件 API；`humanchannel` 先写入 `file` 接入事实并签发票据，必要时由 `runcontroller` 唤醒沙箱，入站路由在 `/readyz` 就绪后转发。`ui_session` 接入不唤醒沙箱，只约束挂起决策。
-6. **直接读取**：`external_csi` 的导出可直接读取且沙箱无需参与时，`FileAccess` 读取导出，不唤醒沙箱；`shared_fs` 只在沙箱节点池挂载，`block` 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级导出，三者的读取一律经文件 API。直接读取沿用第 2 步的路径解析，并同样只接受 `humanchannel` 的调用。写入与上传从不走直接导出。
+4. **文件写**：`ToolExec` 的文件写只由控制面循环驱动器使用，第一版没有面向用户的上传或写入接口；写入在看守进程内执行，要求当前租约持有者是本沙箱，先在同目录写入临时文件，fsync 后原子重命名，校验配额后落盘。文件 API 只提供读取，不承担写入。
+5. **唤醒**：快照态与销毁态的沙箱不能直接服务文件 API；`humanchannel` 先写入 `file` 接入事实并取得票据，必要时由 `runcontroller` 唤醒沙箱，入站路由在 `/readyz` 就绪后转发。`ui_session` 接入不唤醒沙箱，只约束挂起决策。
+6. **直接读取**：`external_csi` 的导出可直接读取且沙箱无需参与时，`FileAccess` 读取导出，不唤醒沙箱；`shared_fs` 只在沙箱节点池挂载，`block` 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级导出，三者的读取一律经文件 API。直接读取沿用第 2 步的路径解析，并同样只接受 `humanchannel` 的调用。写入从不走直接导出。
 7. **失败**：入站路由失败、沙箱未就绪与文件 API 错误分别返回；调用方按错误类别重试或向用户呈现，不在控制面缓存文件内容。
 
 ### 块存储的亲和与 attach 限制
@@ -538,14 +539,16 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 
 | 失败 | 检测 | 行为 | 调用方可见 |
 | --- | --- | --- | --- |
-| 租约过期 | `RenewLease` 的 CAS 发现 `expires_at <= now()`；`GetLease` 返回已过期的到期时刻 | 旧持有者停止写入，冻结或杀死 Agent 进程树并上报 `LeaseLost`；新代可无 `proof` 接管 | `ErrLeaseExpired`，或 `GetLease` 返回过期状态 |
-| 续约失败 | 数据库不可用、超时、锁等待超时，或持有者不匹配 | 看守进程在到期前重试；仍失败则执行本地保护动作并上报；不自行改写租约 | 暂时性错误或 `ErrNotHolder` |
-| 续约持有证明无效 | `instance_jkt(proof.InstanceKey)` 不等于 `lease.holder_jkt`，签名无效，或 `\|now − proof.IAt\| > T_proof_skew` | 拒绝续约，不延长到期时刻；看守进程按续约失败处理 | 不可重试错误 |
+| 租约过期 | `RenewLease` 的 CAS 发现 `expires_at <= now()`；`GetLease` 返回已过期的到期时刻 | 旧持有者停止写入，冻结或杀死 Agent 进程树并上报 `LeaseLost`（首次续约除外，见[看守进程的义务](#工作区租约的建立续约与接管)）；新代可无 `proof` 接管 | `ErrLeaseExpired`，或 `GetLease` 返回过期状态 |
+| 续约暂时性失败 | 数据库不可用、超时或锁等待超时 | 看守进程在到期前重试；仍失败则按无法续约处理，执行本地保护动作并上报（首次续约除外，见[看守进程的义务](#工作区租约的建立续约与接管)）；不自行改写租约 | 暂时性错误 |
+| 续约持有者不匹配 | `RenewLease` 的 CAS 发现持有者是其他沙箱 | 拒绝续约，不延长到期时刻，不重试；看守进程按无法续约处理，停止写入并执行本地保护动作（首次续约除外，见[看守进程的义务](#工作区租约的建立续约与接管)） | 不可重试错误 `ErrNotHolder` |
+| 续约持有证明无效 | `instance_jkt(proof.InstanceKey)` 不等于 `lease.holder_jkt`，或签名无效 | 拒绝续约，不延长到期时刻；看守进程按无法续约处理（首次续约除外，见[看守进程的义务](#工作区租约的建立续约与接管)） | 不可重试错误 |
+| 续约持有证明时窗不符 | 指纹与签名有效，而 `\|now − proof.IAt\| > T_proof_skew` | 拒绝续约，不延长到期时刻；看守进程据错误详情中的 `server_now` 校时后重试。周期续约重试一次，重试仍失败才按无法续约处理；首次续约连续被拒时按可重试错误退避重试，不按无法续约处理，见[看守进程的义务](#工作区租约的建立续约与接管) | 可重试错误 `proof_time_skew`，详情携带 `server_now`（服务端当前时刻） |
 | 未授权对端 | 对端不是 SPIFFE 身份，或不在该方法的允许集合内 | 拒绝调用，不写入任何行，写审计 | 不可重试的未授权错误 |
 | 接管 `proof` 缺失或代不符 | `TakeoverLease` 发现旧租约未到期，`proof` 为空、不是整代销毁的删除确认、`run_id` 不符或代不等于 `lease.generation` | 不建立新租约，返回旧租约到期时刻；调用方等待到期后重试 | `NotBefore` |
 | `durableDir` 上传失败 | 沙箱提供者的同步挂起返回上传错误，或 `Confirm(suspend_upload)` 核对失败 | 不进入 `Suspended`；销毁路径以同一 `suspend_id` 重试同步挂起；不发出新的 `ReadyToSuspend` | 暂时性错误；重试耗尽由 `runcontroller` 的挂起截止处置 |
 | CSI 不可用 | 绑定时无法供给外部 CSI 卷，或已绑定卷挂接失败 | 绑定时可退到 `durable_dir` 并写入 `on_suspend`；已绑定 `external_csi` 时不静默退化，错误交给 `sandboxprovider` 的预配或恢复路径 | 不可重试的存储错误，或绑定时的退化结果 |
-| 配额耗尽 | 写入或上传前检查失败，或落盘返回空间不足 | 不删除已有文件，不产生部分文件；临时文件清理 | `ErrQuotaExceeded`；Agent 侧写入失败 |
+| 配额耗尽 | 写入前检查失败，或落盘返回空间不足 | 不删除已有文件，不产生部分文件；临时文件清理 | `ErrQuotaExceeded`；Agent 侧写入失败 |
 | 权限错误 | 目录属主或模式不符、`no_root_squash` 与 `seteuid` 都不可用、运行实例 uid 不符 | 绑定探测失败或文件操作拒绝；不绕过权限改写目录 | `ErrPermission` |
 | 路径越界 | 路径含 `..`、为绝对路径或符号链接指向根外 | 拒绝操作，不解析到根外 | `ErrPathOutsideWorkspace` |
 | 代不匹配 | 租约的代与请求的代不同，或请求的代不大于当前租约的代（同一幂等键的重复调用除外） | 拒绝，不产生写入或接管 | `ErrGenerationMismatch` |
@@ -568,7 +571,7 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 
 **释放墓碑。** 墓碑是运行实例级的最终标记，写入后拒绝一切 `CreateLease` 与 `TakeoverLease`。`ReleaseRunLease` 与最后一次租约写入不在同一事务时，写入墓碑之前的接管仍可能成功；因此显式结束与放弃在调用 `ReleaseRunLease` 之前先停止新的接管尝试，`runcontroller` 的效果记录按 `run_id` 幂等执行，迟到执行器看到墓碑后失败。
 
-**文件写入与直接读取。** 文件写入与上传由 `ToolExec` 在租约持有者内执行，因此不存在多个沙箱并发写同一路径。直接读取导出不获取租约，可能与写入并发；写入以同目录临时文件加原子重命名完成，读取看到旧文件或新文件，不看到部分写入。`durable_dir` 没有直接读取，读取与写入都经租约持有者。
+**文件写入与直接读取。** 文件写入由 `ToolExec` 的文件写在租约持有者内执行（只由控制面循环驱动器使用），因此不存在多个沙箱并发写同一路径。直接读取导出不获取租约，可能与写入并发；写入以同目录临时文件加原子重命名完成，读取看到旧文件或新文件，不看到部分写入。`durable_dir` 没有直接读取，读取与写入都经租约持有者。
 
 **事务边界。** 绑定记录、租约行与墓碑在 PostgreSQL 事务内写入；运行实例子目录的创建、权限设置与配额在事务提交后以幂等方式执行。持久化确认与 `durableDir` 上传不在数据库事务内，以 `ReadyToSuspend` 与效果记录的顺序保证销毁前提；确认可重复执行，不产生重复上传或重复租约。文件内容不进入数据库，数据库也不保存文件清单。
 

@@ -24,7 +24,7 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - **EgressPolicy 落地与撤销**：保存 `connectorhub` 推送的每运行实例出口策略；在预配时按 `(run_id, generation)` 落地为 EgressPolicy：策略中 `PlaintextHosts` 的主机落地为 `http` 规则并带其注入规则，其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` 规则并显式列出端口；落地时追加放行控制面主机（`stream`、`lease`、`llm`、`connector`、`human`）的 `tls_passthrough` 规则，使看守进程的出站流、`workspace` 续约、`llmgateway` 请求以及平台 MCP 服务器对 `connectorhub` 与 `humanchannel` 的请求经出口网关透传；`EgressPolicy` 规则上限 256 条，单条规则的主机上限 256，`replaceHeaders` 上限 16，同一主机与端口的规则不得跨 `https` 与 `tls_passthrough` 重复；凭据引用只有 `credential_uri` 与 `actorJwt`，`project_id`、`run_id`、`generation`、`system`、`auth_method` 与 `scopes` 编码在 `ate-secret://<provider-class>/<provider-name>/...` 的路径段中，由凭据提供者解析，出口网关按 URI 的 host 路由到已配置的提供者；按代撤销并写撤销墓碑。
 - **外部 CSI 卷与 durableDir**：为每个 actor 挂载一卷外部 CSI 卷，写穿持久、崩溃不丢、沙箱外可经同一导出访问、内容不进快照；所有卷的 bind 挂载带 `nodev`，`mount_path` 不得为 `/dev`，也不得位于 `/dev/pts`、`/proc`、`/sys` 之下；`durableDir` 卷根以 0777 创建（gVisor 下没有 sticky 位），恢复时重放快照记录的模式；外部 CSI 不可用时在绑定时退到 `durableDir`，退化配置下回合边界的销毁使用同步挂起。
 - **worker 分配与容量耗尽**：以 `ResumeActor` 请求 Substrate 把 actor 分配到 `WorkerPool` 中剩余容量足以容纳 actor 资源上限与运行时开销的预热 worker；microVM 每个 actor 另计 4 MiB 加 8 MiB/GiB 的运行时开销，gVisor 不计，worker 上报容量为 Pod 内存上限减去 64 MiB 预留；不选择具体 worker，不维护预热分片记录；`ResumeActor` 返回 `RESOURCE_EXHAUSTED` 时，`Provision` 与 `RestoreSnapshot` 返回暂时性错误，不存在绕开 worker 的冷启动路径。
-- **恢复完成后的交接**：`/wake` 只在出站流重建完成之后返回；看守进程随后校时、断开 Agent 进程的旧 TCP 连接，并由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。本子模块只负责把 actor 恢复到可就绪状态，不执行这些看守进程动作。
+- **恢复完成后的交接**：`/wake` 只在出站流重建完成之后返回；看守进程先续约租约（时窗不符时按返回的服务端时刻校时），续约成功后重建出站流并按 `Challenge.server_now` 再校时，随后断开 Agent 进程的旧 TCP 连接，并由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。本子模块只负责把 actor 恢复到可就绪状态，不执行这些看守进程动作。
 - **串行化与幂等**：同一运行实例的 Suspend、Resume 与 Destroy 按到达顺序串行；以 `suspend_id`、`(run_id, generation, attempt_id)`、`(run_id, generation)` 与 `(generation, sandbox_id)` 幂等；重复调用返回首次结果。
 
 ### 非职责
@@ -128,8 +128,9 @@ substrate 子模块是 [sandboxprovider](design-sandboxprovider.md) 的提供者
 - 网络前提未验证：actor 网络为 IPv4-only，内部 `169.254.17.0/30` 承载网关、DNS 中继、入站与探针；UDP 被静默丢弃而不是拒绝，其他非 TCP/UDP 以 ICMP unreachable 拒绝；DNS 中继不递归；出口网关对 `https` 在连接层要求 SNI 匹配、请求层要求 `Host` 等于 `:authority`，对 `tls_passthrough` 要求 SNI 等于规则主机；带 ECH 的 ClientHello 没有 v1.0.0 实现依据，须实测；CA 轮换重叠期也须实测。任一不成立时 Substrate 路径不上线。
 - `trustBundle` 的运行时投射与 CA 轮换须端到端验证：确认 actor 在快照恢复后读到的信任库、新旧 CA 的重叠期与 `T_ca_overlap` 的取值一致，预置 CA 的镜像在轮换后不再受信。
 - `parked-request-budget` 默认 5 s，只约束发起新的恢复重试，不取消在途恢复；客户端被持有的上限是预算加 5 s，停泊池满时返回 503。部署按恢复 p95 加 `/readyz` 余量设置，并同时设置 `drain-timeout` 与 `terminationGracePeriodSeconds`。
-- MEMORY 快照恢复后的 guest 时钟行为按运行时不同：microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 的行为没有文档依据；看守进程在恢复后按 `Resumed.wall_clock_now` 校时是防御性措施，不能把“快照恢复重置时钟”写成所有沙箱的必然事实。旧 TCP 连接也不能依赖读超时，看守进程必须在恢复后主动断开 Agent 的旧连接。
+- MEMORY 快照恢复后的 guest 时钟行为按运行时不同：microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 的行为没有文档依据；看守进程不依赖恢复后的时钟行为：续约时窗不符按返回的服务端时刻校时，每次握手再以 `Challenge.server_now` 校时，`Resumed.wall_clock_now` 只用于核对偏移，不是校时来源；不能把“快照恢复重置时钟”写成所有沙箱的必然事实。旧 TCP 连接也不能依赖读超时，看守进程必须在恢复后主动断开 Agent 的旧连接。
 - 对象存储由 in-tree `objectstore-plugin` sidecar 访问；GCS 上需要 control 侧交换服务能签发只覆盖 actor 前缀的凭据，S3 上 node sidecar 使用插件 Pod 自身凭据、没有按 actor 的存储凭据隔离；S3 路径仍需试点确认。
+- 看守进程以退出原因退出、actor 的主容器随之退出之后，Substrate 中 actor 的实际状态没有文档依据：是否进入 `CRASHED`、`ListSandboxes` 与 `GetSandbox` 据以判定沙箱丢失的状态字段、之后 `ResumeActor`、`RevertActor` 与删除的行为，都须在目标集群实测；主容器退出按沙箱丢失报告的判定依据取决于实测结果。
 - 路由器 `/wake`、EgressPolicy、凭据提供者、actor JWT 注入、同步快照、`CRASHED` 后的 `RevertActor` 恢复、worker 退役时的 30 分钟同步挂起窗口与 `image-cache` 升级路径需要在目标集群完成端到端试点；仅凭文档与源码不能判定 go。
 
 ## UML 图
@@ -191,11 +192,18 @@ sequenceDiagram
     K-->>B: 接入票据公钥集合
     Note over B: 同一事务内 claimed=true，写 claimed_at 与 instance_jkt
     B-->>W: {run_id, generation, sandbox_id, lease_id, tokens, token_expires_at, access_ticket_keys}
-    Note over W: 令牌组、lease_id 与实例私钥只存于内存，首次 RenewLease 成功
+    Note over W: 令牌组、lease_id 与实例私钥只存于内存
+    W->>V: RenewLease(l-6, generation=6, sandbox_id=a-6, holder_proof)
+    Note over W: 时窗不符时按返回的服务端时刻校时后重试，连续被拒时退避重试
+    V-->>W: 首次续约成功，lease.holder 为 a-6
+    W->>R: 经出口网关建立出站流
+    R-->>W: Challenge{nonce, server_now}
+    Note over W: 按 server_now 再校时
     W->>R: Hello{generation=6, sandbox_id=a-6, instance_key, holder_proof, sandbox_config_revision=0}
+    R-->>W: HelloAck
 ```
 
-时序图固定了预配与领取的顺序：提供者在 `ResumeActor` 激活 actor 之前写入引导记录并创建含注入规则的 EgressPolicy，看守进程的首次领取不会落在记录或规则缺失的窗口里。新 actor 从模板快照恢复，快照中的看守进程停在等待领取的状态；`wakeupProbe` 探测 `/readyz` 时，看守进程读到的 `actor-name` 与快照中记下的值不同，立即领取，不等退避到期；actor 在分配 worker 后进入 `RESUMING`，出口在容器启动前即启用，这次领取可以在 `ResumeActor` 返回之前成功，图中画的是 `ResumeActor` 成功之后到达引导接口的那次领取。唤醒中途失败并从同一快照重试时，唤醒期间已经发出的出站请求可能重复发送。引导接口先以实例公钥指纹调用 `SetHolderKey` 登记工作区租约，再以同一指纹签发令牌组并取接入票据公钥集合，在同一事务内把 `claimed` 置真后返回，令牌不进入提供者的任何记录；看守进程首次续约后发送携带 `instance_key` 与 `holder_proof` 的 `Hello`，`sandbox_config_revision=0` 使 `runcontroller` 随后在出站流上发送 `SandboxConfig`。`ResumeActor` 在 `wakeupProbe` 返回 200 后成功，提供者随后返回 `SandboxHandle`，不等待领取或 `Hello`。
+时序图固定了预配与领取的顺序：提供者在 `ResumeActor` 激活 actor 之前写入引导记录并创建含注入规则的 EgressPolicy，看守进程的首次领取不会落在记录或规则缺失的窗口里。新 actor 从模板快照恢复，快照中的看守进程停在等待领取的状态；`wakeupProbe` 探测 `/readyz` 时，看守进程读到的 `actor-name` 与快照中记下的值不同，立即领取，不等退避到期；actor 在分配 worker 后进入 `RESUMING`，出口在容器启动前即启用，这次领取可以在 `ResumeActor` 返回之前成功，图中画的是 `ResumeActor` 成功之后到达引导接口的那次领取。唤醒中途失败并从同一快照重试时，唤醒期间已经发出的出站请求可能重复发送。引导接口先以实例公钥指纹调用 `SetHolderKey` 登记工作区租约，再以同一指纹签发令牌组并取接入票据公钥集合，在同一事务内把 `claimed` 置真后返回，令牌不进入提供者的任何记录；看守进程首次续约成功后经出口网关建立出站流，收到 `Challenge` 并按其 `server_now` 校时，再发送携带 `instance_key` 与 `holder_proof` 的 `Hello`，`HelloAck` 之后握手完成，`sandbox_config_revision=0` 使 `runcontroller` 随后在出站流上发送 `SandboxConfig`。`ResumeActor` 在 `wakeupProbe` 返回 200 后成功，提供者随后返回 `SandboxHandle`，不等待领取或 `Hello`。
 
 ### Suspend、Resume 与路由器唤醒时序图
 
@@ -208,6 +216,7 @@ sequenceDiagram
     participant S as Substrate 控制面
     participant A as actor
     participant W as 看守进程
+    participant V as workspace
 
     R->>P: Snapshot(suspend_id=s-5, generation=5)
     P->>S: SuspendActor(actor_id=a-5, MEMORY)
@@ -224,13 +233,20 @@ sequenceDiagram
     W-->>S: /readyz 返回 200，不以出站流为条件
     S-->>X: ResumeActor 成功，actor 置为运行态
     X->>W: 转发停泊的 /wake
-    W->>R: 经出口网关重建出站流，Hello{generation=5, sandbox_id=a-5}
+    W->>V: RenewLease(lease_id, generation=5, sandbox_id=a-5, holder_proof)
+    Note over W: 时窗不符时按返回的服务端时刻校时后重试，连续被拒时退避重试
+    V-->>W: 续约成功，lease.holder 恢复为 a-5
+    W->>R: 经出口网关重建出站流
+    R-->>W: Challenge{nonce, server_now}
+    Note over W: 按 server_now 再校时
+    W->>R: Hello{generation=5, sandbox_id=a-5, instance_key, holder_proof}
+    R-->>W: HelloAck
     W-->>X: 握手完成后 /wake 返回
     X-->>P: /wake 返回
     P-->>R: SandboxHandle
 ```
 
-时序图固定了恢复的两段：`RestoreSnapshot` 不直接恢复 actor，而是经路由器调用 `/wake`；路由器负责恢复 actor、把请求停泊到 `wakeupProbe` 就绪，`/wake` 返回即表示看守进程的出站流已重建。`wakeupProbe` 在 `ResumeActor` 把 actor 置为运行态之前探测；actor 处于 `RESUMING` 时出口已放行，看守进程的 `/readyz` 仍不以出站流为条件；`ResumeActor` 成功后，路由器把停泊的 `/wake` 转发给看守进程，看守进程经出口网关重建出站流，握手完成后 `/wake` 返回。快照恢复在同一代内进行，不递增代；快照恢复的是同一 actor：Substrate 把它分配到有余量的 worker 并恢复，actor 名与 actor UID 不变，`SandboxHandle` 的 `sandbox_id` 与代都保持不变；没有运行时兼容的 worker 有余量时，持久快照降级为 `ROOTFS` 冷启动，进程内存、令牌与出站流状态丢失，不能按内存恢复处理；看守进程以领取响应中的 `sandbox_id` 续约并发送 `Hello`。恢复后看守进程校时、断开 Agent 进程的旧 TCP 连接，并由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应；这些动作不在路由器或提供者内执行。
+时序图固定了恢复的两段：`RestoreSnapshot` 不直接恢复 actor，而是经路由器调用 `/wake`；路由器负责恢复 actor、把请求停泊到 `wakeupProbe` 就绪，`/wake` 返回即表示看守进程的出站流已重建。`wakeupProbe` 在 `ResumeActor` 把 actor 置为运行态之前探测；actor 处于 `RESUMING` 时出口已放行，看守进程的 `/readyz` 仍不以出站流为条件；`ResumeActor` 成功后，路由器把停泊的 `/wake` 转发给看守进程，看守进程先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试，期间不建立传输），续约成功、`lease.holder` 恢复为本沙箱之后经出口网关重建出站流，收到 `Challenge` 并按 `server_now` 再校时、发送 `Hello`，收到 `HelloAck`（握手完成）后 `/wake` 返回。快照恢复在同一代内进行，不递增代；快照恢复的是同一 actor：Substrate 把它分配到有余量的 worker 并恢复，actor 名与 actor UID 不变，`SandboxHandle` 的 `sandbox_id` 与代都保持不变；没有运行时兼容的 worker 有余量时，持久快照降级为 `ROOTFS` 冷启动，进程内存、令牌与出站流状态丢失，不能按内存恢复处理；看守进程以领取响应中的 `sandbox_id` 续约，续约成功后才发送 `Hello`。恢复后看守进程在续约时与握手时先后校时，断开 Agent 进程的旧 TCP 连接，并由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应；这些动作不在路由器或提供者内执行。
 
 ### EgressPolicy 落地与撤销图
 
@@ -291,8 +307,8 @@ flowchart LR
 | --- | --- | --- |
 | 1 | `Snapshot(s-5)` | 提供者以 `DURABILITY_MODE_SYNCHRONOUS` 执行 MEMORY 快照，等对象存储中的快照完成；`SnapshotTrace(s-5)` 写入，`snapshot_id=snap-5`、`expires_at=t2`；actor 进入 `suspended`；工作区租约以快照保留期为上限 `HoldLease`；计算资源释放；`EgressCopy(r-1, 5)` 保留 |
 | 2 | 控制面调用 `RestoreSnapshot(r-1, 5, s-5, rs-1)`；提供者经路由器以 `ate-target-actor: <atespace>/a-5` 调用 `/wake` | 路由器以 actor 为键建立单飞恢复，后来请求共享剩余预算与结果，不写逐请求记录；路由器调用 `ResumeActor` 恢复 actor |
-| 3 | `wakeupProbe` 探测 `/readyz` 返回 200，`ResumeActor` 成功并把 actor 置为运行态 | actor 在 `RESUMING` 期间已可出站；路由器把停泊的 `/wake` 转发给看守进程；看守进程经出口网关重建出站流，握手完成后 `/wake` 返回 |
-| 4 | `RestoreSnapshot` 返回 | `SnapshotTrace(s-5).restored=true`；`SandboxHandle{generation=5, sandbox_id=a-5}`；看守进程校时、断开旧 TCP 连接，本地代理按 `request_id` 取回已完成响应；`EgressCopy(r-1, 5)` 与引导记录不改写，看守进程不重新领取 |
+| 3 | `wakeupProbe` 探测 `/readyz` 返回 200，`ResumeActor` 成功并把 actor 置为运行态 | actor 在 `RESUMING` 期间已可出站；路由器把停泊的 `/wake` 转发给看守进程；看守进程先 `RenewLease` 并校时，续约成功后经出口网关重建出站流，以 `Challenge` 再校时并发送 `Hello`，握手完成后 `/wake` 返回 |
+| 4 | `RestoreSnapshot` 返回 | `SnapshotTrace(s-5).restored=true`；`SandboxHandle{generation=5, sandbox_id=a-5}`；租约 `holder` 已在 `Hello` 之前恢复为 `a-5`，看守进程断开旧 TCP 连接，本地代理按 `request_id` 取回已完成响应；`EgressCopy(r-1, 5)` 与引导记录不改写，看守进程不重新领取 |
 | 5 | `Destroy(r-1, 5)` | actor 进入 `destroyed`；写入创建墓碑 `(r-1, ≤5)`；删除第 5 代的引导记录；保留运行实例级资源；返回 `DestroyReceipt{generation=5}` |
 | 6 | 迟到的 `Provision(r-1, 5, a-9)` | 被创建墓碑拒绝；不创建 actor，状态仍为 `destroyed` |
 | 7 | `Provision(r-1, 6, a-10)`，`lease_id=l-6` | 绑定外部 CSI 卷 `v-6`；以 `(r-1, 6, a-10)` 派生的名称创建 actor `a-6`，actor 处于挂起态，actor UID 为 `u-6`；写入引导记录 `a-6{actor_uid=u-6, run_id=r-1, generation=6, lease_id=l-6, claimed=false}`；落地 `EgressCopy(r-1, 6)` 并追加引导接口的注入规则；以 `ResumeActor` 激活 actor，Substrate 把它分配到剩余容量足够的 worker 并从模板快照恢复，`ActorRecord(r-1, 6)` 的 `worker` 与 `placement` 写入 |
@@ -336,13 +352,13 @@ flowchart LR
 1. `runcontroller` 按 `resume_mode` 调用 `RestoreSnapshot` 或 `Provision`：`snapshot_restore` 调用 `RestoreSnapshot`，`cold_start` 调用 `Provision`；本子模块不声明 `WarmPool`，`suspendpolicy` 不为它返回 `warm_claim`。`RestoreSnapshot` 在同一代内恢复快照，不递增代；请求携带 `run_id`、`generation`、`suspend_id` 与 `attempt_id`，`attempt_id` 取 `resume_id`。调用前检查创建墓碑与释放墓碑；已销毁或已释放时以确定性错误拒绝，不恢复 actor。
 2. 提供者经 Substrate 路由器以 `ate-target-actor: <atespace>/<actor>` 头调用 `/wake`。路由器按该头定位 actor，调用 `ResumeActor` 恢复 actor；调用方必须持有 SPIFFE 身份且在路由器的入站白名单内，并具备 `can_resume`；白名单是连接级精确匹配，不按路径或目标 actor 再授权，只有 Envoy 数据面校验客户端证书。
 3. 路由器把请求停泊到 `wakeupProbe` 就绪；`wakeupProbe` 为看守进程的 `/readyz:80`，就绪之前路由器不释放入站请求。停泊预算由 `parked-request-budget` 配置，默认 5 s，只约束发起新的恢复重试，不取消在途恢复；预算耗尽后新的尝试返回 503，停泊池满（默认 1024）同样返回 503，客户端被持有的上限是预算加 5 s；晚到的恢复成功仍会转发，不把未就绪的 actor 标记为恢复完成。
-4. `ResumeActor` 成功、actor 置为运行态之后，路由器把停泊的 `/wake` 转发给看守进程，看守进程经出口网关重建出站流，握手完成后 `/wake` 返回；`/wake` 返回表示看守进程的出站流已重建。提供者随后返回 `SandboxHandle`；`runcontroller` 以同代 `Hello` 完成 `Resuming` 到 `Active` 的转移。快照不存在或已过期时提供者返回确定性错误，`runcontroller` 转重建意图，不把该错误计入恢复失败次数。actor 处于 `CRASHED` 时 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败而不停泊重试；提供者以 `RevertActor` 退回最近一次已完成的持久快照后重试，未上报完成的快照上传会被 `RevertActor` 删除。
+4. `ResumeActor` 成功、actor 置为运行态之后，路由器把停泊的 `/wake` 转发给看守进程，看守进程经出口网关重建出站流，握手完成后 `/wake` 返回；`/wake` 返回表示看守进程的出站流已重建。提供者随后返回 `SandboxHandle`；`runcontroller` 以同代 `Hello` 完成 `Resuming` 到 `Active` 的转移。快照不存在或已过期时提供者返回确定性错误，`runcontroller` 转重建意图，不把该错误计入恢复失败次数。actor 处于 `CRASHED` 时 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败而不停泊重试；提供者以 `RevertActor` 退回最近一次已完成的持久快照后重试，未上报完成的快照上传会被 `RevertActor` 删除。这次重试只发生在 `RestoreSnapshot` 内部，单次调用内 `RevertActor` 之后至多重试一次，不处理看守进程退出所致的沙箱丢失；失败的恢复尝试由 `runcontroller` 以 `resume_attempts` 计数、受 `N_resume` 约束。从旧快照恢复出的看守进程版本不受支持时不按恢复失败计数：它的同代 `Hello` 由 `runcontroller` 按版本不支持作废本代沙箱，计入 `proto_voids`、受 `N_proto_void` 约束，并以当前镜像重建新代，不再恢复这份快照，见 [runcontroller](../design-runcontroller.md#hello-的处理)。
 5. 销毁重建由 `Provision` 创建并激活新代 actor，Substrate 把它分配到剩余容量足够的 worker 并从模板快照恢复，快照与运行时不兼容时降级为 `ROOTFS` 冷启动，随后看守进程领取、续约并发送 `Hello`；这条路径不经过 `/wake`，领取由 `actor-name` 的变化或退避触发，路由器只承担快照恢复的入站唤醒与终端、文件访问。快照恢复与销毁重建在没有 worker 有余量时都返回暂时性错误，调用方按同一幂等键退避重试。
-6. 恢复完成后，看守进程先校时、主动断开 Agent 进程的旧 TCP 连接，避免半死连接等到读超时；在途 LLM 请求由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。提供者不重放请求，也不改写工作区。
+6. 恢复完成后，看守进程先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试，期间不建立传输），续约成功之后重建出站流，以 `Challenge` 再校时，再发送 `Hello`，并主动断开 Agent 进程的旧 TCP 连接，避免半死连接等到读超时；在途 LLM 请求由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。提供者不重放请求，也不改写工作区。
 
 ### 恢复后校时与旧连接清理
 
-快照恢复可能使旧 TCP 连接处于半死状态；guest 时钟的行为按运行时不同，microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 没有文档依据。看守进程在出站流重建之后按 `Resumed.wall_clock_now` 校时，并在恢复之后主动断开 Agent 进程的旧连接，再通知 Agent 驱动器；本地代理向 `llmgateway` 取回已完成响应并按 `request_id` 交付。本子模块只保证 `/wake` 在出站流重建之后返回，不代为执行校时、连接清理或响应取回；这些动作属于 `warden` 的恢复路径，其细节见看守进程模块文档。
+快照恢复可能使旧 TCP 连接处于半死状态；guest 时钟的行为按运行时不同，microVM 在 Cloud Hypervisor 53 及以上由 VMM 自行推进到当前墙钟，gVisor 没有文档依据。看守进程的顺序为先调用 `RenewLease`，时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试、期间不建立传输，这一步同时完成校时；续约成功、`lease.holder` 恢复为本沙箱之后重建传输，收到 `Challenge` 并按 `server_now` 再校时，再发送 `Hello`，`Hello` 租约核对要求的持有者因而先于 `Hello` 就位；`Resumed.wall_clock_now` 只用于核对偏移，偏差超过 `T_proof_skew` 时计数告警，不是校时来源；看守进程还在恢复之后主动断开 Agent 进程的旧连接，再通知 Agent 驱动器；本地代理向 `llmgateway` 取回已完成响应并按 `request_id` 交付。本子模块只保证 `/wake` 在出站流重建之后返回，不代为执行校时、连接清理或响应取回；这些动作属于 `warden` 的恢复路径，其细节见看守进程模块文档。
 
 ### EgressPolicy 落地与撤销
 
@@ -377,7 +393,7 @@ flowchart LR
 
 | 失败 | 处置 |
 | --- | --- |
-| Resume 失败 | 暂时性失败按同一 `resume_id` 重驱动；连续达到上限时 `runcontroller` 进入 `Degraded`，经兜底以新会话或恢复句柄重试，或放弃进入 `Failed`。actor 处于 `CRASHED` 时 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败；提供者以 `RevertActor` 退回最近一次已完成的持久快照后重试，未上报完成的快照上传会被删除 |
+| Resume 失败 | 暂时性失败按同一 `resume_id` 重驱动；连续达到上限时 `runcontroller` 进入 `Degraded`，经兜底以新会话或恢复句柄重试，或放弃进入 `Failed`。actor 处于 `CRASHED` 时 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败；提供者以 `RevertActor` 退回最近一次已完成的持久快照后重试，未上报完成的快照上传会被删除；该重试只发生在 `RestoreSnapshot` 内部，单次调用内至多一次，失败的恢复尝试仍计入 `resume_attempts`，受 `N_resume` 约束 |
 | 路由器不可达或 `/wake` 未返回 | 暂时性；提供者返回错误，`runcontroller` 以同一 `resume_id` 重驱动；`/wake` 不返回成功即不把 actor 标记为恢复完成，不产生虚假的 `Resuming` 转移 |
 | 路由器的 SPIFFE 身份或白名单拒绝 | 确定性；提供者返回认证失败，不重试；部署前提未满足，恢复无法进行 |
 | 停泊预算耗尽 | 路由器不再发起新的恢复重试，返回 503；在途恢复继续，晚到的成功仍会转发；提供者按暂时性错误返回，调用方重试；不把未就绪的 actor 标记为恢复完成；停泊池满同样返回 503 |
@@ -393,6 +409,7 @@ flowchart LR
 | `durableDir` 下回合中 actor 崩溃 | 上次上传之后的写入丢失；`runcontroller` 写入“回合被中断”事件并从回退后的消费位置重投，已接受的事件带 `redelivery=true` |
 | worker 容量耗尽 | `ResumeActor` 返回 `RESOURCE_EXHAUSTED`；`Provision` 与 `RestoreSnapshot` 返回暂时性错误，调用方按同一幂等键退避重试；快照恢复路径上路由器在停泊预算内发起重试，预算耗尽后新的尝试返回 503，在途恢复晚到的成功仍会转发；不存在绕开 worker 的冷启动路径 |
 | actor 在回合中丢失 | 提供者报告沙箱丢失；`runcontroller` 写“回合被中断”事件，经恢复准入以新代重建 |
+| 看守进程在不可恢复的协议状态下以退出原因退出（原因闭集与写入格式见 [warden](../warden/design-warden.md)） | 看守进程是 PID 1，其退出使 actor 的主容器退出；提供者在 `ListSandboxes` 与 `GetSandbox` 中按沙箱丢失报告，走与 actor 丢失相同的路径，`runcontroller` 据此转入重建路径，不必等待出站流的连接宽限。本子模块没有读取主容器终止信息或日志的机制，只按沙箱丢失上报，不区分原因。主容器退出之后 actor 的实际状态没有文档依据，列入[依赖](#依赖)一节的验证前提与已知限制；`CRASHED` 之后的 `RevertActor` 重试只在 `RestoreSnapshot` 内部使用，不用于这条路径 |
 | 整代销毁或释放之后到达的创建 | 创建墓碑或释放墓碑拒绝；不创建 actor 或运行实例级资源 |
 
 提供者不把能力缺失暴露为运行时错误：`Freeze` 与 `Thaw` 不在能力集内，调用以参数非法拒绝；`suspendpolicy` 不为此提供者选择冻结。删除确认、快照撤销与释放的重复调用都返回首次结果，调用方据此区分“已完成”与“未执行”。

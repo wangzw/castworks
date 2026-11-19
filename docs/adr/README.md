@@ -41,6 +41,15 @@
 | [外部副作用经效果记录在提交后执行](adr-effect-record-after-commit.md) |
 | [以持久化状态与纠正性对账收敛](adr-state-based-reconciliation.md) |
 
+## 出站流协议
+
+| 决策 |
+| --- |
+| [出站流只重放看守进程发出的消息，控制面发出的消息按持久化状态重新产生](adr-asymmetric-stream-replay.md) |
+| [出站流不可恢复的失败以作废本代沙箱并重建收场](adr-unrecoverable-stream-failure-rebuilds-sandbox.md) |
+| [协议版本按代固定，两端支持当前与前一版本](adr-protocol-version-pinned-per-generation.md) |
+| [活动度样本以不进入可靠序号的遥测帧发送](adr-activity-outside-reliable-sequence.md) |
+
 ## 进程与循环
 
 | 决策 |

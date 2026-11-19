@@ -17,7 +17,7 @@
 - **签发运行实例令牌**：以 `run_id`、`generation`、`exp` 与实例公钥指纹 `cnf.jkt` 为受众闭集中的每个受众各构造一张 JWT，按令牌签名密钥签名，返回同 `exp`、同 `cnf.jkt` 的令牌组与到期时刻；首个令牌组由 `sandboxprovider` 的[引导接口](../../glossary.md)在看守进程领取时调用签发，`cnf.jkt` 取领取请求中实例公钥的指纹，令牌组随领取响应交给看守进程。令牌不持久化，由签名自证。
 - **校验运行实例令牌**：验证签名、`run_id`、受众与 `exp`，令牌受众不等于期望受众时判为无效；按调用方身份限定其可校验的受众；返回令牌载荷、实例公钥指纹与过期标记；不查询运行实例当前代，代比较与持有证明核对归调用方。
 - **轮换运行实例令牌**：在到期前以运行实例记录的实例公钥指纹签发后继令牌组，交 `runcontroller` 经 `TokenRotate` 发往看守进程；`cnf.jkt` 不变，旧令牌在 `exp` 之前继续有效，后继令牌组投递成功时新旧令牌存在有效期重叠。
-- **签发接入票据**：应 `humanchannel` 的申请，以与令牌签名密钥分开的接入票据签名密钥签发绑定平台用户、项目、运行实例、代与接入通道的短期一次性 JWT；向 `sandboxprovider` 与 `runcontroller` 提供接入票据公钥集合，由它们下发给看守进程；票据不持久化。
+- **签发接入票据**：应 `humanchannel` 的申请，以与令牌签名密钥分开的接入票据签名密钥签发绑定平台用户、项目、运行实例、代与接入通道的短期 JWT，`channel=terminal` 的票据一次性，`channel=file` 的票据在有效期内可多次使用；向 `sandboxprovider` 与 `runcontroller` 提供接入票据公钥集合，由它们下发给看守进程；票据不持久化。
 - **提供[凭据主体](../../glossary.md)**：按项目向 `humanchannel` 返回凭据对象在外部系统中的凭据主体，不返回凭据值、凭据路径与版本，供其拒绝凭据主体发出的消息与审批决定。
 - **换取真实凭据**：校验运行实例令牌与调用方身份（不携带令牌的状态核对只校验调用方身份），按调用方给出的目标读取凭据对象，按凭据对象的 `token_minting` 铸造真实凭据，返回控制面调用方；不返回沙箱，不写入工作区。
 - **校验调用方授权**：按调用方的 SPIFFE 身份逐方法限定可调用的方法，按身份与部署白名单限制可换取的 `(Kind, System, AuthMethod)` 集合，三者均必填；方法或目标不在允许集合时拒绝并写拒绝审计，不读取凭据对象，不暴露其存在性。
@@ -127,7 +127,7 @@ type AccessTicketClaims struct {
 ```
 
 - `IssueAccessTicket` 的调用方只有 `humanchannel`。`humanchannel` 在完成用户身份认证与项目角色授权之后调用，本模块不判定用户权限，只校验字段：`Subject`、`ProjectID` 与 `RunID` 非空，`Generation` 为正整数，`Channel` 属于闭集 `terminal`、`file`；不满足返回 `ErrInvalidArgument`。
-- 票据为 JWT，头部为 `{alg: EdDSA, kid, typ: castworks-access-ticket}`，载荷为 `{aud: warden, sub, project_id, run_id, generation, channel, iat, exp, jti}`：`aud` 固定为 `warden`，`sub` 取 `Subject`，`exp − iat ≤ T_access_ticket`（60 s），`jti` 每次签发唯一。每个入站请求使用一张票据，一次性由看守进程记录已出现的 `jti` 直到其 `exp`，重复出现即拒绝。
+- 票据为 JWT，头部为 `{alg: EdDSA, kid, typ: castworks-access-ticket}`，载荷为 `{aud: warden, sub, project_id, run_id, generation, channel, iat, exp, jti}`：`aud` 固定为 `warden`，`sub` 取 `Subject`，`exp − iat ≤ T_access_ticket`（60 s），`jti` 每次签发唯一。`channel=terminal` 的票据一次性：看守进程记录已出现的 `jti` 直到其 `exp`，重复出现即拒绝。`channel=file` 的票据在有效期内可用于同一 `sub`、同一 `run_id`、同一 `generation` 的多次只读请求，看守进程不对它做 `jti` 一次性检查，其余校验不变。
 - 接入票据签名密钥与令牌签名密钥分开，`kid` 不重叠：运行实例令牌的校验不接受接入票据签名密钥签发的 JWT，看守进程只以接入票据公钥集合校验票据。
 - `AccessTicketKeys` 的调用方为 `sandboxprovider` 与 `runcontroller`，返回当前接入票据公钥集合（JWKS），调用方可缓存。`sandboxprovider` 把它放进领取响应的 `access_ticket_keys`，`runcontroller` 把它放进 `TokenRotate` 的 `access_ticket_keys`，看守进程据此校验 `/terminal` 与 `/files` 上的票据。
 - 公钥集合的发布与保留：新签名密钥加入公钥集合不少于两个运行实例令牌有效期之后才用于签发；停止签发的旧密钥在集合中保留不少于 `T_access_ticket`。看守进程至少每个令牌有效期经 `TokenRotate` 收到一次公钥集合，两个有效期的提前量使在线的看守进程在新密钥启用之前都已持有它。
@@ -505,7 +505,7 @@ flowchart TB
 | `channel` | 载荷 | `terminal` 或 `file`，看守进程要求与端点相符（`/terminal` 对 `terminal`，`/files` 对 `file`） |
 | `iat` | 载荷 | 签发时刻 |
 | `exp` | 载荷 | 到期时刻，`exp − iat ≤ T_access_ticket` |
-| `jti` | 载荷 | 票据标识，每次签发唯一；看守进程记录到 `exp`，重复出现即拒绝 |
+| `jti` | 载荷 | 票据标识，每次签发唯一；`channel=terminal` 时看守进程记录到 `exp`，重复出现即拒绝；`channel=file` 时不做一次性检查 |
 
 票据不持久化，本模块不维护已签发票据的清单。
 
@@ -624,18 +624,18 @@ flowchart TB
 4. 旧令牌在 `exp` 之前继续有效；新旧令牌在重叠期内都能通过校验，换取路径不因轮换而拒绝。
 5. 看守进程未收到 `TokenRotate` 时，旧令牌到期后换取返回 `ErrTokenExpired`；看守进程重连时 `Hello` 携带过期的 `runcontroller` 令牌、实例公钥与持有证明。`runcontroller` 只在同一沙箱实例延续或快照恢复的状态下接受过期令牌，且令牌到期时刻不低于接受下界 `run.token_accept_floor`，接受后再次触发轮换；新代状态下或低于接受下界时以不可重试认证失败关闭流（规则见 [runcontroller](design-runcontroller.md) 的 `Hello` 处理）。
 
-轮换只由 `runcontroller` 发起，本模块不与看守进程直接通信。轮换不撤销旧令牌，也不使真实凭据缓存失效；旧令牌在换取路径上的失效由 `exp` 与代递增完成，在 `Hello` 上另受接受下界约束：`rotate_token` 完成时接受下界推进到上一张令牌的到期时刻，更早的令牌不再能接管出站流。`TokenRotate` 是看守进程获得轮换令牌组的唯一路径；首个令牌组由看守进程经引导接口领取，不经 `TokenRotate`，见令牌签发与校验时序图后的说明。
+轮换只由 `runcontroller` 发起，本模块不与看守进程直接通信。轮换不撤销旧令牌，也不使真实凭据缓存失效；旧令牌在换取路径上的失效由 `exp` 与代递增完成，在 `Hello` 上另受接受下界约束：`rotate_token` 完成时接受下界推进到上一张令牌的到期时刻，更早的令牌不再能接管出站流；由看守进程在 `Hello` 中出示较旧令牌而触发的轮换例外，下界取所出示令牌的到期时刻且不低于当前值，使上一组 `TokenRotate` 未送达时看守进程仍可凭所持令牌重连，规则见 [runcontroller](design-runcontroller.md)。`TokenRotate` 是看守进程获得轮换令牌组的唯一路径；首个令牌组由看守进程经引导接口领取，不经 `TokenRotate`，见令牌签发与校验时序图后的说明。
 
 ### 接入票据的签发与公钥轮换
 
 签发：
 
-1. `humanchannel` 完成用户身份认证与项目角色授权后调用 `IssueAccessTicket`，终端在建立连接之前申请，文件读取在每次 `List`、`Read` 或 `Stream` 调用之前申请。
+1. `humanchannel` 完成用户身份认证与项目角色授权后调用 `IssueAccessTicket`，终端在建立连接之前申请；文件读取在持有的 `channel=file` 票据剩余有效期不足以完成一次请求时才重新申请，否则复用。
 2. 本模块按[调用方授权](#调用方授权)确认对端为 `humanchannel`，再校验 `AccessTicketClaims` 的字段；不满足返回 `ErrInvalidArgument`。
 3. 取 `iat` 为当前时刻，`exp` 不晚于 `iat + T_access_ticket`，生成唯一的 `jti`，按 `{aud: warden, sub, project_id, run_id, generation, channel, iat, exp, jti}` 构造载荷。
 4. 选择当前用于签发的接入票据签名密钥，头部写 `{alg: EdDSA, kid, typ: castworks-access-ticket}`，签名后返回票据字符串。
 
-签发不持久化，不维护已签发票据的清单；一次性与通道、代的核对由看守进程执行。
+签发不持久化，不维护已签发票据的清单；通道、代与 `terminal` 票据一次性的核对由看守进程执行。
 
 公钥轮换：
 
@@ -742,7 +742,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 | 请求的授权范围超出凭据对象的授权范围，或 `token_minting` 为空而 `Target.Scopes` 不等于授权范围 | `ErrScopeDenied`，不可重试；写 `denied` 审计，不铸造；`Target.Scopes` 为空时使用授权范围，不触发该错误 |
 | 密钥库不可达或超时 | 可重试；未到核对时刻且未到期的缓存条目可继续服务；条目已过核对时刻时无法核对状态与版本，换取失败，不返回未核对或过期的凭据 |
 | 令牌签名密钥不可用 | `IssueRunToken` 失败；引导接口向看守进程返回 503，看守进程退避重试领取；`rotate_token` 效果按退避重试；已签发令牌在 `exp` 前继续有效 |
-| 接入票据签名密钥不可用 | `IssueAccessTicket` 返回可重试错误；`humanchannel` 不建立终端连接、不发起文件读取，向用户呈现接入失败；已签发票据在 `exp` 前继续有效 |
+| 接入票据签名密钥不可用 | `IssueAccessTicket` 返回可重试错误；`humanchannel` 不建立终端连接，没有可复用的 `file` 票据时不发起文件读取，向用户呈现接入失败；已签发票据在 `exp` 前继续有效，持有未过期 `file` 票据的读取不受影响 |
 | `IssueAccessTicket` 的字段非法（`Channel` 越出闭集、标识为空或 `Generation` 非正） | `ErrInvalidArgument`，不可重试；不签发票据 |
 | `IssueRunToken` 的调用方身份不在白名单 | 未授权错误，不可重试；不签发令牌 |
 | 铸造被上游拒绝 | 区分上游的暂时性与永久性错误；暂时性错误可重试，永久性错误不可重试；均不返回凭据，写 `denied` 审计 |
@@ -761,7 +761,7 @@ Substrate 路径选择以 credential provider 插件对接密钥库。约束如�
 `IssueRunToken` 只签名、不写存储，不参与调用方的数据库事务：`rotate_token` 效果的签发在状态转移与效果记录同事务提交之后由效果执行器调用；引导接口的签发在领取时调用，领取的一次性由 `sandboxprovider` 保证。因此签发与代递增之间没有共享数据库锁；轮换的原子性由有效期重叠与调用方的代比较保证，而不是由两阶段提交保证。
 
 - 轮换先签发后继令牌，再经 `TokenRotate` 投递；新旧令牌在重叠期内都有效，看守进程在收到新令牌后替换，投递成功时不出现无可用令牌的窗口。
-- 后继令牌组未送达时，旧令牌到期后换取返回 `ErrTokenExpired`；看守进程重连的 `Hello` 在其接受规则允许时触发再次轮换。轮换完成事务把接受下界推进到上一张令牌的到期时刻，与令牌签发之间同样不共享锁：签发失败或重复签发不改变接受下界，只有 `runcontroller` 的完成事务改变它。
+- 后继令牌组未送达时，旧令牌到期后换取返回 `ErrTokenExpired`；看守进程重连的 `Hello` 在其接受规则允许时触发再次轮换。轮换完成事务把接受下界推进到上一张令牌的到期时刻（由 `Hello` 出示较旧令牌触发的轮换取所出示令牌的到期时刻，且不低于当前值），与令牌签发之间同样不共享锁：签发失败或重复签发不改变接受下界，只有 `runcontroller` 的完成事务改变它。
 - 同一效果被重复执行时，`runcontroller` 以效果记录的 `ref` 幂等；本模块不维护令牌清单，重复签发的令牌只要未过期都能通过校验。
 - 代递增不撤销令牌，也不写吊销记录；旧代令牌的拒绝由调用方比较当前代完成，代递增的事务提交即令比较结果改变。
 

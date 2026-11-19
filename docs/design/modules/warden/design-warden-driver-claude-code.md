@@ -18,10 +18,10 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 - **声明 LLM 主机与引流途径**：向看守进程声明 Claude Code 的 [LLM 主机](../../../glossary.md) `api.anthropic.com`，并按部署配置项 `llm_access`（闭集 `intercept`、`base_url`，默认 `intercept`）选择 LLM 请求到达本地代理的途径；结果是默认途径下 LLM 请求经本地 DNS 与[透明拦截器](../../../glossary.md)到达本地代理，`base_url` 只在透明拦截对被托管的 Claude Code 不可用时启用（[ADR-transparent-interception-by-default](../../../adr/adr-transparent-interception-by-default.md)）。
 - **托管策略设置注入**：以工作区之外的托管策略设置文件（Linux 为 `/etc/claude-code/managed-settings.json`，随镜像提供）注入 hooks 与权限设置，并以 `allowManagedHooksOnly` 屏蔽工作区内声明的 hooks。审批用的 `PreToolUse`，对账、旁证与意图解析用的 `Stop`、`SubagentStop` 与 `UserPromptSubmit`，提示用的 `PostToolUse`、`PostToolBatch`（兼作旁证）与 `SubagentStart`，以及核对用的 `PostToolUseFailure`（针对以错误结束的工具调用，输出恒为空）都由看守进程提供的托管 hook 二进制实现，二进制随镜像放在工作区之外；托管策略设置中注册的 hook 命令写成 `exec <托管 hook 二进制路径>` 的形式，Claude Code 经 shell 执行 hook 时 shell 以 `exec` 让位，二进制的父进程为 Agent 主进程。二进制经看守进程的托管 hook IPC 端点向驱动器查询并同步返回，端点以 `SO_PEERCRED` 与一次性事件核对认证查询方，两者都由看守进程执行，一次性核对依据驱动器的已观察事件状态（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)、[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对)）。结果是审批、安全检查与提示不被 Agent 自身的写入改变。
 - **一次性核对的事件状态**：从 stream-json 维护托管 hook 查询的已观察事件状态（已观察的 `tool_use` 与尚未应答的 `tool_use_id`、已结束的批次、回合与子代理的开始与结束窗口、即将开始的回合），供看守进程的托管 hook IPC 端点逐次核对，并把通过核对的事件标识记为已接受；结果是工具命令以 `exec` 运行托管 hook 二进制发出的伪造查询，只能落在已存在、尚未应答的事件上，同一事件标识只接受一次。
-- **回合边界判定**：等待 `session_state_changed: idle` 与 `result.queued_turn_count=0` 都到齐，结合 `result.origin` 区分人类回合与任务通知回合；结果是驱动器只在回合边界发出 `turn_ended`，并向控制面报告回合位置；`queued_turn_count` 不计任务通知，后台作业非空的回合边界不构成安全点。
+- **回合边界判定**：等待 `session_state_changed: idle` 与 `result.queued_turn_count=0` 都到齐，把原生字段 `result.stop_reason` 与 `result.origin` 翻译为 `turn_ended.reason` 与 `turn_ended.origin`；结果是驱动器只在回合边界发出 `turn_ended`，并向控制面报告回合位置；`queued_turn_count` 不计任务通知，后台作业非空的回合边界不构成安全点。
 - **事件翻译**：把工具开始与结束、权限询问、会话状态、订阅创建、定时请求、等待开始、后台任务集合与自唤醒条目的变化翻译为 `AgentEvent`；结果是 `runcontroller` 收到与控制面循环驱动器相同的闭集事件，另有只由本驱动器产生的 `self_wake_changed` 与 `intent_observed`（控制面循环驱动器的等待由 `WaitDeclared` 显式表达，不产生意图事件）。
 - **LLM 等待旁证**：以本地代理的 `llm.request.started` 为主信号，以 `UserPromptSubmit`、`PostToolBatch`、`Stop` 等 hook 事件为旁证；结果是 LLM 等待的开始与结束有独立于 Agent 自述的证据。
-- **审批路径**：实现 `PreToolUse` hook 的询问、`permissionDecision: "defer"` 的延迟、`stop_reason: tool_deferred` 的回合结束、以 `--resume` 不改写 prompt 的续接，以及实时接入中的阻塞等待；首次触发时计算工具输入的[审批内容摘要](../../../glossary.md)（`input_hash`）并随 `permission_requested` 发出，阻塞路径与续接路径在交付决定前按当前 hook 输入重算摘要并与之比对；hook 的 IPC 查询失败或摘要不一致时输出拒绝而不放行；结果是回合中审批可以转为回合边界，或在不销毁沙箱时等待决定，平台审批不可用时不放行工具调用，放行的调用内容与审批时一致。
+- **审批路径**：实现 `PreToolUse` hook 的询问、`permissionDecision: "defer"` 的延迟、`stop_reason: tool_deferred` 的回合结束、以 `--resume` 不改写 prompt 的续接，以及实时接入中的阻塞等待；首次触发时以规范编码函数 `CanonicalJSON` 计算工具输入的[审批内容摘要](../../../glossary.md)（`input_hash`）并随 `permission_requested` 发出，阻塞路径与续接路径在交付决定前以同一函数按当前 hook 输入重算摘要并与之比对；hook 的 IPC 查询失败、工具输入无法规范编码或摘要不一致时输出拒绝而不放行；结果是回合中审批可以转为回合边界，或在不销毁沙箱时等待决定，平台审批不可用时不放行工具调用，放行的调用内容与审批时一致。
 - **平台 MCP 服务器接入**：向 Agent 提供平台 MCP 服务器的工具，设置工具超时，把阻塞型工具调用翻译为 `wait_started` 与 `tool_ended`，把 Agent 通过可选参数 `expected_wait` 自报的预计等待时长翻译为 `subscription_created` 与 `wait_started` 的 `agent_expected_ms`，并在阻塞型调用被 Claude Code 自动转后台时通知平台 MCP 服务器以转换结果结束该调用；结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1）。
 - **第三方 MCP 服务器接入**：合并项目作用域工具接入声明中已批准的第三方 MCP 服务器配置，只支持 stdio 本地子进程，注入其环境变量并管理生命周期，被自动转后台的第三方 MCP 调用计入后台作业；结果是第三方 MCP 工具经本地代理或[透明拦截器](../../../glossary.md)到出口代理执行，平台不为其增加平台工具。
 - **安全点检查**：在回合边界执行 I9 检查，核对后台作业为空，以及 `fire_at` 为空或不早于 `PrepareSuspend.self_wake_cutoff` 的自唤醒条目都随续接恢复。关闭 stdin、等待正常退出，在 Agent 正常退出之后终止已声明的第三方 MCP 服务器（挂起路径中唯一终止的进程），复核本地代理与透明拦截器无外部在途连接、核对会话记录 JSONL 末尾、工作区持久化、进程与工作区写文件描述符，并上报 `ReadyToSuspend`；任一检查不满足时回 `Busy`，不为满足检查而终止后台作业、残留进程或孤儿进程。结果是销毁前会话已落盘，`--resume` 不丢失最后一回合，也不丢失 Agent 的运行态。
@@ -37,7 +37,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 
 非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
 
-- 协议信封、消息序号、重放、按 `(generation, msg_seq)` 去重与协议版本归 `agentprotocol`；本模块只产生每条消息的沙箱侧内容。
+- 协议信封、消息序号、重放与协议版本归 `agentprotocol`；本模块只产生每条消息的沙箱侧内容。
 - 运行实例状态机、收件箱、唤醒谓词与自唤醒到期、`StartAgent` 的发出时机、投递游标、代与失效判定归 `runcontroller`；本模块只报告回合、工具、等待、后台作业、自唤醒条目与退出信号，并执行 `StartAgent`。
 - 挂起决策、静止证据与忙信号的解释、冻结上限取值、DRAIN 与冻结中复评归 `suspendpolicy`；本模块只执行 `PrepareSuspend` 的沙箱侧检查并报告结果。
 - 冻结与解冻的执行归 `sandboxprovider` 与节点冻结代理；本模块不写 cgroup，也不向 Agent 发送 `SIGSTOP`。
@@ -63,7 +63,7 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | 延迟审批 | deferred permission | warden Claude Code 驱动器 | `PreToolUse` hook 返回 `permissionDecision: "defer"`，回合以 `stop_reason: tool_deferred` 结束，决定到达后以 `--resume` 续接同一工具调用。 |
 | 托管策略设置 | managed policy settings | warden Claude Code 驱动器 | 位于工作区之外、Agent 只读的 Claude Code 设置文件（Linux 为 `/etc/claude-code/managed-settings.json`）；hooks 与权限设置经它注入，`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效，hook 二进制随镜像放在工作区之外（[REF-claude-code-settings](../../../references.md)）。 |
 | 旁证信号 | corroborating hook signal | warden Claude Code 驱动器 | `UserPromptSubmit`、`PostToolBatch`、`Stop` 等 hook 事件；用于确认 LLM 等待的开始与结束，不单独触发阻塞。 |
-| 任务通知回合 | task-notification turn | warden Claude Code 驱动器 | `result.origin = task-notification` 的回合；后台任务结束（含被自动转后台的工具调用完成）时由 Claude Code 注入，不是人类输入触发的回合，不计入 `result.queued_turn_count`。 |
+| 任务通知回合 | task-notification turn | warden Claude Code 驱动器 | 原生字段 `result.origin` 取 `task-notification` 的回合；后台任务结束（含被自动转后台的工具调用完成）时由 Claude Code 注入，不是人类输入触发的回合，不计入 `result.queued_turn_count`。 |
 
 ## 外部接口契约
 
@@ -107,10 +107,10 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | 开始处理一条输入 | `turn_started{session_id, delivery_id}` | `delivery_id` 为本回合消费的投递；Agent 自行开始的回合（任务通知回合、会话内定时触发的回合）为空 |
 | `session_state_changed: idle` | `state_changed{idle}` | 与 `result` 共同构成回合边界；单独到达不结束回合 |
 | `session_state_changed: requires_action` | `state_changed{requires_action}` | 表示会话停在权限询问等请求上，不构成回合边界 |
-| `result` | 回合结果摘要 | 提供 `queued_turn_count`、`origin` 与 `stop_reason`；与 `idle` 齐备后发出 `turn_ended` |
-| Assistant 消息中的 `tool_use` | `tool_started{call_id}` | 每个 `call_id` 一次 |
-| User 消息中的 `tool_result` | `tool_ended{call_id}` | 与 `tool_started` 配对；未配对的调用在进程退出时清理 |
-| 被自动转后台的工具调用的占位 `tool_result` | `tool_ended{call_id}` | 照常配对；真实结果随带 `tool_use_id` 的 `task_notification` 到达；平台 MCP 阻塞型调用另按自动转后台规则转换，其余调用作为后台任务计入 `bg_jobs` |
+| `result` | `turn_ended{reason, origin, agent_exited, bg_procs}` 的取值来源 | 提供 `queued_turn_count`、`origin` 与 `stop_reason`；与 `idle` 齐备后发出 `turn_ended`：`stop_reason=tool_deferred` 时 `reason=tool_deferred`，其余为空；原生 `origin` 为 `task-notification` 时 `origin=task_notification`，其余为空 |
+| Assistant 消息中的 `tool_use` | `tool_started{call_id, name, summary}` | 每个 `call_id` 一次；`call_id` 取 `tool_use.id`，`name` 取 `tool_use.name`，`summary` 由 `tool_use.input` 生成：Bash 取 `command` 的首行，带 `file_path` 的文件类工具取该路径，`Monitor` 取其命令或 URL，其余工具为空；超过 `S_tool_summary`（256 字节）时按 UTF-8 字符边界截断，只用于呈现 |
+| User 消息中的 `tool_result` | `tool_ended{call_id, status}` | 与 `tool_started` 配对；`tool_result.is_error` 为真时 `status=error`，否则为 `ok`；未配对的调用在进程退出时清理 |
+| 被自动转后台的工具调用的占位 `tool_result` | `tool_ended{call_id, status=ok}` | 照常配对；真实结果随带 `tool_use_id` 的 `task_notification` 到达；平台 MCP 阻塞型调用另按自动转后台规则转换，其余调用作为后台任务计入 `bg_jobs` |
 | 权限询问 | `permission_requested{id, call_id, blocking, tool}` | `blocking=true` 用于实时接入与并行工具调用退回的阻塞等待，`false` 用于延迟审批；`tool{name, input, input_preview, input_hash, input_size}` 取首次触发时捕获的待批工具调用，`input_size` 为规范 JSON 编码的字节数；`input_size ≤ S_tool_input`（1 MiB）时 `input` 为完整规范 JSON、`input_preview` 为空，超过时 `input` 为空、`input_preview` 为规范编码的前 `S_tool_preview`（64 KiB）字节，摘要仍对完整内容计算 |
 | 平台 MCP 工具 `list_events` | 无额外事件 | 只产生 `tool_started` 与 `tool_ended`，不产生阻塞等待 |
 | 平台 MCP 工具 `subscribe_event` 完成 | `subscription_created{sub_id, since_cursor, agent_expected_ms}` | 订阅登记由平台 MCP 服务器完成；`agent_expected_ms` 取 Agent 在该调用中自报的 `expected_wait`，未填时为空 |
@@ -119,22 +119,22 @@ Claude Code 驱动器的职责穷举如下，每条先写执行的动作，再�
 | system 消息 `background_tasks_changed` | `bg_jobs_changed{job_ids}` | 以推送的完整集合替换驱动器的后台任务集合，`ambient=true` 的任务不计入；后台作业集合变化时发出 |
 | `task_started{is_backgrounded}`、`task_updated`、`task_notification{status, tool_use_id}` | `bg_jobs_changed{job_ids}` | 逐任务补充两次集合推送之间的变化；后台作业集合变化时发出 |
 | 进程表中不属于任何任务的进程 | `bg_jobs_changed{job_ids}` | 孤儿进程以 `proc:<pid>` 计入；已声明的第三方 MCP 服务器进程与托管 hook 二进制进程不计入 |
-| `CronCreate`、`CronDelete`、`ScheduleWakeup` 的 `tool_use` 与 `tool_result` | `self_wake_changed{entries, crons_synced}` | `CronCreate` 产生 `kind=cron` 条目，`ScheduleWakeup` 产生 `kind=wakeup` 条目，`CronDelete` 移除对应条目；cron 表达式无法解析时 `fire_at` 为空 |
+| `CronCreate`、`CronDelete`、`ScheduleWakeup` 的 `tool_use` 与 `tool_result` | `self_wake_changed{entries, crons_synced}` | `kind` 是描述性标签，接收方只区分 `cron` 与其余取值；`CronCreate` 产生 `kind=cron` 条目，`ScheduleWakeup` 产生 `kind=wakeup` 条目，`CronDelete` 移除对应条目；cron 表达式无法解析时 `fire_at` 为空 |
 | Bash 工具调用的 `timeout`、`Monitor` 的 `timeout_ms` | `self_wake_changed{entries, crons_synced}` | 分别产生 `kind=tool_timeout` 与 `kind=monitor_deadline` 条目 |
 | `Stop` 与 `SubagentStop` hook 输入的 `session_crons` | `self_wake_changed{entries, crons_synced}` | 回合结束（`Stop`）或子代理结束（`SubagentStop`）时以它为准增删 `kind=cron` 条目；本进程首次取得时 `crons_synced` 置真；集合与 `crons_synced` 都不变时不发 |
-| 前台工具调用的 `tool_use` 输入（Bash、Agent 工具、workflow、`Monitor`），以及归属于该调用的周期性连接 | `intent_observed{ref_kind=call, ref=call_id, class, target, expected_ms, prior, source, confidence}` | 在该调用的 `tool_started` 之后、`tool_ended` 之前发出；`run_in_background=true` 的调用不发 `call` 意图 |
-| 后台作业进入 `bg_jobs`，作业发起调用的输入，以及归属于该作业的周期性连接 | `intent_observed{ref_kind=job, ref=job_id, class, target, expected_ms, prior, source, confidence}` | 作业进入 `bg_jobs` 之后发出，离开之后不发；被自动转后台的调用产生的作业继承该调用的意图 |
-| `Stop` hook 输入的 `last_assistant_message` | `intent_observed{ref_kind=turn, ref=turn_id, class, target, expected_ms, prior, source, confidence}` | 处理该回合的 `Stop` 输入时发出；下一回合已开始时丢弃 |
-| 宿主侧分类模型的结果 | `intent_observed{..., source=classifier, confidence=0.6}` | 覆盖同一对象的规则结果；对象已结束（调用已 `tool_ended`、作业已离开 `bg_jobs`、下一回合已开始）时丢弃 |
-| 进程退出 | `turn_ended{reason, agent_exited=true, bg_procs}`；自唤醒条目变化时另发 `self_wake_changed{entries, crons_synced}` | 不就地重启；下一次投递或 `StartAgent` 以 `resume_session_id` 启动；后台作业集合清空，`survives_resume=false` 的自唤醒条目移除，意图表清空，不为清空发出 `intent_observed` |
+| 前台工具调用的 `tool_use` 输入（Bash、Agent 工具、workflow、`Monitor`），以及归属于该调用的周期性连接 | `intent_observed{ref_kind=call, ref=call_id, class, target, expected_ms, prior, source}` | 在该调用的 `tool_started` 之后、`tool_ended` 之前发出；`run_in_background=true` 的调用不发 `call` 意图 |
+| 后台作业进入 `bg_jobs`，作业发起调用的输入，以及归属于该作业的周期性连接 | `intent_observed{ref_kind=job, ref=job_id, class, target, expected_ms, prior, source}` | 作业进入 `bg_jobs` 之后发出，离开之后不发；被自动转后台的调用产生的作业继承该调用的意图 |
+| `Stop` hook 输入的 `last_assistant_message` | `intent_observed{ref_kind=turn, ref=turn_id, class, target, expected_ms, prior, source}` | 处理该回合的 `Stop` 输入时发出；下一回合已开始时丢弃 |
+| 宿主侧分类模型的结果 | `intent_observed{..., source=classifier}` | 覆盖同一对象的规则结果；对象已结束（调用已 `tool_ended`、作业已离开 `bg_jobs`、下一回合已开始）时丢弃 |
+| 进程退出 | `turn_ended{reason, origin, agent_exited=true, bg_procs}`；自唤醒条目变化时另发 `self_wake_changed{entries, crons_synced}` | 不就地重启；下一次投递或 `StartAgent` 以 `resume_session_id` 启动；后台作业集合清空，`survives_resume=false` 的自唤醒条目移除，意图表清空，不为清空发出 `intent_observed` |
 
-`turn_ended` 只在回合边界或进程退出时发出。回合边界的条件是 `result` 与 `idle` 齐备且 `result.queued_turn_count=0`；`queued_turn_count` 不计任务通知，`result.origin=task-notification` 的回合照常发出 `turn_ended`，但不视为人类回合。`bg_jobs_changed` 与 `self_wake_changed` 都携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换，或替换非 `cron` 条目并按 `entry_id` 合并 `cron` 条目（见[自唤醒源镜像](#自唤醒源镜像)）。这两种事件、`state_changed` 与 `intent_observed` 不受回合位置限制，没有进行中回合时同样发出。`intent_observed` 以 `(ref_kind, ref)` 标识对象，同一对象后到的覆盖先到的；`prior` 是命中签名的时长先验 `{p25, p50, p90}`，只在 `source=signature` 时非空，其余来源为空；`ref_kind=turn` 时 `ref` 为该回合的 `turn_id`，与回合外事件为空的信封字段 `turn_id` 无关。`class` 为 `unknown` 且 `target` 与 `expected_ms` 都为空的意图不发出，除非它覆盖同一对象已发出的意图；接收方没有某个对象的意图即按 `unknown` 处理。回合内事件的 `event_seq` 在同一回合内单调，接收方按它丢弃重复或乱序的回合内事件；没有进行中回合时发出的事件（下称回合外事件）`turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件的重复与乱序不改变结果。
+`turn_ended` 只在回合边界或进程退出时发出。回合边界的条件是 `result` 与 `idle` 齐备且 `result.queued_turn_count=0`；`queued_turn_count` 不计任务通知，原生 `result.origin` 为 `task-notification` 的回合照常发出 `turn_ended`，其 `turn_ended.origin` 为 `task_notification`；`origin` 是描述性标签，`runcontroller` 只把它写入指标与回合事实，不据以分支，Agent 自行开始的回合由 `turn_started.delivery_id` 为空表达。`bg_jobs_changed` 与 `self_wake_changed` 都携带完整集合：`bg_jobs_changed` 按替换语义处理，`self_wake_changed` 按 `crons_synced` 整体替换，或替换非 `cron` 条目并按 `entry_id` 合并 `cron` 条目（见[自唤醒源镜像](#自唤醒源镜像)）。这两种事件、`state_changed` 与 `intent_observed` 不受回合位置限制，没有进行中回合时同样发出。`intent_observed` 以 `(ref_kind, ref)` 标识对象，同一对象后到的覆盖先到的；`prior` 是命中签名的时长先验 `{p25, p50, p90}`，只在 `source=signature` 时非空，其余来源为空；`ref_kind=turn` 时 `ref` 为该回合的 `turn_id`，与回合外事件为空的信封字段 `turn_id` 无关。`class` 为 `unknown` 且 `target` 与 `expected_ms` 都为空的意图不发出，除非它覆盖同一对象已发出的意图；接收方没有某个对象的意图即按 `unknown` 处理。回合内事件的 `event_seq` 在同一回合内单调，接收方按它丢弃重复或乱序的回合内事件；没有进行中回合时发出的事件（下称回合外事件）`turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件的重复与乱序不改变结果。
 
 ## 依赖
 
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对本地代理、平台 MCP 服务器与工作区的调用是同一进程内的组件协作或运行时调用，不是代码依赖。
 
-- `agentprotocol`：`AgentEvent` 的种类、字段、`event_seq` 与出站流发送；驱动器只负责事件内容。
+- `agentprotocol`：`AgentEvent` 的种类、字段、`event_seq` 与出站流发送，以及审批内容摘要所用的规范编码函数 `CanonicalJSON`；驱动器只负责事件内容。
 - Claude Code 无头模式：`-p`、`--output-format stream-json`、`--input-format stream-json`、`--verbose` 与 `--resume`（[REF-claude-code-headless](../../../references.md)）。
 - Claude Code hooks：command hook 的执行方式（是否经 shell 执行，决定注册命令是否带 `exec` 前缀），`PreToolUse` 的 `defer`、`timeout`、`onFailure` 与输出中的 `permissionDecision`、`permissionDecisionReason`，`Stop` 与 `SubagentStop` 输入中的 `background_tasks` 与 `session_crons{id, schedule, recurring, prompt}`，`Stop` 输入中的 `last_assistant_message`，`PostToolUse` 与 `PostToolUseFailure` 输入中的 `tool_name`、`tool_input` 与 `tool_use_id`，`Stop` 与 `SubagentStop` 先于回合或子代理结束执行（两者可以阻止停止），`PostToolUse`、`PostToolBatch` 与 `SubagentStart` 输出的 `hookSpecificOutput.additionalContext`（上限 10000 字符；前两者出现在工具结果旁，模型在下一次模型请求时读到，`SubagentStart` 的出现在子代理开始时；`Stop` 与 `SubagentStop` 的 `additionalContext` 会让对话继续，本模块不使用），以及 `UserPromptSubmit`、`StopFailure`、`SessionEnd`（[REF-claude-code-hooks](../../../references.md)、[REF-claude-agent-sdk-typescript](../../../references.md)）。
 - Claude Code 设置：托管策略设置文件的作用域、优先级与 `allowManagedHooksOnly`（[REF-claude-code-settings](../../../references.md)）。
@@ -282,7 +282,7 @@ sequenceDiagram
 | `turn` | 当前或最近一个回合的记录 |
 | `pending_delivery` | 已写入 stdin 但尚未观察到 `turn_started` 的投递 |
 | `pending_permissions` | 按 `permission_id` 索引的待决审批记录 |
-| `running_tools` | 未配对的 `tool_started` 调用集合 |
+| `running_tools` | 未配对的 `tool_started` 调用集合，每项为 `{call_id, name, summary}` |
 | `hook_ledger` | 一次性核对的已观察事件状态：本进程 stdout 中已观察到 `tool_use` 的调用及其所在上下文、所属批次与是否已结束，回合与子代理的结束窗口，已观察到开始的子代理，即将开始的回合，以及按 hook 事件记录的已接受事件标识；每次 Agent 进程启动时从空起算，规则见[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对) |
 | `bg_tasks` | 最近一次 `background_tasks_changed` 推送并经 `task_*` 补充的存活后台任务集合，含 `ambient=true` 的任务；进程启动或重启时置空 |
 | `bg_jobs` | 按 `job_id` 索引的后台作业记录：`bg_tasks` 中 `ambient=false` 的任务与孤儿进程；`bg_jobs_changed` 的来源 |
@@ -314,7 +314,7 @@ sequenceDiagram
 | `turn_id` | 驱动器分配的回合标识，同一代内唯一 |
 | `delivery_id` | 本回合消费的投递；Agent 自行开始的回合为空 |
 | `started_at`、`ended_at` | 回合开始与边界时刻 |
-| `origin` | `result.origin`；`task-notification` 表示任务通知回合 |
+| `origin` | 原生 `result.origin`；取 `task-notification` 时表示任务通知回合，`turn_ended.origin` 为 `task_notification` |
 | `queued_turn_count` | `result.queued_turn_count`；为 0 才可能构成边界 |
 | `stop_reason` | `result.stop_reason`；`tool_deferred` 表示延迟审批 |
 | `agent_exited` | 回合是否因进程退出而结束 |
@@ -351,7 +351,7 @@ sequenceDiagram
 | 字段 | 含义 |
 | --- | --- |
 | `entry_id` | `kind=cron` 取 `CronCreate` 的 `tool_result` 中的作业标识（与 `session_crons[].id` 相同）；其余种类取产生该条目的工具调用的 `call_id` |
-| `kind` | 闭集 `cron`、`wakeup`、`tool_timeout`、`monitor_deadline` |
+| `kind` | 描述性标签；本驱动器产生 `cron`、`wakeup`、`tool_timeout`、`monitor_deadline`，接收方只区分 `cron` 与其余取值 |
 | `fire_at` | 下一次触发的绝对时刻；为空表示触发时刻未知，只出现在 cron 表达式无法解析的 `kind=cron` 条目上 |
 | `survives_resume` | 销毁重建后该项是否经 `--resume` 由 Agent 自行恢复：`cron` 为真，其余为假 |
 | `schedule`、`recurring` | 只用于 `kind=cron`：5 字段 cron 表达式与是否周期触发；`recurring` 为真时触发后重算 `fire_at` |
@@ -362,20 +362,19 @@ sequenceDiagram
 
 | 字段 | 含义 |
 | --- | --- |
-| `ref_kind` | 闭集 `call`（前台工具调用）、`job`（后台作业）、`turn`（回合） |
+| `ref_kind` | 已知取值 `call`（前台工具调用）、`job`（后台作业）、`turn`（回合） |
 | `ref` | `call` 为 `call_id`，`job` 为 `job_id`，`turn` 为 `turn_id` |
-| `class` | `call` 与 `job` 取闭集 `waiting`、`working`、`serving`、`unknown`；`turn` 取闭集 `question`、`completed`、`unknown` |
+| `class` | 已知取值随 `ref_kind` 而定：`call` 与 `job` 取 `waiting`、`working`、`serving`、`unknown`；`turn` 取 `question`、`completed`、`unknown` |
 | `target` | 等待对象的描述性标识，例如 `github:workflow_run:1234`；可空 |
 | `expected_ms` | 预计等待时长；可空 |
 | `prior` | 命中签名的时长先验 `{p25, p50, p90}`（毫秒），取自该签名的 `prior`；只在 `source=signature` 时非空，此时 `expected_ms` 取其中的 p50；其余来源为空 |
-| `source` | 闭集 `signature`、`self_report`、`keyword`、`classifier`；本驱动器发出的意图只取 `signature`、`keyword` 或 `classifier` |
-| `confidence` | 0～1；`signature` 为 0.9，`keyword` 为 0.3，`classifier` 为 0.6 |
+| `source` | 已知取值 `signature`、`self_report`、`keyword`、`classifier`；本驱动器发出的意图只取 `signature`、`keyword` 或 `classifier` |
 | `signature_id` | 命中的等待签名的 `id`；未命中为空 |
 | `correlation` | 按签名的 `correlation` 规则从匹配结果提取的[关联键身份键](../../../glossary.md)取值；未命中为空 |
 | `context` | 对象所在的上下文：主会话或某个子代理，按 stream-json 消息的 `parent_tool_use_id` 判定；只用于选择返回提示的 hook |
 | `classifier_pending` | 是否有进行中的宿主侧分类请求；每个对象至多一个 |
 
-`intent_observed` 携带 `{ref_kind, ref, class, target, expected_ms, prior, source, confidence}`；`signature_id`、`correlation`、`context` 与 `classifier_pending` 只在驱动器内使用。
+`ref_kind`、`class` 与 `source` 是开放集合，表中列出的是已知取值：接收方丢弃取值越出已知取值的事件并计数，新增取值不涉及协议版本，也不需要能力标识。`intent_observed` 携带 `{ref_kind, ref, class, target, expected_ms, prior, source}`，不携带置信度，置信度由 suspendpolicy 按 `source` 查“等待意图的置信度”表得到（[suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度)）；`signature_id`、`correlation`、`context` 与 `classifier_pending` 只在驱动器内使用。
 
 ### 提示频率状态
 
@@ -435,11 +434,11 @@ sequenceDiagram
 
 | 步骤 | 事件或调用 | 驱动器状态 | 持久写入 |
 | --- | --- | --- | --- |
-| 1 | Agent 在主会话调用 `Bash{command="gh run watch 1234", run_in_background=true}`（`call_id=t-5`） | 命中 `gh-run-watch`，算得意图 `waiting`、`target=github:workflow_run:1234`、`expected_ms=360000`、`prior={p25: 120000, p50: 360000, p90: 1200000}`、`signature`、0.9、`correlation={workflow_run.id: 1234}`；`run_in_background=true`，不登记 `call` 意图 | 无；发出 `tool_started{t-5}` |
-| 2 | `tool_result` 返回后台任务标识 `b-1`，`b-1` 进入后台任务集合 | `intents` 加入 `(job, b-1)`，继承第 1 步的意图；`gh-run-watch` 没有条目，首次命中，`pending_hints` 加入 `b-1`（主会话） | 无；发出 `tool_ended{t-5}`、`bg_jobs_changed{[b-1]}` 与 `intent_observed{job, b-1, waiting, github:workflow_run:1234, 360000, prior={120000, 360000, 1200000}, signature, 0.9}` |
+| 1 | Agent 在主会话调用 `Bash{command="gh run watch 1234", run_in_background=true}`（`call_id=t-5`） | 命中 `gh-run-watch`，算得意图 `waiting`、`target=github:workflow_run:1234`、`expected_ms=360000`、`prior={p25: 120000, p50: 360000, p90: 1200000}`、`signature`、`correlation={workflow_run.id: 1234}`；`run_in_background=true`，不登记 `call` 意图 | 无；发出 `tool_started{t-5}` |
+| 2 | `tool_result` 返回后台任务标识 `b-1`，`b-1` 进入后台任务集合 | `intents` 加入 `(job, b-1)`，继承第 1 步的意图；`gh-run-watch` 没有条目，首次命中，`pending_hints` 加入 `b-1`（主会话） | 无；发出 `tool_ended{t-5}`、`bg_jobs_changed{[b-1]}` 与 `intent_observed{job, b-1, waiting, github:workflow_run:1234, 360000, prior={120000, 360000, 1200000}, signature}` |
 | 3 | Agent 在主会话调用 `Read`（`t-6`），其 `PostToolUse` 是作业登记之后主会话的首个 hook 查询 | `pending_hints` 清空；`gh-run-watch`：`k=0`、`last_hint_turn=41`、`window={workflow_run.id: 1234, until_turn=44}`、`hinted=1` | 异步写入 `.platform/hint-state.json`；hook 返回订阅建议作为 `additionalContext` |
 | 4 | Agent 在下一次模型请求读到提示，调用 `subscribe_event`（外部系统 github，事件 `workflow_run.completed`，`correlation={workflow_run.id: 1234}`，`expected_wait=10m`，`call_id=t-7`），平台 MCP 服务器登记 `sub-3` | `gh-run-watch`：窗口内出现同一 `event_type`、同一关联对象的订阅（满足其一即可），判为采纳；`window` 置空，`k=0`，`adopted=1` | 异步写入频率状态；发出 `tool_started{t-7}`、`subscription_created{sub-3, since_cursor, agent_expected_ms=600000}` 与 `tool_ended{t-7}` |
-| 5 | 回合结束，`Stop` 输入的 `last_assistant_message` 为“已登记 workflow run 1234 的完成订阅，本回合的修改已全部提交。” | `intents` 加入 `(turn, turn-20)`：`completed`、`keyword`、0.3 | 无；发出 `intent_observed{turn, turn-20, completed, keyword, 0.3}`；`result` 与 `idle` 齐备后发出 `turn_ended` |
+| 5 | 回合结束，`Stop` 输入的 `last_assistant_message` 为“已登记 workflow run 1234 的完成订阅，本回合的修改已全部提交。” | `intents` 加入 `(turn, turn-20)`：`completed`、`keyword` | 无；发出 `intent_observed{turn, turn-20, completed, keyword}`；`result` 与 `idle` 齐备后发出 `turn_ended` |
 
 走查确认意图层的结论。`run_in_background=true` 的调用立即返回，意图挂在它产生的作业上，作业触发的提示在作业登记之后、同一上下文的首个 `PostToolUse` 返回，Agent 在下一次模型请求才读到；签名意图携带签名的 `prior`，等待时长预测按其中的三个分位扣除已等待时长使用，已等待时长超过 p90 后该意图退出候选，由平台给出的 `predicted_ms`、等待来源的先验行等其余候选给出预测（见 [suspendpolicy](../design-suspendpolicy.md)）。采纳按窗口内同一关联对象或同一 `event_type` 的 `subscribe_event` 判定，第 4 步若订阅的是 workflow run 1235 的 `workflow_run.completed`，同样判为采纳；`expected_wait` 只随 `subscription_created.agent_expected_ms` 上报，不产生 `intent_observed`。`b-1` 仍在运行，回合边界不构成安全点，这一次等待由静止冻结与入站数据唤醒兜住；回合意图为 `completed`，宽限期的选择归 [suspendpolicy](../design-suspendpolicy.md)。若 Agent 忽略提示（第 4 步没有发生），并在 `turn_ordinal=42` 的回合再次以 `gh run watch` 等待，该提示判为未采纳（`k=1`），退避到 `turn_ordinal ≥ 43` 才再次提示；再次提示后仍未采纳时 `k=2`，本运行实例此后不提示该签名。Agent 以前台 `sleep 20` 等待时，纯定时等待的定时总长短于 `T_hint_timer`，驱动器只发出 `waiting` 意图，不触发提示。
 
@@ -490,11 +489,11 @@ claude -p --output-format stream-json --input-format stream-json --verbose [--re
 1. `session_state_changed: idle` 到达，且
 2. `result.queued_turn_count=0` 到达。
 
-`result` 与 `idle` 的先后不固定，两者都到齐才判定；缺少任一个都不发 `turn_ended`，也不进入 `boundary`。`result.origin=task-notification` 的回合照常判定边界，但在事件中保留 `origin`，由 `runcontroller` 区分人类回合与任务通知回合。`requires_action` 不是边界；它表示会话停在权限询问等请求上。
+`result` 与 `idle` 的先后不固定，两者都到齐才判定；缺少任一个都不发 `turn_ended`，也不进入 `boundary`。原生 `result.origin` 为 `task-notification` 的回合照常判定边界，驱动器把它翻译为 `turn_ended.origin=task_notification`；`runcontroller` 只把 `origin` 写入指标与回合事实，不据以分支。`requires_action` 不是边界；它表示会话停在权限询问等请求上。
 
 同一回合只发一次 `turn_ended`。`result` 到达时 `queued_turn_count` 大于 0 表示还有排队的回合，当前回合不结束；队列排空后由后续的 `result` 与 `idle` 判定。进程在回合中退出时，驱动器立即发 `turn_ended{agent_exited=true}`，不等待缺失的信号。
 
-`result.queued_turn_count` 只计 human 来源的消息，不计任务通知（[REF-claude-agent-sdk-typescript](../../../references.md)）。`queued_turn_count=0` 因而只说明没有排队的人类输入：`bg_jobs` 非空的回合边界上，任一后台任务结束都会使 Claude Code 注入 `origin=task-notification` 的回合，这样的边界随时可能被 Agent 自行开始的回合打断。驱动器照常为它发 `turn_ended` 并进入 `boundary`，但该边界不构成安全点，控制面也不从它起算宽限期，宽限期从后台作业集合变为空时起算（[runcontroller](../design-runcontroller.md)）。会话内定时触发的回合同样由 Claude Code 自行开始，判定规则相同。
+`result.queued_turn_count` 只计 human 来源的消息，不计任务通知（[REF-claude-agent-sdk-typescript](../../../references.md)）。`queued_turn_count=0` 因而只说明没有排队的人类输入：`bg_jobs` 非空的回合边界上，任一后台任务结束都会使 Claude Code 注入原生 `origin=task-notification` 的回合，这样的边界随时可能被 Agent 自行开始的回合打断。驱动器照常为它发 `turn_ended` 并进入 `boundary`，但该边界不构成安全点，控制面也不从它起算宽限期，宽限期从后台作业集合变为空时起算（[runcontroller](../design-runcontroller.md)）。会话内定时触发的回合同样由 Claude Code 自行开始，判定规则相同。
 
 ### LLM 等待信号与 hooks 旁证
 
@@ -510,7 +509,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 `PreToolUse` hook 由看守进程提供的本地二进制实现，二进制随镜像放在工作区之外，在托管策略设置中的注册方式保证二进制的父进程为 Agent 主进程：Claude Code 经 shell 执行 hook 命令时注册为 `exec <托管 hook 二进制路径>`，shell 以 `exec` 让位；直接执行时注册为二进制路径本身（见[托管 hook 的执行](design-warden.md#托管-hook-的执行)）；`allowManagedHooksOnly` 使工作区内声明的 hooks 不生效。二进制经看守进程的托管 hook IPC 端点向驱动器查询，端点以 `SO_PEERCRED` 与一次性事件核对认证查询方，见[托管 hook 的执行](design-warden.md#托管-hook-的执行)与[托管 hook 查询的一次性核对](#托管-hook-查询的一次性核对)。驱动器在 hook 与 Claude Code 之间传递询问与决定。
 
-**审批内容绑定。** 首次 `PreToolUse` 触发时，驱动器对 hook 输入中的 `tool_input` 按规范 JSON 编码计算审批内容摘要（`input_hash`），规范 JSON 编码由 `agentprotocol` 提供的函数实现，首次触发与交付前重算使用同一函数，与 `tool_use_id`、工具名一起记入 `pending_permissions`，并随 `permission_requested.tool{name, input, input_preview, input_hash, input_size}` 发出，`input` 与 `input_preview` 的取值规则见[事件输出](#事件输出)。阻塞路径与续接路径在把决定交给 hook 之前，按当前 hook 输入重新计算摘要，它必须等于 `target.input_hash`；不一致时输出 `permissionDecision: "deny"`，原因为“工具调用内容与审批时不一致”，计数 `approval_input_mismatch` 并告警，该次调用不放行。续接进程的 `tool_input` 取自 Agent 可写的会话记录，按不可信处理，摘要比对使这份输入不能替换[审批人](../../../glossary.md)所见的内容。审批人给出 `updatedInput` 时原样交给 Claude Code，比对仍以首次触发时的原始摘要为准。
+**审批内容绑定。** 首次 `PreToolUse` 触发时，驱动器对 hook 输入中的 `tool_input` 按规范 JSON 编码计算审批内容摘要（`input_hash`），规范 JSON 编码由 `agentprotocol` 提供的函数 `CanonicalJSON` 实现，首次触发与交付前重算使用同一函数。`CanonicalJSON` 对无法规范编码的输入（例如对象里有重复键）返回错误，此时驱动器不发起审批、不发出 `permission_requested`，hook 输出 `permissionDecision: "deny"`，原因为“工具调用输入无法规范编码”，计数 `approval_input_uncanonical`，该次调用不放行；交付前重算时无法规范编码同样拒绝。摘要与 `tool_use_id`、工具名一起记入 `pending_permissions`，并随 `permission_requested.tool{name, input, input_preview, input_hash, input_size}` 发出，`input` 与 `input_preview` 的取值规则见[事件输出](#事件输出)。阻塞路径与续接路径在把决定交给 hook 之前，按当前 hook 输入重新计算摘要，它必须等于 `target.input_hash`；不一致时输出 `permissionDecision: "deny"`，原因为“工具调用内容与审批时不一致”，计数 `approval_input_mismatch` 并告警，该次调用不放行。续接进程的 `tool_input` 取自 Agent 可写的会话记录，按不可信处理，摘要比对使这份输入不能替换[审批人](../../../glossary.md)所见的内容。审批人给出 `updatedInput` 时原样交给 Claude Code，比对仍以首次触发时的原始摘要为准。
 
 **异步渠道。** 驱动器先发出 `permission_requested{blocking=false, tool{name, input, input_hash}}`，hook 再返回 `permissionDecision: "defer"`，阶段保持 `in_turn`，不经过 `blocked`；Claude Code 以 `stop_reason: tool_deferred` 结束回合后，驱动器发出 `turn_ended`，回合进入边界，可由 `runcontroller` 在安全点销毁。决定到达后，`Deliver` 的 `target=permission_decision{id, input_hash}` 与 `resume_session_id` 触发续接：以 `--resume` 不带 prompt 启动，同一工具调用再次触发 `PreToolUse`，驱动器的续接进程按当前 hook 输入重算摘要，与 `target.input_hash` 相等才把决定交给 hook，hook 返回 allow（可携带 `updatedInput`）或 deny（携带消息）。
 
@@ -542,7 +541,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 驱动器向 Claude Code 注入平台 MCP 服务器的连接配置，并合并项目作用域工具接入声明中已批准的第三方 MCP 服务器；工作区内的 `.mcp.json` 被忽略，`--strict-mcp-config` 或等效配置只使用平台下发的服务器集合。工具集合与语义归平台 MCP 服务器与第三方服务器；本模块负责以下接入工作：把工具调用的开始与结束翻译为 `tool_started` 与 `tool_ended`，阻塞型工具调用在开始时另发 `wait_started{kind=...}`，把 `subscribe_event`、`sleep_until` 与 `wait_for` 的结果翻译为 `subscription_created`、`timer_requested{scope=run}` 与 `wait_started{kind=wait_for}`，处置被自动转后台的调用，以及设置 `MCP_TOOL_TIMEOUT`。
 
-**自报等待时长与 `instructions`。** Agent 调用 `subscribe_event`、`wait_for` 与 `sleep_until` 时可以填写可选参数 `expected_wait`（预计等待时长）与 `reason`（短文本），不填就没有；参数定义与解析归看守进程的[平台 MCP 工具](design-warden.md#平台-mcp-工具)，平台不提供单独的意图回报工具。平台 MCP 服务器把 `expected_wait` 换算为毫秒，随工具事件交给驱动器，驱动器写入 `subscription_created.agent_expected_ms` 与 `wait_started.agent_expected_ms`（`wait_for` 与阻塞型 `sleep_until`），未填或无法解析时为空；它与平台给出的 `predicted_ms` 分开上报，来源不混，置信度由 `suspendpolicy` 按该运行实例的自报历史计算。非阻塞 `sleep_until` 只产生 `timer_requested`，到点时刻已由 `fire_at` 给出，`expected_wait` 不上报；`reason` 不进入协议事件，由平台 MCP 服务器连同 `run_id`、`call_id`、工具名与 `expected_wait` 写进结构化日志，供诊断与抽检。平台 MCP 服务器在初始化时以 `instructions` 提供等待方式的选择规则，内容与工具描述一致（见[等待方式的选择](design-warden.md#等待方式的选择)），驱动器的 `SubagentStart` hook 向子代理注入同一文本。
+**自报等待时长与 `instructions`。** Agent 调用 `subscribe_event`、`wait_for` 与 `sleep_until` 时可以填写可选参数 `expected_wait`（预计等待时长）与 `reason`（短文本），不填就没有；参数定义与解析归看守进程的[平台 MCP 工具](design-warden.md#平台-mcp-工具)，平台不提供单独的意图回报工具。平台 MCP 服务器把 `expected_wait` 换算为毫秒，随工具事件交给驱动器，驱动器写入 `subscription_created.agent_expected_ms` 与 `wait_started.agent_expected_ms`（`wait_for` 与阻塞型 `sleep_until`），未填或无法解析时为空；它与平台给出的 `predicted_ms` 分开上报，来源不混，置信度由 [suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度) 按该运行实例的自报历史计算。非阻塞 `sleep_until` 只产生 `timer_requested`，到点时刻已由 `fire_at` 给出，`expected_wait` 不上报；`reason` 不进入协议事件，由平台 MCP 服务器连同 `run_id`、`call_id`、工具名与 `expected_wait` 写进结构化日志，供诊断与抽检。平台 MCP 服务器在初始化时以 `instructions` 提供等待方式的选择规则，内容与工具描述一致（见[等待方式的选择](design-warden.md#等待方式的选择)），驱动器的 `SubagentStart` hook 向子代理注入同一文本。
 
 第三方 MCP 服务器只支持 stdio 本地子进程，可执行文件来自镜像内预置并固定版本与摘要；进程是 Agent 的子进程，位于 `agent` 子 cgroup，随 Agent 冻结与解冻，服务器进程本身不进入 `bg_jobs`。本模块所称已声明的第三方 MCP 服务器进程包含这些服务器进程的子进程，与 `Activity.mcp_procs` 的计数范围相同；安全点检查第 6、9 步与孤儿进程的判定都按此口径。Agent 退出后这些服务器没有客户端，驱动器终止它们；以挂起为目的的销毁中，终止发生在 Agent 正常退出之后（安全点第 9 步），这是挂起路径中唯一的进程终止动作，口径见[安全点](#安全点)。快照恢复后重连或重启，销毁重建后必然重启。远程 MCP 视为普通外部系统流量，经本地代理或透明拦截器到出口代理，不在沙箱内起进程。
 
@@ -587,7 +586,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 ### 快照恢复后的衔接
 
-快照恢复后，看守进程先以 `Resumed.wall_clock_now` 校准本地时钟，再主动断开 Agent 进程的旧 TCP 连接，最后通知驱动器。驱动器在此之后：
+快照恢复后，看守进程先完成校时（先以恢复后的首次 `RenewLease` 校时，重建出站流后再按 `Challenge.server_now` 校时，规则见[看守进程](design-warden.md#校时)），再主动断开 Agent 进程的旧 TCP 连接，最后通知驱动器。驱动器在此之后：
 
 - 丢弃按旧时钟计算的 hook 截止时间与等待超时，按校时后的时钟重新建立；
 - 不重放已交付的输入，不重复发出 `turn_started`；
@@ -668,15 +667,15 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 
 - `match.command` 是正则，在 Bash 的 `command`（作业取其发起调用的 `command`）与 `Monitor` 的命令中查找。
 - `match.request{host, method, path_regex}` 对 `Monitor` 的 URL 按主机与路径匹配。对网络请求的匹配需要路径级观察，路径只在出口代理可见，这一观察是可选能力；不具备时驱动器不以网络请求判定 `match.request` 命中，同一主机的重复连接只按周期性连接分类。
-- 命中后按 `correlation` 规则从匹配结果（正则的命名分组）提取关联键身份键的取值；`target` 由外部系统名、`event_type` 的对象部分与身份键取值拼成（`github:workflow_run:1234`），意图的 `prior` 取签名的 `prior`，`expected_ms` 取其中的 p50，`class=waiting`，`confidence=0.9`。
+- 命中后按 `correlation` 规则从匹配结果（正则的命名分组）提取关联键身份键的取值；`target` 由外部系统名、`event_type` 的对象部分与身份键取值拼成（`github:workflow_run:1234`），意图的 `prior` 取签名的 `prior`，`expected_ms` 取其中的 p50，`class=waiting`，`source=signature`。
 - `event_type` 属于该外部系统事件目录（与 `list_events` 一致）由 `connectorhub` 在装载时校验，驱动器不重复校验；正则无法编译的签名跳过并计数。
 - 没有签名命中的等待只做分类，不给订阅建议；纯定时等待另按频率键 `timer` 建议 `sleep_until`，门槛见下文“提示触发”。
 
-**周期性连接。** 本地代理与透明拦截器按主机与归属对象记录 Agent 外部连接的建立时刻并判定周期性连接，承载 LLM 请求与平台 MCP 交互的回环连接不在记录之列；判据与参数见[本地代理](design-warden-llmproxy.md#周期性连接观测)。归属对象由驱动器按连接所属进程判定：该进程或其祖先进程属于某个作业的 `pids` 时归该作业；否则 `running_tools` 中恰好有一个 Bash 调用时归该调用；其余情形不归属。归属为空的观测不产生意图；有归属的观测判为 `class=waiting`，`target` 取主机名，`source=keyword`，`confidence=0.3`，对象已有更高置信度的意图时不发出；撤销通知不改变已发出的意图。
+**周期性连接。** 本地代理与透明拦截器按主机与归属对象记录 Agent 外部连接的建立时刻并判定周期性连接，承载 LLM 请求与平台 MCP 交互的回环连接不在记录之列；判据与参数见[本地代理](design-warden-llmproxy.md#周期性连接观测)。归属对象由驱动器按连接所属进程判定：该进程或其祖先进程属于某个作业的 `pids` 时归该作业；否则 `running_tools` 中恰好有一个 Bash 调用时归该调用；其余情形不归属。归属为空的观测不产生意图；有归属的观测判为 `class=waiting`，`target` 取主机名，`source=keyword`，对象已有按“等待意图的置信度”表置信度更高的意图时不发出（[suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度)）；撤销通知不改变已发出的意图。
 
-**宿主侧分类。** `intent.classifier` 开启时，规则结果为 `unknown` 的调用与作业（命令与描述）以及回合（最后一条消息）由看守进程经本地代理向 `llmgateway` 发出分类请求。请求只含待分类的文本与 `class` 闭集，不含会话记录，不经 Agent 进程，不进入 Agent 上下文，附 `llmgateway` 受众的运行实例令牌、按运行实例计费。本地代理转发时附上请求头 `x-castworks-purpose: classifier`（`purpose=classifier`），不为它发出 `llm.request.*` 事件，不计入本地代理的请求记录、外部在途连接与 `Activity.llm_last_request_at`；`llmgateway` 照常校验令牌并计费，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，不参与事件源实例租约（不为它调用 `RenewSourceLease`），也不写 `llm_completed` 或 `llm_failed` 唤醒信号，分类请求在网关内部的跟踪按网关自身的超时处理。分类请求因此不进入阻塞条件与静止证据，不影响 I9 预检的“本代无在途请求”与看守进程侧的安全点复核。该标记只由看守进程自身发起的分类请求携带：本地代理剥离来自 Agent 进程的请求中的该请求头，`llmgateway` 不接受 Agent 侧的该标记（见[本地代理](design-warden-llmproxy.md#宿主侧分类请求)）。每个对象至多一个请求，失败与超时不重试；结果属于闭集时以 `source=classifier`、`confidence=0.6` 发出并覆盖规则结果，越出闭集按 `unknown` 处理，对象已结束时丢弃。hook 查询与回合边界判定都不等待分类结果；进入安全点时放弃进行中的分类请求。
+**宿主侧分类。** `intent.classifier` 开启时，规则结果为 `unknown` 的调用与作业（命令与描述）以及回合（最后一条消息）由看守进程经本地代理向 `llmgateway` 发出分类请求。请求只含待分类的文本与 `class` 的已知取值，不含会话记录，不经 Agent 进程，不进入 Agent 上下文，附 `llmgateway` 受众的运行实例令牌、按运行实例计费。本地代理转发时附上请求头 `x-castworks-purpose: classifier`（`purpose=classifier`），不为它发出 `llm.request.*` 事件，不计入本地代理的请求记录、外部在途连接与 `Activity.llm_last_request_at`；`llmgateway` 照常校验令牌并计费，但不经 `SetRunFact{inflight_request}` 登记在途请求事实，不参与事件源实例租约（不为它调用 `RenewSourceLease`），也不写 `llm_completed` 或 `llm_failed` 唤醒信号，分类请求在网关内部的跟踪按网关自身的超时处理。分类请求因此不进入阻塞条件与静止证据，不影响 I9 预检的“本代无在途请求”与看守进程侧的安全点复核。该标记只由看守进程自身发起的分类请求携带：本地代理剥离来自 Agent 进程的请求中的该请求头，`llmgateway` 不接受 Agent 侧的该标记（见[本地代理](design-warden-llmproxy.md#宿主侧分类请求)）。每个对象至多一个请求，失败与超时不重试；结果属于 `class` 的已知取值时以 `source=classifier` 发出并覆盖规则结果，越出已知取值按 `unknown` 处理，对象已结束时丢弃。hook 查询与回合边界判定都不等待分类结果；进入安全点时放弃进行中的分类请求。
 
-**发出规则。** 每个对象先按规则得到意图，宿主侧分类在规则之后补判；同一对象后到的结果只在置信度不低于当前意图时发出，接收方以它覆盖先到者。
+**发出规则。** 每个对象先按规则得到意图，宿主侧分类在规则之后补判；同一对象后到的结果只在其 `source` 按“等待意图的置信度”表（[suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度)）的置信度不低于当前意图时发出，接收方以它覆盖先到者。
 
 - `call` 意图在该调用的 `tool_started` 之后发出，`tool_ended` 之后不发；`run_in_background=true` 的调用不发 `call` 意图。
 - `job` 意图在作业进入 `bg_jobs` 并发出 `bg_jobs_changed` 之后发出，作业离开 `bg_jobs` 之后不发。作业继承发起调用的意图：关联取任务消息携带的 `tool_use_id`，`run_in_background=true` 的 Bash 调用按其 `tool_result` 返回的后台任务标识关联；关联不上时不产生意图。周期性连接可以在作业存续期间更新它的意图。
@@ -783,6 +782,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 | `PreToolUse` hook 超过 `timeout` | `onFailure: block` 生效，返回拒绝结果并带消息；不默认放行，不无限阻塞 |
 | 托管 `PreToolUse` hook 的 IPC 查询失败：端点不可达、认证被拒（`SO_PEERCRED` 校验或一次性核对不通过）、超过查询截止时间或应答无法解析 | hook 输出 `permissionDecision: "deny"`，原因为“平台审批暂不可用”，不放行；拒绝作为工具结果交回模型，回合继续；计数 |
 | 审批决定交付前重算的 `input_hash` 与 `target.input_hash` 不一致 | hook 输出 `permissionDecision: "deny"`，原因为“工具调用内容与审批时不一致”，计数 `approval_input_mismatch` 并告警；不放行该次调用，Agent 需重新发起并重新审批 |
+| `PreToolUse` 的工具输入无法规范编码（`CanonicalJSON` 返回错误，例如对象里有重复键），首次触发或交付前重算时 | 不发起审批，不发出 `permission_requested`；hook 输出 `permissionDecision: "deny"`，原因为“工具调用输入无法规范编码”，计数 `approval_input_uncanonical`；不放行该次调用 |
 | 托管 hook 查询未通过一次性核对：事件未观察到、已接受过或不在窗口之内 | 端点拒绝该查询并计数告警，查询不进入驱动器的应答、对账与意图解析；hook 按查询失败处理，`PreToolUse` 输出拒绝，其余 hook 输出空结果 |
 | 审批决定的目标已失效 | 回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递 |
 | 并行工具调用使 `defer` 被忽略 | 退回阻塞等待；各决定以定向投递分别送达，不销毁 |
@@ -820,7 +820,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 - **意图与提示状态**：`intents`、`pending_hints` 与 `hint_state` 的更新在驱动器锁内执行。托管 hook 的查询只读写内存状态，不执行网络调用、不等待分类请求、不写盘，也不持有进程监督锁，耗时目标 10 ms 以内；`hint_state` 的持久化在锁外异步执行。宿主侧分类请求在锁外异步执行，结果回到锁内按对象是否仍存在决定发出或丢弃。`intent_observed{ref_kind=call}` 在同一回合内按 `event_seq` 位于该调用的 `tool_started` 与 `tool_ended` 之间；`job` 意图位于使该作业进入集合的 `bg_jobs_changed` 之后。
 - **一次性核对**：核对与把事件标识记为已接受在驱动器锁内一次完成，同一事件标识的并发查询只有一个通过；核对之前先处理 stdout 中已到达的消息，使 hook 执行之前已输出的事件进入 `hook_ledger`；`T_hook_sync` 之内的等待在锁外进行，每次重新核对时再取锁。核对不执行网络调用、不写盘，也不持有进程监督锁；`PreToolUse` 在实时接入中的阻塞等待发生在核对通过之后，不占用驱动器锁。
 - **stdin 单写者**：所有写入由同一协程串行执行；写入与进程退出通过 `closed` 标志协调，不向已关闭的管道写入。
-- **回合边界串行**：`result` 与 `idle` 的到达可能并发，边界判定在驱动器锁内执行；同一回合只发一次 `turn_ended`。
+- **回合边界串行**：`result` 与 `idle` 的到达可能并发，边界判定在驱动器锁内执行；同一回合只发一次 `turn_ended`。锁内先把 `turn_ended` 等回合进展事件交给出站流，再把进程监督记录的阶段置为 `boundary` 或更新回合标识，顺序约束见 [warden](design-warden.md)。
 - **事件顺序**：同一回合的 `turn_started` 先于工具与等待事件，`turn_ended` 最后；回合内事件的 `event_seq` 单调，重复或乱序的回合内事件按它丢弃。回合外事件的 `turn_id` 与 `event_seq` 为空，不按 `event_seq` 丢弃，顺序由出站流的 `msg_seq` 保证，集合类事件按替换或合并语义处理，重复与乱序不改变结果。
 - **审批决定**：按 `permission_id` 索引，每个询问只接受一个决定；允许与拒绝同时到达时以先到者为准，后到者计数丢弃。
 - **进程监督锁**：启动、正常退出、强制终止与冻结检查共用看守进程的进程监督锁；持有该锁时不执行网络调用与日志同步写入。
@@ -844,7 +844,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 
 ### 新增意图来源
 
-新增意图来源须说明信号从何处取得、对应的 `ref_kind`、可产出的 `class`、映射到 `source` 闭集中的哪个取值与置信度，以及对象结束后如何丢弃。新来源同样受意图层的边界约束：被动获取，不拒绝、不阻塞、不让对话继续、不为获取意图额外发出 Agent 的模型请求，只作软输入。能映射到现有 `source` 与 `class` 时只扩展本模块的解析规则；需要新的 `source` 或 `class` 取值时须同时修改 `agentprotocol`、`runcontroller` 与 `suspendpolicy`。
+新增意图来源须说明信号从何处取得、对应的 `ref_kind`、可产出的 `class`、映射到 `source` 的哪个已知取值（置信度由 [suspendpolicy](../design-suspendpolicy.md#等待时长预测与置信度) 的“等待意图的置信度”表按 `source` 给出），以及对象结束后如何丢弃。新来源同样受意图层的边界约束：被动获取，不拒绝、不阻塞、不让对话继续、不为获取意图额外发出 Agent 的模型请求，只作软输入。能映射到现有 `source` 与 `class` 时只扩展本模块的解析规则；需要新的 `source` 或 `class` 取值时，同时在 `agentprotocol` 的已知取值、`runcontroller` 与 `suspendpolicy` 中加入它，新的 `source` 须在置信度表中有对应项。新取值不涉及协议版本，也不需要能力标识；尚未认识它的接收方丢弃该事件并计数。
 
 ### 新增第三方工具或 MCP 服务器
 
@@ -856,7 +856,7 @@ on_registered(call):                       # subscribe_event 或 sleep_until 登
 
 ### 新增自唤醒源
 
-Claude Code 出现新的由 Agent 自己触发的唤醒来源时（新的定时类工具或带截止的后台机制），驱动器在自唤醒源镜像的来源表中增加一行：说明条目来源、`fire_at` 的计算、`survives_resume` 的取值与移除条件。`kind` 是 `agentprotocol` 的闭集，新来源能映射到现有 `kind` 时只扩展翻译表；需要新 `kind` 时须同时修改 `agentprotocol`、`runcontroller` 与 `suspendpolicy`。新来源同样只观测，不禁用、不拦截。
+Claude Code 出现新的由 Agent 自己触发的唤醒来源时（新的定时类工具或带截止的后台机制），驱动器在自唤醒源镜像的来源表中增加一行：说明条目来源、`fire_at` 的计算、`survives_resume` 的取值与移除条件。`kind` 是描述性标签，接收方只区分 `cron` 与其余取值：新来源取新的 `kind` 取值不升协议版本，也不修改 `runcontroller` 与 `suspendpolicy`；只有经 `session_crons` 对账、随续接恢复的来源取 `cron`。新来源同样只观测，不禁用、不拦截。
 
 ### 新增 Agent 驱动器
 

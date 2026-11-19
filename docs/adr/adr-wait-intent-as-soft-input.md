@@ -60,7 +60,7 @@ Claude Code 提供可用的接入点（[REF-claude-code-hooks](../references.md)
 
 本决策使项目承担以下义务：
 
-- Claude Code 驱动器从工具输入、hook 输入与本地代理观察到的周期性连接解析意图，以 `intent_observed` 上报，每条意图带来源与置信度；控制面循环驱动器的等待由 `WaitDeclared` 显式表达，不产生意图。
+- Claude Code 驱动器从工具输入、hook 输入与本地代理观察到的周期性连接解析意图，以 `intent_observed` 上报，每条意图带来源，置信度由 `suspendpolicy` 按来源确定，不由驱动器给出；控制面循环驱动器的等待由 `WaitDeclared` 显式表达，不产生意图。
 - 外部系统定义声明等待签名，签名的事件类型必须属于该外部系统的事件目录；签名随沙箱侧配置下发给看守进程。
 - 平台 MCP 服务器的 `instructions` 与工具描述承载同一套等待方式的选择规则；`subscribe_event`、`wait_for` 与 `sleep_until` 接受可选的预计等待时长与原因，Agent 自报与平台预测分开上报，来源不混。
 - 情境提示由看守进程提供的托管 hook 二进制实现，与审批 hook 同一机制；提示内容只含事实、可选做法与可以忽略的说明，标明来自平台而非用户。

@@ -35,7 +35,7 @@ Agent 提供的信号不足以重建回合位置：L1 的 `Hello.agent_state` �
 - 每条影响回合位置的进展事件在 `Active` 与非 `Active` 状态下都必须按同一规则更新回合字段；非 `Active` 状态下不得做 Active 子状态转移、投递或挂起决策；`suspending` 且 `suspend_origin=active` 时，`substate` 仍须同步为与回合字段一致的 active 子状态。
 - 回合字段与 `state`、`substate` 的组合必须满足闭集约束；进入 `Active` 的每条路径都必须按回合字段选择分支。
 - `turn_phase`、`blocked_on`、`pending_targets`、`running_tools` 与 `current_turn_id` 的写入与清除点必须穷举，其中 `turn_phase` 只有写入点，没有清除点；漏掉任一点会使恢复后的路由错误。
-- 看守进程上报的 `agent_state` 在回合位置上不替代回合字段。`Active` 中 `phase=exited` 触发“Agent 进程退出”；`phase=boundary` 而 `turn_phase=in_turn` 时按“回合结束”对账；`frozen=true` 且冻结标识等于 `aborted_suspend_id` 时发 `Thaw`，不等于时计数、告警并执行“本代沙箱作废”。非 `Active` 状态一律按“非 Active 回合进展”对账，不做 Active 子状态转移、投递或挂起决策；其余不一致按回合字段对账或计数。
+- 看守进程上报的 `agent_state` 在回合位置上不替代回合字段。同代 `Hello` 只写入 `agent_state`，不改回合字段，也不据以执行以回合进展事件为输入的转移：同代 `Hello` 来自本代同一个看守进程，看守进程先把回合进展事件交给出站流、再更新 `agent_state`，两者不一致时尚未提交的事件必然随上行重放到达，回合字段由它们按同一规则更新。报告 `phase=exited` 时不触发“Agent 进程退出”，回合边界需要 Agent 进程运行时写 `send(StartAgent)`，该转移的计数与清理只由 `turn_ended{agent_exited=true}` 触发；`phase=boundary` 而 `turn_phase=in_turn` 时不执行“回合结束”，回合结束由随后到达的 `turn_ended` 承担，它携带 `Hello` 没有的 `reason` 与 `bg_procs`。`Active` 中 `frozen=true` 且冻结标识等于 `aborted_suspend_id` 时发 `Thaw`，不等于时计数、告警并执行“本代沙箱作废”；其余不一致只计数。
 - 挂起期间到达的回合进展事件必须被持久化，不能因为沙箱不可达而丢弃。
 - 销毁重建后，恢复句柄与回合字段共同决定新代的起始位置；新代 `Hello` 不得清空回合字段，代递增时只按 `fence_and_bump` 清空与旧代沙箱绑定的字段。
 - L0 的 `turn_phase` 恒为 `idle`，处理中状态由 `idle_cursor` 与游标比较判定，不能依赖回合字段。
@@ -44,7 +44,7 @@ Agent 提供的信号不足以重建回合位置：L1 的 `Hello.agent_state` �
 
 - `run` 行变宽，每次回合进展事件都要写入控制面，回合内的事件密度直接影响数据库写入量。
 - 回合字段与子状态的组合约束增多，状态机与转移表的复杂度上升。
-- 回合字段与 `agent_state` 不一致时需要额外对账，且不一致本身可能无法立即判定。
+- 重连后回合字段可能暂时落后于 `agent_state`，直到随上行重放到达的回合进展事件提交，其间的挂起决策按落后的回合字段判定；这依赖看守进程先把事件交给出站流、再更新 `agent_state` 的顺序。
 - L0 的回合语义被弱化为 `idle`，部分回合级判断只能退化为游标比较。
 - 恢复路径必须覆盖全部字段组合，遗漏会使恢复后停在 `InTurn` 却没有回合，或产生错误投递。
 

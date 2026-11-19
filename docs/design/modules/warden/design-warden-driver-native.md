@@ -16,7 +16,7 @@
 - **规定事件集合与顺序**：要求两种驱动器使用同一套 `AgentEvent` 种类与字段，规定回合开始与结束、工具、权限询问、等待、订阅、定时与后台作业事件的触发点与顺序，自唤醒条目事件只由存在自唤醒源的驱动器发出，[等待意图](../../../glossary.md)事件只由解析等待意图的驱动器发出；结果是收件箱、游标与唤醒谓词不依赖循环位置。
 - **规定 `Deliver` 翻译**：为 `next_user_message`、`tool_result{call_id}`、`permission_decision{id, input_hash}` 与 `resume_session_id` 规定翻译语义，两种驱动器各自实现原生形态；结果是投递的两级确认对两种循环一致，审批决定只在[审批内容摘要](../../../glossary.md)与待决调用一致时解除等待。
 - **规定挂起与恢复语义**：定义回合边界、恢复点、以挂起为目的的退出、恢复句柄与快照恢复后的衔接；结果是两种循环的挂起决策与恢复准入使用同一套规则。
-- **规定 `ToolExec` 的使用**：定义 exec、文件读写、流式输出与后台作业在控制面循环中的用法、帧关联、偏移续传与错误处置；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
+- **规定 `ToolExec` 的调用方式**：规定控制面循环调用 `ToolExecRequest` 各 `op` 的时机、`exec_id` 的分配、断线后的重发与去重、截止到期与所有者副本切换后的查询与偏移续传，以及错误处置；各 `op` 的 `args`、结果与错误由看守进程主文档定义；结果是沙箱内没有 Agent 进程时仍可作为工具执行器使用。
 - **实现控制面循环驱动器**：作为库链接进 `runcontroller`，运行原生 Agent 循环，经出站流上的 `ToolExec` 帧调用沙箱，按接口发出事件、接收 `Deliver`、执行挂起准备与恢复；结果是平台原生 Agent 不需要打包进沙箱镜像，也不需要独立的沙箱凭据与协议会话。
 - **持久化循环状态**：在恢复点保存回合位置、待决工具调用、已交付输入与恢复句柄；结果是不依赖 Agent 原生会话持久化也能跨代续接。
 - **维护两类驱动器的契约一致性**：以同一套事件、目标闭集与契约测试约束两种实现；结果是新增一种驱动器不修改 `runcontroller`、`suspendpolicy` 或协议消息。
@@ -25,11 +25,11 @@
 
 非职责举例如下，判定标准为：职责清单之外、由主文档、同级子模块或其他模块拥有的事实与机制。
 
-- 协议信封、消息序号、重放、按 `(generation, msg_seq)` 去重与协议版本归 `agentprotocol`；本模块只声明接口级事件与翻译语义。
+- 协议信封、消息序号、重放与协议版本归 `agentprotocol`；本模块只声明接口级事件与翻译语义。
 - 运行实例状态机、收件箱、唤醒谓词、投递游标、代与失效判定归 `runcontroller`；本模块只发出同一套事件并按 `Deliver` 喂入。
 - 挂起决策、冻结上限、DRAIN 与冻结中复评归 `suspendpolicy`；本模块只执行挂起准备并报告恢复点。
 - 沙箱预配、冻结、快照、销毁与工作区租约归 `sandboxprovider` 与 `workspace`；本模块不管理沙箱生命周期。
-- `ToolExec` 的沙箱侧实现、出站流鉴权、路径边界与进程执行归看守进程；本模块只按契约调用。
+- `ToolExec` 各 `op` 的 `args`、结果、错误与幂等语义，沙箱侧实现、出站流鉴权、路径边界与进程执行归看守进程；本模块只按契约调用。
 - Claude Code 的启动命令、hooks、托管设置与 stream-json 翻译归 [Claude Code 驱动器](design-warden-driver-claude-code.md)；本模块只定义它必须实现的接口。
 - 审批决定的内容与人类身份归 `humanchannel`；本模块只接收决定并解除循环中的等待。
 - 控制面循环的模型调用在控制面执行，其上游选择与凭据由实现该循环的模块决定；看守进程不代理控制面的模型调用。
@@ -42,7 +42,7 @@
 | 循环状态 | loop state | warden 控制面循环驱动器 | 控制面循环自行持久化的回合位置、对话、待决工具调用、已交付输入与恢复句柄；用于跨代续接。 |
 | 恢复点 | resume point | warden 控制面循环驱动器 | 控制面循环可以安全挂起或重启的位置：无在途模型调用、无未确认工具调用、循环状态已同步写入。 |
 | 输入翻译 | delivery translation | warden Agent 驱动器接口 | 把 `Deliver.target` 映射为某 Agent 原生输入的函数；接口规定映射的种类，驱动器实现具体形态。 |
-| 工具执行记录 | tool execution record | warden 控制面循环驱动器 | 控制面循环为一次工具调用保存的 `call_id`、`exec_id`、输出偏移与结果；用于恢复后查询而不重发。 |
+| 工具执行记录 | tool execution record | warden 控制面循环驱动器 | 控制面循环为一次工具调用保存的 `call_id`、`exec_id`、输出偏移与结果；用于断线后按 `exec_id` 重发与去重，以及同代内截止到期与所有者副本切换后的查询。 |
 
 ## 外部接口契约
 
@@ -89,7 +89,7 @@ type DriverState struct {
     BgJobs       []string
     SelfWake     []SelfWakeEntry // 自唤醒条目，项结构取自 agentprotocol 的 self_wake_changed；没有自唤醒源的驱动器为空
     CronsSynced  bool          // 语义同 agentprotocol 的 self_wake_changed.crons_synced；没有自唤醒源的驱动器不使用
-    RunningTools []string
+    RunningTools []RunningTool // 未配对的工具调用，每项为 {call_id, name, summary}
 }
 ```
 
@@ -102,7 +102,7 @@ type DriverState struct {
 | `PrepareForSuspend` | 回合边界；I9 前置检查可执行 | 返回 `SuspendReady`，或返回 `Busy` 语义的错误；不绕过检查 |
 | `Resume` | 同一代解冻，或新代已预配 | 恢复原生 Agent 或循环状态；失败时按恢复失败处置 |
 | `Terminate` | 任意阶段 | 优雅终止或强制终止；之后释放工具执行与循环资源 |
-| `SnapshotRestored` | 看守进程已校时并清理旧连接 | 重建超时与流偏移；不重放已交付输入 |
+| `SnapshotRestored` | 看守进程已校时并清理旧连接 | 重建超时；不重放已交付输入 |
 | `Events` | 任意阶段 | 事件流；回合内事件的 `event_seq` 在同一回合内单调，回合外事件的 `turn_id` 与 `event_seq` 为空；终止后关闭 |
 | `State` | 任意阶段 | 返回阶段、回合、会话、阻塞条件、后台作业与自唤醒条目快照 |
 
@@ -113,16 +113,16 @@ type DriverState struct {
 | 事件 | 触发点 | 约束 |
 | --- | --- | --- |
 | `turn_started{session_id, delivery_id}` | `Feed` 返回 `fed=true` 且回合开始 | `delivery_id` 为本回合消费的投递；循环自行开始的回合为空 |
-| `turn_ended{reason, agent_exited, bg_procs}` | 回合到达恢复点，或 `Terminate` 后 | 回合结束的判定由驱动器实现；`agent_exited` 为真时表示原生 Agent 退出 |
-| `tool_started{call_id}` | 开始一次工具调用，或发出一次 `ToolExec` 调用之前 | `call_id` 由驱动器分配，同一回合唯一 |
-| `tool_ended{call_id}` | 工具调用结束或失败 | 与 `tool_started` 配对；未配对的调用在 `turn_ended` 时清理 |
+| `turn_ended{reason, origin, agent_exited, bg_procs}` | 回合到达恢复点，或 `Terminate` 后 | 回合结束的判定由驱动器实现；`reason` 取空或 `tool_deferred`，`origin` 是描述性标签，取值见 `agentprotocol`；`agent_exited` 为真时表示原生 Agent 退出 |
+| `tool_started{call_id, name, summary}` | 开始一次工具调用，或发出一次 `ToolExec` 调用之前 | `call_id` 由驱动器分配，同一回合唯一；`name` 为工具名；`summary` 是驱动器生成的单行描述（例如命令的首行、文件路径），不超过 `S_tool_summary`（256 字节），可以为空，只用于呈现 |
+| `tool_ended{call_id, status}` | 工具调用结束或失败 | 与 `tool_started` 配对；工具调用以错误结果交回循环时 `status=error`，否则为 `ok`；未配对的调用在 `turn_ended` 时清理 |
 | `permission_requested{id, call_id, blocking, tool}` | 循环需要审批 | `blocking` 表示是否在回合中阻塞等待；`tool{name, input, input_preview, input_hash, input_size}` 取首次触发时捕获的待批工具调用，`input_hash` 为[审批内容摘要](../../../glossary.md)，`input_size` 为规范 JSON 编码的字节数；`input_size ≤ S_tool_input`（1 MiB）时 `input` 为完整规范 JSON、`input_preview` 为空，超过时 `input` 为空、`input_preview` 为规范编码的前 `S_tool_preview`（64 KiB）字节，摘要仍对完整内容计算 |
 | `wait_started{call_id, kind, ref, fire_at, predicted_ms, agent_expected_ms}` | 循环开始一次阻塞等待 | `kind` 取 `wait_for`、`timer`，与 `runcontroller` 的 `blocked_on.kind` 中对应种类一致；`sleep_until` 映射为 `timer`；`agent_expected_ms` 没有自报时为空 |
 | `subscription_created{sub_id, since_cursor, agent_expected_ms}` | 循环登记订阅 | 由平台 MCP 服务器或控制面循环自身登记；`agent_expected_ms` 没有自报时为空 |
 | `timer_requested{timer_id, fire_at, scope}` | 循环登记定时 | `scope` 只取 `run` |
 | `bg_jobs_changed{job_ids}` | `ToolExec` 后台作业集合变化 | 携带完整集合；未结束的作业使回合边界不构成安全点；回合结束之后集合变化时作为回合外事件发出 |
 | `self_wake_changed{entries, crons_synced}` | 控制面循环驱动器不发出 | 由存在自唤醒源的驱动器发出；可作为回合外事件发出 |
-| `intent_observed{ref_kind, ref, class, target, expected_ms, prior, source, confidence}` | 控制面循环驱动器不发出 | 由解析等待意图的驱动器发出；`prior{p25, p50, p90}` 只在 `source=signature` 时非空；同一 `(ref_kind, ref)` 后到的覆盖先到的；`ref_kind`、`class`、`source` 越出闭集或 `class` 不属于 `ref_kind` 对应的闭集时，接收方丢弃该事件并计数，不终止传输；可作为回合外事件发出 |
+| `intent_observed{ref_kind, ref, class, target, expected_ms, prior, source}` | 控制面循环驱动器不发出 | 由解析等待意图的驱动器发出；`prior{p25, p50, p90}` 只在 `source=signature` 时非空；同一 `(ref_kind, ref)` 后到的覆盖先到的；`ref_kind`、`class`、`source` 是开放集合，取值越出已知取值或 `class` 不属于 `ref_kind` 对应的已知取值时，接收方丢弃该事件并计数，不终止传输，新增取值不涉及协议版本，也不需要能力标识；可作为回合外事件发出 |
 | `state_changed{idle\|requires_action}` | 驱动器有对应的原生状态时；控制面循环没有原生状态时在回合结束发出 `state_changed{idle}` | 不替代 `turn_ended`；进程驱动器在没有进行中回合时发出的为回合外事件 |
 
 回合内事件在 `turn_started` 之后、`turn_ended` 之前按发生顺序发出，`event_seq` 在同一回合内单调。`turn_ended` 只在恢复点或终止后发出；回合进行中的工具与等待事件不得晚于它。`bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed` 等事件也可以在没有进行中回合时发出，这类回合外事件的 `turn_id` 与 `event_seq` 为空，`event_seq` 的单调约束只及于回合内事件。回合外事件的顺序：进程驱动器的事件经看守进程的出站流发送，由 `msg_seq` 保证；控制面循环驱动器的事件经宿主的事件入口按发出顺序交给 `runcontroller`。集合类事件按替换语义处理，`self_wake_changed` 按 [runcontroller](../design-runcontroller.md) 的合并规则处理，`intent_observed` 按 `(ref_kind, ref)` 以后到者覆盖先到者，重复与乱序不改变结果。
@@ -154,34 +154,35 @@ type DriverState struct {
 
 控制面循环没有自唤醒条目，I9 中关于自唤醒条目随续接恢复的一项恒成立；`SuspendRequest` 复用 `PrepareSuspend` 的字段语义，其中的 `self_wake_cutoff` 对控制面循环驱动器不起作用。进程驱动器在安全点只检查 `fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目，规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md)。
 
-`Resume` 分两种：同一代解冻时继续原循环，`SnapshotRestored` 重建超时与流偏移；新代续接时按恢复句柄加载循环状态，重新建立 `ToolExec` 调用，不重放未确认的工具调用。工具调用以 `call_id` 与 `exec_id` 标识，恢复后先查询结果，查询不到时把该调用作为失败结果交回循环，不重新执行有副作用的命令。
+`Resume` 分两种：同一代解冻时继续原循环，`SnapshotRestored` 重建超时，在途的 `ToolExec` 调用按流重建的规则以同一 `exec_id` 重发；新代续接时按恢复句柄加载循环状态，重新建立 `ToolExec` 调用，不重放未确认的工具调用。`exec_id` 只在同一代内有效：上一代未收到终态应答的调用在新代直接作为失败结果交回循环，不以 `get_exec` 查询，也不重新执行有副作用的命令。
 
 ### `ToolExec` 的操作集合
 
-控制面循环通过下列操作使用沙箱；操作语义、路径边界与鉴权由 [看守进程](design-warden.md) 定义，本模块只规定调用方式。
+控制面循环以 `ToolExecRequest` 的 `op` 使用沙箱。各 `op` 的 `args`、结果、错误与按 `exec_id` 幂等的规则由[看守进程的 ToolExec API](design-warden.md#toolexec-api) 定义；本模块只规定控制面循环何时使用哪个 `op`。
 
-| 操作 | 控制面循环的用法 |
+| `op` | 控制面循环的用法 |
 | --- | --- |
-| exec | 执行工具命令，返回退出码与标准输出、标准错误流；命令继承工具接入声明的凭据占位符环境变量与非秘密配置 |
-| 文件读 | 读取运行实例子目录内的文件，作为工具结果的一部分 |
-| 文件写 | 在运行实例子目录内写入文件，作为工具副作用 |
-| 流式输出 | 按输出偏移续传一次执行或后台作业的输出；断线后从上次偏移继续 |
-| 后台作业 | 列出、查询与终止后台作业；未结束的作业计入后台作业集合 |
+| `exec` | 执行工具命令；前台执行取退出码与标准输出、标准错误，`background=true` 启动后台作业；命令继承工具接入声明的凭据占位符环境变量与非秘密配置 |
+| `read_file` | 读取运行实例子目录内的文件，作为工具结果的一部分 |
+| `write_file` | 在运行实例子目录内写入文件，作为工具副作用 |
+| `stream` | 按输出偏移续传一次执行或后台作业的输出；同一代内截止到期或所有者副本切换后从工具执行记录的 `output_offset` 继续，断线不用它 |
+| `list_jobs`、`get_job`、`terminate_job` | 列出、查询与终止后台作业；未结束的作业计入后台作业集合 |
+| `get_exec` | 同一代内截止到期或所有者副本切换后，按 `exec_id` 查询一次请求的状态与已记录的终态应答；断线后不用它，也不跨代查询 |
 
-每次调用经宿主写入本代出站流并按代校验；`Shutdown` 与 `Fenced` 到达后停止新调用并终止在途执行。控制面循环不得假定沙箱内存在 Agent 进程、会话文件或 hook；它只把沙箱当作工具执行器。
+取消一次在途请求用 `ToolExecCancel`。每次调用经宿主写入本代出站流并按代校验；`Shutdown` 与 `Fenced` 到达后停止新调用并终止在途执行。控制面循环不得假定沙箱内存在 Agent 进程、会话文件或 hook；它只把沙箱当作工具执行器。
 
 ### `ToolExec` 的传输与鉴权
 
-`ToolExec` 是看守进程在出站流上处理的一组帧，不是沙箱地址上的独立 gRPC 服务。控制面循环驱动器在宿主进程内调用 `ToolExecClient`，由 `runcontroller` 把请求帧写入该运行实例已有的出站流；看守进程在同一流上以响应帧与数据帧应答。请求、数据与应答以 `(run_id, generation, exec_id)` 关联，`msg_seq`、`ack_msg_seq`、重放与去重沿用出站流，不建立第二个序号域。帧集合为 `Exec`、`ReadFile`、`WriteFile`、`Stream`、`ListJobs`、`GetJob`、`TerminateJob` 与 `Cancel`；`Exec` 与 `Stream` 的输出以带偏移的数据帧分片返回。
+`ToolExec` 是看守进程在出站流上处理的一组帧，不是沙箱地址上的独立 gRPC 服务。控制面循环驱动器在宿主进程内调用 `ToolExecClient`，由 `runcontroller` 把请求帧写入该运行实例已有的出站流；看守进程在同一流上以响应帧与数据帧应答。请求、数据与应答以 `(run_id, generation, exec_id)` 关联，`msg_seq` 与 `ack_msg_seq` 沿用出站流，不建立第二个序号域。`ToolExecRequest` 的 `op` 取 `exec`、`read_file`、`write_file`、`stream`、`list_jobs`、`get_job`、`terminate_job` 与 `get_exec`，取消用 `ToolExecCancel`；`exec`、`read_file` 与 `stream` 的输出以带偏移的 `ToolExecData` 分片返回，终态以 `ToolExecResponse` 返回。`ToolExecRequest` 与 `ToolExecCancel` 是控制面到看守进程的消息，不跨连接重放。`runcontroller` 在本副本接受同代 `Hello` 后，经 `ToolExecClient.StreamEpochs` 向驱动器通知新的 `stream_epoch`；驱动器据此在新连接上对尚未收到终态应答的请求以同一 `exec_id`、同一 `op` 与 `args` 重新发出，对已发出取消的请求再发 `ToolExecCancel`，看守进程按 `exec_id` 幂等，不重复执行。看守进程到控制面的 `ToolExecResponse` 与 `ToolExecData` 随出站流重放，重发的请求还可能使已记录的终态应答再到达一次：驱动器对 `ToolExecResponse` 按 `exec_id` 去重，对 `ToolExecData` 按 `exec_id`、`stream` 与偏移去重。断线只走重发，不调用 `get_exec`。
 
-鉴权由出站流承担：流由看守进程主动建立并以运行实例令牌通过 `Hello` 认证，只有当前代的流接受 `ToolExec` 帧。控制面循环驱动器不持有令牌，也不得直接连接沙箱；宿主只在该运行实例由本进程拥有、帧的代等于当前代且运行实例未终态时写入请求帧。错误以响应帧返回：令牌或代问题在流层已按 `Fenced`、可重试关闭或认证失败处置；路径越界与未知执行标识返回未找到，偏移无效返回参数非法，输出超出上限返回资源耗尽，`Shutdown` 与 `Fenced` 之后的请求返回已中止。
+鉴权由出站流承担：流由看守进程主动建立并以运行实例令牌通过 `Hello` 认证，只有当前代的流接受 `ToolExec` 帧。控制面循环驱动器不持有令牌，也不得直接连接沙箱；宿主只在该运行实例由本进程拥有、帧的代等于当前代且运行实例未终态时写入请求帧。令牌或代问题在流层按关闭帧处置；各 `op` 的错误以 `ToolExecResponse.error` 返回，取值与含义见[看守进程的 ToolExec API](design-warden.md#toolexec-api)，驱动器据 `not_found` 与 `exec_id_conflict` 区分查询不到与标识冲突，其余错误作为工具结果交回循环。
 
-每次调用携带截止时间；截止到期只结束本次流，已启动的执行不被终止，调用方以 `GetJob` 查询结果。`ToolExec` 帧不承载 `AgentEvent`：控制面循环驱动器经宿主提供的事件入口把 `AgentEvent` 交给 `runcontroller` 的同一套进入规则，并从中接收 `Deliver`、挂起准备与恢复通知；它不发送 `Hello`，也不与看守进程争用 `msg_seq`。
+每次调用携带截止时间；截止到期只结束看守进程为本次请求发送数据，已启动的执行不被终止，调用方以 `get_exec` 查询结果、以 `stream` 续传输出。`ToolExec` 帧不承载 `AgentEvent`：控制面循环驱动器经宿主提供的事件入口把 `AgentEvent` 交给 `runcontroller` 的同一套进入规则，并从中接收 `Deliver`、挂起准备与恢复通知；它不发送 `Hello`，也不与看守进程争用 `msg_seq`。
 
 ### 稳定性承诺
 
 - 接口操作、事件种类（`self_wake_changed` 只由存在自唤醒源的驱动器发出，`intent_observed` 只由解析等待意图的驱动器发出）、`Deliver.target` 闭集、`agent_state.phase` 闭集、挂起与恢复语义对两种驱动器稳定；新增一种驱动器实现不修改 `runcontroller`、`suspendpolicy` 或协议消息。
-- `ToolExec` 的操作集合对控制面循环稳定；新增操作须同时修改看守进程主文档、本模块与 `agentprotocol`。
+- `ToolExecRequest` 的 `op` 闭集对控制面循环稳定；新增 `op` 取值须同时修改看守进程主文档的 `op` 表、本模块的调用规则与 `agentprotocol`。
 - 接口变更须同时覆盖进程驱动器与控制面循环驱动器，并以同一套契约测试约束；事件种类变化另须提升协议版本。
 
 ## 依赖
@@ -189,7 +190,7 @@ type DriverState struct {
 代码依赖只有 `agentprotocol`，与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `ToolExec` 的调用是运行时接口调用，不是代码依赖。
 
 - `agentprotocol`：`AgentEvent`、`Deliver`、`PrepareSuspend`、`Resumed`、`Shutdown` 与 `ToolExec` 帧的字段与发送；本模块只声明接口级操作与触发点。
-- 看守进程的 `ToolExec`：exec、文件读写、流式输出与后台作业的运行时契约；沙箱侧实现归看守进程，帧在已认证的出站流上传输。
+- 看守进程的 `ToolExec`：各 `op` 的 `args`、结果、错误与按 `exec_id` 幂等的运行时契约（[ToolExec API](design-warden.md#toolexec-api)）；沙箱侧实现归看守进程，帧在已认证的出站流上传输。
 - `runcontroller`：状态机效果、投递选择、游标推进与恢复准入；本模块不复制其规则。
 - `suspendpolicy`：挂起决策、冻结上限与恢复点相关的策略参数；本模块只执行挂起准备。
 - 循环状态的持久化：位置由实现选定，约束是跨代可读、在恢复点同步写入，并与工作区或控制面持久化同寿命；恢复句柄经 `Deliver.resume_session_id` 与 `SuspendReady.SessionID` 传递。
@@ -221,11 +222,16 @@ classDiagram
     class AgentEvent
     class DriverState
     class ToolExecClient {
-        +Exec(ExecRequest) ExecResult
-        +ReadFile(Path) Bytes
-        +WriteFile(Path, Bytes) error
-        +Stream(ExecID, Offset) OutputStream
-        +ListJobs() JobList
+        +Exec(ExecID, ExecArgs) ExecResult
+        +ReadFile(ExecID, Path) Bytes
+        +WriteFile(ExecID, Path, Bytes) error
+        +Stream(ExecID, Target, StreamName, Offset) OutputStream
+        +ListJobs(ExecID) JobList
+        +GetJob(ExecID, JobID) Job
+        +TerminateJob(ExecID, JobID) Job
+        +GetExec(ExecID, Target) ExecState
+        +Cancel(ExecID) error
+        +StreamEpochs() EpochStream
     }
     Driver <|.. ProcessDriver
     Driver <|.. ControlPlaneLoopDriver
@@ -234,7 +240,7 @@ classDiagram
     Driver --> DriverState : 报告
 ```
 
-图固定两种实现与接口的关系：`ProcessDriver` 与 `ControlPlaneLoopDriver` 实现同一接口，`ProcessDriver` 驱动沙箱内的 Claude Code，`ControlPlaneLoopDriver` 在控制面运行循环；只有控制面循环驱动器依赖 `ToolExecClient`，进程驱动器不依赖它。接口不定义协议字段，`AgentEvent` 与 `Deliver` 的字段归 `agentprotocol`。
+`ToolExecClient` 中除 `StreamEpochs` 之外的每个方法对应一个 `op` 或 `ToolExecCancel`，首个参数是驱动器为本次请求分配的 `exec_id`；`Stream` 的 `StreamName` 取 `stdout` 或 `stderr`，与看守进程 `stream` 操作的 `args.stream` 一致。`StreamEpochs` 交付 `runcontroller` 在本副本接受同代 `Hello` 后的新 `stream_epoch`，驱动器据此重发请求。图固定两种实现与接口的关系：`ProcessDriver` 与 `ControlPlaneLoopDriver` 实现同一接口，`ProcessDriver` 驱动沙箱内的 Claude Code，`ControlPlaneLoopDriver` 在控制面运行循环；只有控制面循环驱动器依赖 `ToolExecClient`，进程驱动器不依赖它。接口不定义协议字段，`AgentEvent` 与 `Deliver` 的字段归 `agentprotocol`。
 
 ### 控制面循环驱动器与看守进程的交互时序图
 
@@ -248,18 +254,19 @@ sequenceDiagram
     R->>D: Deliver{target=next_user_message}
     D->>D: 加载循环状态，进入回合
     D->>R: AgentEvent turn_started
-    D->>R: AgentEvent tool_started{call_id}
+    D->>R: AgentEvent tool_started{call_id, name, summary}
     D->>R: ToolExecClient.Exec{exec_id}
-    R->>W: ToolExecRequest 帧（既有出站流）
+    R->>W: ToolExecRequest{exec_id, op=exec}，既有出站流
     W->>S: 在运行实例 uid 下执行
     S-->>W: 标准输出、标准错误与退出码
     W-->>R: ToolExecData 帧，按偏移分片
-    R-->>D: 按偏移续传
-    D->>R: AgentEvent tool_ended{call_id}
+    W-->>R: ToolExecResponse{exec_id, status=completed, exit_code}
+    R-->>D: 输出分片与终态应答
+    D->>R: AgentEvent tool_ended{call_id, status}
     D->>R: AgentEvent turn_ended
     R->>D: PrepareForSuspend{suspend_id, mode}
-    D->>R: ListJobs，确认后台作业为空
-    R->>W: ToolExec 帧
+    D->>R: ToolExecClient.ListJobs，确认后台作业为空
+    R->>W: ToolExecRequest{op=list_jobs}
     D->>D: 同步写入循环状态
     D-->>R: SuspendReady{suspend_id}
     R->>W: PrepareSuspend{要求沙箱侧静默}
@@ -279,7 +286,7 @@ sequenceDiagram
 | `session_id` | 循环的恢复句柄；由控制面循环定义并持久化 |
 | `blocked_on` | 当前的阻塞条件；`kind` 取 `llm`、`timer`、`approval` 或 `wait_for` |
 | `bg_jobs` | 未结束的 `ToolExec` 后台作业 |
-| `running_tools` | 未配对的工具调用 |
+| `running_tools` | 未配对的工具调用，每项为 `{call_id, name, summary}` |
 | `loop_state_ref` | 循环状态的引用；恢复时按它加载 |
 
 ### 状态一览
@@ -311,10 +318,10 @@ sequenceDiagram
 | 字段 | 含义 |
 | --- | --- |
 | `call_id` | 驱动器分配的工具调用标识；`tool_started` 与 `tool_ended` 使用 |
-| `exec_id` | 驱动器分配的执行标识，随 `exec` 请求帧发出；流式输出与查询使用 |
-| `operation` | exec、文件读、文件写、流式输出或后台作业 |
-| `args_digest` | 调用参数的摘要；用于恢复后核对，不用于重发 |
-| `output_offset` | 已消费的输出偏移；断线后从此处续传 |
+| `exec_id` | 驱动器分配的执行标识，同一代内唯一，随 `ToolExecRequest` 发出；重发、`stream` 续传与 `get_exec` 查询使用 |
+| `operation` | `ToolExecRequest` 的 `op` |
+| `args_digest` | 调用参数的摘要；用于所有者副本切换后核对，不用于重发 |
+| `output_offset` | 已消费的输出偏移；同一代内截止到期或所有者副本切换后从此处续传，断线后重复到达的分片按它丢弃 |
 | `state` | 已发出、运行中、已完成或失败 |
 | `result` | 退出码、输出摘要或错误 |
 
@@ -328,16 +335,16 @@ sequenceDiagram
 | --- | --- | --- | --- |
 | 1 | `Feed` 收到投递，按 `consumed_deliveries` 去重后 `3` 未消费 | 追加输入；`turn_position=in_turn`；`fed=true` | 无 |
 | 2 | 发出 `turn_started{turn_id=turn-11, delivery_id=d-7}` | `turn_id=turn-11` | 无 |
-| 3 | 循环决定调用工具；发出 `tool_started{call_id=call-1}` | `running_tools={call-1}` | 建立 `call-1`，状态 `已发出` |
-| 4 | 经宿主转发 `ToolExec exec` 帧，代与当前代一致 | 无变化 | `exec_id=x-1`，状态 `运行中` |
-| 5 | 沙箱执行并返回标准输出、标准错误与退出码 | 无变化 | `output_offset` 随流式输出前进；状态 `已完成` |
-| 6 | 发出 `tool_ended{call_id=call-1}`，把结果加入循环状态 | `running_tools` 清空 | 保存结果 |
+| 3 | 循环决定调用工具；发出 `tool_started{call_id=call-1, name, summary}` | `running_tools={call-1}` | 建立 `call-1`，状态 `已发出` |
+| 4 | 经宿主转发 `ToolExecRequest{exec_id=x-1, op=exec}`，代与当前代一致 | 无变化 | `exec_id=x-1`，状态 `运行中` |
+| 5 | 沙箱执行，以 `ToolExecData` 返回标准输出与标准错误，以 `ToolExecResponse{status=completed, exit_code}` 结束 | 无变化 | `output_offset` 随流式输出前进；状态 `已完成` |
+| 6 | 发出 `tool_ended{call_id=call-1, status=ok}`，把结果加入循环状态 | `running_tools` 清空 | 保存结果 |
 | 7 | 循环完成模型调用，进入恢复点；发出 `turn_ended` | `turn_position=boundary`；同步写入循环状态 | 无在途记录 |
 | 8 | `PrepareForSuspend`：查询在途 `ToolExec`、确认后台作业为空、循环状态已写入 | 保持 `boundary` | 全部记录终态 |
 | 9 | 返回 `SuspendReady{SessionID=ls-4}`；控制面销毁沙箱，进入 `Suspended{destroyed}`；下一次重建准入放行时代递增为 3 | 循环状态保留 | 工具记录保留 |
 | 10 | 新代 `Deliver{resume_session_id=ls-4}`；`Resume` 加载循环状态 | 从 `boundary` 进入 `in_turn` | 无待决调用 |
 
-走查确认工具配对、恢复点与跨代续接的结论。`tool_started` 先于 `ToolExec exec` 发出，`tool_ended` 在结果写入循环状态之后发出，`runcontroller` 看到的工具配对与控制面循环的实际执行一致。恢复点要求无在途模型调用、无未确认工具调用与循环状态已写入；`ToolExec` 的记录在终态后才允许 `SuspendReady`。跨代续接按 `ls-4` 加载循环状态，不重新执行 `call-1`；若恢复后需要确认该调用的结果，先按 `exec_id` 查询，查询不到时把失败结果交回循环。
+走查确认工具配对、恢复点与跨代续接的结论。`tool_started` 先于 `exec` 请求发出，`tool_ended` 在结果写入循环状态之后发出，`runcontroller` 看到的工具配对与控制面循环的实际执行一致。恢复点要求无在途模型调用、无未确认工具调用与循环状态已写入；`ToolExec` 的记录在终态后才允许 `SuspendReady`。跨代续接按 `ls-4` 加载循环状态，不重新执行 `call-1`；`exec_id` 只在同一代内有效，新代沙箱没有上一代的执行记录，上一代未收到终态应答的调用在新代直接作为失败结果交回循环，不以 `get_exec` 查询。
 
 ### 回合生命周期
 
@@ -361,9 +368,11 @@ sequenceDiagram
 
 **挂起。** `PrepareForSuspend` 只在回合边界调用。驱动器先停止接受新的模型调用与工具调用，等待在途 `ToolExec` 完成或记录其终态，确认后台作业为空，把循环状态同步写入，再返回 `SuspendReady`。任一条件不满足时返回 `Busy` 语义的错误，不报告成功。
 
-**同一代解冻。** `Resume` 继续原循环；`SnapshotRestored` 在校时之后重建超时与流偏移，按 `output_offset` 续传，不重放已交付输入。
+**同一代解冻。** `Resume` 继续原循环；`SnapshotRestored` 在校时之后重建超时，不重放已交付输入；快照恢复伴随出站流重建，在途的 `ToolExec` 调用按[`ToolExec` 的使用](#toolexec-的使用)第 1 步以同一 `exec_id` 重发。
 
-**新代续接。** `Resume` 按恢复句柄加载循环状态；待决工具调用先按 `exec_id` 查询结果，查询不到时作为失败结果交回循环；不重新执行有副作用的命令。循环状态中的 `consumed_deliveries` 防止重投的事件被再次喂入。
+**新代续接。** `Resume` 按恢复句柄加载循环状态。`exec_id` 只在同一代内有效：上一代未收到终态应答的待决工具调用直接作为失败结果交回循环，不以 `get_exec` 查询，不重新执行有副作用的命令。循环状态中的 `consumed_deliveries` 防止重投的事件被再次喂入。
+
+**所有者副本切换（同代）。** 新副本的驱动器按循环状态与工具执行记录续接待决工具调用：先以 `get_exec` 按 `exec_id` 查询，仍在执行时以 `stream` 从 `output_offset` 续传并等待终态，已结束时取已记录的终态应答，未找到时作为失败结果交回循环；不重新执行有副作用的命令。工具执行记录只保存 `args_digest`，不保存可重发的参数，因此新副本用 `get_exec` 查询而不重新发出请求。
 
 **终止。** `Terminate` 停止新调用，取消在途执行，释放工具执行与循环资源；优雅终止允许在途调用完成，强制终止直接取消。终止后事件流关闭。
 
@@ -371,16 +380,16 @@ sequenceDiagram
 
 `ToolExec` 的调用按以下规则：
 
-1. 每次调用经宿主写入本代出站流；流已关闭、代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。
-2. 驱动器为每次 `exec` 分配同一代内唯一的 `exec_id` 并随请求帧发出，以 `call_id` 与 `exec_id` 建立工具执行记录；`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
-3. 流式输出按 `output_offset` 续传；断线后先查询执行状态，再从上次偏移继续，不从零重放。
-4. 后台作业由 `exec` 启动；驱动器按循环的需要列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使回合边界不构成[安全点](../../../glossary.md)，运行实例不以挂起为目的销毁；驱动器不为挂起终止作业。
-5. 文件读写在运行实例子目录内进行，路径越界按错误返回。
+1. 每次调用经宿主写入本代出站流；代不匹配或运行实例已终态时，调用按不可重试错误返回，循环把错误作为工具结果。连接中断时，驱动器收到 `StreamEpochs` 交付的新 `stream_epoch` 之后，在新连接上对未收到终态应答的请求以同一 `exec_id`、同一 `op` 与 `args` 重新发出，对已发出取消的请求再发 `ToolExecCancel`；随重放与重发再次到达的 `ToolExecResponse` 按 `exec_id` 去重，`ToolExecData` 按 `exec_id`、`stream` 与偏移去重。断线只走重发，不调用 `get_exec`；所有者副本切换后改按[挂起与恢复](#挂起与恢复)中的查询路径处理。
+2. 驱动器为每次 `ToolExecRequest` 分配同一代内唯一的 `exec_id`，以 `call_id` 与 `exec_id` 建立工具执行记录；`tool_started` 在调用之前发出，`tool_ended` 在结果写入循环状态之后发出。
+3. 流式输出按 `output_offset` 续传：同一代内截止到期或所有者副本切换后，先以 `get_exec` 查询执行状态，再以 `stream` 从上次偏移继续，不从零重放。`get_exec` 与 `stream` 的续传不跨代使用。
+4. 后台作业由 `background=true` 的 `exec` 启动，`job_id` 取该请求的 `exec_id`；驱动器按循环的需要以 `list_jobs`、`get_job` 与 `terminate_job` 列出、查询与终止作业，并在集合变化时发出 `bg_jobs_changed`。未结束的作业使回合边界不构成[安全点](../../../glossary.md)，运行实例不以挂起为目的销毁；驱动器不为挂起终止作业。
+5. 文件读写在运行实例子目录内进行，路径越界以 `not_found` 返回。
 6. `Shutdown` 与 `Fenced` 到达后停止新调用，终止在途执行，不再接受新的工具调用。
 
 ### 复杂度
 
-接口操作为 O(1) 次事件或状态写入；工具输出转发为 O(B)，B 为输出字节数；循环状态同步写入为 O(S)，S 为状态大小。恢复时的工具结果查询为每个待决调用一次，不重放执行。
+接口操作为 O(1) 次事件或状态写入；工具输出转发为 O(B)，B 为输出字节数；循环状态同步写入为 O(S)，S 为状态大小。断线后的重发与所有者副本切换后的查询都是每个待决调用一次，不重放执行。
 
 ## 错误与失败语义
 
@@ -393,8 +402,12 @@ sequenceDiagram
 | `Deliver.target` 越出闭集 | 回 `DeliveryFailed{retryable=false}`；不喂入 |
 | 目标工具调用或审批已结束 | 回 `DeliveryFailed{reason=target_gone}`；控制面回退为常规投递 |
 | `ToolExec` 鉴权失败、代不匹配或运行实例终态 | 调用返回不可重试错误；循环把错误作为工具结果，不重试 |
-| `ToolExec` 执行启动失败 | 返回错误；`tool_ended` 携带失败结果，回合继续 |
-| 流式输出偏移无效或执行已过期 | 返回错误；该工具调用按失败结果交回循环，不重放执行 |
+| `ToolExec` 执行启动失败（`start_failed`） | 返回错误；`tool_ended{status=error}`，回合继续 |
+| 流式输出偏移无效或输出已不在保留范围内（`invalid_argument`、`resource_exhausted`） | 返回错误；该工具调用按失败结果交回循环，不重放执行 |
+| 所有者副本切换后 `get_exec` 返回 `not_found` | 该工具调用作为失败结果交回循环；不重新执行有副作用的命令 |
+| 新代续接时存在上一代未收到终态应答的工具调用 | 直接作为失败结果交回循环；不以 `get_exec` 查询，不重新执行 |
+| 断线后重发的请求与重放的应答使同一终态应答或输出分片再次到达 | `ToolExecResponse` 按 `exec_id`、`ToolExecData` 按 `exec_id`、`stream` 与偏移丢弃重复；不改变工具执行记录 |
+| 重新发出的请求以 `exec_id_conflict` 应答 | 驱动器实现缺陷：同一 `exec_id` 的 `op` 或 `args` 与首次不同；该调用作为失败结果交回循环并告警，已有执行不受影响 |
 | 后台作业未结束 | 不报告 `SuspendReady`，回合边界不构成安全点；不为挂起终止作业 |
 | 循环状态同步写入失败 | 不报告 `SuspendReady`；按退避重试，控制面在 `retry_after` 后复评 |
 | 在途工具调用未确认时请求挂起 | 返回 `Busy` 语义的错误；等待调用终态后重试 |
@@ -411,7 +424,7 @@ sequenceDiagram
 - **每运行实例单实例**：同一运行实例同一代只有一个循环驱动器实例；`Feed` 串行调用，回合不并发。
 - **事件顺序**：回合内事件的 `event_seq` 在同一回合内单调；`turn_started` 先于工具与等待事件，`turn_ended` 最后；回合外事件不带 `event_seq`，按事件流的发出顺序交付；事件流是单写者。
 - **挂起屏障**：`PrepareForSuspend` 先停止新调用，再等待在途调用终态，再同步写入循环状态，最后返回 `SuspendReady`；从停止新调用到返回 `SuspendReady` 之间不插入新的 `Feed`。
-- **工具执行记录**：按 `call_id` 与 `exec_id` 索引；同一 `exec_id` 的流式输出只有单读者，偏移前进串行化。恢复后的查询不重发执行。
+- **工具执行记录**：按 `call_id` 与 `exec_id` 索引；同一 `exec_id` 的流式输出只有单读者，偏移前进串行化，重复的分片按偏移丢弃。断线后的重发由看守进程按 `exec_id` 幂等吸收，所有者副本切换后的查询不重发执行。
 - **循环状态写入**：恢复点的写入先于 `SuspendReady`；写入失败时不报告成功。循环状态与事件流的顺序不跨代保证，跨代以状态为准。
 - **`ToolExec` 调用的串行边界**：同一工具调用内的读写按调用顺序；不同调用可并发，`bg_jobs_changed` 的集合变化在驱动器锁内合并。
 - **终止与恢复**：`Terminate` 与 `Resume` 不并发；终止后不再接受 `Feed`，恢复前不发出事件。
@@ -429,7 +442,7 @@ sequenceDiagram
 
 ### 新增 `ToolExec` 操作
 
-新增操作须同时修改看守进程主文档、本模块的调用规则与 `agentprotocol` 的对应消息；操作须保持出站流鉴权与代校验、路径边界与错误分类。
+新增 `op` 取值须同时修改看守进程主文档的 `op` 表、本模块的调用规则与 `agentprotocol` 的 `op` 闭集；新 `op` 须保持出站流鉴权与代校验、路径边界、错误闭集与按 `exec_id` 幂等。
 
 ### 新增事件种类
 

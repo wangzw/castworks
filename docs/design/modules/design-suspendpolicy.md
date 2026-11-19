@@ -17,7 +17,7 @@
 - **冻结中复评**：在冻结时长达到复评点、冻结上限到达或节点内存压力变化时，返回 `KEEP`、`SNAPSHOT`、`DESTROY` 或 `DRAIN`，并按升级梯决定解冻之后的目标机制；实时接入期间只在 `KEEP` 与 `DRAIN` 之间返回；静止冻结只返回 `KEEP`，其冻结上限到达时由 `runcontroller` 直接唤醒，不进入复评。
 - **恢复机制选择**：依恢复时的子状态、沙箱提供者能力集合与恢复意图返回 `resume_mode`，取值为 `thaw`、`snapshot_restore`、`warm_claim` 与 `cold_start` 的闭集。
 - **自唤醒提前量与有效自唤醒条目的界限**：按挂起落地的子状态给出[自唤醒源](../../glossary.md)的提前量 `L_self_wake(substate)`，取该形态恢复时延的 p95 加 `safety_margin`（见[参数表](#参数表)），并给出[有效自唤醒条目](../../glossary.md)的界限 `now − (L_self_wake(substate) + P_quiesce)`（见[初判决策](#初判决策)）；`runcontroller` 以有效自唤醒条目中最早的 `fire_at` 减去提前量得到所有者侧截止 `self_wake_at`，保证到点时 Agent 进程可运行，并在销毁模式的挂起尝试中以 `destroyed` 形态的界限作为 `PrepareSuspend.self_wake_cutoff` 下发，看守进程的安全点检查因而与 I9 预检按同一界限排除[过期自唤醒条目](../../glossary.md)；给出 `L_thaw`，供探测定时器提前于已知最早自唤醒时刻触发。
-- **等待时长预测与置信度**：在调用方传入的平台单点预测、Agent 自报的预计等待（`agent_expected_ms`）与等待意图给出的预计时长中取置信度最高者为 p50，按等待来源的先验展开 p25 与 p90 并给出置信度；等待意图携带[等待签名](../../glossary.md)的时长先验 `prior` 时直接使用其 p25、p50 与 p90，意图的预计时长与 `prior` 的分位都扣除自意图观察时刻 `observed_at` 起已等待的时长，已等待时长超过 `prior` 的 p90（没有 `prior` 时为预计时长的 1.5 倍）的意图退出候选，由其余候选给出预测；没有单点值时取来源先验，人类等待按渠道与在线态先验取值，回合等待意图为 `completed` 的回合边界取“回合完成”先验；供初判决策计算保守值 `D_lo` 与上限值 `D_hi`；来源覆盖 LLM、CI 与异步事件、人、回合完成、定时与静止；有效自唤醒条目中最早的触发时刻作为全部来源预测的上界；按 `policy_state` 中的自报命中记录校准 Agent 自报的置信度。等待意图只作软输入，不进入静止证据、空闲证据与可销毁判定（[ADR-wait-intent-as-soft-input](../../adr/adr-wait-intent-as-soft-input.md)）。
+- **等待时长预测与置信度**：在调用方传入的平台单点预测、Agent 自报的预计等待（`agent_expected_ms`）与等待意图给出的预计时长中取置信度最高者为 p50，按等待来源的先验展开 p25 与 p90 并给出置信度；等待意图携带[等待签名](../../glossary.md)的时长先验 `prior` 时直接使用其 p25、p50 与 p90，意图的预计时长与 `prior` 的分位都扣除自意图观察时刻 `observed_at` 起已等待的时长，已等待时长超过 `prior` 的 p90（没有 `prior` 时为预计时长的 1.5 倍）的意图退出候选，由其余候选给出预测；没有单点值时取来源先验，人类等待按渠道与在线态先验取值，回合等待意图为 `completed` 的回合边界取“回合完成”先验；供初判决策计算保守值 `D_lo` 与上限值 `D_hi`；来源覆盖 LLM、CI 与异步事件、人、回合完成、定时与静止；有效自唤醒条目中最早的触发时刻作为全部来源预测的上界；按等待意图的 `source` 查表给出其置信度，按 `policy_state` 中的自报命中记录校准 Agent 自报的置信度。等待意图只作软输入，不进入静止证据、空闲证据与可销毁判定（[ADR-wait-intent-as-soft-input](../../adr/adr-wait-intent-as-soft-input.md)）。
 - **抖动预算记账**：按挂起机制的成本从每运行实例的恢复时延预算中扣减，预算耗尽后把可选机制收窄为不挂起与冻结；预算窗口与余额随 `policy_state` 持久化。
 - **冻结态内存装箱与压力升级**：依节点冻结态内存比例与冻结运行实例列表选出升级对象，给出快照、回合边界销毁或 `DRAIN` 的升级选择；在节点压力超过硬阈值时驱动该节点回合边界且非实时接入的新等待按零宽限期处置。
 - **恢复准入**：在事务提交后把运行实例放入按机制划分的内存队列，按唤醒原因优先级与排队老化决定放行顺序，按机制限速与并发槽位放行；冻结态携带的截止到达时越过限速强制放行。
@@ -139,7 +139,7 @@ type ReviewResult struct {
 - **`remove`**：`runcontroller` 执行“显式结束”时在事务提交后调用，把条目从进程内队列移除并从槽位计数中释放；对不存在的条目幂等。它不改变 `run` 行，持久事实已由该转移清空。
 - **`on_resumed`**：恢复完成时调用，返回新的 `flap_counter` 与更新后的 `policy_state`；`runcontroller` 在同一事务把两者写入 `run` 行。`policy_state.SelfReportOpen` 非零时，按与 `flap_counter` 相同的实际等待时长判定 Agent 自报是否命中（实际等待落在 `[0.5 × SelfReportOpen, 1.5 × SelfReportOpen]` 内），累加 `SelfReportSamples`，命中时累加 `SelfReportHits`，并把 `SelfReportOpen` 清零。
 - **`approve_predictive`**：`runcontroller` 在 `run` 行锁内调用，调用点为 `wake_check` 的 `wake_hint` 分支，以及 `suspended.{frozen, snapshotted}` 中 `llm.first_token` 的处理事务。输入为运行实例子状态、`wake_hint` 的来源标识、来源类型与置信度、`policy_state`；返回是否批准与更新后的 `policy_state`（批准的来源标识已加入 `PredictiveDone`）。
-- **`quiescence_evidence`**：所有者处理每个 `Activity` 时在 `run` 行锁内调用。输入为最近两个活动度样本（含各自的 `cpu_usage_usec`）、上一次取证返回的 `QuietSince` 与本代在途 LLM 请求列表，判据见[静止证据与忙信号](#静止证据与忙信号)。返回的 `QuietSince` 不论 `OK` 真假都给出当前静止窗的起点，所有者保存在内存中并在下一次取证时原样传回，接管后从空值起算。`OK` 为真且所有者累计的 `Activity` 不少于 `Q_quiet` 时，L1、L2 经“静止冻结”以 `trigger=quiesce` 调用 `decide`，`QuietSince` 同时作为 `wait(kind=quiesce)` 的 `since`。
+- **`quiescence_evidence`**：所有者处理每个 `Activity` 时在 `run` 行锁内调用。输入为最近两个已收到的活动度样本（含各自的 `cpu_usage_usec`）、上一次取证返回的 `QuietSince` 与本代在途 LLM 请求列表，判据见[静止证据与忙信号](#静止证据与忙信号)。返回的 `QuietSince` 不论 `OK` 真假都给出当前静止窗的起点（取采样时刻），所有者保存在内存中并在下一次取证时原样传回，接管后从空值起算。`OK` 为真且所有者累计的 `Activity` 的 `sampled_at` 跨度不少于 `Q_quiet` 时，L1、L2 经“静止冻结”以 `trigger=quiesce` 调用 `decide`，`QuietSince` 同时作为 `wait(kind=quiesce)` 的 `since`。
 - **`idle_evidence`**：`runcontroller` 在 L0 的“看门狗空闲”判定中于行锁内调用。输入为同一 `Activity` 上 `quiescence_evidence` 的结果、最近一次活动度摘要、在途请求数、后台作业集合与 `cursor` 位置；判据为静止证据成立（忙信号全部适用，含 CPU 用量判据），且无在途请求、无后台作业、无已接受未消费的输入、进程树中只剩 Agent 主进程。
 - **`failure_backoff`**：无应答或提供者失败时返回下一次复评的绝对时刻；取值随 `PolicyState.NoResponseCount` 或 `PolicyState.ProviderFailures` 指数增长，上限 10 min。
 - **`jitter`**：为定时类等待、探测定时器与退避重试的到期时刻加随机偏移，返回落库的到期时刻；偏移范围见参数表，重驱动不重新抽样。
@@ -295,8 +295,7 @@ type Intent struct { // run.intents 的一项：同一 (RefKind, Ref) 最近一�
     Target     string        // 等待对象的描述性标识，可空；本模块不解释
     ExpectedMs time.Duration // 预计等待时长；为 0 表示未给出；source=signature 时为 Prior.P50
     Prior      *Quantiles    // 等待签名的时长先验；source=signature 时非空，其余来源为空
-    Source     string        // signature、self_report、keyword、classifier
-    Confidence float64       // 0～1；source=self_report 时由本模块按命中记录重算
+    Source     string        // signature、self_report、keyword、classifier；置信度由本模块按它查表，事件不携带
     ObservedAt time.Time     // 所有者事务处理该 intent_observed 的时刻
 }
 
@@ -313,13 +312,13 @@ type InFlightLLM struct {
 
 type SelfWakeEntry struct {
     EntryID        string
-    Kind           string    // cron、wakeup、tool_timeout、monitor_deadline
+    Kind           string    // 开放的描述性标签（示例：cron、wakeup、tool_timeout、monitor_deadline）；本模块不读取
     FireAt         time.Time // 下一次触发的绝对时刻；为空表示触发时刻未知
     SurvivesResume bool      // 销毁重建后经 --resume 由 Agent 自行恢复
 }
 
 type ActivitySummary struct { // 一次 Activity 的字段，取值口径见 agentprotocol
-    At                        time.Time
+    At                        time.Time     // Activity.sampled_at：采样时刻，取看守进程校时后的时间；窗口时长按它之差计，不取样本到达时刻
     PSI                       PSITotals     // cpu、io、mem：some 行 total 累计微秒值
     CPUUsageUsec              int64         // cpu_usage_usec：Agent 子 cgroup 的 cpu.stat 中 usage_usec 的累计值
     Procs                     ProcCounts    // R、D、S、T、Z
@@ -329,6 +328,7 @@ type ActivitySummary struct { // 一次 Activity 的字段，取值口径见 age
     TimedSleepers             TimedSleepers
     LLMLastRequestAt          time.Time
     LLMLastRetryableFailureAt time.Time
+    FrozenBy                  string        // frozen_by；取 backpressure 表示看守进程因待发队列满而自行冻结了 Agent 进程树，本模块只读这一个取值
 }
 
 type TimedSleepers struct {
@@ -400,7 +400,7 @@ type NodePressure struct {
 
 `DecisionContext.Prediction` 由调用方按 `blocked_on` 或 `wait_started` 写入等待来源与平台单点预测；`AgentExpectedMs` 取同一等待的 Agent 自报值：`blocked_on` 非空时取 `blocked_on.agent_expected_ms`，回合边界取作为等待来源的订阅等待行的 `agent_expected_ms`，未自报时为 0。平台单点预测与 Agent 自报分开传入，调用方不以其一填充另一个。`predict` 在平台单点预测、Agent 自报与等待意图给出的时长中取置信度最高者作为 `p50`，按来源先验的比例系数展开 `p25` 与 `p90`，等待意图的 `Prior` 非空时直接使用其三个分位，候选与置信度规则见[等待时长预测与置信度](#等待时长预测与置信度)。`DecisionContext.Intents` 为 `run.intents` 的全部条目，`Prior` 由 `runcontroller` 取自 `intent_observed.prior`，`ObservedAt` 为所有者事务处理该事件的时刻；本模块使用意图的预计时长时扣除自 `ObservedAt` 起已等待的时长，剩余为 `max(0, expected − (now − ObservedAt))`，`Prior` 的三个分位同样扣除；已等待时长 `now − ObservedAt` 超过 `Prior.P90`（`Prior` 为空时为 `1.5 × ExpectedMs`）的意图不参与等待时长预测，也不进入静止冻结的 `D_lo`。`runcontroller` 在对象结束时删除对应条目（调用的 `tool_ended`、作业离开 `bg_jobs`、下一回合开始），本模块不判断条目所指对象是否已结束，只按 `RefKind` 与 `Ref` 把意图对应到 `blocked_on` 所属调用、`RunningTools`、`BGJobs` 或回合。`llm.first_token` 到达后，剩余等待取 `max(0, predicted_ms − (now − blocked_on.since))`。`llmgateway` 的直方图只用于校准先验与诊断，不逐请求传入。`PolicyState` 序列化为 `run.policy_state`，所有权转移后由新所有者从该列恢复；`runcontroller` 不解释其内容。
 
-`DecisionContext.InFlightLLM` 每个在途 `request_id` 一项，取自本代 `status=in_flight` 的 `source_request` 行，`Mode` 取本地代理登记行的 `mode`；只有 `llmgateway` 登记的请求 `Mode` 为空，网关在冻结期间继续缓冲上游响应，上限按 `hold` 计；看守进程自身发起的宿主侧分类请求不登记在途请求事实，不出现在该列表中。`SelfWake` 取 `run.self_wake` 中的有效自唤醒条目与 `FireAt` 为空的条目，跨代保留的条目同样按此传入，过期自唤醒条目不传入；挂起决策时机制尚未选定，调用方按 `L_self_wake` 最大的形态的界限筛选后传入，`decide` 再按各机制落地后的形态收窄（见[初判决策](#初判决策)）。`QuiesceContext` 只携带相邻两个样本（含两次 `cpu_usage_usec` 累计值）与上一次的 `QuietSince`，静止窗按样本增量推进，所有者不保存样本序列；`IdleContext.InFlightRequests` 为本代在途 LLM 请求列表的长度。
+`DecisionContext.InFlightLLM` 每个在途 `request_id` 一项，取自本代 `status=in_flight` 的 `source_request` 行，`Mode` 取本地代理登记行的 `mode`；只有 `llmgateway` 登记的请求 `Mode` 为空，网关在冻结期间继续缓冲上游响应，上限按 `hold` 计；看守进程自身发起的宿主侧分类请求不登记在途请求事实，不出现在该列表中。`SelfWake` 取 `run.self_wake` 中的有效自唤醒条目与 `FireAt` 为空的条目，跨代保留的条目同样按此传入，过期自唤醒条目不传入；挂起决策时机制尚未选定，调用方按 `L_self_wake` 最大的形态的界限筛选后传入，`decide` 再按各机制落地后的形态收窄（见[初判决策](#初判决策)）。自唤醒条目的 `kind` 是开放的描述性标签，策略不读取它，只读 `fire_at` 与 `survives_resume`，驱动器新增 `kind` 取值不影响本模块。`QuiesceContext` 只携带相邻两个已收到的样本（含两次 `cpu_usage_usec` 累计值）与上一次的 `QuietSince`，静止窗按样本增量推进，所有者不保存样本序列；`IdleContext.InFlightRequests` 为本代在途 LLM 请求列表的长度。
 
 ### 状态一览
 
@@ -428,7 +428,7 @@ type NodePressure struct {
 
 走查体现的约束：`f_cap` 来自初判而不是复评；复评只能把冻结引向快照、销毁或 `DRAIN`，不能延长冻结上限；入队时的机制在放行时只读；队列与槽位在 `run` 行之外只是缓存。
 
-第二个场景是静止冻结。同一提供者上的 L1 运行实例，主循环已结束回合，后台子代理仍在运行并等待自己的 LLM 请求。初始 `run` 行：`state=active`、`substate=boundary`、`turn_phase=boundary`、`blocked_on` 为空、`bg_jobs=[t-7]`、`self_wake=[{entry_id: c-1, kind: cron, fire_at: T0+600 s, survives_resume: true}, {entry_id: w-2, kind: wakeup, fire_at: T0−300 s, survives_resume: false}]`（`w-2` 已触发而驱动器尚未对账）、`policy_state.ProbeBackoff=30 s`；本代在途 LLM 请求 `r-9` 为子代理所发，`registered_at=T0−20 s`、`mode=hold`、`predicted_ms=90 s`。`T0−2 s` 与 `T0` 的两个 `Activity` 样本之间，PSI 的 `cpu`、`io` 累计值不变，`cpu_usage_usec` 增加 6 ms（不超过 `U_quiet × 2 s = 20 ms`），无 R、D 态进程，无 fork，工作区写文件描述符不变；`T0` 样本的 `timed_sleepers={known_earliest_expiry: ∅, unknown: 0}`，`llm_last_request_at=T0−20 s`，`llm_last_retryable_failure_at` 为空。
+第二个场景是静止冻结。同一提供者上的 L1 运行实例，主循环已结束回合，后台子代理仍在运行并等待自己的 LLM 请求。初始 `run` 行：`state=active`、`substate=boundary`、`turn_phase=boundary`、`blocked_on` 为空、`bg_jobs=[t-7]`、`self_wake=[{entry_id: c-1, kind: cron, fire_at: T0+600 s, survives_resume: true}, {entry_id: w-2, kind: wakeup, fire_at: T0−300 s, survives_resume: false}]`（`w-2` 已触发而驱动器尚未对账）、`policy_state.ProbeBackoff=30 s`；本代在途 LLM 请求 `r-9` 为子代理所发，`registered_at=T0−20 s`、`mode=hold`、`predicted_ms=90 s`。`sampled_at` 为 `T0−2 s` 与 `T0` 的两个相邻 `Activity` 样本（间隔等于 `T_activity`）之间，PSI 的 `cpu`、`io` 累计值不变，`cpu_usage_usec` 增加 6 ms（不超过 `U_quiet × 2 s = 20 ms`），无 R、D 态进程，无 fork，工作区写文件描述符不变；`T0` 样本的 `timed_sleepers={known_earliest_expiry: ∅, unknown: 0}`，`llm_last_request_at=T0−20 s`，`llm_last_retryable_failure_at` 为空。
 
 1. `T0`：所有者处理 `Activity`，`quiescence_evidence` 返回 `OK=true`、`QuietSince=T0−2 s`（静止窗 2 s 不短于 `Q_quiet`，`r-9` 未超过 `T0−20 s+F_cap(llm)`）。`bg_jobs` 非空，常规路径不适用，“静止冻结”调用 `decide(trigger=quiesce)`。`sandboxprovider` 未提供恢复时延估计，各形态的 p95 取参数表的兜底值，`L_self_wake` 在各形态中最大为 `snapshotted` 的 `T_resume(snapshot_restore)+safety_margin=120 s+40 s=160 s`，各形态中最早的有效自唤醒条目的界限为 `T0−(160 s+P_quiesce)=T0−220 s`；`w-2` 早于它，是过期自唤醒条目，`runcontroller` 不把它传入上下文；`SelfWake` 只含 `c-1`，没有 `fire_at` 为空的条目。`r-9` 的剩余预测为 `90 s−20 s=70 s`（置信度 0.8，取 p50），已知最早自唤醒时刻取有效自唤醒条目 `c-1` 的 `T0+600 s`，`D_lo=70 s ≥ T_nofreeze`；`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`FCap` 为空、`FreezeDeadline=T0−20 s+240 s=T0+220 s`、`ProbeInterval=min(30 s, P_quiesce)=30 s`、`grace=0`、`NextReviewAt` 为空，抖动预算扣除冻结成本 0.1 s。`runcontroller` 在同一事务登记代范围探测定时器、`wait(kind=probe)` 与 `wait(kind=quiesce, since=T0−2 s)`，I8 检查通过后发起挂起，`run` 行写入 `suspend_mode=freeze_shrink`、`freeze_basis=quiesce`、`freeze_cap_at=T0+220 s`，`grace_deadline` 保持为空；探测定时器的 `fire_at=min(T0+30 s+抖动, T0+600 s−L_thaw)`，抖动 2 s 时为 `T0+32 s`。冻结落地后 `freeze_deadline=T0+220 s`，`self_wake_at=T0+600 s−L_self_wake(frozen)=T0+600 s−(L_thaw+safety_margin)=T0+559 s`；`w-2` 不参与 `self_wake_at` 与探测定时器的 `fire_at`，也不阻止挂起，驱动器下一次对账时更新或移除它。
 2. `T0+25 s`：`r-9` 完成，网关写入 `llm_completed(ref=r-9)`，`created_at` 晚于 `wait.since`，`quiesce` 等待满足，不按 `ref` 匹配。汇入事务把 `run` 行转 `wake_queued`、`wake_reason=llm_completed`、`resume_intent=normal`；`mechanism(frozen, caps, normal)` 返回 `thaw` 并入队。
@@ -440,13 +440,13 @@ type NodePressure struct {
 
 1. `T0`：`wait_started{kind=wait_for, agent_expected_ms=120 s}` 到达，`predicted_ms` 为空；`runcontroller` 写 `blocked_on={kind: wait_for, since: T0, predicted_ms: ∅, agent_expected_ms: 120 s}` 并调用 `decide(trigger=blocked)`，`Prediction={Source: CI 与异步事件, PredictedMs: 0, AgentExpectedMs: 120 s}`。候选为平台候选与 Agent 自报：平台候选取“CI 与异步事件”行的来源先验，置信度 0.3；Agent 自报的置信度为 `min(0.7, 3/4)=0.7`，按该来源的默认比例系数展开为 p25=80 s、p50=120 s、p90=216 s。自报置信度最高，`D_lo=p50=120 s`。回合中、无 `Snapshot`，`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`f_cap=F_cap(wait_for)`，`State.SelfReportOpen=120 s`，抖动预算扣除 0.1 s。
 2. `T0+150 s`：订阅的 CI 事件进入收件箱，阻塞满足，运行实例转 `wake_queued` 并解冻，`wait_for` 返回该事件。`on_resumed` 以实际等待 150 s 判定：它落在 `[p25, p90]=[80 s, 216 s]` 内，`flap_counter=0`；它落在自报值的 ±50%（`[60 s, 180 s]`）内，返回的 `policy_state` 为 `SelfReportSamples=5`、`SelfReportHits=4`、`SelfReportOpen=0`，`runcontroller` 在同一事务写回。此后自报的置信度为 `min(0.7, 4/5)=0.7`。
-3. 回合结束之前，驱动器按 `Stop` hook 的 `last_assistant_message`（“CI 已通过，修复已合并。”）判定该回合陈述任务完成且没有提问，发出 `intent_observed{ref_kind=turn, ref=turn-3, class=completed, source=keyword, confidence=0.3}`（非 `signature` 来源，`prior` 为空）；`runcontroller` 写入 `run.intents`，`observed_at` 取该事务的时刻，不产生状态转移。随后 `turn_ended` 到达，“回合结束”调用 `decide(trigger=boundary)`，`Prediction={Source: 人, PredictedMs: 0, AgentExpectedMs: 0}`，`grace_deadline` 为空。若没有回合等待意图，按“人”行 UI 活跃的先验 `D_lo` 不超过 2 min，低于剩余宽限期 300 s，结果是 `FREEZE` 并写 `grace_deadline=now()+300 s`。回合等待意图为 `completed` 时取“回合完成”行代替“人”行：p25=20 min、p50=30 min、p90=54 min、置信度 0.3，`D_lo=p25=20 min`；剩余宽限期为 `graceFor(ctx)=min(10 s, 300 s)=10 s`，`D_lo` 超过它；`Destroy` 可用、`safe_to.destroy` 为真且自唤醒条目为空，返回 `DESTROY`、`grace=0`、`State.SelfReportOpen=0`，抖动预算扣除 10 s、余额 9.9 s。`turn-3` 的回合等待意图保留到下一回合开始，由 `runcontroller` 删除。
+3. 回合结束之前，驱动器按 `Stop` hook 的 `last_assistant_message`（“CI 已通过，修复已合并。”）判定该回合陈述任务完成且没有提问，发出 `intent_observed{ref_kind=turn, ref=turn-3, class=completed, source=keyword}`（非 `signature` 来源，`prior` 为空）；`runcontroller` 写入 `run.intents`，`observed_at` 取该事务的时刻，不产生状态转移。随后 `turn_ended` 到达，“回合结束”调用 `decide(trigger=boundary)`，`Prediction={Source: 人, PredictedMs: 0, AgentExpectedMs: 0}`，`grace_deadline` 为空。若没有回合等待意图，按“人”行 UI 活跃的先验 `D_lo` 不超过 2 min，低于剩余宽限期 300 s，结果是 `FREEZE` 并写 `grace_deadline=now()+300 s`。回合等待意图为 `completed` 时取“回合完成”行代替“人”行：p25=20 min、p50=30 min、p90=54 min、置信度 0.3，`D_lo=p25=20 min`；剩余宽限期为 `graceFor(ctx)=min(10 s, 300 s)=10 s`，`D_lo` 超过它；`Destroy` 可用、`safe_to.destroy` 为真且自唤醒条目为空，返回 `DESTROY`、`grace=0`、`State.SelfReportOpen=0`，抖动预算扣除 10 s、余额 9.9 s。`turn-3` 的回合等待意图保留到下一回合开始，由 `runcontroller` 删除。
 
 走查体现的约束：Agent 自报只在置信度最高时决定 p50，其置信度来自本运行实例的命中记录，命中记录只在挂起之后的恢复中更新；回合等待意图只改变宽限期与先验，是否销毁仍由 `destroyable` 与 `runcontroller` 的 I9 预检判定；意图与自报不改变 `decide` 的触发与返回范围。
 
-第四个场景是等待意图超过预计时长。同一提供者上的 L1 运行实例，Agent 以 `Bash{command="gh run watch 1234", run_in_background=true}` 等待 CI 后结束回合，作业 `b-1` 进入 `bg_jobs`；驱动器按等待签名 `(github, gh-run-watch)` 发出 `intent_observed{ref_kind=job, ref=b-1, class=waiting, expected_ms=6 min, prior={p25: 2 min, p50: 6 min, p90: 20 min}, source=signature, confidence=0.9}`，`runcontroller` 写入 `run.intents`，`observed_at=T0`。初始 `run` 行：`state=active`、`substate=boundary`、`turn_phase=boundary`、`blocked_on` 为空、`bg_jobs=[b-1]`、`self_wake` 为空、`policy_state.ProbeBackoff=30 s`；本代没有在途 LLM 请求，活动度样本中没有定时睡眠进程，各 `Activity` 都满足静止证据。CI 在 `T0+25 min` 完成。
+第四个场景是等待意图超过预计时长。同一提供者上的 L1 运行实例，Agent 以 `Bash{command="gh run watch 1234", run_in_background=true}` 等待 CI 后结束回合，作业 `b-1` 进入 `bg_jobs`；驱动器按等待签名 `(github, gh-run-watch)` 发出 `intent_observed{ref_kind=job, ref=b-1, class=waiting, expected_ms=6 min, prior={p25: 2 min, p50: 6 min, p90: 20 min}, source=signature}`，`runcontroller` 写入 `run.intents`，`observed_at=T0`。初始 `run` 行：`state=active`、`substate=boundary`、`turn_phase=boundary`、`blocked_on` 为空、`bg_jobs=[b-1]`、`self_wake` 为空、`policy_state.ProbeBackoff=30 s`；本代没有在途 LLM 请求，活动度样本中没有定时睡眠进程，各 `Activity` 都满足静止证据。CI 在 `T0+25 min` 完成。
 
-1. `T0+1 min`：“静止冻结”调用 `decide(trigger=quiesce)`。已等待 1 min，不超过 `prior.p90=20 min`，`b-1` 的意图进入 `waitingIntents`；`intentRemaining` 扣除 1 min 后为 p25=1 min、p50=5 min、p90=19 min，置信度 0.9 不低于 0.7，取 p50。没有在途 LLM 请求与已知自唤醒时刻，`D_lo=5 min ≥ T_nofreeze`；`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`FreezeDeadline` 为空（没有在途 LLM 请求，`blocked_on` 为空，内存比低于阈值）、`ProbeInterval=min(30 s, P_quiesce)=30 s`、`grace=0`、`NextReviewAt` 为空。探测定时器到期唤醒运行实例，解冻后的 `Activity` 按同一规则再次决策。
+1. `T0+1 min`：“静止冻结”调用 `decide(trigger=quiesce)`。已等待 1 min，不超过 `prior.p90=20 min`，`b-1` 的意图进入 `waitingIntents`；`intentRemaining` 扣除 1 min 后为 p25=1 min、p50=5 min、p90=19 min，置信度按 `source=signature` 查表为 0.9，不低于 0.7，取 p50。没有在途 LLM 请求与已知自唤醒时刻，`D_lo=5 min ≥ T_nofreeze`；`Freeze` 可用且 `D_lo > T_shrink`，返回 `FREEZE_SHRINK`、`variant=cgroup`、`FreezeDeadline` 为空（没有在途 LLM 请求，`blocked_on` 为空，内存比低于阈值）、`ProbeInterval=min(30 s, P_quiesce)=30 s`、`grace=0`、`NextReviewAt` 为空。探测定时器到期唤醒运行实例，解冻后的 `Activity` 按同一规则再次决策。
 2. `T0+6 min` 起：已等待时长达到 p50 而未超过 p90，意图留在候选中。以 `T0+10 min` 为例，扣除 10 min 后 p25=0、p50=0、p90=10 min，取 p50，`D_lo=0 < T_nofreeze`，返回 `NONE`；此后直到 `T0+20 min`，每次取证都得到同一结果，运行实例保持 `active`。
 3. `T0+20 min` 之后的首个 `Activity`：已等待时长超过 `prior.p90`，`intentInBound` 为假，`b-1` 的意图不进入 `waitingIntents`。各类来源都没有，`D_lo` 取“静止”行的 p25：p50 为 `P_quiesce=60 s`，p25 按默认比例系数为 40 s，`D_lo=40 s ≥ T_nofreeze`，按 `D_lo` 与 `T_shrink` 的比较返回 `FREEZE` 或 `FREEZE_SHRINK`，`ProbeInterval` 不超过 `P_quiesce`。此后运行实例在静止冻结与探测唤醒之间交替。
 4. `T0+25 min` 之后的首次探测唤醒：解冻后 `gh run watch` 取得 workflow run 的结束状态并退出，`bg_jobs_changed` 使 `b-1` 离开 `bg_jobs`，`runcontroller` 在同一事务按意图修剪删除 `(job, b-1)` 的条目。
@@ -497,7 +497,8 @@ decide(ctx) -> Decision:
   return can_freeze ? freezeDecision(FREEZE, ctx) : d
 
 quiesceDecision(ctx, d, can_freeze) -> Decision:           # 只返回 FREEZE、FREEZE_SHRINK 或 NONE
-  if ctx.QuietSince 为空 or now − ctx.QuietSince < Q_quiet: return d
+  if ctx.QuietSince 为空 or ctx.Activity.At − ctx.QuietSince < Q_quiet: return d
+                                                          # 静止窗时长按采样时刻之差计，Activity 取最近一个样本
   rem = { max(0, lo(predictLLM(r)) − (now − r.RegisteredAt)) : r ∈ ctx.InFlightLLM, r.PredictedMs > 0 }
   rem = rem ∪ { lo(intentRemaining(i, ∅, ctx)) : i ∈ waitingIntents(ctx) }
                                                           # 意图的剩余预计时长，自 ObservedAt 起扣除已等待时长；
@@ -558,13 +559,14 @@ freezeCapExpired(ctx, now) =
 | 忙信号 | 判定 | 依据 |
 | --- | --- | --- |
 | CPU 或 I/O 停滞 | 相邻样本的 `psi.cpu` 或 `psi.io` 累计值之差不为零 | 有进程在等待 CPU 或 I/O |
-| CPU 用量 | 相邻样本的 `cpu_usage_usec` 之差超过 `U_quiet` 乘以样本间隔；静止窗由不满足该条件的相邻样本对连成，窗内增量因而不超过 `U_quiet` 乘以窗口时长 | Agent 进程树在使用 CPU；PSI 只记停滞时间，独占空闲 CPU 的短时突发不产生压力，R 态计数只反映采样瞬间 |
+| CPU 用量 | 相邻样本的 `cpu_usage_usec` 之差超过 `U_quiet` 乘以样本间隔（两个样本 `sampled_at` 之差）；静止窗由不满足该条件的相邻样本对连成，窗内增量因而不超过 `U_quiet` 乘以窗口时长 | Agent 进程树在使用 CPU；PSI 只记停滞时间，独占空闲 CPU 的短时突发不产生压力，R 态计数只反映采样瞬间 |
 | 可运行或不可中断进程 | 本次样本的 `procs.R` 或 `procs.D` 不为零 | 有进程正在执行或等待 I/O 完成 |
 | 进程创建 | `last_fork_at` 晚于上一个样本的时刻 | Agent 正在派生新进程 |
 | 工作区写入 | 相邻样本的 `ws_write_fds` 不同 | Agent 正在打开或关闭工作区的写文件描述符 |
 | 到期时刻未知的定时睡眠 | `timed_sleepers.unknown` 不为零 | 定时睡眠进程会在托管侧不知道的时刻自行醒来 |
 | 可重试失败后的重试窗 | `llm_last_retryable_failure_at` 晚于 `llm_last_request_at`，且距今不超过 `T_retry_window` | Agent 的 LLM 客户端在进程内退避后重试，退避定时器不可观测 |
 | 在途请求已到冻结上限 | 本代某个在途 LLM 请求满足 `now ≥ RegisteredAt + llmCap(Mode)` | 冻结会立即到达上限 |
+| 看守进程的背压冻结 | 本次样本或上一个样本带 `frozen_by=backpressure` | 看守进程自行冻结了 Agent 进程树，样本呈现的静默来自冻结而不是 Agent 静止；该冻结由看守进程在待发队列回落后自行解除，不是挂起冻结，不据以挂起 |
 
 到期时刻已知的 sleep 进程（`timed_sleepers.known_earliest_expiry`）不视为忙：它的到期时刻经探测定时器的触发时刻进入唤醒集合。处于 S 态、等待套接字或进程内定时器的进程也不视为忙。等待套接字的进程由所在连接的进展唤醒：承载 LLM 请求的连接经 `llm.first_token`、`llm.request.completed` 与 `llm.request.failed`，与平台 MCP 服务器之间的连接经定向投递，经本地代理转发的外部系统连接与透明拦截器接管的连接经 `conn.inbound`；两端都在 Agent 进程树内的回环连接不经 `conn.inbound`，`conn.inbound` 只表达外部输入，对端进程的推进由本表的忙信号反映。等待进程内定时器的进程未被镜像，探测间隔不超过 `P_quiesce`，其延迟因而有界。`psi.mem` 不参与判定。
 
@@ -574,6 +576,7 @@ freezeCapExpired(ctx, now) =
 quiescence_evidence(ctx) -> QuiesceEvidence:
   prev, cur = ctx.Prev, ctx.Cur
   quiet_pair = prev 非空
+               and cur.FrozenBy ≠ backpressure and prev.FrozenBy ≠ backpressure
                and cur.PSI.CPU = prev.PSI.CPU and cur.PSI.IO = prev.PSI.IO
                and cur.CPUUsageUsec − prev.CPUUsageUsec ≤ U_quiet × (cur.At − prev.At)
                and cur.Procs.R = 0 and cur.Procs.D = 0
@@ -597,6 +600,7 @@ idle_evidence(ctx) -> bool:                               # L0
 ```
 
 - 静止窗按相邻样本增量推进：一对样本满足静默条件时沿用上一次的 `QuietSince`（为空时取上一个样本的时刻），不满足时清空。PSI 累计值之差、`cpu_usage_usec` 之差与 `last_fork_at` 覆盖整个样本间隔，`cpu_usage_usec` 的允许增量随间隔按比例放大，间隔变长不削弱这三项判定；逐对满足 `U_quiet` 的样本对连成的静止窗，窗内 `cpu_usage_usec` 的增量不超过 `U_quiet` 乘以窗口时长；所有者接管后的首个样本没有可比较的上一个样本，静止窗从下一个样本起算。`QuietSince` 只描述静默，定时睡眠、重试窗与在途请求上限只影响 `OK`，因而 `OK` 为假时 `QuietSince` 仍可非空；这些条件消失后，静止窗不必重新累计。
+- `Activity` 是遥测帧，传输不保证送达，所有者可能丢样本（帧的传输语义见 [agentprotocol](design-agentprotocol.md)）。累计量（`psi`、`cpu_usage_usec`）按相邻两个已收到样本之差计算，样本间隔与静止窗时长都取 `sampled_at` 之差，不取样本到达时刻；中间丢了样本只使间隔变长，PSI、`cpu_usage_usec` 与 `last_fork_at` 三项判定仍覆盖整个间隔，不影响正确性。采样与发送周期为 `T_activity`（定义见 agentprotocol）。`now` 只用于与 LLM 时刻字段、到期时刻与在途请求登记时刻这类非采样量比较。
 - `QuietSince` 是 `runcontroller` 登记 `wait(kind=quiesce)` 时的 `since`：静止窗起点之后到达的 LLM 完成必然尚未被 Agent 处理，否则 Agent 的处理活动会打断静止窗。
 - 复杂度：每个 `Activity` 样本为 O(1) 加本代在途 LLM 请求数的线性项，所有者不保存样本序列。
 
@@ -633,8 +637,8 @@ idle_evidence(ctx) -> bool:                               # L0
 | `G_turn_grace` | 异步渠道 30 s；UI 会话活跃 300 s | 回合结束后保持冻结的宽限期，按渠道人类回复间隔的 EWMA 自适应；回合等待意图为 `completed` 时首次边界决策取 `G_turn_grace_done` |
 | `G_turn_grace_done` | 10 s，且不超过 `G_turn_grace(channel)` | 最近一次回合等待意图为 `completed` 时回合边界的宽限期，实际取 `min(G_turn_grace_done, G_turn_grace(channel))`；只在首次边界决策选定，见[初判决策](#初判决策) |
 | Agent 自报置信度 | `min(0.7, SelfReportHits/SelfReportSamples)`；`SelfReportSamples=0` 时 0.5 | `agent_expected_ms` 与 `source=self_report` 的等待意图的置信度；实际等待落在自报值的 ±50% 以内计命中，命中记录见[策略状态与复位](#策略状态与复位) |
-| `Q_quiet` | 2 s | 静止证据与 L0 空闲证据要求的最短静止窗；所有者另要求累计的 `Activity` 不少于此值 |
-| `U_quiet` | 1%（每秒 10 ms） | 静止证据与 L0 空闲证据允许的 CPU 用量：相邻样本间 `cpu_usage_usec` 的增量不超过本值乘以样本间隔；取值表示 Node 事件循环的周期定时器等常驻开销之下的 CPU 用量。PSI 的 `total` 衡量停滞时间而不是 CPU 用量，独占空闲 CPU 的短时突发进程不产生压力，R 态计数只是采样瞬间的值，三者都不能代替本判据 |
+| `Q_quiet` | 2 s | 静止证据与 L0 空闲证据要求的最短静止窗，按 `sampled_at` 之差计；所有者另要求累计的 `Activity` 的 `sampled_at` 跨度不少于此值；`Activity` 的采样周期为 `T_activity` |
+| `U_quiet` | 1%（每秒 10 ms） | 静止证据与 L0 空闲证据允许的 CPU 用量：相邻样本间 `cpu_usage_usec` 的增量不超过本值乘以样本间隔（`sampled_at` 之差）；取值表示 Node 事件循环的周期定时器等常驻开销之下的 CPU 用量。PSI 的 `total` 衡量停滞时间而不是 CPU 用量，独占空闲 CPU 的短时突发进程不产生压力，R 态计数只是采样瞬间的值，三者都不能代替本判据 |
 | `P_quiesce` | 60 s | 静止冻结的探测间隔上限；约束未镜像的进程内定时器被延迟的时长；同时进入[有效自唤醒条目](../../glossary.md)的界限 `now − (L_self_wake(substate) + P_quiesce)` |
 | `T_retry_window` | 60 s | LLM 可重试失败后的重试窗；窗口内静止证据不成立 |
 | `L_thaw` | 1 s | 解冻的提前量，也是 `L_self_wake(frozen)` 中冻结态恢复时延的 p95；探测定时器的 `fire_at` 不晚于已知最早自唤醒时刻（只取有效自唤醒条目与到期时刻已知的 sleep 进程）减此值 |
@@ -732,7 +736,18 @@ idle_evidence(ctx) -> bool:                               # L0
 | --- | --- | --- | --- |
 | 平台候选 | `Prediction.PredictedMs`（`blocked_on.predicted_ms` 或 `wait_started.predicted_ms`）；为 0 时取上表对应行的先验 | 单点值为 p50，按等待来源先验的比例系数展开；回合边界上回合等待意图为 `completed` 时“人”行由“回合完成”行代替 | 上表“置信度”列 |
 | Agent 自报 | `Prediction.AgentExpectedMs`（`agent_expected_ms`） | 自报值为 p50，按等待来源先验的比例系数展开 | 参数表“Agent 自报置信度”行 |
-| 等待意图 | `ctx.Intents` 中 `blocked_on` 所属调用的意图，要求 `class=waiting`、带 `expected_ms`，且自 `observed_at` 起已等待的时长不超过界限：`prior` 非空时为其 p90，为空时为 `expected_ms` 的 1.5 倍 | `prior` 非空（`source=signature`）时直接取[等待签名](../../glossary.md)时长先验的 p25、p50、p90；为空时 `expected_ms` 为 p50，按等待来源先验的比例系数展开；三个分位都扣除自 `observed_at` 起已等待的时长，不低于 0 | 意图携带的 `confidence`（`signature` 0.9、`classifier` 0.6、`keyword` 0.3）；`source=self_report` 时按参数表“Agent 自报置信度”行重算 |
+| 等待意图 | `ctx.Intents` 中 `blocked_on` 所属调用的意图，要求 `class=waiting`、带 `expected_ms`，且自 `observed_at` 起已等待的时长不超过界限：`prior` 非空时为其 p90，为空时为 `expected_ms` 的 1.5 倍 | `prior` 非空（`source=signature`）时直接取[等待签名](../../glossary.md)时长先验的 p25、p50、p90；为空时 `expected_ms` 为 p50，按等待来源先验的比例系数展开；三个分位都扣除自 `observed_at` 起已等待的时长，不低于 0 | 按意图的 `source` 查下表“等待意图的置信度” |
+
+`intent_observed` 不携带置信度，`run.intents` 也不保存该字段：置信度由本模块按 `source` 查下表（下称“等待意图的置信度”表）得到。`source` 是开放集合，下表列出已知取值；不认识的取值在接收时已丢弃该事件并计数，不进入本模块（见 [agentprotocol](design-agentprotocol.md)）。
+
+| `source` | 置信度 | 含义 |
+| --- | --- | --- |
+| `signature` | 0.9 | 命中[等待签名](../../glossary.md)，时长先验取自 `prior` |
+| `self_report` | `min(0.7, 自报历史命中率)`；没有历史时 0.5 | Agent 自报的预计等待；校准规则见下 |
+| `classifier` | 0.6 | 宿主侧分类模型的判定 |
+| `keyword` | 0.3 | 等待签名以外的规则判定，例如命令、描述与最后一条消息中的关键词 |
+
+自报历史命中率的校准规则：按运行实例累计，命中率为 `SelfReportHits / SelfReportSamples`；一次自报在恢复后以实际等待落在自报值 ±50% 以内计命中，只有挂起之后经 `on_resumed` 的等待才计入样本；`SelfReportSamples=0` 时没有历史，取 0.5。`agent_expected_ms` 与 `source=self_report` 的等待意图共用这一规则，不另按事件上的数值重算，规则的状态与更新见[策略状态与复位](#策略状态与复位)。
 
 ```text
 predict(ctx) -> P:                                        # P 含 p25、p50、p90、置信度与候选种类
@@ -754,7 +769,8 @@ base(ctx) =
 expand(v, src, c) = { P25: v × r25(src), P50: v, P90: v × r90(src), Confidence: c }
                     # r25、r90 为 src 先验的比例系数；src 为空时取「LLM 先验」行的默认值
 selfConf(ps)      = ps.SelfReportSamples = 0 ? 0.5 : min(0.7, ps.SelfReportHits / ps.SelfReportSamples)
-intentConf(i, ps) = i.Source = self_report ? selfConf(ps) : i.Confidence
+intentConf(i, ps) = i.Source = self_report ? selfConf(ps) : conf_by_source[i.Source]
+                    # conf_by_source：signature 0.9、classifier 0.6、keyword 0.3，见“等待意图的置信度”表
 intentDist(i, src, ctx) =
   i.Prior 非空 ? { P25: i.Prior.P25, P50: i.Prior.P50, P90: i.Prior.P90, Confidence: intentConf(i, ctx.PolicyState) }
               : expand(i.ExpectedMs, src, intentConf(i, ctx.PolicyState))
@@ -768,7 +784,7 @@ elapse(p, e)      = { P25: max(0, p.P25 − e), P50: max(0, p.P50 − e), P90: m
 - 等待意图的候选资格以已等待时长为界（`intentInBound`）：`prior` 非空时界限为其 p90，为空时为 `expected_ms` 的 1.5 倍。界限之内按扣除已等待时长后的剩余参与比较；已等待时长超过界限时该意图退出候选，预测在其余候选中取置信度最高者：平台候选取平台给出的 `predicted_ms` 或等待来源的先验行，Agent 自报照常参与比较。已等待时长越过 `lo` 所取的分位时，扣减后的剩余归零，选定该意图的 `D_lo` 低于 `T_nofreeze`；界限使这一时段止于 p90 或 1.5 倍预计时长，而不是延续到该对象结束或意图被覆盖。静止冻结的 `D_lo` 按同一界限取意图（见[初判决策](#初判决策)）。
 - 常规路径只有 `blocked_on` 所属调用的意图参与候选：运行中的工具或后台作业存在时只有静止冻结可选，它们的等待意图经 `waitingIntents` 进入静止冻结的 `D_lo`（见[初判决策](#初判决策)）。回合等待意图不给出时长，只经“回合完成”行与 `graceFor` 起作用。
 - Agent 自报与等待意图不写 `ConfidencePenalty`；选定候选失准时，`flap_counter` 照常按 `on_resumed` 的规则计数。
-- Agent 自报的命中记录按运行实例累计在 `policy_state`：`decide` 返回挂起模式时以 `SelfReportOpen` 记下本次的自报值，`on_resumed` 以实际等待判定命中（落在自报值的 ±50% 以内）并累加 `SelfReportSamples` 与 `SelfReportHits`。驱动器发出的 `self_report` 意图所带的 `confidence` 不参与比较，按同一命中率重算。没有挂起的等待不经过 `on_resumed`，不计入命中记录。
+- Agent 自报的命中记录按运行实例累计在 `policy_state`：`decide` 返回挂起模式时以 `SelfReportOpen` 记下本次的自报值，`on_resumed` 以实际等待判定命中（落在自报值的 ±50% 以内）并累加 `SelfReportSamples` 与 `SelfReportHits`。`source=self_report` 的等待意图不带置信度，按同一命中率取值。没有挂起的等待不经过 `on_resumed`，不计入命中记录。
 
 等待意图只作软输入：只进入本节的候选、静止冻结的 `D_lo` 与回合边界的宽限期选择，不进入单一条件门控、静止证据、I9 与唤醒集合（I11，[ADR-wait-intent-as-soft-input](../../adr/adr-wait-intent-as-soft-input.md)）。没有等待意图与 Agent 自报时，预测只取平台候选，宽限期取 `G_turn_grace(channel)`。
 
@@ -839,7 +855,7 @@ elapse(p, e)      = { P25: max(0, p.P25 − e), P50: max(0, p.P50 − e), P90: m
 | 已过冻结上限的阻塞 | `decide` 不返回冻结；回合中按能力返回快照或 `NONE`，回合边界按销毁或快照处置 |
 | 冻结上限到达 | `review` 只返回 `SNAPSHOT` 或 `DRAIN`，不返回 `DESTROY` 或 `KEEP`；`blocked_on` 所属调用之外有运行中的工具时，`trigger=quiesce` 之外不挂起，第三方工具调用不是 `blocked_on`。静止冻结的冻结上限到达不调用 `review`，由 `runcontroller` 直接唤醒 |
 | 后台作业存活 | `decide` 只在 `trigger=quiesce` 下返回 `FREEZE` 或 `FREEZE_SHRINK`，其余触发返回 `NONE`；I9 不成立，不返回 `DESTROY`；策略不给出终止后台作业或残留进程的决策 |
-| 静止证据不成立 | 静默窗不足（含相邻样本间 `cpu_usage_usec` 增量超过 `U_quiet` 乘以样本间隔）、到期时刻未知的定时睡眠、可重试失败后的重试窗或在途请求已到冻结上限时 `quiescence_evidence` 返回 `OK=false`，不发起静止冻结；下一个 `Activity` 重新取证，`QuietSince` 在静默未被打断时保留 |
+| 静止证据不成立 | 静默窗不足（含相邻样本间 `cpu_usage_usec` 增量超过 `U_quiet` 乘以样本间隔）、看守进程的背压冻结、到期时刻未知的定时睡眠、可重试失败后的重试窗或在途请求已到冻结上限时 `quiescence_evidence` 返回 `OK=false`，不发起静止冻结；下一个 `Activity` 重新取证，`QuietSince` 在静默未被打断时保留 |
 | 静止证据误判 | 静止冻结期间 Agent 本应推进而未被唤醒（未镜像的进程内定时器、未计入的活动）时，探测定时器在 `ProbeInterval` 加抖动之内唤醒运行实例；`ProbeInterval` 不超过 `P_quiesce` |
 | 自唤醒条目不随续接恢复 | `destroyed` 形态的[有效自唤醒条目](../../glossary.md)或 `fire_at` 为空的条目中存在 `survives_resume=false` 的项时 `destroyable` 为假，`decide` 不返回 `DESTROY`，回合边界按快照或冻结处置；`runcontroller` 的 I9 预检同样拒绝，看守进程按 `PrepareSuspend.self_wake_cutoff` 以同一界限复核；过期自唤醒条目不参与该检查 |
 | 自唤醒时刻已到或已过 | 形态 `s` 的有效自唤醒条目中存在 `fire_at` 已到或已过的项时，落地为 `s` 的机制的预测上界为 0，`D_lo` 低于 `T_nofreeze`，不选该机制，其余机制都不可选时返回 `NONE`；过期自唤醒条目视为已触发、待驱动器对账，不参与上界，也不阻止挂起 |
@@ -863,7 +879,7 @@ elapse(p, e)      = { P25: max(0, p.P25 − e), P50: max(0, p.P50 − e), P90: m
 ## 扩展点
 
 - **新增挂起机制**：扩展决策模式闭集、能力集合、`mechanism` 的恢复模式映射与升级梯，并给出该机制的恢复时延、失败处置与准入限速；`runcontroller` 的状态机只增加对应的模式取值，不改变转移结构。
-- **新增预测来源**：给出该来源先验的比例系数与先验置信度、用于校准先验的历史数据与失准判定；预测输入通过上下文传入，不新增协议消息，也不改状态机。等待意图的 `source` 新取值由 `agentprotocol` 规定其 `confidence`，本模块按候选规则直接比较，并在置信度相同时的取舍顺序中给出它的位置。
+- **新增预测来源**：给出该来源先验的比例系数与先验置信度、用于校准先验的历史数据与失准判定；预测输入通过上下文传入，不新增协议消息，也不改状态机。等待意图的 `source` 是开放集合，新取值不涉及协议版本，也不需要能力标识（见 [agentprotocol](design-agentprotocol.md)）；接收方认识该取值之前丢弃对应事件，本模块在“等待意图的置信度”表中给出它的置信度，按候选规则直接比较，并在置信度相同时的取舍顺序中给出它的位置。
 - **新增唤醒原因优先级**：扩展优先级表与老化规则，并同步 `runcontroller` 的 `wake_reason` 派生；准入桶结构不变。
 - **调整策略参数**：参数表集中登记默认值与适用边界，调整默认值不改变函数签名与返回闭集；策略行为变化不得要求改变 `runcontroller` 的状态机。
 - **新增能力**：扩展沙箱提供者的能力集合与闭集内的机制组合；新增能力必须同时给出退化路径与测试矩阵。

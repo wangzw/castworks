@@ -7,3 +7,12 @@
 | [v0.1.0](v0.1.0/README.md) | 概念验证：在 Substrate 上，Agent 等人时以快照挂起沙箱，人回复后恢复，Agent 带着原有上下文继续 | [Substrate 试点的 go 判定](verification.md#substrate-试点的-go-判定)中的“驱动 Claude Code”与“快照恢复”两项；观察“恢复后状态”中 MEMORY 快照恢复后的时钟与旧连接 |
 
 后续版本在 v0.1.0 完成后规划。
+
+## 设计尚未覆盖的能力
+
+下表列出设计文档中没有提供、也尚未排入任何版本的面向用户的能力。“现状”列是设计文档中的结论，“待定”列是排入版本之前需要确定的事项；排入版本时在该版本目录中列出，并修改相应的设计文档。
+
+| 事项 | 现状 | 待定 |
+| --- | --- | --- |
+| Agent 输出正文到达界面的路径 | 助手消息与工具输出不经出站流，`agentprotocol` 不承载它们（[agentprotocol](../design/modules/design-agentprotocol.md)）；界面呈现回合状态与进行中的工具调用（`RunView.running_tools`），不呈现正文 | 是否让正文经控制面到达界面；提供时的传输路径、保存位置与访问授权 |
+| 面向用户的工作区上传与写入 | `/files` 只读；`ToolExec` 的文件写只由控制面循环驱动器使用，不是面向用户的上传途径（[workspace](../design/modules/design-workspace.md)） | 是否提供用户向工作区上传或写入文件的接口；提供时的授权方式，以及经工作区租约持有者写入的路径 |

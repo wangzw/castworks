@@ -14,7 +14,7 @@
 | 唤醒谓词 | wake predicate | 判定运行实例是否应恢复的条件：阻塞条件或代范围的等待条件（探测定时器、显式声明、静止冻结登记的等待）已被唤醒信号满足，或冻结期间 Agent 持有的外部系统连接收到入站数据，或处于回合边界，且存在可投递事件（含跨代重投区间内待重投的事件）或以 hook 的 `defer`（[REF-claude-code-hooks](references.md)）推迟的审批决定，或冻结的截止时间已到。自唤醒源的到期不属于唤醒谓词，由所有者侧截止时间驱动 |
 | 自唤醒源 | self-wake source | Agent 自行安排、到点由 Agent 进程自行触发而不经任何托管侧组件的唤醒来源，例如 Claude Code 的会话内定时（`CronCreate`、`ScheduleWakeup`）、`sleep` 进程、工具超时与 `Monitor` 截止；与之相对，LLM 完成、外部系统事件、人类消息与托管侧定时器经托管侧组件到达。托管侧观测其触发时刻并镜像进唤醒集合。每个已镜像的自唤醒安排称为自唤醒条目，触发时刻无法确定的条目同样镜像，其触发时刻为空 |
 | 有效自唤醒条目 | valid self-wake entry | `fire_at` 非空且不早于 `now − (L_self_wake(substate) + P_quiesce)` 的自唤醒条目；`substate` 是界限所针对的挂起形态，`L_self_wake(substate)` 是该形态的自唤醒提前量，`P_quiesce` 是静止冻结的探测间隔上限；`fire_at` 早于该界限的自唤醒条目称为过期自唤醒条目，视为已触发、待 Agent 驱动器对账；`fire_at` 为空的自唤醒条目既不是有效自唤醒条目，也不是过期自唤醒条目 |
-| 等待意图 | wait intent | Agent 驱动器对某个前台工具调用、后台作业或回合推断出的等待性质：在等什么、预计多久，以及该调用或作业是在工作、等待还是提供服务，该回合是以提问结束还是以任务完成结束；每条意图带来源与置信度 |
+| 等待意图 | wait intent | Agent 驱动器对某个前台工具调用、后台作业或回合推断出的等待性质：在等什么、预计多久，以及该调用或作业是在工作、等待还是提供服务，该回合是以提问结束还是以任务完成结束；每条意图带来源，置信度由 `suspendpolicy` 按来源确定 |
 | 订阅 | Subscription | 运行实例对某外部系统事件的持久登记，含所属项目、过滤条件、关联键、完成条件与生命周期；只匹配 `project_ids` 包含其 `project_id` 的事件 |
 | 回合 | Turn | Agent 从收到一条输入到停下等待下一条输入之间的工作段 |
 | 回合边界 | turn boundary | 回合结束、Agent 等待下一条输入的时刻；L1 与 L2 以挂起为目的销毁沙箱的唯一时点（L0 不以挂起为目的销毁） |
@@ -23,7 +23,7 @@
 | 代 | generation | 运行实例每次预配沙箱时递增的单调计数 |
 | 代范围 | generation scope | 随代递增作废的等待与定时器范围；代范围条件只对登记它的一代有效 |
 | 运行实例范围 | run scope | 跨代保留的等待与定时器范围；运行实例范围的等待与定时器不携带代 |
-| 失效判定 | fencing | 以代为依据拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求 |
+| 失效判定 | fencing | 以代为依据拒绝过期沙箱的消息、令牌、工作区写入、游标推进与出口请求；出站流上，同一代内工作区租约或 `sandbox_id` 与登记不符的连接同样按失效处理 |
 | 挂起 | suspend | 释放沙箱计算资源的统称，涵盖冻结、快照与销毁重建 |
 | 冻结 | freeze | 停止 Agent 进程树的 CPU 调度并保留内存；反向操作为解冻 |
 | 静止冻结 | quiescent freeze | 没有单一等待条件可依（后台作业存活，或回合中多个 Agent 循环并发）时，依据静止证据执行的冻结。静止证据指没有任何 Agent 循环能在不依赖托管侧唤醒的情况下推进。冻结附带探测定时器，由本代 LLM 完成或失败、冻结期间的入站数据、探测定时器、自唤醒到期或冻结上限唤醒，不升级为快照或销毁 |
@@ -77,12 +77,12 @@
 | 持久化确认 | persistence confirmation | 在销毁沙箱前确认工作区写入已持久化的处理；`sync` 为 fsync 完成，`on_suspend` 为同步挂起上传完成 |
 | 运行实例所有者租约 | run owner lease | `run` 行上的 `owner_id`、`owner_epoch` 与 `owner_lease_expires_at`，决定该运行实例状态机的写者 |
 | 实例密钥 | instance key | 看守进程在领取之前生成、私钥只保存在进程内存中的签名密钥对；公钥随领取请求提交，其指纹写入运行实例令牌的 `cnf.jkt` 与工作区租约的 `holder_jkt` |
-| 持有证明 | holder proof | 看守进程以实例密钥的私钥对用途、运行实例或租约标识、代、沙箱标识与签名时刻所作的签名，随 `Hello` 与 `RenewLease` 提交；接收方据此确认调用方持有领取时登记的实例密钥 |
+| 持有证明 | holder proof | 看守进程以实例密钥的私钥对用途、运行实例或租约标识、代、沙箱标识，以及 `Hello` 时控制面为该条出站流生成的一次性挑战随机数或 `RenewLease` 时的签名时刻所作的签名，随 `Hello` 与 `RenewLease` 提交；`Hello` 的持有证明不带时窗，`RenewLease` 的持有证明按时窗判定签名时刻。接收方据此确认调用方持有领取时登记的实例密钥 |
 | 运行实例令牌 | Run token | 按受众划分的短期 JWT 组，一次签发同 `run_id`、同代、同 `exp`、同一实例公钥指纹（`cnf.jkt`）的一组令牌，接收方只接受本身受众的令牌；受众闭集为 `runcontroller`、`llmgateway`、`connectorhub`、`humanchannel`、`egress`。首个令牌组经引导接口领取，此后按控制面的 `TokenRotate` 轮换，只由看守进程持有；令牌须同时满足以下条件才有效：签名、过期时间、`run_id` 与受众校验通过；令牌中的代等于运行实例当前代；运行实例未进入终态；本代沙箱未被判定作废 |
 | 引导接口 | bootstrap endpoint | `sandboxprovider` 在控制面服务中以 HTTPS 暴露的 `POST /v1/bootstrap/claim`，看守进程以沙箱实例的身份凭据调用它，请求体携带实例公钥，领取按受众划分的运行实例令牌组、工作区租约的 `lease_id` 与接入票据公钥集合；领取指一次性取得令牌组、`lease_id` 与公钥集合的这一次请求，同一沙箱实例至多领取成功一次，看守进程在启动 Agent 主进程之前完成领取。k8s 路径以绑定到 Pod 的投射 ServiceAccount 令牌认证，Substrate 路径以出口网关注入的 actor JWT 认证，领取语义相同 |
-| 接入票据 | access ticket | 由 `secrets` 按 `humanchannel` 的申请签发的短期一次性 JWT，绑定平台用户、项目、运行实例、代与接入通道（`terminal` 或 `file`）；入站路由原样转发，看守进程在 `/terminal` 与 `/files` 上校验后才建立终端或读取文件 |
+| 接入票据 | access ticket | 由 `secrets` 按 `humanchannel` 的申请签发的短期 JWT，绑定平台用户、项目、运行实例、代与接入通道（`terminal` 或 `file`）；入站路由原样转发，看守进程在 `/terminal` 与 `/files` 上校验后才建立终端或读取文件。`terminal` 通道的票据只接受一次，`file` 通道的票据在有效期内可用于同一用户、同一运行实例、同一代的多次只读请求 |
 | 面向沙箱的端点 | sandbox-facing endpoint | 控制面中供看守进程调用、与只接受 SPIFFE（[REF-spiffe](references.md)）对端的内部接口分开监听的端点，部署在独立的主机名与端口上：出站流、引导接口、工作区租约续约、LLM 网关的请求与回放取回、`connectorhub` 的事件目录、订阅登记与附件取回、`humanchannel` 的附件取回，以及 k8s 路径的平台出口代理；每个端点都要求 Agent 进程不持有的凭据 |
-| 出站流 | outbound stream | 看守进程运行时始终维持的一条主动外连控制面的 gRPC 双向流，承载全部协议消息与投递；重连后发送方重放未确认消息，Hello 与 HelloAck 做状态对账 |
+| 出站流 | outbound stream | 看守进程运行时始终维持的一条主动外连控制面的 gRPC 双向流，承载全部协议消息与投递；重连后看守进程重放控制面尚未提交的消息，控制面发往看守进程的消息不跨连接重放，由 `runcontroller` 按持久化状态重新产生，Hello 与 HelloAck 做状态对账 |
 | 汇入契约 | ingestion contract | runcontroller 向事件源模块提供的唯一写入接口，用于写入收件箱事件、唤醒信号、运行实例事实、事件源实例租约与沙箱侧配置；runcontroller 不反向调用事件源模块 |
 | 效果记录 | effect record | 由 runcontroller 与产生它的状态转移或汇入写入在同一数据库事务内写入，并在提交后按幂等键执行的副作用记录；副作用例如调用沙箱提供者、workspace 与 secrets 模块，或经出站流发送消息；滞留超过截止时间的记录由对账器重驱动 |
 | 对账器 | reconciler | runcontroller 的纠正性后台组件，按 `T_reconcile` 周期扫描持久化状态，对因过渡态超时、唤醒遗漏、沙箱丢失等而停住的运行实例以同一标识幂等重驱动；以持久化状态为准，不以事件历史为准（I10） |

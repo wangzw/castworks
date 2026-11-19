@@ -57,7 +57,7 @@
 
 稳定性承诺按接口类别给出：生命周期接口对 `runcontroller` 稳定；出口策略接口对 `connectorhub` 稳定；引导接口的路径、响应字段与错误码对看守进程稳定；提供者在能力集合内声明的能力可以增加，扩展能力集合的闭合取值、删除能力或改变已有能力的语义是破坏性变更；墓碑与幂等语义是提供者必须满足的契约，不满足的实现不是合规提供者。生命周期调用经 `runcontroller` 的效果记录在数据库事务提交后发出；出口策略推送由 `connectorhub` 直接调用；引导接口由看守进程以 HTTPS 调用。`sandboxprovider` 不读写控制面的表，也不参与控制面事务。
 
-调用方认证按[认证与授权边界](../../architecture.md#认证与授权边界)的按方法授权表执行（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。`Provider` 接口只在内部监听器上提供：只接受 mTLS 对端，对端的 SPIFFE 工作负载身份（[REF-spiffe](../../../references.md)）须在授权表中该方法的允许集合内；生命周期方法、只读查询与 `RevokeEgressPolicy` 只接受 `runcontroller`，`PutEgressPolicy` 只接受 `connectorhub`。内部监听器不接受非 SPIFFE 对端，也不对沙箱网段开放；对端不在授权表中，或调用了授权表不允许该对端调用的方法时，以不可重试的未授权错误拒绝并写审计，不执行调用。引导接口部署在[面向沙箱的端点](../../../glossary.md) `bootstrap` 上，与内部监听器使用不同的主机名与端口，调用方为看守进程，认证见[引导接口](#引导接口)。`Provider.Thaw` 是提供者方法；协议消息 `Thaw{suspend_id}` 由 `runcontroller` 经出站流发送给看守进程，不调用本接口。
+调用方认证按[认证与授权边界](../../architecture.md#认证与授权边界)的按方法授权表执行（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。`Provider` 接口只在内部监听器上提供：只接受 mTLS 对端，对端的 SPIFFE 工作负载身份（[REF-spiffe](../../../references.md)）须在授权表中该方法的允许集合内；生命周期方法、只读查询与 `RevokeEgressPolicy` 只接受 `runcontroller`，`PutEgressPolicy` 只接受 `connectorhub`。内部监听器不接受非 SPIFFE 对端，也不对沙箱网段开放；对端不在授权表中，或调用了授权表不允许该对端调用的方法时，以不可重试的未授权错误拒绝并写审计，不执行调用。引导接口部署在[面向沙箱的端点](../../../glossary.md) `bootstrap` 上，与内部监听器使用不同的主机名与端口，调用方为看守进程，认证见[引导接口](#引导接口)。`Provider.Thaw` 是提供者方法；协议消息 `Thaw{freeze_id}` 由 `runcontroller` 经出站流发送给看守进程，不调用本接口。
 
 ```go
 type Provider interface {
@@ -239,7 +239,7 @@ type EgressPolicyDocument struct {
 | 401 | 凭据无效或 audience 不符；Substrate 路径另含引导记录中的 actor UID 与 JWT 不一致 | 不可重试 |
 | 404 | 没有对应的引导记录，包括记录尚未写入的沙箱实例，以及记录已被整代销毁、单个销毁或释放删除的沙箱实例 | 退避重试 |
 | 409 | 引导记录已领取；或 `workspace` 拒绝 `SetHolderKey`（租约已释放、代不符或租约已登记另一实例公钥指纹） | 停止领取，不启动 Agent 主进程；`runcontroller` 按沙箱丢失以新代重建 |
-| 410 | 该代已有创建墓碑，或运行实例已有释放墓碑 | 退出 |
+| 410 | 该代已有创建墓碑，或运行实例已有释放墓碑 | 以退出原因 `claim_gone` 退出（见 [warden](../warden/design-warden.md)） |
 | 503 | `secrets`、`workspace` 或存储不可达；k8s 路径另含 `TokenReview` 请求失败 | 退避重试 |
 
 ## 依赖
@@ -366,7 +366,13 @@ sequenceDiagram
     P->>P: 同一事务内 claimed=true，写 claimed_at 与 instance_jkt
     P-->>D: run_id, generation, sandbox_id, lease_id, tokens, token_expires_at, access_ticket_keys
     D->>W: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+    Note over D: 时窗不符时按返回的服务端时刻校时后重试，连续被拒时退避重试
+    W-->>D: 首次续约成功，lease.holder 为本沙箱
+    D->>R: 建立出站流
+    R-->>D: Challenge(nonce, server_now)
+    Note over D: 按 server_now 再校时
     D->>R: Hello(generation, sandbox_id, instance_key, holder_proof)
+    R-->>D: HelloAck
 
     Note over R,P: 回合中冻结
     R->>P: Freeze(freeze_id, cgroup)
@@ -379,7 +385,7 @@ sequenceDiagram
     R->>P: Thaw(freeze_id)
     P->>L: 解冻
     P-->>R: 解冻返回
-    R->>D: Thaw(suspend_id)
+    R->>D: Thaw(freeze_id)
     D-->>R: Thawed
 
     Note over R,P: 恢复按 resume_mode 分派
@@ -390,7 +396,14 @@ sequenceDiagram
         L->>D: 恢复同一 actor 并停泊请求直到 /readyz
         D-->>L: /readyz 就绪
         L->>D: ResumeActor 成功、actor 置为运行态后转发停泊的 /wake
-        D->>R: 经出口网关重建出站流，Hello(generation, sandbox_id)
+        D->>W: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+        Note over D: 时窗不符时按返回的服务端时刻校时后重试，连续被拒时退避重试
+        W-->>D: 续约成功，lease.holder 恢复为本沙箱
+        D->>R: 经出口网关重建出站流
+        R-->>D: Challenge(nonce, server_now)
+        Note over D: 按 server_now 再校时
+        D->>R: Hello(generation, sandbox_id, instance_key, holder_proof)
+        R-->>D: HelloAck
         D-->>L: 握手完成后 /wake 返回
         L-->>P: /wake 返回
         P-->>R: SandboxHandle
@@ -411,7 +424,12 @@ sequenceDiagram
         P-->>R: SandboxHandle
         D->>P: 领取，请求体 {instance_key}
         P-->>D: 令牌组、lease_id 与接入票据公钥集合
+        D->>W: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+        W-->>D: 首次续约成功，lease.holder 为本沙箱
+        D->>R: 建立出站流
+        R-->>D: Challenge(nonce, server_now)
         D->>R: Hello(generation, sandbox_id, instance_key, holder_proof)
+        R-->>D: HelloAck
     else cold_start，k8s 提供者
         R->>P: Provision(run_id, generation, attempt_id, lease_id)
         P->>L: 把 Sandbox CR 改回 Running，或创建沙箱
@@ -421,7 +439,12 @@ sequenceDiagram
         P-->>R: SandboxHandle
         D->>P: 领取，请求体 {instance_key}
         P-->>D: 令牌组、lease_id 与接入票据公钥集合
+        D->>W: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+        W-->>D: 首次续约成功，lease.holder 为本沙箱
+        D->>R: 建立出站流
+        R-->>D: Challenge(nonce, server_now)
         D->>R: Hello(generation, sandbox_id, instance_key, holder_proof)
+        R-->>D: HelloAck
     else cold_start，substrate 提供者
         R->>P: Provision(run_id, generation, attempt_id, lease_id)
         P->>L: CreateActor 登记挂起态 actor
@@ -432,11 +455,16 @@ sequenceDiagram
         P-->>R: SandboxHandle
         D->>P: 领取，请求体 {instance_key}
         P-->>D: 令牌组、lease_id 与接入票据公钥集合
+        D->>W: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+        W-->>D: 首次续约成功，lease.holder 为本沙箱
+        D->>R: 经出口网关建立出站流
+        R-->>D: Challenge(nonce, server_now)
         D->>R: Hello(generation, sandbox_id, instance_key, holder_proof)
+        R-->>D: HelloAck
     end
 ```
 
-时序图固定预配、冻结与恢复的消息顺序：预配先保存出口策略并绑定工作区，`Provision` 在取得沙箱实例身份之后写入引导记录，substrate 子模块在激活 actor 之前写入并在出口策略落地之后激活，k8s 子模块在观察到 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试；k8s 子模块的 `Claim` 在认领之后依次写 Pod 注解、经节点挂载代理绑定运行实例子目录、写入引导记录，再通知看守进程，冷启动 Pod 的运行实例子目录在卷发布时绑定；看守进程携带实例公钥领取，引导接口先登记实例公钥指纹再签发令牌组，看守进程以持有证明首次续约成功后发送携带 `instance_key` 与 `holder_proof` 的 `Hello`；提供者不等待领取与 `Hello`。冻结先由提供者执行 `Freeze{cgroup}`，解冻返回后由 `runcontroller` 经出站流发送协议消息 `Thaw{suspend_id}`；恢复按提供者分流，substrate 子模块的 `MEMORY` 快照恢复经路由器 `/wake` 恢复同一 actor 并等待 `/readyz`，沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变，看守进程不重新领取；快照与 worker 运行时不兼容且没有兼容 worker 时降级为 `ROOTFS` 冷启动，进程内存与令牌丢失；substrate 子模块的销毁态重建只走 `cold_start`，`Provision` 以 `ResumeActor` 把新 actor 分配到剩余容量足够的 worker 并从模板快照恢复，actor 模板尚无模板快照时冷启动；k8s 子模块解冻、把 Sandbox CR 改回 `Running` 或认领预热 Pod，看守进程领取后连接。substrate 子模块快照恢复的 `/wake` 返回即表示出站流已重建；k8s 预热认领经 wake-router 调用 `/wake` 只作通知，`/wake` 失败由看守进程的退避领取兜底；k8s 路径的事件驱动恢复由控制面直调提供者，不经入站路由。每步之后的持久化结果见走查。
+时序图固定预配、冻结与恢复的消息顺序：预配先保存出口策略并绑定工作区，`Provision` 在取得沙箱实例身份之后写入引导记录，substrate 子模块在激活 actor 之前写入并在出口策略落地之后激活，k8s 子模块在观察到 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试；k8s 子模块的 `Claim` 在认领之后依次写 Pod 注解、经节点挂载代理绑定运行实例子目录、写入引导记录，再通知看守进程，冷启动 Pod 的运行实例子目录在卷发布时绑定；看守进程携带实例公钥领取，引导接口先登记实例公钥指纹再签发令牌组，看守进程以持有证明首次续约成功后建立出站流，收到 `Challenge` 并按其 `server_now` 校时，再发送携带 `instance_key` 与 `holder_proof` 的 `Hello`，`HelloAck` 之后握手完成；提供者不等待领取与 `Hello`。冻结先由提供者执行 `Freeze{cgroup}`，解冻返回后由 `runcontroller` 经出站流发送协议消息 `Thaw{freeze_id}`；恢复按提供者分流，substrate 子模块的 `MEMORY` 快照恢复经路由器 `/wake` 恢复同一 actor 并等待 `/readyz`，沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变，看守进程不重新领取，恢复后的顺序为先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试，期间不建立传输）、续约成功后重建出站流、收到 `Challenge` 并按 `server_now` 再校时、发送 `Hello`，首次续约成功后才发 `Hello` 的规则对初次领取与快照恢复相同；快照与 worker 运行时不兼容且没有兼容 worker 时降级为 `ROOTFS` 冷启动，进程内存与令牌丢失；substrate 子模块的销毁态重建只走 `cold_start`，`Provision` 以 `ResumeActor` 把新 actor 分配到剩余容量足够的 worker 并从模板快照恢复，actor 模板尚无模板快照时冷启动；k8s 子模块解冻、把 Sandbox CR 改回 `Running` 或认领预热 Pod，看守进程领取后连接。substrate 子模块快照恢复的 `/wake` 返回即表示出站流已重建；k8s 预热认领经 wake-router 调用 `/wake` 只作通知，`/wake` 失败由看守进程的退避领取兜底；k8s 路径的事件驱动恢复由控制面直调提供者，不经入站路由。每步之后的持久化结果见走查。
 
 ### 能力集合与机制映射图
 
@@ -594,7 +622,7 @@ flowchart LR
 | 引导认证与触发 | 投射 ServiceAccount 令牌，`TokenReview` 校验后按 Pod UID 查引导记录；预热认领经 wake-router 调用 `/wake` 通知领取 | 出口网关注入的 actor JWT，经 OIDC 发现验签后按 actor 名查引导记录并核对 actor UID；新 actor 被 `wakeupProbe` 探测时看守进程读到 `actor-name` 变化即领取一次，actor 处于 `RESUMING` 时出口已放行，领取可以在 `ResumeActor` 返回之前成功；`MEMORY` 快照恢复的 actor 名不变，不重新领取 |
 | 工作区 | 共享文件系统为默认，块存储为退化配置；挂载根只在节点上，预热 Pod 只带空的工作区挂载点，认领时由节点挂载代理绑定运行实例子目录 | 外部 CSI 卷优先，`durableDir` 为退化配置；外部 CSI 卷在 actor 分配到 worker 时挂载；退化配置下回合边界销毁使用同步挂起 |
 | 出口 | 平台出口代理配置加 NetworkPolicy；NetworkPolicy 只放行到面向沙箱的端点的 TCP，Pod 内按 uid 的出站规则使非 root uid 只到回环；平台出口代理逐请求校验代，按代撤销为空操作 | EgressPolicy 以 MITM 与 `replaceHeaders` 落地，`PlaintextHosts` 只落地 `http` 规则，面向沙箱的端点主机以 `tls_passthrough` 透传；按 uid 的出站收敛、非 TCP 限制与 DNS 中继不递归为部署前提；按代撤销即墓碑，新请求最多再滞后一个策略缓存 TTL |
-| 快照 | 不具备 | 内存快照，恢复在同一代内进行；恢复的是同一 actor，actor 名、actor UID 与 `sandbox_id` 不变，可能换到另一个 worker；恢复后校时并清理旧连接 |
+| 快照 | 不具备 | 内存快照，恢复在同一代内进行；恢复的是同一 actor，actor 名、actor UID 与 `sandbox_id` 不变，可能换到另一个 worker；恢复后先续约租约（时窗不符时按返回的服务端时刻校时），再重建出站流并以 `Challenge.server_now` 再校时，并清理旧连接 |
 | 预热 | SandboxWarmPool 与 SandboxClaim；认领过的 Pod 不回收复用 | 不具备 `WarmPool`，没有可认领的 actor；计算容量由 WorkerPool 中的[预热 worker](design-sandboxprovider-substrate.md#术语表)提供，新建 actor 从模板快照恢复 |
 
 共性：k8s 子模块与 substrate 子模块实现同一 `Provider` 接口，共用看守进程、协议与控制面，遵循同一套墓碑、幂等与按代销毁语义，共用引导接口的领取语义，接受同一出口策略推送与工作区绑定抽象。差异留在各自子模块：k8s 的 Sandbox CR、节点冻结代理、节点挂载代理、原地缩放、沙箱 Pod 安全基线、NetworkPolicy、投射 ServiceAccount 令牌与 wake-router 见 [k8s 子模块](design-sandboxprovider-k8s.md)；substrate 的 actor 模板、Suspend 与 Resume、路由器唤醒、EgressPolicy、actor JWT、`systemInfo` 卷与 credential provider 见 [substrate 子模块](design-sandboxprovider-substrate.md)。
@@ -615,7 +643,7 @@ flowchart LR
 2. `Freeze{cgroup}` 由节点冻结代理执行：代理核对目标 Pod 属于本节点的沙箱命名空间、代标注等于请求的代，按 Pod UID 与容器标识经容器运行时解析容器 cgroup 路径，不接受调用方给出的路径，在容器 cgroup 下维护子 cgroup `agent`，写 `agent/cgroup.freeze=1`；看守进程留在父 cgroup，继续应答探针、续约工作区租约、维持出站流并持有本地代理的上游连接。`Freeze{signal}` 由看守进程对 Agent 进程树执行 SIGSTOP，只允许短冻结，提供者不执行该变体。
 3. `Freeze` 返回之后，`runcontroller` 以同一 `freeze_id` 调用 `Shrink`；提供者具备 `InPlaceResize` 时只缩小 CPU request，不缩内存 request；沙箱 Pod 从创建起即 Burstable，原始 CPU request 存注解，容器 `resizePolicy` 为 `NotRequired`；缩小立即生效，恢复时的放大可能进入 `Deferred`。
 4. 提供者持久化 `FreezeRecord` 并返回 `FreezeReceipt`；`frozen_at` 取节点冻结代理的确认时刻。`Freeze{signal}` 的冻结确认由看守进程的 `ReadyToSuspend` 承担。
-5. `Thaw(freeze_id)` 由提供者执行 `Freeze{cgroup}` 的解冻：节点冻结代理写 `agent/cgroup.freeze=0`；返回后 `runcontroller` 经出站流发送协议消息 `Thaw{suspend_id}`，看守进程观察到 Agent 子 cgroup 未冻结后上报 `Thawed`。`Freeze{signal}` 的解冻由看守进程自行执行，协议消息仍由 `runcontroller` 发送。
+5. `Thaw(freeze_id)` 由提供者执行 `Freeze{cgroup}` 的解冻：节点冻结代理写 `agent/cgroup.freeze=0`；返回后 `runcontroller` 经出站流发送协议消息 `Thaw{freeze_id}`，看守进程观察到 Agent 子 cgroup 未冻结后上报 `Thawed`。`Freeze{signal}` 的解冻由看守进程自行执行，协议消息仍由 `runcontroller` 发送。
 6. 已解冻的 `freeze_id` 不再接受冻结与缩小；迟到的冻结与缩小请求不生效，CPU request 不会停在缩小值。冻结中升级先解冻；解冻与恢复时的原地放大并行，不等待放大完成。
 7. 冻结态 Pod 标注 `cluster-autoscaler.kubernetes.io/safe-to-evict=false`（[REF-cluster-autoscaler-faq](../../../references.md)）；`preStop` 先解冻再终止，否则 SIGTERM 会送给冻结进程。节点内存压力下 Pod 仍可能被驱逐，`runcontroller` 把“冻结态且沙箱已死”转入重建路径。
 8. 原地放大进入 `Deferred` 时，解冻与放大并行；`Deferred` 超过阈值且处于回合边界时销毁重建以迁移，回合中则以低权重继续运行。提供者经 `ResizeStatus` 暴露 `Deferred` 状态。
@@ -626,8 +654,8 @@ flowchart LR
 2. 提供者持久化快照并返回 `SnapshotReceipt`，其中 `SnapshotExpiresAt` 是快照保留期限；`runcontroller` 在保留期临近前作废该代，避免恢复落在已过期快照上。
 3. 撤销尚未确认的快照尝试按 `suspend_id` 执行，提供者写入快照撤销墓碑；撤销确认之后到达的同一 `suspend_id` 的快照请求不生效。
 4. `RestoreSnapshot` 在同一代内恢复，不递增代；请求携带 `run_id`、`generation`、`suspend_id` 与 `attempt_id`，返回 `SandboxHandle`。快照恢复沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变；看守进程不重新领取，令牌组、`lease_id` 与实例私钥已在快照的进程内存中，令牌在挂起期间过期时由 `runcontroller` 的 `rotate_token` 效果处理。快照不存在或已过期时返回确定性错误，`runcontroller` 转重建意图，不把该错误计入恢复失败次数。
-5. 恢复完成后，看守进程校时并主动断开 Agent 进程的旧 TCP 连接；在途 LLM 请求由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。工作区按提供者持久化，快照不替代工作区持久化；同一代的出口策略副本沿用，不重新生成。
-6. substrate 子模块的快照恢复会重置 guest 时钟并切断旧连接；k8s 子模块不具备快照能力，`suspendpolicy` 不选择快照。
+5. 恢复完成后，看守进程先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试、期间不建立传输，这一步同时完成校时），续约成功、`lease.holder` 恢复为本沙箱之后重建出站流，收到 `Challenge` 并按其 `server_now` 再校时，再发送 `Hello`，并主动断开 Agent 进程的旧 TCP 连接；`Resumed.wall_clock_now` 只用于核对校时偏移，不作为校时来源；在途 LLM 请求由本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。工作区按提供者持久化，快照不替代工作区持久化；同一代的出口策略副本沿用，不重新生成。
+6. substrate 子模块的快照恢复后 guest 时钟与旧连接的状态按运行时而不同，不作必然断言，看守进程不依赖恢复后的时钟：续约时窗不符按返回的服务端时刻校时，握手时再以 `Challenge.server_now` 校时，并主动断开旧连接（见 [substrate 子模块](design-sandboxprovider-substrate.md#恢复后校时与旧连接清理)）；k8s 子模块不具备快照能力，`suspendpolicy` 不选择快照。
 
 ### 恢复触发
 
@@ -662,7 +690,7 @@ substrate 子模块不具备 `WarmPool`，不维护预热池分片记录。Worke
 | 机制 | 组成步骤 | p95 目标 | 前提 |
 | --- | --- | --- | --- |
 | 解冻 | 准入放行，提供者解冻返回，看守进程观察到 Agent 子 cgroup 未冻结，Agent 可接收 | 决策完成到 Agent 可接收小于 100 ms；事件到达至 Agent 可接收小于 200 ms | 冻结机制；看守进程未被冻结 |
-| 快照恢复 | 准入放行，快照读取，actor 恢复，校时与旧连接清理，看守进程重连或同代 `Hello`，在途响应取回 | 同节点本地快照且无在途请求小于 2 s；通用小于 5 s | 快照机制；快照未过期 |
+| 快照恢复 | 准入放行，快照读取，actor 恢复，看守进程续约租约并校时，重建出站流并以 `Challenge` 再校时，同代 `Hello`，旧连接清理，在途响应取回 | 同节点本地快照且无在途请求小于 2 s；通用小于 5 s | 快照机制；快照未过期 |
 | 预热池认领 | 准入放行，认领，写 Pod 注解与工作区子目录绑定挂载，看守进程领取与 `Hello`，重投 | 小于 10 s | 共享文件系统；Agent 二进制与依赖缓存在镜像内；启动期外联快速失败；池非空 |
 | 冷启动 | 准入放行，放置与资源挂接，沙箱启动，工作区挂载，看守进程启动与 `Hello`，重投 | 共享文件系统小于 20 s；块存储小于 60 s | k8s 子模块；共享文件系统；块存储退化配置有节点或可用区亲和 |
 
@@ -703,6 +731,7 @@ substrate 子模块的 `cold_start` 由 `Provision` 以 `CreateActor` 登记 act
 | 预热池为空（具备 `WarmPool` 的提供者） | 认领返回池空；恢复退化为冷启动，受冷启动并发上限约束，`pool_miss_rate` 上升 |
 | 提供者层容量耗尽（Substrate 的 `ResumeActor` 返回 `RESOURCE_EXHAUSTED`） | 暂时性；`Provision` 与 `RestoreSnapshot` 返回暂时性错误，`runcontroller` 以同一幂等键退避重试，不改走其他恢复路径 |
 | 节点内存压力或 Pod 被驱逐 | 提供者报告沙箱丢失；`runcontroller` 把冻结态或运行中的丢失转入重建路径；`preStop` 先解冻再终止 |
+| 看守进程在不可恢复的协议状态下以退出原因退出（原因闭集与写入格式见 [warden](../warden/design-warden.md)） | 看守进程是 PID 1，退出即沙箱退出；提供者经 `ListSandboxes` 与 `GetSandbox` 观察到沙箱已终止，按沙箱丢失报告，`runcontroller` 据此转入重建路径，不必等待出站流的连接宽限；退出原因取自容器终止信息或日志末行 `castworks-warden-exit: <原因>`，由各子模块按自身机制读取，只进入日志与指标，不改变丢失报告；子模块取不到时只按沙箱丢失上报，不区分原因 |
 | 原地放大进入 `Deferred` | 解冻与放大并行；`Deferred` 超过阈值且处于回合边界时销毁重建迁移，回合中以低权重继续运行 |
 | `ReleaseRun` 之后的迟到预配 | 释放墓碑拒绝；不创建沙箱或运行实例级资源 |
 | 预配已创建沙箱但响应丢失 | 重驱动返回首次 `SandboxHandle`；完成事务校验失败时 `runcontroller` 写单个销毁，遗留沙箱由列举结果回收 |

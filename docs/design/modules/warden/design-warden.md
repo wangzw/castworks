@@ -15,19 +15,19 @@
 - **进程监督**：作为 PID 1 以停止态启动以运行实例 uid 直接运行的进程（例如 Agent 主进程与 `/terminal` 的 shell），k8s 路径上经本 Pod 的节点冻结代理套接字 `/run/castworks/freeze/agent.sock` 以 `AdoptAgent` 只提交容器内 pid，由节点冻结代理移入 `agent` 子 cgroup 后再让它继续执行；`AdoptAgent` 被拒绝或不可达时不让该进程执行，按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报；Agent 主进程的启动由需要喂入事件的投递或 `StartAgent` 触发，`StartAgent` 只以恢复句柄启动、不写入任何输入；回收子进程、转发信号、维护进程组，并把 Agent 驱动器报告的后台作业、工具调用与自唤醒条目登记到进程监督记录。Agent 退出时上报 `turn_ended{agent_exited=true}` 并保持监督；收到 `SIGTERM` 时以退出码 143 终止、杀死 Bash 进程树并执行 `SessionEnd` hook；以挂起为目的的销毁路径上，Agent 主进程正常退出之后终止已声明的第三方 MCP 服务器进程（含其子进程），这是看守进程在挂起路径中唯一终止的进程，除此之外任何挂起路径都不终止进程，后台作业、残留进程与孤儿进程存在时回 `Busy`。结果是 Agent 进程树始终有唯一监督者，退出与信号处理、僵尸回收都由本进程完成（[REF-claude-code-hooks](../../../references.md)）。
 - **冻结与解冻执行**：按 `PrepareSuspend.variant` 执行 `Freeze{cgroup}` 的沙箱侧协调或 `Freeze{signal}` 的降级路径；以 `freeze_id` 幂等，向控制面上报 `ReadyToSuspend`、`Thawed` 或 `Busy`；收到 `Thaw` 后解冻进程树或观察 `agent` 子 cgroup 已解冻。结果是冻结只作用于 Agent 进程树，看守进程自身继续应答探针、续约租约并维持出站流（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
 - **入站数据唤醒**：Agent 进程树处于冻结状态时，由本地代理与透明拦截器在 Agent 持有的非 LLM 上游连接上观察载荷字节，并在冻结确认时检查 Agent 进程树套接字的接收队列，承载 LLM 请求与平台 MCP 交互的回环连接、两端都在 Agent 进程树内的回环连接不在检查之列；任一成立即向控制面发出 `conn.inbound{freeze_id}`，每个 `freeze_id` 至多一次。结果是冻结期间到达 Agent 自持连接的外部数据不被搁置到冻结上限，控制面据此唤醒运行实例；`conn.inbound` 只表达外部输入，Agent 进程树内部的进展由活动度判据负责。
-- **活动度采集**：按固定周期采集 `Activity` 的字段，包括 PSI 累计停滞时间、CPU 累计用量 `cpu_usage_usec`、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态与 `freeze_id`。结果是控制面获得不依赖 Agent 配合的忙闲证据，`suspendpolicy` 与 `runcontroller` 据此判断能否挂起，包括后台作业存活或回合中多循环并发时的[静止冻结](../../../glossary.md)。
-- **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代、附以[实例密钥](../../../glossary.md)签名的[持有证明](../../../glossary.md)周期调用 `workspace.RenewLease`，首次成功续约绑定持有者；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`。结果是每一代沙箱对工作区保持单写者边界。
+- **活动度采集**：按周期 `T_activity` 采集 `Activity` 的字段，包括 PSI 累计停滞时间、CPU 累计用量 `cpu_usage_usec`、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态、`freeze_id` 与 `frozen_by`，每个样本带进程内单调递增的 `sample_seq` 与校时后的采样时刻 `sampled_at`，以遥测帧在已建立的出站流上发送，未连接或握手中时丢弃当期样本。结果是控制面获得不依赖 Agent 配合的忙闲证据，`suspendpolicy` 与 `runcontroller` 据此判断能否挂起，包括后台作业存活或回合中多循环并发时的[静止冻结](../../../glossary.md)。
+- **工作区租约续约**：以经[引导接口](../../../glossary.md)领取的 `lease_id` 与代、附以[实例密钥](../../../glossary.md)签名的[持有证明](../../../glossary.md)周期调用 `workspace.RenewLease`，首次成功续约绑定持有者，以 `proof_time_skew` 被拒时按错误详情中的 `server_now` 校时后重试（周期续约重试一次，首次续约连续被拒时退避重试）；在租约到期前无法续约时停止向工作区写入、冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`；首次续约（初次领取之后、快照恢复与长时间冻结之后）失败另按[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)中首次续约失败的规则处理，不上报 `LeaseLost`。结果是每一代沙箱对工作区保持单写者边界。
 - **投递意图日志**：`Deliver` 到达后先在 `.platform/deliveries.jsonl` 追加 `accepted{seq}` 并同步写入，按日志去重后把事件喂给 Agent；观察到回合开始后追加 `consumed{seq, turn_id}` 并同步写入，再发出 `Consumed`。结果是至少一次投递在跨代重建后仍可由日志去重，重建后不重复处理已消费事件（[ADR-delivery-intent-log](../../../adr/adr-delivery-intent-log.md)）。
 - **平台 MCP 服务器**：向 Agent 提供闭集工具，把列出可订阅事件、登记订阅、阻塞等待与附件取回翻译为对 `connectorhub`、`humanchannel` 的调用，各附对方受众的运行实例令牌，把定时经 Agent 驱动器以定时请求或等待开始事件上报；阻塞型调用临近冻结上限或被 Agent 自动转到后台时返回已转为订阅或定时的结果。初始化时以 `instructions` 提供[等待方式的选择](#等待方式的选择)规则；解析 `subscribe_event`、`wait_for` 与 `sleep_until` 的可选参数 `expected_wait` 与 `reason`，`expected_wait` 换算为毫秒后经 Agent 驱动器随 `subscription_created` 与 `wait_started` 的 `agent_expected_ms` 上报，`reason` 连同 `run_id`、`call_id`、工具名与 `expected_wait` 写入结构化日志，供诊断与抽检。结果是 Agent 每一次可能阻塞的对外交互对托管环境可见（I1），Agent 自报的等待时长与平台的预测分开进入控制面，`reason` 不进入协议事件。
 - **托管 hook**：随镜像在工作区之外提供 Claude Code 托管 hook 的二进制，按使其父进程为 Agent 主进程的方式注册在托管策略设置中（经 shell 执行时写成 `exec <托管 hook 二进制路径>`）；二进制经本地 IPC 把 hook 输入交给 Agent 驱动器并同步返回驱动器的应答，IPC 端点以 `SO_PEERCRED` 认证对端，并按 Agent 驱动器观察到的 stream-json 事件对查询做一次性核对，只应答由 Agent 主进程执行的托管 hook 二进制针对已存在、尚未应答事件的查询：`PostToolUse` 与 `PostToolBatch` 返回等待意图的情境提示，`SubagentStart` 向子代理注入等待方式的选择规则，审批所用的 `PreToolUse` 与旁证所用的其余 hook 共用同一机制；查询失败时 `PreToolUse` 输出拒绝，其余 hook 输出空结果。结果是提示只搭载在 Agent 下一次本来就要发出的模型请求上，与等待意图相关的 hook 输出只有 `additionalContext`，不拒绝、不阻塞工具调用，也不让对话继续，审批在平台不可用时不放行（[REF-claude-code-hooks](../../../references.md)、[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 - **等待意图配置应用**：按沙箱侧配置中的 `wait_signatures`、`intent.hints` 与 `intent.classifier` 设置 Agent 驱动器的签名匹配、情境提示开关与宿主侧分类开关；宿主侧分类请求经本地代理附分类标记发往 `llmgateway`，不经 Agent 进程、不进入 Agent 上下文，也不计入在途请求与 LLM 等待信号，不参与事件源实例租约。结果是[等待签名](../../../glossary.md)随外部系统定义下发，提示与宿主侧分类可按运行实例关闭，意图解析与 `intent_observed` 始终进行。
 - **工具接入声明执行**：按[沙箱侧配置](../../../glossary.md)（`SandboxConfig`，接收与应用见[沙箱侧配置](#沙箱侧配置)）中的[工具接入声明](../../../glossary.md)向 Agent 进程与 `ToolExec.exec` 注入凭据占位符环境变量与非秘密配置，合并已批准的第三方 MCP 服务器配置；只注入字面占位符，不解析、不换取、不缓存真实凭据。结果是第三方工具经同一组环境变量使用平台的出口凭据通道，平台不需要知道哪个工具使用了哪条通道。
-- **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 exec、文件读写、流式输出与后台作业帧，按代校验；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，且驱动器无需持有运行实例令牌。
-- **出站流与状态对账**：始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，发送 `Hello`、`AgentEvent`、`Activity`、`Accepted`、`Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`Busy`、`Thawed`、`LeaseLost`、`conn.inbound`、本地代理与平台 MCP 服务器的请求事件与 `ToolExec` 响应/数据帧，处理 `HelloAck`、`Deliver`、`StartAgent`、`PrepareSuspend`、`CancelSuspend`、`Thaw`、`Resumed`、`LiveState`、`Shutdown`、`Fenced`、`TokenRotate`、`SandboxConfig` 与 `ToolExec` 请求/取消帧；断连后退避重连、重放未确认消息并以 `Hello` 做状态对账。结果是控制面以持久化状态而非事件历史恢复一致（I10）。
+- **ToolExec API**：在已认证的出站流上接收控制面循环驱动器经 `runcontroller` 转发的 `ToolExecRequest`，按代校验，按 `op` 启动命令、读写文件、续传输出、管理后台作业与查询执行，按 `exec_id` 幂等并把终态应答保留到本代结束；不接受沙箱地址上的直接调用。结果是沙箱内没有 Agent 进程时，沙箱仍可作为工具执行器使用，驱动器无需持有运行实例令牌，重发的请求不会重复执行。
+- **出站流与状态对账**：始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，发送 `Hello`、`AgentEvent`、`Activity`、`Accepted`、`Consumed`、`DeliveryFailed`、`ReadyToSuspend`、`Busy`、`Thawed`、`LeaseLost`、`conn.inbound`、本地代理与平台 MCP 服务器的请求事件、`ToolExec` 应答与数据帧、`Ack` 与 `Close`，处理 `Challenge`、`HelloAck`、`Deliver`、`StartAgent`、`PrepareSuspend`、`CancelSuspend`、`Thaw`、`Resumed`、`LiveState`、`TokenRotate`、`SandboxConfig`、`ToolExec` 请求与取消帧和 `Ack`，并处理关闭帧 `Fenced`、`Shutdown` 与 `Close`；看守进程发出的应用消息在任何连接状态下都分配序号并写入重放缓冲，窗口满时进入待发队列并施加出站流背压；断连后退避重连，以 `Challenge` 校时、以 `Hello` 做状态对账，并按 `HelloAck.committed_msg_seq` 重放控制面尚未提交的消息；收到不可恢复的关闭帧时按[退出原因](#退出原因)退出。结果是控制面以持久化状态而非事件历史恢复一致（I10），看守进程无法继续服务本代时沙箱随之退出，由控制面重建。
 - **令牌持有与轮换**：领取之前生成实例密钥，经引导接口领取按受众划分的运行实例令牌组、`lease_id` 与[接入票据](../../../glossary.md)公钥集合，实例私钥、令牌组与 `lease_id` 只保存在进程内存，领取成功之前不以运行实例 uid 启动任何进程；按受众使用令牌：`Hello.resume_token` 取 `runcontroller` 令牌，本地代理发往 `llmgateway` 的请求取 `llmgateway` 令牌、发往 k8s 路径平台出口代理的请求取 `egress` 令牌，平台 MCP 服务器对 `connectorhub` 与 `humanchannel` 分别取各自受众的令牌；以实例私钥为 `Hello` 与 `RenewLease` 签持有证明；按 `TokenRotate` 整体替换令牌组与接入票据公钥集合；令牌过期且未收到新令牌之前，不向 `llmgateway`、`connectorhub`、`humanchannel` 与平台出口代理发请求。结果是同一沙箱实例至多领取成功一次，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，任一接收方收到的令牌只能用于它自身的受众，不持有实例私钥的一方即使取得令牌与 `lease_id` 也不能建立出站流或续约租约，沙箱内不出现长期凭据或 LLM 密钥，运行实例令牌只由看守进程持有（I6，[ADR-run-token-audience-and-holder-binding](../../../adr/adr-run-token-audience-and-holder-binding.md)）。
-- **快照恢复后的清理**：恢复后先校时、主动断开 Agent 进程的旧 TCP 连接，再通知 Agent 驱动器；本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。结果是半死连接不会把恢复拖到读超时。
+- **快照恢复后的校时与清理**：恢复后按固定顺序先续约租约（以 `proof_time_skew` 被拒时按 `server_now` 校时后重试，连续被拒时退避重试），续约成功之后重建出站流的传输、以 `Challenge.server_now` 再校时、发送 `Hello`；续约以不可重试错误失败时停止工作区写入、冻结 Agent 进程树，仍建立传输并发送 `Hello`，由控制面以代失效关闭；校时之后主动断开 Agent 进程的旧 TCP 连接，再通知 Agent 驱动器；本地代理按 `request_id` 向 `llmgateway` 取回已完成响应。结果是持有证明与采样时刻不依赖恢复后的沙箱时钟，半死连接不会把恢复拖到读超时。
 - **DRAIN 处置**：收到 `Resumed{drain=true}` 后按 `suspend_id` 幂等，把已等待与之后发起的阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即按终止等待的结果返回，使当前回合能够结束。结果是控制面能在回合边界执行以挂起为目的的销毁（[ADR-turn-boundary-destroy](../../../adr/adr-turn-boundary-destroy.md)）。
-- **入站服务**：只在 Pod 地址上监听 80 端口，拒绝来源为回环地址或本 Pod 地址的连接，提供 `/readyz`、`/wake`、`/terminal` 与 `/files`；`/terminal` 与 `/files` 只在接入票据校验通过后建立终端或读取文件；入站端点不承载事件内容。结果是提供者恢复与预热认领通知、探针与人类接入有稳定入口，人类接入经端到端认证，沙箱内的进程不能经回环调用入站端点，事件投递仍只走出站流。
+- **入站服务**：只在 Pod 地址上监听 80 端口，拒绝来源为回环地址或本 Pod 地址的连接，提供 `/readyz`、`/wake`、`/terminal` 与 `/files`；`/terminal` 与 `/files` 只在接入票据校验通过后建立终端或读取文件，`/files` 只读；入站端点不承载事件内容。结果是提供者恢复与预热认领通知、探针与人类接入有稳定入口，人类接入经端到端认证，沙箱内的进程不能经回环调用入站端点，事件投递仍只走出站流。
 
 ### 子模块分工
 
@@ -48,7 +48,7 @@
 - 等待意图的使用归 `suspendpolicy` 与 `runcontroller`：等待时长预测、宽限期选择与 `run.intents` 的保存都不在看守进程；意图不进入看守进程的冻结前置核对、入站数据唤醒与安全点复核。等待签名的定义与装载校验归 `connectorhub`。看守进程不向 Agent 定期提问，不以拒绝或阻塞工具调用、`Stop` 与 `SubagentStop` 的 `additionalContext`、强制转后台或终止进程的方式索取意图，提示可以被 Agent 忽略（[ADR-wait-intent-as-soft-input](../../../adr/adr-wait-intent-as-soft-input.md)）。
 - 工作区租约表、租约绑定、接管与[持久化确认](../../../glossary.md)归 `workspace`；工作区在节点上的挂载与运行实例子目录的绑定挂载归 `sandboxprovider` 的 k8s 子模块与[节点挂载代理](../../../glossary.md)（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）；看守进程只在已挂载的本运行实例子目录内读写，不管理挂载。
 - 运行实例令牌的签发、签名与轮换签名，以及接入票据的签发与签名密钥归 `secrets`；看守进程只领取、持有、使用并替换令牌，只校验接入票据。
-- 协议信封、序列化、重放与按 `(generation, msg_seq)` 去重的规则归 `agentprotocol`；看守进程只声明每条消息的沙箱侧效果。
+- 协议信封、帧的分类、序列化、序号、确认、窗口与重放的规则、握手帧与关闭帧的格式以及协议版本的协商归 `agentprotocol`；看守进程只声明每条消息的沙箱侧效果，并实现自身一侧的待发队列、出站流背压与退出行为。
 - LLM 凭据换取、在途请求与回放存储归 `llmgateway`；外部系统定义、订阅、[连接器事件日志](../../../glossary.md)、出口策略与沙箱侧配置的生成、工具接入声明的装载与校验归 `connectorhub`；人类会话、身份与审批决定归 `humanchannel`。看守进程只发起附运行实例令牌的运行时 HTTP 调用。
 - Agent 会话记录的内容归 Agent 自身；看守进程只保证状态目录位于工作区内，并在[安全点](../../../glossary.md)要求持久化完成。
 - 出口的凭据替换与默认拒绝归出口代理；本地代理与透明拦截器只终止 LLM 主机的 TLS，不终止外部系统主机的 TLS，不替换凭据。
@@ -61,56 +61,94 @@
 | 停止态启动 | stopped-state spawn | warden | 看守进程先让以运行实例 uid 直接启动的进程（例如 Agent 主进程）以停止态出现，待节点冻结代理经 `AdoptAgent` 把它移入 `agent` 子 cgroup 后再继续执行；其后的 fork 自动继承该子 cgroup。 |
 | 投递意图日志条目 | delivery intent log entry | warden | 工作区 `.platform/deliveries.jsonl` 中的一行，取值为 `accepted{seq}` 或 `consumed{seq, turn_id}`；`accepted{seq}` 在喂给 Agent 之前同步写入，`consumed{seq, turn_id}` 在观察到回合开始后同步写入。 |
 | DRAIN 处置 | DRAIN disposition | warden | 收到 `Resumed{drain=true}` 后，把阻塞型审批、`wait_for` 与阻塞型 `sleep_until` 立即按终止等待的结果返回，使当前回合能够结束并转入回合边界。 |
-| 活动度样本 | activity sample | warden | 固定周期采集并随 `Activity` 上报的一组观测值，含 PSI 累计停滞时间、CPU 累计用量、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态与 `freeze_id`。 |
+| 活动度样本 | activity sample | warden | 按周期 `T_activity` 采集并随 `Activity` 上报的一组观测值，含 PSI 累计停滞时间、CPU 累计用量、进程态、定时睡眠进程、已声明的第三方 MCP 服务器进程数、`throttled_usec`、`last_fork_at`、`ws_write_fds`、I/O 与网络字节、本地代理最近一次 LLM 请求与最近一次可重试失败的时刻、冻结状态、`freeze_id` 与 `frozen_by`，以 `sample_seq` 与 `sampled_at` 标识。 |
 | 冻结执行记录 | freeze execution record | warden | 按 `freeze_id` 保存的冻结变体、冻结时刻、冻结确认时刻、SIGSTOP 扫描轮次、已停止 PID 集合与入站数据是否已上报，用于幂等解冻、迟到请求判定与 `conn.inbound` 的至多一次。 |
+| 挂起尝试记录 | suspend attempt record | warden | 按 `suspend_id` 保存的一次挂起尝试在沙箱侧的参数、状态与已发出的应答，保留到本代结束；`PrepareSuspend`、`CancelSuspend` 与 `Resumed` 按它幂等。 |
+| 处理完成点 | handling completion point | warden | 一条控制面到看守进程的应用消息在看守进程一侧算作处理完成的时点：达到之后看守进程推进下行接收位置、确认该消息并派发下一条，耗时的动作在此之后继续；按消息定义。 |
+| 取消墓碑 | cancellation tombstone | warden | 状态为已取消的挂起尝试记录：看守进程已为该 `suspend_id` 回 `Busy{reason=cancelled}`，此后同一标识的 `PrepareSuspend` 不再执行；保留到本代结束。 |
+| 待发队列 | pending queue | warden | 出站流窗口满时，看守进程暂存此后产生的应用消息的队列；队列中的消息尚未分配序号，窗口回收后按入队顺序分配序号发送，编码字节数的上限为 `Q_pending_bytes`。 |
+| 背压冻结 | backpressure freeze | warden | 待发队列达到 `Q_pending_bytes` 时看守进程自行发起、队列降到上限一半以下时自行解除的 Agent 进程树冻结；不属于任何挂起尝试，`Activity.frozen_by` 为 `backpressure`。 |
 
 ## 外部接口契约
 
-看守进程对外的可调用接口为：与控制面的协议消息、平台 MCP 工具、托管 hook、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；托管 hook 的输出形态受 Claude Code hook 契约约束，对 Claude Code 驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
+看守进程对外的可调用接口为：与控制面的协议消息、平台 MCP 工具、托管 hook、`ToolExec` 与文件 API、入站端点；沙箱侧配置经协议消息 `SandboxConfig` 到达，应用规则见[沙箱侧配置](#沙箱侧配置)。看守进程另作为调用方使用 `sandboxprovider` 的[引导接口](../../../glossary.md)，见[启动与领取](#启动与领取)。协议消息的名称、字段与稳定性由 `agentprotocol` 的协议版本约束；平台 MCP 工具名与 `ToolExec` 操作对 Agent 驱动器与控制面循环驱动器稳定；托管 hook 的输出形态受 Claude Code hook 契约约束，对 Claude Code 驱动器稳定；文件 API 对 `workspace` 稳定；入站端点对 `sandboxprovider` 与入站路由稳定；[退出原因](#退出原因)的闭集与输出格式对读取容器终止信息与看守进程日志的一方稳定。新增或删除其中任一项都改变跨模块契约，须同步修改 `agentprotocol` 或对应模块文档。
 
 ### 与控制面的协议
 
-信封、`msg_seq`、`ack_msg_seq`、重放与按代去重的规则见 [agentprotocol](../design-agentprotocol.md)。看守进程实现的消息穷举如下，表中只写沙箱侧效果。
+帧的分类、信封、`msg_seq`、`ack_msg_seq`、窗口、重放与具名参数（`T_activity`、`W_replay_msgs`、`W_replay_bytes`、`T_ack`、`T_reconnect_min`、`T_reconnect_max`、`T_keepalive`、`T_keepalive_timeout`、`Q_pending_bytes`）见 [agentprotocol](../design-agentprotocol.md)。本文以上行指看守进程到控制面的方向，以下行指控制面到看守进程的方向。看守进程实现的消息穷举如下，表中只写沙箱侧效果。
 
 | 方向 | 消息 | 沙箱侧效果 |
 | --- | --- | --- |
-| 发出 | `Hello` | 建立或重建出站流时携带代、`session_epoch`、`resume_token`（令牌组中的 `runcontroller` 令牌）、`workspace_lease_id`、`sandbox_id`、`instance_key`（实例公钥 JWK）、`holder_proof`（用途为 `hello` 的持有证明）、`agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`last_received_msg_seq` 与 `sandbox_config_revision`（已应用的沙箱侧配置版本，尚未应用为 0）；领取成功且首次续约成功之后才发出 |
-| 发出 | `AgentEvent` | 回合开始与结束、工具开始与结束、权限询问、订阅创建、定时请求、等待开始、后台作业变化、自唤醒条目变化与等待意图；`subscription_created` 与 `wait_started` 携带 `agent_expected_ms`，取 Agent 经 `expected_wait` 自报的预计等待时长，未自报时为空，与 `predicted_ms` 分开；`bg_jobs_changed{job_ids}` 每次携带完整集合，`self_wake_changed{entries, crons_synced}` 每次携带驱动器当前掌握的全部条目，`crons_synced` 标明其中的 cron 条目是否已按本进程的 `session_crons` 对账，为假时 cron 条目可能不完整；`intent_observed{ref_kind, ref, class, target, expected_ms, prior, source, confidence}` 由 Claude Code 驱动器发出，`prior{p25, p50, p90}` 在 `source=signature` 时取等待签名的时长先验，其余来源为空，同一 `(ref_kind, ref)` 后到的覆盖先到的；没有进行中回合时发出的事件（例如 `bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed`）`turn_id` 与 `event_seq` 为空 |
-| 发出 | `Activity` | 固定周期的活动度样本与冻结状态 |
+| 接收 | `Challenge` | 握手帧，携带 `nonce` 与 `server_now`；看守进程以 `server_now` 校时，以 `nonce` 签 `Hello` 的持有证明；一条流一个 `nonce` |
+| 发出 | `Hello` | 握手帧，收到本流的 `Challenge` 之后发出，携带代、`resume_token`（令牌组中的 `runcontroller` 令牌）、`workspace_lease_id`、`sandbox_id`、`instance_key`（实例公钥 JWK）、`holder_proof{nonce, sig}`（对本流 `Challenge.nonce` 的持有证明）、`versions{min, max}` 与 `capabilities[]`（看守进程支持的连续协议版本区间与能力标识）、`agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents` 与 `sandbox_config_revision`（已应用的沙箱侧配置版本，尚未应用为 0）；信封的 `ack_msg_seq` 恒为 0；启动时领取成功且首次续约成功之后才发出；首次续约（初次领取之后、快照恢复与长时间冻结之后）以不可重试错误失败时同样发出，见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost) |
+| 接收 | `HelloAck` | 握手帧，携带 `accepted`、`fenced{current_generation, reason}`、`desired_state`、`active_suspend_id`、`committed_msg_seq`、`stream_epoch`、`protocol_version`、`capabilities[]`、`owner_epoch`、游标与实时接入状态；`accepted` 时按 `committed_msg_seq` 裁剪上行重放缓冲并从其后重放，本代使用返回的 `protocol_version` 与 `capabilities[]`，按 `active_suspend_id` 了结已就绪的挂起尝试，按 `desired_state` 对齐 Agent 进程树的冻结状态，规则见[出站流建立、重连与状态对账](#出站流建立重连与状态对账)；`fenced` 的处理见[关闭帧的处理](#关闭帧的处理) |
+| 发出 | `AgentEvent` | 回合开始与结束、工具开始与结束、权限询问、订阅创建、定时请求、等待开始、后台作业变化、自唤醒条目变化与等待意图；`turn_ended{reason, origin, agent_exited, bg_procs}` 的 `reason` 取空或 `tool_deferred`，`origin` 是描述性标签；`tool_started{call_id, name, summary}` 携带工具名与驱动器生成的单行摘要，`tool_ended{call_id, status}` 的 `status` 取 `ok` 或 `error`；`subscription_created` 与 `wait_started` 携带 `agent_expected_ms`，取 Agent 经 `expected_wait` 自报的预计等待时长，未自报时为空，与 `predicted_ms` 分开；`bg_jobs_changed{job_ids}` 每次携带完整集合，`self_wake_changed{entries, crons_synced}` 每次携带驱动器当前掌握的全部条目，条目的 `kind` 是描述性标签，`crons_synced` 标明其中的 cron 条目是否已按本进程的 `session_crons` 对账，为假时 cron 条目可能不完整；`intent_observed{ref_kind, ref, class, target, expected_ms, prior, source}` 由 Claude Code 驱动器发出，`prior{p25, p50, p90}` 在 `source=signature` 时取等待签名的时长先验，其余来源为空，同一 `(ref_kind, ref)` 后到的覆盖先到的；没有进行中回合时发出的事件（例如 `bg_jobs_changed`、`self_wake_changed`、`intent_observed` 与 `state_changed`）`turn_id` 与 `event_seq` 为空 |
+| 发出 | `Activity` | 遥测帧：按 `T_activity` 采集的活动度样本、`sample_seq`、`sampled_at` 与冻结状态；不占序号、不进上行重放缓冲、不确认，只在已建立的出站流上发送，未连接或握手中时丢弃，见[活动度采集](#活动度采集) |
 | 发出 | `Accepted`、`Consumed`、`DeliveryFailed` | 投递接受、常规投递的消费与投递失败；接受与消费记录的同步写入先于对应消息 |
-| 发出 | `ReadyToSuspend`、`Busy`、`Thawed` | 挂起就绪、挂起前置不满足或取消确认、解冻完成；均以 `suspend_id` 或 `freeze_id` 幂等 |
-| 发出 | `LeaseLost` | 工作区租约在到期前无法续约 |
-| 发出 | `conn.inbound` | Agent 进程树处于冻结状态时，本地代理或透明拦截器在 Agent 持有的非 LLM 上游连接上收到载荷字节，或冻结确认时 Agent 进程树中除承载 LLM 请求与平台 MCP 交互的回环连接、两端都在 Agent 进程树内的回环连接之外任一套接字的接收队列非空；`freeze_id` 取该冻结尝试的 `suspend_id`，每个 `freeze_id` 至多一次 |
+| 发出 | `ReadyToSuspend`、`Busy`、`Thawed` | 挂起就绪、挂起前置不满足或取消确认、解冻完成；均以 `suspend_id` 或 `freeze_id` 幂等，同一 `suspend_id` 的重复请求与取消按[冻结与解冻](#冻结与解冻)中的规则应答 |
+| 发出 | `LeaseLost` | 工作区租约在到期前无法续约；首次续约以不可重试错误失败时不发出 |
+| 发出 | `conn.inbound` | Agent 进程树处于冻结状态时，本地代理或透明拦截器在 Agent 持有的非 LLM 上游连接上收到载荷字节，或冻结确认时 Agent 进程树中除承载 LLM 请求与平台 MCP 交互的回环连接、两端都在 Agent 进程树内的回环连接之外任一套接字的接收队列非空；`freeze_id` 为该冻结的标识，每个 `freeze_id` 至多一次 |
 | 发出 | `llm.request.started`、`llm.first_token`、`llm.request.completed`、`llm.request.failed` | 本地代理的 LLM 在途状态；`mode` 决定冻结上限取 `F_stream` 还是 `F_cap(llm)` |
-| 接收 | `HelloAck` | `accepted`、`fenced{current_generation}`、`desired_state`、`last_received_msg_seq`、`owner_epoch`、游标与实时接入状态；决定是否继续投递与重连 |
+| 发出 | `ToolExecResponse`、`ToolExecData` | `ToolExecRequest` 的终态应答与输出分片；各 `op` 的结果见 [ToolExec API](#toolexec-api) |
+| 发出 | `Close` | 判定控制面协议违规时发出 `Close{state=protocol_violation, reason, msg_seq}`，随后以退出原因 `protocol_violation` 退出 |
+| 发出与接收 | `Ack` | 确认帧。看守进程没有上行应用消息可搭载确认时，在 `T_ack` 之内以它确认本连接上已达到处理完成点的下行连续前缀，未确认的下行条数达到 `W_replay_msgs` 的一半时立即确认；收到的 `Ack` 与信封 `ack_msg_seq` 一样释放上行重放缓冲 |
 | 接收 | `Deliver` | 一批投递事件、`through_seq`、`target` 与 `resume_session_id`；投递只在此消息上到达 |
 | 接收 | `StartAgent` | 以 `resume_session_id` 启动 Agent 主进程而不写入任何输入；Agent 进程已在运行时为空操作；处理见 [StartAgent 的处理](#startagent-的处理) |
-| 接收 | `PrepareSuspend`、`CancelSuspend`、`Thaw` | 挂起前置、冻结变体、截止时间与 `mode=destroy` 时的自唤醒截止时刻 `self_wake_cutoff`；取消与解冻 |
-| 接收 | `Resumed` | 解冻或恢复完成、冻结时长与 `drain` 标志 |
+| 接收 | `PrepareSuspend`、`CancelSuspend`、`Thaw` | 挂起前置、冻结变体、截止时间与 `mode=destroy` 时的自唤醒截止时刻 `self_wake_cutoff`；取消；`Thaw{freeze_id}` 解冻；按[挂起尝试记录](#挂起尝试记录)登记、附着与取消，规则见[冻结与解冻](#冻结与解冻) |
+| 接收 | `Resumed` | 解冻或恢复完成、冻结时长、`wall_clock_now` 与 `drain` 标志；`wall_clock_now` 只用于核对时钟偏移，不作为校时来源 |
 | 接收 | `LiveState` | 实时接入状态，按 `as_of` 取最新 |
-| 接收 | `Shutdown`、`Fenced` | 关闭与代过期 |
+| 接收 | `Fenced`、`Shutdown`、`Close` | 关闭帧：代失效、关停与 `Close` 的各关闭状态；看守进程的动作见[关闭帧的处理](#关闭帧的处理) |
 | 接收 | `TokenRotate` | `tokens`（按受众为键的令牌组，形态与领取响应相同，`cnf.jkt` 不变）、`token_expires_at` 与 `access_ticket_keys`；整体替换进程内存中的令牌组与接入票据公钥集合 |
 | 接收 | `SandboxConfig` | `revision` 与 `config`；按 `revision` 幂等应用，首次应用之前不启动 Agent 主进程；应用规则见[沙箱侧配置](#沙箱侧配置) |
+| 接收 | `ToolExecRequest`、`ToolExecCancel` | 工具执行请求与取消；按 `exec_id` 幂等，见 [ToolExec API](#toolexec-api) |
 
-稳定性承诺按类别给出：协议消息受协议版本约束，看守进程不自行增删字段；`Hello` 与 `HelloAck` 的状态摘要字段是状态对账的唯一依据，字段变化须同时修改 `runcontroller` 的进入规则与本模块文档；`Shutdown`、`Fenced` 与不可重试认证失败关闭是三种不同的终止语义，不得合并。`runcontroller` 的唤醒与进入规则依赖看守进程的下列承诺：`conn.inbound` 对每个 `freeze_id` 至多发出一次；`bg_jobs_changed` 每次携带完整集合，接收方按替换语义处理；`self_wake_changed` 每次携带驱动器当前掌握的全部条目与 `crons_synced`，接收方在 `crons_synced` 为真时整体替换，为假时整体替换 cron 之外的条目、cron 条目按 `entry_id` 合并，规则见 [runcontroller](../design-runcontroller.md)；`intent_observed` 只作软输入，接收方对同一 `(ref_kind, ref)` 以后到者覆盖先到者，`ref_kind`、`class`、`source` 越出闭集或 `class` 不属于 `ref_kind` 对应的闭集时丢弃该事件并计数，不终止传输；回合外事件不带 `event_seq`，其顺序由出站流的 `msg_seq` 保证，重复与乱序不改变接收方的结果；`StartAgent` 幂等，重复到达不启动第二个 Agent 进程。
+稳定性承诺按类别给出：协议消息受协议版本约束，看守进程不自行增删字段，本代可用的版本与能力取 `HelloAck` 返回的值；`Hello` 与 `HelloAck` 的状态摘要字段是状态对账的唯一依据，字段变化须同时修改 `runcontroller` 的进入规则与本模块文档；`Fenced`、`Shutdown` 与 `Close` 的各关闭状态是不同的终止语义，看守进程按[关闭帧的处理](#关闭帧的处理)逐项区分，不得合并。`runcontroller` 的唤醒与进入规则依赖看守进程的下列承诺：`conn.inbound` 对每个 `freeze_id` 至多发出一次；`bg_jobs_changed` 每次携带完整集合，接收方按替换语义处理；`self_wake_changed` 每次携带驱动器当前掌握的全部条目与 `crons_synced`，接收方在 `crons_synced` 为真时整体替换，为假时整体替换 cron 之外的条目、cron 条目按 `entry_id` 合并，规则见 [runcontroller](../design-runcontroller.md)，条目的 `kind` 只区分 `cron` 与其余取值；`intent_observed` 只作软输入，接收方对同一 `(ref_kind, ref)` 以后到者覆盖先到者，`ref_kind`、`class`、`source` 越出已知取值或 `class` 不属于 `ref_kind` 对应的取值时按 agentprotocol 对描述性字段的规则丢弃该事件并计数，不终止传输；回合外事件不带 `event_seq`，其顺序由出站流的 `msg_seq` 保证，重复与乱序不改变接收方的结果；`StartAgent` 幂等，重复到达不启动第二个 Agent 进程。
+
+### 退出原因
+
+看守进程只在下列情形主动退出。退出之前按[关闭帧的处理](#关闭帧的处理)结束 Agent 进程树：`Shutdown{graceful=true}` 先关闭 Agent 的 stdin，到 `deadline` 仍未退出才强制终止；其余不可恢复的关闭状态强制终止 Agent 进程树。两种情形都在停止工作区写入之后，再以对应的退出原因结束进程；`claim_gone` 发生在领取成功之前，此时没有以运行实例 uid 启动的进程。看守进程是 PID 1，退出即沙箱退出。退出原因是闭集：
+
+| 退出原因 | 触发 |
+| --- | --- |
+| `auth_failed` | 收到 `Close{state=auth_failed}` |
+| `version_unsupported` | 收到 `Close{state=version_unsupported}` |
+| `protocol_violation` | 收到 `Close{state=protocol_violation}`，或看守进程判定控制面协议违规并发出该帧 |
+| `fenced` | 收到 `Fenced` 或 `HelloAck.fenced` |
+| `shutdown` | 收到 `Shutdown` 并按 `graceful` 结束 Agent 进程树 |
+| `claim_gone` | 领取返回 410 |
+
+退出原因写入容器终止信息与看守进程日志的末行，格式为 `castworks-warden-exit: <原因>`，`<原因>` 取上表的标识；k8s 路径的容器终止信息是主容器的 `/dev/termination-log`（`terminationMessagePolicy: File`），Pod 的 `restartPolicy` 为 `Never`，见 [k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md#沙箱-pod-安全基线)。看守进程崩溃或被外部终止时不写退出原因。沙箱提供者观察到沙箱退出后按沙箱丢失路径上报，控制面据此重建，不必等待 `T_connect_grace`。退出原因的闭集归本模块，`agentprotocol` 只引用；新增退出原因须修改本节。
 
 ### ToolExec API
 
-控制面循环驱动器在沙箱内没有 Agent 进程时使用该接口。可调用操作是闭集；帧在已认证的出站流上传输，由链接进 `runcontroller` 的驱动器经宿主写入，不接受沙箱地址上的直接调用。鉴权由出站流承担，帧的代必须等于当前代；命令在运行实例 uid 下执行，`no_new_privs` 与 capability 约束与沙箱内工具一致。
+控制面循环驱动器在沙箱内没有 Agent 进程时使用该接口。帧在已认证的出站流上传输，由链接进 `runcontroller` 的驱动器经宿主写入，不接受沙箱地址上的直接调用。鉴权由出站流承担，帧的代必须等于当前代；命令与文件操作都以运行实例 uid 的权限执行，`no_new_privs` 与 capability 约束与沙箱内工具一致。帧的格式与关联由 [agentprotocol](../design-agentprotocol.md) 的 `ToolExecRequest{exec_id, op, args, deadline}`、`ToolExecResponse{exec_id, status, exit_code, result, error}`、`ToolExecData{exec_id, stream, offset, data, eof}` 与 `ToolExecCancel{exec_id}` 定义；看守进程是执行方，`op` 的 `args`、结果与错误由本节定义，控制面循环驱动器的调用方式见 [design-warden-driver-native.md](design-warden-driver-native.md#toolexec-的使用)。
 
-| 操作 | 结果 |
-| --- | --- |
-| exec | 按请求帧携带的执行标识在沙箱内启动命令，返回退出码与标准输出、标准错误流 |
-| 文件读 | 返回运行实例子目录内文件的字节流与元数据 |
-| 文件写 | 在运行实例子目录内写入或覆盖文件 |
-| 流式输出 | 按输出偏移续传一次执行或后台作业的标准输出与标准错误 |
-| 后台作业 | 列出、查询与终止由 exec 启动的后台作业；未结束的作业计入后台作业集合，使回合边界不构成安全点 |
+`op` 是闭集。路径都是运行实例子目录内的相对路径，按解析符号链接之后的实际路径判定是否越界。
 
-帧格式与关联由 [agentprotocol](../design-agentprotocol.md) 的 `ToolExecRequest`、`ToolExecResponse`、`ToolExecData` 与 `ToolExecCancel` 定义，操作语义由 [design-warden-driver-native.md](design-warden-driver-native.md) 定义；本模块保证上表的操作语义、路径边界与鉴权边界。`ToolExec` 帧不建立第二条协议会话，不参与投递与状态机。`Shutdown` 与 `Fenced` 到达时，在途执行与后台作业按终止语义处理，不再接受新的 `ToolExec` 请求。
+| `op` | `args` | 结果 | 错误 |
+| --- | --- | --- | --- |
+| `exec` | `argv`（命令与参数，非空）、`cwd`（缺省为运行实例子目录）、`background`（缺省为假） | 前台执行：标准输出与标准错误以 `ToolExecData` 按偏移分片返回，进程退出后以 `status=completed` 与 `exit_code` 应答。`background=true`：进程启动后即以 `status=completed` 与 `result{job_id}` 应答，`job_id` 取本请求的 `exec_id`；该作业未退出前计入后台作业集合，使回合边界不构成安全点，输出以 `stream` 取回 | `cwd` 越界或不存在为 `not_found`；进程无法启动为 `start_failed` |
+| `read_file` | `path` | 文件内容以 `ToolExecData`（`stream=stdout`）按偏移分片返回，读完后以 `status=completed` 与 `result{size, mode, mtime}` 应答 | 路径越界、不存在或不是普通文件为 `not_found`；读取失败为 `io_error` |
+| `write_file` | `path`、`data` | 先写临时文件再原子替换目标，目标已存在时覆盖；以 `status=completed` 与 `result{size}` 应答 | 路径越界或父目录不存在为 `not_found`；空间不足为 `resource_exhausted`；其余写入失败为 `io_error` |
+| `stream` | `target`（一次 `exec` 的 `exec_id`）、`stream`（`stdout` 或 `stderr`）、`offset` | 从 `offset` 起以 `ToolExecData` 返回该流的输出，执行仍在进行时随产生继续发送；该流结束或 `deadline` 到达时以 `status=completed` 与 `result{offset, eof}` 应答 | `target` 未知为 `not_found`；`offset` 大于已产生的字节数为 `invalid_argument`；`offset` 所指的输出已不在保留范围内为 `resource_exhausted` |
+| `list_jobs` | 无 | `result{jobs}`，每项为 `{job_id, state, exit_code}`，`state` 取 `running` 或 `exited` | 无 |
+| `get_job` | `job_id` | `result{job_id, state, exit_code, stdout_size, stderr_size}` | `job_id` 未知为 `not_found` |
+| `terminate_job` | `job_id` | 向作业的进程组发送 `SIGTERM`，`deadline` 到达仍未退出时发送 `SIGKILL`；作业退出后以 `result{job_id, exit_code}` 应答，作业已退出时直接应答 | `job_id` 未知为 `not_found` |
+| `get_exec` | `target`（被查询请求的 `exec_id`） | `result{state, response}`：`state` 取 `running` 或 `finished`，`finished` 时 `response` 为该请求已记录的终态应答 | `target` 未知为 `not_found` |
+
+`status` 取 `completed`、`failed` 或 `cancelled`。`status=failed` 时 `error` 取下列闭集：`not_found`、`invalid_argument`、`resource_exhausted`、`io_error`、`start_failed`、`exec_id_conflict`。除表中各行之外，`args` 缺少必需字段或取值不合法时为 `invalid_argument`。`exec` 的进程按[进程监督](#进程监督)的停止态启动步骤进入 `agent` 子 cgroup，环境变量取工具接入声明注入的变量与[合并信任库](#出口-ca-信任)的 CA 变量，请求不另带环境变量，标准输入为空。
+
+幂等：`exec_id` 在同一代内唯一，看守进程按 `exec_id` 幂等。同一 `exec_id` 的重复 `ToolExecRequest`：执行仍在进行时附着到已有执行，不再启动，此后的输出分片与终态应答照常发出，已发出的输出不重发，需要时以 `stream` 按偏移取回；执行已结束时重发已记录的 `ToolExecResponse`；`op` 或 `args` 与首次请求不同时以 `status=failed` 与 `error=exec_id_conflict` 应答，这一应答不记录，已有执行不受影响。由 `ToolExecCancel` 先行建立的记录没有 `op` 与 `args`，不做这一核对，见下文的取消规则。终态应答按 `exec_id` 保留到本代结束。`exec` 的标准输出与标准错误同样保留到本代结束，供 `stream` 按偏移取回；单次执行的保留量受部署配置的上限约束，达到上限后丢弃最早的输出。
+
+`deadline` 是校时后的绝对时刻，只约束看守进程为本次请求发送数据的时长：前台 `exec` 到期后不再发送输出分片，执行不终止，进程退出时照常记录并发出终态应答，调用方以 `get_exec` 查询、以 `stream` 续传；`stream` 到期时以已发送到的位置应答；`terminate_job` 到期时对未退出的作业发送 `SIGKILL`；其余 `op` 不使用 `deadline`。
+
+`ToolExecCancel{exec_id}` 按 `exec_id` 幂等：前台 `exec` 仍在执行时向其进程组发送 `SIGKILL`，进程退出后以 `status=cancelled` 与 `exit_code` 应答；`stream` 与 `read_file` 停止发送并以 `status=cancelled` 应答；请求已结束时重发已记录的终态应答；`exec_id` 尚无记录时建立没有 `op` 与 `args` 的记录，记为 `status=cancelled` 的终态应答并发出，此后同一 `exec_id` 的请求直接重发该 `cancelled` 应答，不执行，也不以 `exec_id_conflict` 应答。后台作业的终止用 `terminate_job`，取消启动它的 `exec` 不终止作业。
+
+`ToolExec` 帧不建立第二条协议会话，不参与投递与状态机。`Shutdown` 与 `Fenced` 是关闭帧，到达之后这条流不再有下行消息：看守进程终止在途执行与后台作业的进程组，并按[关闭帧的处理](#关闭帧的处理)退出。
 
 ### 文件 API 与回环代理端点
 
-文件 API 为界面提供工作区文件的读取，包括列目录与读文件，入站路径为 `/files`（agentprotocol 常量 `PathFiles`）；路径限定在运行实例子目录内，请求由 `workspace` 经入站路由转发到达，按[接入票据](../../../glossary.md)（`channel=file`）与实时接入状态鉴权。看守进程核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。票据的校验规则见[入站端点](#入站端点)。文件 API 不提供事件通道。
+文件 API 为界面提供工作区文件的只读访问，包括列目录与读文件，入站路径为 `/files`（agentprotocol 常量 `PathFiles`）；用户没有向工作区上传或写入文件的接口，`ToolExec` 的 `write_file` 只由控制面循环驱动器使用，不是面向用户的上传途径。路径限定在运行实例子目录内，请求由 `workspace` 经入站路由转发到达，按[接入票据](../../../glossary.md)（`channel=file`）与实时接入状态鉴权。看守进程核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。票据的校验规则见[入站端点](#入站端点)。文件 API 不提供事件通道。
 
 本地代理监听回环地址，处理 Agent 进程的 LLM 请求与按代理变量到达的外部系统请求；LLM 主机以及 `mitm` 与 `passthrough` 主机的流量由本地 DNS 指向同一看守进程内的透明拦截器，LLM 主机的连接由透明拦截器终止 TLS 后交给本地代理。Agent 不持有令牌，本地代理在转发时附加对应受众的运行实例令牌：LLM 请求附 `llmgateway` 令牌转到 `llmgateway`，外部系统请求以 CONNECT 或 HTTP 前置转到出口代理，透明拦截器同样以 CONNECT 把原始 TLS 字节转给出口代理，k8s 路径上两者对平台出口代理都附 `egress` 令牌。本地代理与透明拦截器不终止外部系统主机的 TLS，不替换凭据，这些主机的 TLS 终止由出口代理承担；模式选择、缓冲与回放见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
@@ -167,17 +205,17 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 | 端点 | 调用方 | 语义 |
 | --- | --- | --- |
 | `/readyz` | kubelet 就绪探针、Substrate 的 `wakeupProbe`（[REF-substrate](../../../references.md)） | 不以领取为条件：看守进程尚未领取时，可服务即返回就绪；领取之后，k8s 路径上出站流已建立且看守进程可服务时返回就绪，否则返回未就绪；Substrate 路径上可服务即返回就绪，不以出站流为条件：`wakeupProbe` 在 `ResumeActor` 把 actor 置为运行态之前探测，actor 处于 `RESUMING` 时出口已放行；快照恢复的出站流在路由器转发 `/wake` 之后重建，`/wake` 在重建完成后返回。Substrate 路径下看守进程尚未领取时，每次被探测都读取 `actor-name`，与上次读取不同即立即领取一次；已领取的看守进程不再领取；快照恢复的是同一 actor，`actor-name` 不变，看守进程不重新领取 |
-| `/wake` | `sandboxprovider`：Substrate 路由器（快照恢复）、k8s 的 wake-router（预热认领后的领取通知） | 已领取时为恢复触发入口，看守进程立即重建出站流，不等重连退避到期，返回即表示出站流已重建；Substrate 路由器把请求停泊到 `/readyz` 就绪之后才转发给看守进程；尚未领取时为领取通知，看守进程立即经引导接口领取，再首次 `RenewLease` 并发送 `Hello`，出站流建立之后返回。并发调用合并为同一次处理 |
+| `/wake` | `sandboxprovider`：Substrate 路由器（快照恢复）、k8s 的 wake-router（预热认领后的领取通知） | 已领取时为恢复触发入口，看守进程按[快照恢复后的校时与连接清理](#快照恢复后的校时与连接清理)的顺序先续约租约，再立即重建出站流，不等重连退避到期，返回即表示出站流已重建；Substrate 路由器把请求停泊到 `/readyz` 就绪之后才转发给看守进程；尚未领取时为领取通知，看守进程立即经引导接口领取，再首次 `RenewLease` 并发送 `Hello`，出站流建立之后返回。并发调用合并为同一次处理 |
 | `/terminal` | `humanchannel` 经入站路由 | 人类 shell 终端接入；校验接入票据（`channel=terminal`）后建立；shell 以停止态启动并经 `AdoptAgent` 进入 `agent` 子 cgroup，与 Agent 进程树一同受冻结约束；票据中的用户写入终端审计；领取成功之前返回 503，不启动 shell |
-| `/files` | `workspace` 经入站路由 | 校验接入票据（`channel=file`）后到达文件 API，读取工作区文件；领取成功之前返回 503 |
+| `/files` | `workspace` 经入站路由 | 校验接入票据（`channel=file`）后到达文件 API，只读访问工作区文件；领取成功之前返回 503 |
 
-`/terminal` 与 `/files` 的请求以请求头 `x-castworks-access-ticket` 携带接入票据，每个入站请求一张，入站路由原样转发；票据的签发与形态归 `secrets`，端点契约见 [agentprotocol](../design-agentprotocol.md#入站端点契约)（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。看守进程逐项校验，校验所用的公钥集合是随领取响应与 `TokenRotate` 下发的 `access_ticket_keys`：
+`/terminal` 与 `/files` 的请求以请求头 `x-castworks-access-ticket` 携带接入票据，入站路由原样转发：`channel=terminal` 的票据每次接入一张、只用一次，`channel=file` 的票据在有效期内可用于多次只读请求；票据的签发与形态归 `secrets`，端点契约见 [agentprotocol](../design-agentprotocol.md#入站端点契约)（[ADR-control-plane-call-authentication](../../../adr/adr-control-plane-call-authentication.md)）。看守进程逐项校验，校验所用的公钥集合是随领取响应与 `TokenRotate` 下发的 `access_ticket_keys`：
 
 - JOSE 头部的 `alg` 为 `EdDSA`、`typ` 为 `castworks-access-ticket`；`kid` 属于 `access_ticket_keys`，且签名有效。
 - `aud` 为 `warden`；`run_id` 与 `generation` 等于本沙箱的运行实例与代。
 - `channel` 与端点相符：`/terminal` 要求 `terminal`，`/files` 要求 `file`。
 - 未过期，且 `exp − iat ≤ T_access_ticket`（60 s）。
-- `jti` 未出现过；看守进程在内存中记录已接受的 `jti`，保留到该票据的 `exp`。
+- `channel=terminal` 的票据只用一次：`jti` 未出现过；看守进程在内存中记录已接受的 `jti`，保留到该票据的 `exp`。`channel=file` 的票据在有效期内可用于同一 `sub`、同一 `run_id`、同一 `generation` 的多次只读请求，看守进程不对它做 `jti` 一次性检查。
 
 任一项不通过时返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；通过时票据的 `sub`（平台用户标识）写入终端审计，`/files` 另照常执行租约持有者核对与 `file` 通道的实时接入要求。入站服务只监听 Pod 地址，拒绝来源为回环地址或本 Pod 地址的连接：沙箱内的进程不能经回环或 Pod 地址调用 `/wake`、`/terminal` 与 `/files`，探针与入站路由的请求来自 Pod 之外。
 
@@ -199,8 +237,8 @@ Claude Code 可把长 MCP 调用自动移到后台：该调用的 `tool_result` 
 
 代码依赖为 `agentprotocol` 与 `workspace` 的沙箱侧部分（文件 API、持久化确认与租约续约），与[模块依赖图](../../architecture.md#模块依赖图)一致；对 `llmgateway`、`connectorhub` 与 `humanchannel` 的调用是附对方受众运行实例令牌的运行时 HTTP 调用，对 `sandboxprovider` 的[引导接口](../../../glossary.md)的调用是以沙箱实例身份凭据认证的运行时 HTTPS 调用，都不是代码依赖。`runcontroller` 是唯一依赖本模块的模块：本模块的控制面循环驱动器子模块以库的形式链接进 `runcontroller` 进程，`runcontroller` 调用其 Agent 驱动器接口；看守进程的其余部分不被任何模块依赖。
 
-- `agentprotocol`：信封、消息类型、出站流客户端、未确认消息重放、按 `(generation, msg_seq)` 去重与协议版本。看守进程只实现每条消息的沙箱侧效果。
-- `workspace`：`RenewLease(lease_id, generation, sandbox_id, proof)` 的 CAS 语义与首次续约绑定持有者；`proof` 为用途是 `renew` 的持有证明，`workspace` 要求其中实例公钥的指纹等于租约的 `holder_jkt`（由 `sandboxprovider` 在领取时以 `SetHolderKey` 登记）、签名与时窗有效，否则以不可重试错误拒绝；租约到期前无法续约时由本模块执行本地保护动作并上报 `LeaseLost`。租约的建立、接管与释放不在本模块。
+- `agentprotocol`：信封、帧的分类、消息类型、出站流客户端（上行重放缓冲、窗口与确认）、握手帧与关闭帧、协议版本与具名参数，以及规范 JSON 编码函数 `CanonicalJSON` 与持有证明签名文本 `HolderProofMessage`。看守进程只实现每条消息的沙箱侧效果。
+- `workspace`：`RenewLease(lease_id, generation, sandbox_id, proof)` 的 CAS 语义与首次续约绑定持有者；`proof` 为用途是 `renew` 的持有证明，`workspace` 要求其中实例公钥的指纹等于租约的 `holder_jkt`（由 `sandboxprovider` 在领取时以 `SetHolderKey` 登记）、签名有效且 `iat` 在时窗之内；时窗不符时以可重试错误 `proof_time_skew` 拒绝，错误详情的 `server_now` 字段为服务端当前时刻，其余不符以不可重试错误拒绝；租约到期前无法续约时由本模块执行本地保护动作，首次续约以外的情形上报 `LeaseLost`。租约的建立、接管与释放不在本模块。
 - `llmgateway`：本地代理转发的 LLM 请求与宿主侧分类请求以 `llmgateway` 受众的运行实例令牌鉴权，只发往[面向沙箱的端点](../../../glossary.md) `llm`，按运行实例计费；在途请求与回放存储归 `llmgateway`，恢复后按 `request_id` 取回（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。宿主侧分类请求带分类标记，`llmgateway` 不为它登记在途请求事实、不写 `llm_completed` 或 `llm_failed`，它也不参与事件源实例租约，标记的约定见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求)。
 - `connectorhub` 与 `humanchannel`：平台 MCP 服务器发往 `connectorhub` 的事件目录查询、订阅登记与附件取回请求以 `connectorhub` 受众的运行实例令牌鉴权，只发往面向沙箱的端点 `connector`；发往 `humanchannel` 的附件取回请求以 `humanchannel` 受众的运行实例令牌鉴权，只发往面向沙箱的端点 `human`；订阅匹配与连接器事件日志归 `connectorhub`。沙箱侧配置中的 `wait_signatures` 由 `connectorhub` 从外部系统定义生成，`event_type` 与事件目录的一致性在装载时由它校验。
 - `sandboxprovider`：提供引导接口，看守进程以请求体 `{instance_key}` 经运行时 HTTPS 调用领取按受众划分的令牌组、`lease_id` 与接入票据公钥集合；`sandboxprovider` 在返回领取响应之前以 `SetHolderKey` 把实例公钥指纹登记为租约的 `holder_jkt`，并以同一指纹签发令牌组；请求与响应、错误码与一次性领取语义见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)。k8s 路径的预热认领经 wake-router 调用 `/wake` 通知看守进程领取。k8s 路径的节点冻结代理在本 Pod 的套接字上提供 `AdoptAgent`，核验规则见 [k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md)。
@@ -256,7 +294,7 @@ flowchart TB
     warden -->|"AdoptAgent，经按 Pod 套接字"| nfa
     router -->|"/readyz /wake；/terminal /files 携带接入票据"| warden
     warden -->|"HTTPS 领取令牌组与 lease_id，请求体 instance_key"| boot
-    warden -->|"出站 gRPC 流，Hello 附持有证明"| rc
+    warden -->|"出站 gRPC 流，Challenge 之后 Hello 附持有证明"| rc
     proxy -->|"附 llmgateway 受众令牌"| gw
     proxy -->|"CONNECT 或 HTTP 前置，k8s 路径附 egress 受众令牌"| egress
     mcp -->|"附 connectorhub 受众令牌"| hub
@@ -280,10 +318,13 @@ sequenceDiagram
     W->>W: 生成实例密钥，私钥只在进程内存
     W->>B: POST /v1/bootstrap/claim，请求体 {instance_key}，Authorization 携带沙箱实例身份凭据
     B-->>W: run_id, generation, sandbox_id, lease_id, tokens, token_expires_at, access_ticket_keys
-    W->>S: RenewLease(lease_id, generation, sandbox_id, holder_proof)
+    W->>S: RenewLease(lease_id, generation, sandbox_id, holder_proof{iat, sig})
     S-->>W: 成功，绑定租约持有者
-    W->>R: Hello{generation, session_epoch, resume_token, workspace_lease_id, sandbox_id, instance_key, holder_proof, agent_state, 游标, pending_intents, last_received_msg_seq, sandbox_config_revision=0}
-    R-->>W: HelloAck{accepted, desired_state, last_received_msg_seq, owner_epoch, cursor_accepted, live_attached}
+    W->>R: 建立 gRPC 双向流的传输
+    R->>W: Challenge{nonce, server_now}
+    W->>W: 以 server_now 校时
+    W->>R: Hello{generation, resume_token, workspace_lease_id, sandbox_id, instance_key, holder_proof{nonce, sig}, versions, capabilities, agent_state, 游标, pending_intents, sandbox_config_revision=0}
+    R-->>W: HelloAck{accepted, desired_state, active_suspend_id, committed_msg_seq, stream_epoch, protocol_version, capabilities, owner_epoch, cursor_accepted, live_attached}
     R->>W: SandboxConfig{revision, config}
     W->>W: 按 revision 应用沙箱侧配置
     R->>W: Deliver{delivery_id, batch, through_seq, target, resume_session_id}
@@ -298,12 +339,14 @@ sequenceDiagram
     W->>W: 追加 consumed{seq, turn_id} 并同步写入
     W-->>R: Consumed{through_seq, turn_id}
     Note over W,R: 出站流断开
-    W->>R: 退避后重连，重放未确认消息
-    W->>R: Hello{instance_key, holder_proof, last_received_msg_seq, 游标, pending_intents, sandbox_config_revision}
-    R-->>W: HelloAck 状态对账结果
+    W->>W: 上一条连接上未达处理完成点的下行消息处理到完成点或中止，退避后重建传输
+    R->>W: Challenge{nonce, server_now}
+    W->>R: Hello{instance_key, holder_proof{nonce, sig}, versions, capabilities, 游标, pending_intents, sandbox_config_revision}
+    R-->>W: HelloAck{committed_msg_seq, stream_epoch, 状态对账结果}
+    W->>R: 从 committed_msg_seq 之后按原序号重放上行消息，再发送此后分配的消息
 ```
 
-启动顺序的约束：实例密钥在领取之前生成，领取成功之后才调用 `RenewLease`，首次 `RenewLease` 成功之后才发 `Hello`，首次应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，图中为 k8s 路径上投递触发的路径，领取不经过出站流。`RenewLease` 与 `Hello` 都附以实例私钥签名的持有证明，每次调用重新签名；`Hello` 的 `generation`、令牌与租约持有者必须一致，令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 必须相同，否则控制面回 `HelloAck.fenced` 或以不可重试认证失败关闭流。图中 `AdoptAgent` 只提交容器内 pid，cgroup 路径由节点冻结代理经容器运行时解析，看守进程收到移入完成之后才让 Agent 主进程继续执行。`HelloAck.desired_state=frozen` 时看守进程不恢复 Agent 执行，直到收到 `Thaw` 或新的恢复消息。重连不重新执行 `PrepareSuspend`，未确认消息由发送方重放，接收方按 `(generation, msg_seq)` 去重。`Hello` 的 `pending_intents` 使控制面在新代推进 `cursor_accepted`，再按对账后的 `cursor_consumed` 决定重投起点。
+启动顺序的约束：实例密钥在领取之前生成，领取成功之后才调用 `RenewLease`，首次 `RenewLease` 成功之后才建立出站流，收到 `Challenge` 之后才发 `Hello`，首次应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，图中为 k8s 路径上投递触发的路径，领取不经过出站流。`RenewLease` 与 `Hello` 都附以实例私钥签名的持有证明，每次调用重新签名：`RenewLease` 的签名绑定校时后的 `iat`，`Hello` 的签名绑定本流的 `Challenge.nonce`，规则见[启动与领取](#启动与领取)。`Hello` 的 `generation`、令牌与租约持有者必须一致，令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 必须相同，否则控制面回 `HelloAck.fenced` 或以 `Close{state=auth_failed}` 关闭流。图中 `AdoptAgent` 只提交容器内 pid，cgroup 路径由节点冻结代理经容器运行时解析，看守进程收到移入完成之后才让 Agent 主进程继续执行。`HelloAck.desired_state=frozen` 时看守进程不恢复 Agent 执行，直到收到 `Thaw` 或新的恢复消息。重连不重新执行 `PrepareSuspend`：进行中的挂起尝试跨重连继续，控制面重新产生的同一 `suspend_id` 的 `PrepareSuspend` 附着到它（见[冻结与解冻](#冻结与解冻)）；上行消息由看守进程从 `HelloAck.committed_msg_seq` 之后按原序号重放，下行消息不跨连接重放，仍然需要的由 `runcontroller` 在接受 `Hello` 时按持久化状态与状态摘要重新产生（[runcontroller](../design-runcontroller.md#hello-的处理)）。`Hello` 的 `pending_intents` 使控制面在新代推进 `cursor_accepted`，再按对账后的 `cursor_consumed` 决定重投起点。
 
 ### 冻结与解冻时序
 
@@ -335,17 +378,17 @@ sequenceDiagram
         R->>P: 解冻
         P->>A: 清除 agent/cgroup.freeze
         P-->>R: 解冻调用返回
-        R->>W: Thaw{suspend_id}
+        R->>W: Thaw{freeze_id}
         W->>W: 读取 agent/cgroup.events 的 frozen 字段，观察到未冻结
     else variant=signal
-        R->>W: Thaw{suspend_id}
+        R->>W: Thaw{freeze_id}
         W->>A: SIGCONT 已停止的 PID
     end
-    W-->>R: Thawed{suspend_id}
+    W-->>R: Thawed{freeze_id}
     R->>W: Resumed{suspend_id, suspended_for_ms, wall_clock_now, drain}
 ```
 
-冻结与解冻都以 `freeze_id` 标识，`Thaw` 与 `Thawed` 的 `suspend_id` 取该标识，已执行过解冻的标识不再接受冻结；迟到的冻结请求因而不在解冻之后生效。`Freeze{cgroup}` 交给控制面的冻结确认由节点冻结代理产生，看守进程只上报就绪与观察结果；`Freeze{signal}` 交给控制面的冻结确认就是看守进程的 `ReadyToSuspend`。看守进程自身的冻结确认用于入站数据唤醒：`cgroup` 变体以读到 `agent/cgroup.events` 的 `frozen=1` 为准，`signal` 变体以冻结执行记录收敛为准；确认之后、开始解冻之前，看守进程按[入站数据唤醒](#入站数据唤醒)的规则检测入站数据，并对同一 `freeze_id` 至多发出一次 `conn.inbound`。进程树从未冻结时，`Thaw` 到达后立即上报 `Thawed`。Agent 进程树在 `cgroup` 变体下于节点冻结代理清除 `agent/cgroup.freeze` 时恢复运行，在 `signal` 变体下于看守进程发送 `SIGCONT` 时恢复运行；看守进程处理 `Resumed` 之后才通知本地代理交付缓冲内容；`drain=true` 时按 DRAIN 处置。冻结期间看守进程继续采集活动度并维持出站流。
+冻结与解冻都以 `freeze_id` 标识，`Thaw` 与 `Thawed` 携带该标识，其定义见 [agentprotocol](../design-agentprotocol.md#消息闭集)；已执行过解冻的标识不再接受冻结；迟到的冻结请求因而不在解冻之后生效。`Freeze{cgroup}` 交给控制面的冻结确认由节点冻结代理产生，看守进程只上报就绪与观察结果；`Freeze{signal}` 交给控制面的冻结确认就是看守进程的 `ReadyToSuspend`。看守进程自身的冻结确认用于入站数据唤醒：`cgroup` 变体以读到 `agent/cgroup.events` 的 `frozen=1` 为准，`signal` 变体以冻结执行记录收敛为准；确认之后、开始解冻之前，看守进程按[入站数据唤醒](#入站数据唤醒)的规则检测入站数据，并对同一 `freeze_id` 至多发出一次 `conn.inbound`。进程树从未冻结时，`Thaw` 到达后立即上报 `Thawed`。Agent 进程树在 `cgroup` 变体下于节点冻结代理清除 `agent/cgroup.freeze` 时恢复运行，在 `signal` 变体下于看守进程发送 `SIGCONT` 时恢复运行；看守进程处理 `Resumed` 之后才通知本地代理交付缓冲内容；`drain=true` 时按 DRAIN 处置。冻结期间看守进程继续采集活动度并维持出站流。
 
 ## 核心数据结构
 
@@ -360,12 +403,13 @@ sequenceDiagram
 | `exit_code` | 最近一次退出码；`SIGTERM` 终止为 143 |
 | `session_id` | 最近一次观察到的会话标识，用于 `ReadyToSuspend` 的恢复句柄 |
 | `bg_jobs` | Agent 驱动器登记的后台作业标识集合：Claude Code 后台任务集合中 `ambient` 为假的任务，加上孤儿进程，即 Agent 进程树中不是 Agent 主进程、不属于任何任务、也不是已声明第三方 MCP 服务器或托管 hook 二进制的进程（作业标识为 `proc:<pid>`）；Claude Code 进程启动或重启时从空集起算，登记规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
-| `self_wake` | Agent 驱动器镜像的自唤醒条目集合，每项为 `{entry_id, kind, fire_at, survives_resume}`，`fire_at` 为空表示触发时刻未知；本代 Agent 进程启动后即可上报，镜像规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
+| `self_wake` | Agent 驱动器镜像的自唤醒条目集合，每项为 `{entry_id, kind, fire_at, survives_resume}`，`kind` 是描述性标签，`fire_at` 为空表示触发时刻未知；本代 Agent 进程启动后即可上报，镜像规则见 [Claude Code 驱动器](design-warden-driver-claude-code.md) |
 | `crons_synced` | `self_wake` 中的 cron 条目是否已按本进程的 `session_crons` 对账；Agent 进程每次启动（含同代重启）时为假，驱动器首次取得本进程的 `session_crons` 后为真，随 `self_wake_changed` 上报 |
-| `running_tools` | 未配对的 `tool_started` 调用集合 |
+| `running_tools` | 未配对的 `tool_started` 调用集合，按 `call_id` 索引，每项为 `{call_id, name, summary}` |
 | `freeze` | 当前冻结执行记录；未冻结时为空 |
+| `backpressure_frozen` | 背压冻结是否生效及其停止的 PID 集合；规则见[出站流背压](#出站流背压) |
 
-进程监督记录是看守进程的单一事实源：`Activity`、`Hello.agent_state`、`ReadyToSuspend`、`bg_jobs_changed` 与 `self_wake_changed` 都从这里取值；`bg_jobs_changed` 在 `bg_jobs` 变化时以完整集合发出，`self_wake_changed` 携带 `self_wake` 与 `crons_synced`，发送时机见 [Claude Code 驱动器](design-warden-driver-claude-code.md)，两者都可在没有进行中回合时发出；控制面不读取该结构，只接收派生消息。进程表只用于把后台 shell 任务关联到 PID 与发现孤儿进程，后台作业集合以 Claude Code 的后台任务集合为准。
+进程监督记录是看守进程的单一事实源：`Activity`、`Hello.agent_state`、`ReadyToSuspend`、`bg_jobs_changed` 与 `self_wake_changed` 都从这里取值；驱动器在进程监督锁内先把回合进展事件交给出站流（`Send` 分配序号写入上行重放缓冲，窗口满时排进待发队列），再更新记录中的阶段、回合标识与阻塞条件，`Hello.agent_state` 因而不领先于已交给出站流的事件，`runcontroller` 据此只以随后到达的事件更新回合字段（见 [runcontroller](../design-runcontroller.md#hello-的处理)）；`bg_jobs_changed` 在 `bg_jobs` 变化时以完整集合发出，`self_wake_changed` 携带 `self_wake` 与 `crons_synced`，发送时机见 [Claude Code 驱动器](design-warden-driver-claude-code.md)，两者都可在没有进行中回合时发出；控制面不读取该结构，只接收派生消息。进程表只用于把后台 shell 任务关联到 PID 与发现孤儿进程，后台作业集合以 Claude Code 的后台任务集合为准。
 
 ### 活动度样本
 
@@ -381,9 +425,12 @@ sequenceDiagram
 | `ws_write_fds` | 进程树持有的工作区写文件描述符数量 |
 | `io_bytes`、`net_bytes` | 累计块设备 I/O 与网络字节 |
 | `llm_last_request_at`、`llm_last_retryable_failure_at` | 本地代理最近一次发出 LLM 请求、最近一次收到可重试失败（429、5xx、overloaded）的时刻；取自本地代理的观测记录，见 [design-warden-llmproxy.md](design-warden-llmproxy.md)，从未发生时为空 |
-| `frozen`、`freeze_id` | Agent 子 cgroup 的冻结状态与当前冻结标识；`cgroup` 变体从 `agent/cgroup.events` 的 `frozen` 字段读取，`signal` 变体取看守进程的冻结执行记录。cgroup 冻结后进程态仍是 S，不能以 T 态判定冻结完成 |
+| `frozen`、`freeze_id` | 只反映挂起冻结：冻结类挂起尝试造成的 Agent 进程树冻结状态与该冻结的标识；`cgroup` 变体从 `agent/cgroup.events` 的 `frozen` 字段读取，`signal` 变体取看守进程的冻结执行记录；背压冻结不改变这两个字段。cgroup 冻结后进程态仍是 S，不能以 T 态判定冻结完成 |
+| `frozen_by` | 独立表示背压冻结是否生效：生效时为 `backpressure`，未生效时为空；取进程监督记录的 `backpressure_frozen`。它与 `frozen` 可以同时成立 |
+| `sample_seq` | 样本序号，看守进程进程内单调递增；接收方丢弃不大于已收到最大值的样本 |
+| `sampled_at` | 校时后的采样时刻；接收方以相邻两个已收到样本的 `sampled_at` 之差作为累计量的区间时长 |
 
-活动度样本只含观测值，不含忙闲判定；判定规则与阈值归 `suspendpolicy`。`frozen` 在 `Active` 中为真且 `freeze_id` 不等于 `aborted_suspend_id` 时，控制面判定本代沙箱作废。
+表中的时刻都取校时后的时刻，见[校时](#校时)。活动度样本只含观测值，不含忙闲判定；判定规则与阈值归 `suspendpolicy`。`frozen` 在 `Active` 中为真且 `freeze_id` 不等于 `aborted_suspend_id` 时，控制面判定本代沙箱作废；背压冻结只体现在 `frozen_by`，不触发这一判定。
 
 ### 投递意图日志条目
 
@@ -401,7 +448,7 @@ sequenceDiagram
 
 | 字段 | 含义 |
 | --- | --- |
-| `freeze_id` | 冻结标识，取 `suspend_id` |
+| `freeze_id` | 冻结标识，定义见 [agentprotocol](../design-agentprotocol.md#消息闭集) |
 | `variant` | `cgroup` 或 `signal` |
 | `frozen_at` | 冻结完成的时刻，随 `ReadyToSuspend` 上报 |
 | `confirmed_at` | 看守进程确认冻结生效的时刻：`cgroup` 变体为读到 `agent/cgroup.events` 的 `frozen=1` 的时刻，`signal` 变体为扫描收敛的时刻；未确认时为空 |
@@ -411,6 +458,47 @@ sequenceDiagram
 | `thawed` | 是否已执行解冻；为真时该标识拒绝新的冻结，缩小请求的幂等由 `sandboxprovider` 按同一标识维护 |
 
 `cgroup` 变体的状态从 `agent/cgroup.events` 的 `frozen` 字段读取（写入仍为 `agent/cgroup.freeze`），`signal` 变体的状态从进程态 `T` 读取。cgroup 冻结后进程态仍为 S，冻结完成的判定必须轮询 `cgroup.events`。两种变体都以 `freeze_id` 幂等，`Thawed` 按同一标识上报。入站数据检测在 `confirmed_at` 写入时开启，在看守进程得知解冻开始时关闭；`inbound_reported` 只由假变真，同一标识至多发出一次 `conn.inbound`。
+
+### 挂起尝试记录
+
+| 字段 | 含义 |
+| --- | --- |
+| `suspend_id` | 挂起尝试的标识，同一代内唯一；冻结类尝试的 `suspend_id` 同时是其冻结执行记录的 `freeze_id` |
+| `mode`、`variant`、`deadline`、`self_wake_cutoff`、`require` | 首次 `PrepareSuspend` 携带的参数；附着与重发都不改变它们 |
+| `state` | `preparing`（进行中：已登记，动作进行中，尚未应答）、`ready`（已就绪：已回 `ReadyToSuspend`）、`busy`（已回 `reason` 不是 `cancelled` 的 `Busy`）、`cancelled`（[取消墓碑](#术语表)：已回 `Busy{reason=cancelled}`）、`ended`（已结束） |
+| `irrevocable` | 是否已越过不可撤销点；只由假变真 |
+| `response` | 已发出的 `ReadyToSuspend` 或 `Busy`；重发时沿用其内容 |
+| `response_msg_seq` | `response` 首次发出时分配的上行序号，尚在待发队列中时为空；与 `HelloAck.committed_msg_seq` 比较，判断控制面是否已提交该应答 |
+| `superseded_by` | 取代该尝试的挂起尝试的 `suspend_id`，只在该尝试因被取代而转为 `ended` 时写入：登记新尝试时取新尝试的标识，重连时取 `HelloAck.active_suspend_id`；其余情形为空 |
+
+挂起尝试记录按 `suspend_id` 索引，只在看守进程内存中，保留到本代结束，快照随内存保留。同一时刻至多一个尝试处于 `preparing` 或 `ready`。状态转移、不可撤销点与各消息的处理见[冻结与解冻](#冻结与解冻)。
+
+### 出站流会话状态
+
+| 字段 | 含义 |
+| --- | --- |
+| `next_msg_seq` | 本代下一个上行应用消息序号，从 1 起，跨连接连续 |
+| `replay_buffer` | 上行重放缓冲：已分配序号、控制面尚未确认提交的上行应用消息，按 `msg_seq` 排列；条数与编码字节数分别受 `W_replay_msgs` 与 `W_replay_bytes` 约束 |
+| `pending_queue` | [待发队列](#术语表)：窗口满时暂存的未编号上行应用消息，按入队顺序排列；编码字节数受 `Q_pending_bytes` 约束 |
+| `recv_msg_seq` | 下行接收位置：本连接上已达到[处理完成点](#下行消息的处理完成点)的下行应用消息的最大连续序号；每条新连接从 0 起 |
+| `protocol_version`、`capabilities` | 本代首次 `HelloAck` 返回的协议版本与能力标识；同代内不变 |
+| `clock_offset` | 时钟偏移：服务端时刻减本地单调时钟；规则见[校时](#校时) |
+| `sample_seq` | 下一个 `Activity` 样本的序号，进程内单调递增 |
+
+出站流会话状态只在看守进程内存中，快照随内存保留；看守进程崩溃即沙箱丢失，代变化时随沙箱重建而丢弃，同代不会以新进程续用这些状态。
+
+### ToolExec 执行记录
+
+| 字段 | 含义 |
+| --- | --- |
+| `exec_id` | 请求的执行标识，同一代内唯一 |
+| `op`、`args` | 首次请求的操作与参数；重复请求按它们核对；由 `ToolExecCancel` 先行建立的记录为空，不做核对 |
+| `state` | `running` 或 `finished` |
+| `response` | 已记录的终态应答；`finished` 时非空 |
+| `pgid` | `exec` 的进程组；其余 `op` 为空 |
+| `output` | `exec` 的标准输出与标准错误各自已产生的字节数与保留部分 |
+
+执行记录按 `exec_id` 索引，只在看守进程内存中，保留到本代结束；`ToolExecCancel` 对尚无记录的 `exec_id` 同样建立记录，`op` 与 `args` 为空，`response` 为 `cancelled` 应答。
 
 ## 核心算法与流程
 
@@ -422,14 +510,14 @@ sequenceDiagram
 | --- | --- | --- |
 | 1 | 看守进程启动并监听入站端点，生成实例密钥（公钥指纹 `J6`），以请求体 `{instance_key}` 经引导接口领取 | 响应携带 `generation=6`、`sandbox_id=sb-6`、`lease_id=L6`、按受众划分的令牌组（各令牌 `cnf.jkt=J6`）与 `access_ticket_keys`；实例私钥、令牌组、`lease_id` 与公钥集合只保存在进程内存 |
 | 2 | `RenewLease(lease_id=L6, generation=6, sandbox_id=sb-6, proof)`，`proof` 为用途 `renew` 的持有证明 | `workspace` 核对实例公钥指纹等于租约的 `holder_jkt=J6`；租约持有者绑定为 `sb-6`；续约成功之前不发 `Hello` |
-| 3 | 发出 `Hello{generation=6, session_epoch=e6, resume_token=<runcontroller 令牌>, workspace_lease_id=L6, sandbox_id=sb-6, instance_key, holder_proof, cursor_accepted=10, cursor_consumed=10, pending_intents=[], sandbox_config_revision=0}` | 控制面核对令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 都为 `J6`；出站流建立；控制面回 `HelloAck{accepted, desired_state=running}` |
-| 4 | 收到 `SandboxConfig{revision=3, config}` | 本地 DNS 与透明拦截器加载主机表；已应用版本为 3，此后才允许启动 Agent 主进程 |
-| 5 | 收到 `Deliver{delivery_id=d-4, batch=[11], through_seq=11, target=next_user_message, resume_session_id=ses-1}` | 追加 `accepted{11}` 并同步写入；日志成为跨代去重依据 |
-| 6 | 按日志去重：`11` 未被消费；先发出 `Accepted{d-4, 11, fed=true}`，再以 `--resume ses-1` 按停止态启动 Claude Code，经本 Pod 套接字以 `AdoptAgent(pid)` 请求节点冻结代理把它移入 `agent` 子 cgroup，收到移入完成后让它继续，喂入事件 | 进程监督记录 `agent_pid=4101`、`agent_pgid=4101`；`agent_state.phase=starting`，随后转为 `in_turn` |
-| 7 | Agent 发出 `turn_started{turn_id=turn-9, delivery_id=d-4}` | 追加 `consumed{11, turn-9}` 并同步写入；随后发出 `Consumed{11, turn-9}` |
-| 8 | 出站流在 `Consumed` 送达前断开，随后重连 | `Hello.pending_intents` 携带 `accepted{11}`、`Hello.cursor_consumed=11`、`Hello.sandbox_config_revision=3`；控制面先推进 `cursor_accepted` 到 11，再按 `Hello.cursor_consumed` 对齐 `cursor_consumed=11`，不重投 11，也不重发 `SandboxConfig` |
+| 3 | 建立出站流的传输，收到 `Challenge{nonce=n-1, server_now}` 并校时，发出 `Hello{generation=6, resume_token=<runcontroller 令牌>, workspace_lease_id=L6, sandbox_id=sb-6, instance_key, holder_proof{nonce=n-1, sig}, versions, capabilities=[], cursor_accepted=10, cursor_consumed=10, pending_intents=[], sandbox_config_revision=0}` | 控制面核对 `nonce`，核对令牌的 `cnf.jkt`、`instance_key` 的指纹与租约的 `holder_jkt` 都为 `J6`；出站流建立；控制面回 `HelloAck{accepted, desired_state=running, committed_msg_seq=0, protocol_version}`；下行接收位置为 0，`next_msg_seq=1` |
+| 4 | 收到 `SandboxConfig{revision=3, config}`（下行 `msg_seq=1`） | 本地 DNS 与透明拦截器加载主机表；已应用版本为 3，此后才允许启动 Agent 主进程；应用即达到处理完成点，下行接收位置为 1 |
+| 5 | 收到 `Deliver{delivery_id=d-4, batch=[11], through_seq=11, target=next_user_message, resume_session_id=ses-1}`（下行 `msg_seq=2`） | 追加 `accepted{11}` 并同步写入；日志成为跨代去重依据 |
+| 6 | 按日志去重：`11` 未被消费；先发出 `Accepted{d-4, 11, fed=true}`（上行 `msg_seq=1`），这条 `Deliver` 随即达到处理完成点；再以 `--resume ses-1` 按停止态启动 Claude Code，经本 Pod 套接字以 `AdoptAgent(pid)` 请求节点冻结代理把它移入 `agent` 子 cgroup，收到移入完成后让它继续，喂入事件 | 下行接收位置为 2，`next_msg_seq=2`；进程监督记录 `agent_pid=4101`、`agent_pgid=4101`；`agent_state.phase=starting`，随后转为 `in_turn` |
+| 7 | 驱动器观察到回合开始，发出 `turn_started{turn_id=turn-9, delivery_id=d-4}`（上行 `msg_seq=2`） | 追加 `consumed{11, turn-9}` 并同步写入；随后发出 `Consumed{11, turn-9}`（上行 `msg_seq=3`）；`next_msg_seq=4`，上行重放缓冲含序号 1 至 3 |
+| 8 | 控制面提交上行序号 1、2：`Accepted` 使 `cursor_accepted=11`，`turn_started` 使运行实例进入回合，`run.in_msg_seq=2`；对序号 2 的确认送达看守进程之前出站流断开，`Consumed`（序号 3）尚未提交。看守进程退避后重建传输，收到新的 `Challenge` 并校时，发出 `Hello` | `Hello.cursor_accepted=11`、`Hello.cursor_consumed=11`、`Hello.sandbox_config_revision=3`，`Hello.pending_intents` 携带尚未得到确认的 `accepted{11}`；控制面的 `cursor_accepted` 已为 11，`pending_intents` 不再推进它，再按 `Hello.cursor_consumed` 对齐 `cursor_consumed=11`，不重投 11，也不重发 `SandboxConfig`；`HelloAck.committed_msg_seq=2`；看守进程从上行重放缓冲裁去序号 1、2，新连接上下行接收位置为 0，按原序号重放 `Consumed`（上行 `msg_seq=3`），控制面按游标吸收这次重复 |
 
-走查结束时，沙箱侧日志含 `consumed{10, turn-8}`、`accepted{11}` 与 `consumed{11, turn-9}`；租约持有者为 `sb-6`；Agent 主进程 PID 为 4101；已应用的沙箱侧配置版本为 3。控制面因 `pending_intents` 与 `cursor_consumed` 的对账，不会把已消费的事件再次喂入。
+走查结束时，沙箱侧日志含 `consumed{10, turn-8}`、`accepted{11}` 与 `consumed{11, turn-9}`；租约持有者为 `sb-6`；Agent 主进程 PID 为 4101；已应用的沙箱侧配置版本为 3；`next_msg_seq=4`，上行重放缓冲在控制面确认序号 3 之后为空。控制面因 `Hello.cursor_consumed` 的对账，不会把已消费的事件再次喂入；`pending_intents` 只在 `Accepted` 尚未提交时推进 `cursor_accepted`，本例中 `Accepted` 已提交，它不改变游标；重放的 `Consumed` 沿用原序号，控制面只提交一次。
 
 **`Freeze{signal}` 降级路径。** 初始条件：运行实例 uid 为 2001，Agent 进程树 PID 为 101、103、104；收到 `PrepareSuspend{suspend_id=s-3, mode=freeze, variant=signal}`。
 
@@ -439,7 +527,7 @@ sequenceDiagram
 | 2 | 第二次扫描发现新 PID 105，发送 `SIGSTOP` | `stopped_pids={101,103,104,105}`、`scan_rounds=2`；未收敛 |
 | 3 | 第三次扫描无新 PID，且全部处于 T 态 | `scan_rounds=3`；连续无新 PID 的扫描计 1 次，未收敛 |
 | 4 | 第四次扫描无新 PID，且全部处于 T 态 | `scan_rounds=4`；连续两次扫描无新 PID，收敛；上报 `ReadyToSuspend{suspend_id=s-3, frozen_at, procs_remaining=0}` |
-| 5 | 收到 `Thaw{suspend_id=s-3}` | 对 `stopped_pids` 逐 PID 发送 `SIGCONT`；记录 `thawed=true`；上报 `Thawed{suspend_id=s-3}` |
+| 5 | 收到 `Thaw{freeze_id=s-3}` | 对 `stopped_pids` 逐 PID 发送 `SIGCONT`；记录 `thawed=true`；上报 `Thawed{freeze_id=s-3}` |
 | 6 | 若扫描轮次超过上限或截止到期 | 对已停止 PID 发送 `SIGCONT`，记录 `thawed=true`，回 `Busy{s-3, reason, retry_after}` |
 
 该路径不是原子操作：扫描期间新 fork 的进程会逃逸，需要下一轮补停；SIGCHLD 与定时器信号在停止过程中产生噪声。设计只允许它承载短冻结，长期冻结使用 `cgroup` 变体。
@@ -453,7 +541,7 @@ sequenceDiagram
 | 3 | 由 Agent 进程树各进程的 `/proc/<pid>/fd` 收集套接字 inode，按 inode 过滤 `/proc/net/tcp` 与 `/proc/net/tcp6`，得到 Agent 主进程到本地代理 LLM 端点的空闲连接、Agent 主进程到平台 MCP 服务器的连接与 `curl` 的隧道连接 `c-5`；按本地代理的连接用途记录，空闲连接为 `llm`、`c-5` 为 `external` | LLM 连接与平台 MCP 连接不检查；`c-5` 的 `rx_queue` 为 0；不发出 `conn.inbound` |
 | 4 | 冻结 40 s 后，隧道 `c-5` 从出口代理读到 1420 字节 | 本地代理照常把字节写入 Agent 侧连接，由套接字缓冲承接；`inbound_reported` 由假变真，发出 `conn.inbound{freeze_id=s-8}` |
 | 5 | 同一隧道再读到 310 字节 | `inbound_reported` 已为真，不重复发出；字节照常写入 Agent 侧连接 |
-| 6 | 收到 `Thaw{suspend_id=s-8}` | 关闭上游载荷检测；读到 `frozen=0` 后上报 `Thawed{suspend_id=s-8}`，记录 `thawed=true` |
+| 6 | 收到 `Thaw{freeze_id=s-8}` | 关闭上游载荷检测；读到 `frozen=0` 后上报 `Thawed{freeze_id=s-8}`，记录 `thawed=true` |
 | 7 | 收到 `Resumed{suspend_id=s-8, drain=false}` | `curl` 从套接字缓冲读到 1730 字节，继续处理事件流 |
 
 走查确认入站数据唤醒的结论。步骤 3 只检查 `c-5`：LLM 连接与平台 MCP 连接即使留有未读字节也不触发，它们的进展由 `llm.*` 事件与定向投递表达；进程树中若还有两端都属于 Agent 进程树的回环连接（例如后台作业启动的本地服务与其客户端之间的连接），步骤 3 同样排除，它们不是外部输入，其进展由活动度判据负责。`conn.inbound` 在步骤 4 发出且只发出一次，步骤 5 的后续载荷不产生第二条消息；控制面据此写唤醒信号并恢复运行实例，规则见 [runcontroller](../design-runcontroller.md)。看守进程不终止外部系统主机的 TLS，无法判断这 1420 字节是业务数据还是 TLS 层的保活帧，误唤醒按普通唤醒处理。冻结期间字节照常转发，不丢弃、不改写，解冻后由 Agent 自行读取。看守进程在整个过程中不终止 `t-2`。
@@ -466,7 +554,7 @@ sequenceDiagram
 2. 生成 Ed25519 [实例密钥](../../../glossary.md)，私钥只在进程内存，不写入任何文件或日志，快照恢复沿用同一密钥对；公钥指纹 `instance_jkt` 按 [ADR-run-token-audience-and-holder-binding](../../../adr/adr-run-token-audience-and-holder-binding.md) 的规则对公钥 JWK 计算。Substrate 路径上尚未领取的看守进程读到的 `actor-name` 与生成密钥时读到的不同时，先重新生成实例密钥再领取：随模板快照进入新 actor 的密钥只属于构建快照的 actor，不用于任何领取。
 3. 调用[引导接口](../../../glossary.md)的 `POST /v1/bootstrap/claim` 领取，请求体为 `{instance_key}`（实例公钥 JWK，不是凭据），调用方身份只来自 `Authorization` 头。领取未成功时按退避重试，退避从 1 s 起翻倍，上限 30 s；k8s 路径收到 `/wake`、Substrate 路径读到的 `actor-name` 发生变化时，尚未领取的看守进程立即领取一次，不受此前 401 或 404 的影响。Substrate 路径由 `actor-name` 变化触发的领取同时把退避重置为从 1 s 起：这次领取发生在 `wakeupProbe` 探测期间，actor 处于 `RESUMING`，出口网关已放行其出口连接，领取可以在 `ResumeActor` 返回之前成功；若领取仍未成功，重置后的退避使下一次重试约 1 s 后发出，不沿用随模板快照带入的退避间隔。401 停止退避重试，409 停止领取，410 使看守进程退出，处置见[错误与失败语义](#错误与失败语义)。
 4. 领取成功后，响应中按受众为键的令牌组 `tokens`（`runcontroller`、`llmgateway`、`connectorhub`、`humanchannel`、`egress`）、`lease_id` 与接入票据公钥集合 `access_ticket_keys` 只保存在进程内存，令牌组中各令牌的 `cnf.jkt` 等于本实例的 `instance_jkt`；响应中的 `generation` 与 `sandbox_id` 用于续约与 `Hello`。
-5. 首次 `RenewLease` 附用途为 `renew` 的持有证明，成功后发送附 `instance_key` 与用途为 `hello` 的持有证明的 `Hello`，其中 `sandbox_config_revision=0`。
+5. 首次 `RenewLease` 附用途为 `renew` 的持有证明；成功后建立出站流的传输，收到 `Challenge` 并校时，再发送附 `instance_key` 与用途为 `hello` 的持有证明的 `Hello`，其中 `sandbox_config_revision=0`。首次续约失败按[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)中首次续约失败的规则处理。
 6. 收到并应用 `SandboxConfig` 之后才启动 Agent 主进程；Agent 主进程由需要喂入事件的投递或 `StartAgent` 触发启动，启动步骤见[进程监督](#进程监督)。
 
 `Authorization` 头按提供者路径取值，两条路径的领取语义相同：
@@ -474,7 +562,12 @@ sequenceDiagram
 - k8s 路径：`Bearer <投射令牌>`。投射令牌是沙箱 Pod 专用 ServiceAccount 的令牌，audience 为 `castworks-bootstrap`、有效期 600 s，kubelet 在到期前替换令牌文件；看守进程每次领取前重新读取令牌文件，不缓存启动时读到的令牌：预热 Pod 在池中停留超过 600 s 时，启动时读到的令牌已过期，携带它领取会得到 401。令牌文件只允许看守进程读取，Agent 进程树以运行实例 uid 运行，读不到该文件。
 - Substrate 路径：占位符，出口网关把它替换为 audience 为 `castworks-bootstrap`、有效期 300 s 的 actor JWT。领取请求在出口网关处以 MITM 终止 TLS，看守进程以 `systemInfo` 卷 `trustBundle` 数据源投射的出口网关 CA（`egress-mitm.ate.dev`）校验网关出示的证书，并在每次领取时读取该文件：进程内存随模板快照进入新 actor，启动时加载的信任库会把构建快照时的 CA 带入所有新 actor。看守进程启动时读取 `systemInfo` 卷投射的 `actor-name` 作为初值；尚未领取时，每次 `/readyz` 被探测都重新读取，与上次读取不同即立即领取一次，不受此前领取失败（含 401）的影响；已领取的看守进程不再领取；快照恢复的是同一 actor，`actor-name` 不变，看守进程不重新领取。看守进程按 `sandbox_facing_endpoints` 中 `bootstrap` 条目的地址连接引导接口主机，不经 DNS 解析。构建模板快照的 actor 没有引导记录，也没有 `sandboxprovider` 落地的 EgressPolicy，领取不会成功：没有出口策略的 actor 发往引导接口主机的连接被出口网关以 403 拒绝，或在请求到达引导接口时因 `Authorization` 仍是占位符而得到 401。看守进程停在等待领取的状态，该状态随模板快照进入从它恢复的新 actor，新 actor 被探测时读到自己的 `actor-name`，先重新生成实例密钥，再立即领取一次，未成功时按从 1 s 起的退避重试。
 
-[持有证明](../../../glossary.md) `holder_proof{iat, sig}` 由看守进程在每次 `Hello` 与 `RenewLease` 时重新生成：`iat` 为当前 Unix 秒，`sig` 为实例私钥对 UTF-8 文本 `castworks-holder-proof\n<用途>\n<标识>\n<generation>\n<sandbox_id>\n<iat>` 的 Ed25519 签名（base64url），用途为 `hello` 时标识取 `run_id`，为 `renew` 时取 `lease_id`。接收方要求 `|now − iat| ≤ T_proof_skew`（60 s）；看守进程在快照恢复后先校时，再发 `Hello` 与 `RenewLease`。取得令牌组或 `lease_id` 而不持有实例私钥的一方，签不出被接受的持有证明。
+[持有证明](../../../glossary.md)由看守进程在每次 `Hello` 与 `RenewLease` 时重新生成，`sig` 为实例私钥对 UTF-8 签名文本的 Ed25519 签名（base64url），签名文本由 `agentprotocol` 的 `HolderProofMessage(purpose, id, generation, sandboxID, binding)` 生成：
+
+- `Hello.holder_proof{nonce, sig}`：签名文本为 `castworks-holder-proof\nhello\n<run_id>\n<generation>\n<sandbox_id>\n<nonce>`，`nonce` 取本流 `Challenge.nonce` 的原值。控制面核对 `nonce` 等于本流发出的值，一条流的 `nonce` 只能使用一次；这一证明没有时窗，不依赖沙箱时钟。
+- `RenewLease` 的持有证明 `{iat, sig}`：签名文本为 `castworks-holder-proof\nrenew\n<lease_id>\n<generation>\n<sandbox_id>\n<iat>`，`iat` 为校时后的当前 Unix 秒（十进制）。`workspace` 要求 `|now − iat| ≤ T_proof_skew`（60 s），时窗不符时以 `proof_time_skew` 拒绝并在错误详情的 `server_now` 中返回服务端当前时刻，看守进程据此校时后重试，周期续约与首次续约的重试规则见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)。
+
+取得令牌组或 `lease_id` 而不持有实例私钥的一方，签不出被接受的持有证明。
 
 同一沙箱实例至多领取成功一次。领取成功之前，看守进程不以运行实例 uid 启动任何进程：Agent 主进程、`/terminal` 的 shell、第三方 MCP 服务器与 `ToolExec.exec` 命令都在领取成功之后才启动，`/terminal` 与 `/files` 在此之前返回 503。Substrate 路径的出口网关为 actor 内任何进程携带占位符头的请求注入 actor JWT，领取之前存在的运行实例 uid 进程都可能抢先领取；领取成功之后，运行实例 uid 下的进程即使请求引导接口也拿不到令牌，运行实例令牌因而只由看守进程持有（I6）。领取的契约见 [sandboxprovider](../sandboxprovider/design-sandboxprovider.md#引导接口)，各响应的处置见[错误与失败语义](#错误与失败语义)。
 
@@ -529,13 +622,85 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 
 ### 出站流建立、重连与状态对账
 
-看守进程运行时始终维持一条主动外连 `runcontroller` 的 gRPC 双向流。流建立顺序为：领取成功；首次 `RenewLease` 成功；发送 `Hello`；处理 `HelloAck`；按 `desired_state` 决定是否恢复 Agent 执行。`HelloAck{accepted}` 之后，控制面保存的沙箱侧配置版本大于 `Hello.sandbox_config_revision` 时在该流上发送 `SandboxConfig`；运行实例的沙箱侧配置在流已接受期间更新时，控制面立即在该流上发送。`HelloAck` 的 `accepted` 表示接管成功，`fenced{current_generation}` 表示本代已过期，`Shutdown` 表示运行实例已终态或本代作废；令牌签名、受众、`run_id` 或代不符，`instance_key` 的指纹与令牌的 `cnf.jkt` 或租约的 `holder_jkt` 不符，持有证明的签名或时窗无效，或令牌到期时刻低于控制面记录的可接受下界时，控制面以不可重试认证失败关闭流，不回 `HelloAck`，看守进程停止重连并上报。
+看守进程运行时始终维持一条主动外连 `runcontroller` 的 gRPC 双向流，按 `T_keepalive` 与 `T_keepalive_timeout` 开启 gRPC keepalive。每条连接的建立顺序为：建立传输；收到 `Challenge{nonce, server_now}` 并以 `server_now` 校时；发送 `Hello`；处理 `HelloAck`；从 `HelloAck.committed_msg_seq` 之后重放上行重放缓冲，重放完成后再发送此后分配的消息；按 `desired_state` 对齐 Agent 执行（规则见下）。启动时这一顺序排在领取成功与首次 `RenewLease` 成功之后，快照恢复与长时间冻结之后排在首次 `RenewLease` 成功之后；首次续约以不可重试错误失败时的例外见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)。控制面在 `Hello` 被接受之前发出的握手帧与关闭帧，信封的 `run_id` 为空、`generation` 为 0，`Hello` 被接受之后的关闭帧填实际值；看守进程对握手帧与关闭帧都不校验信封的 `run_id` 与 `generation`，其余信封字段按 [agentprotocol](../design-agentprotocol.md#信封) 的信封规则校验。握手期间控制面可以发关闭帧代替 `HelloAck`：令牌签名、受众、`run_id` 或代不符，`instance_key` 的指纹与令牌的 `cnf.jkt` 或租约的 `holder_jkt` 不符，持有证明的 `nonce` 或签名无效，或令牌到期时刻低于控制面记录的可接受下界时，控制面发 `Close{state=auth_failed}`，不回 `HelloAck`；各关闭帧的处理见[关闭帧的处理](#关闭帧的处理)。
 
-断连后的重连：按退避重试；重连后重放未确认的发出消息；接收方按 `(generation, msg_seq)` 去重；`Hello` 携带重新签名的持有证明、`last_received_msg_seq`、`cursor_accepted`、`cursor_consumed`、`pending_intents`、`agent_state` 与 `sandbox_config_revision`，`HelloAck` 返回控制面的 `last_received_msg_seq`、游标与实时接入状态；双方以对方的 `last_received_msg_seq` 裁剪重放缓冲，并据此对账。可重试关闭（例如依赖调用失败）不终止 Agent 进程树；`Fenced` 与 `Shutdown{graceful=false}` 要求停止投递与副作用，并对 Agent 进程树执行强制终止。
+`Hello` 携带以本流 `Challenge.nonce` 签名的持有证明、看守进程支持的连续协议版本区间 `versions{min, max}` 与能力标识 `capabilities[]`（当前版本没有已定义的能力标识），以及由 `agent_state`、`cursor_accepted`、`cursor_consumed`、`pending_intents` 与 `sandbox_config_revision` 组成的状态摘要；信封的 `ack_msg_seq` 恒为 0。看守进程在发送 `Hello` 之前，让上一条连接上尚未达到处理完成点的下行消息处理到完成点或中止（见[下行消息的处理完成点](#下行消息的处理完成点)），状态摘要因而反映它。`HelloAck{accepted}` 返回本代的 `protocol_version` 与 `capabilities[]`，看守进程此后按该版本编码确认帧、遥测帧与应用消息，只使用其中列出的能力，同代内这两项不变；握手帧与关闭帧的格式不随版本变化。`HelloAck{accepted}` 之后，控制面保存的沙箱侧配置版本大于 `Hello.sandbox_config_revision` 时在该流上发送 `SandboxConfig`；运行实例的沙箱侧配置在流已接受期间更新时，控制面立即在该流上发送。
+
+`HelloAck{accepted}` 之后，看守进程按 `active_suspend_id` 了结本地的挂起尝试，按 `desired_state` 对齐 Agent 进程树的冻结状态，规则如下：
+
+- 当前挂起尝试（最近登记的[挂起尝试记录](#挂起尝试记录)）已就绪，且其 `ReadyToSuspend` 已被控制面提交（`response_msg_seq` 不大于 `HelloAck.committed_msg_seq`）时，看守进程比较 `HelloAck.active_suspend_id` 与该尝试的 `suspend_id`。相等表示控制面仍在推进该尝试，例如提供者的冻结、快照或销毁调用尚未返回，或冻结已经落地：看守进程保持该尝试，本地代理不交付缓冲内容，看守进程不自行解冻，冻结状态按 `desired_state` 对齐。为空表示控制面已以 `Resumed` 结束或已中止该尝试，且没有新的尝试，`Resumed` 随断开的连接丢失：看守进程结束该尝试并恢复 Agent 执行，`signal` 变体对冻结执行记录中尚未解冻的 PID 发送 `SIGCONT` 并记 `thawed=true`，该尝试按收到 `Resumed{drain=false}` 处理，本地代理交付缓冲内容；Agent 主进程已因销毁模式退出时不重新启动它。`drain=true` 的 `Resumed` 由 `runcontroller` 在接受 `Hello` 时重新产生。非空而不等于该尝试表示控制面的新尝试已经取代它，例如冻结中升级在解冻之后以新的 `suspend_id` 继续挂起：看守进程结束该尝试，做法与登记新的挂起尝试时结束此前 `ready` 的尝试相同（见[冻结与解冻](#冻结与解冻)），写入 `superseded_by=HelloAck.active_suspend_id`，不按 `Resumed` 处理，本地代理此时不交付缓冲内容，缓冲内容留到取代者了结时交付，冻结状态按 `desired_state` 与随后的 `Thaw`、`PrepareSuspend` 对齐。
+- 进行中的尝试，以及 `ReadyToSuspend` 尚未提交的已就绪尝试，不按 `HelloAck` 改变：控制面仍在等待该尝试的应答，由重新产生的 `PrepareSuspend` 或 `CancelSuspend` 按[冻结与解冻](#冻结与解冻)中的规则了结。
+- `desired_state=frozen`：不恢复 Agent 执行，直到收到 `Thaw` 或新的恢复消息。`desired_state=running`：控制面不要求 Agent 进程树保持冻结；保持中的尝试的冻结仍由控制面此后发出的 `Thaw` 解除。
+- 按上述规则或此后的 `Thaw` 恢复 Agent 执行时，都不向背压冻结仍在停止的 PID 发送 `SIGCONT`，这些进程等背压冻结解除时再继续，见[出站流背压](#出站流背压)。
+
+上行应用消息的序号作用域为本代：`Send` 在任何连接状态下（未连接、握手中、重放中）都分配从 1 起严格递增的 `msg_seq` 并写入上行重放缓冲，只是在连接可用且重放完成之前暂不发送；窗口满是唯一不分配序号的情形，见[出站流背压](#出站流背压)。控制面以信封 `ack_msg_seq` 或 `Ack` 确认已提交的上行序号，看守进程据此释放上行重放缓冲；流重建后按 `HelloAck.committed_msg_seq` 裁剪，从其后按原序号、原内容重放。
+
+下行应用消息的序号作用域是一条已接受的连接：每条新连接上看守进程把下行接收位置重置为 0，上一条连接的下行接收状态全部丢弃，下行消息不跨连接重放，仍然需要的由 `runcontroller` 在接受 `Hello` 时重新产生。接收规则以 [agentprotocol](../design-agentprotocol.md#接收规则) 为准：`msg_seq` 不大于下行接收位置的帧丢弃并重发确认，等于接收位置加一的帧派发，大于它的帧是序号缺口，按协议违规处理。下行消息串行处理，前一条达到处理完成点之后才派发下一条，处理完成点与处理失败的处置见[下行消息的处理完成点](#下行消息的处理完成点)。看守进程以信封 `ack_msg_seq` 确认本连接上已达到处理完成点的下行连续前缀；没有上行应用消息可搭载时在 `T_ack` 之内发 `Ack`，未确认的下行条数达到 `W_replay_msgs` 的一半时立即发。
+
+重连的退避从 `T_reconnect_min` 起每次翻倍，带抖动，不超过 `T_reconnect_max`；`/wake` 触发的重建不等退避。没有收到任何关闭帧而流结束，一律按传输中断处理；传输中断与 `Close{state=retryable}` 都不终止 Agent 进程树。
 
 令牌轮换：首个令牌组来自领取，此后的令牌组来自 `TokenRotate`。`Hello` 中令牌已过期或临近到期而签名、代、租约与持有证明校验通过时，控制面在同一事务写 `TokenRotate`；已过期的令牌只在同一沙箱实例延续或快照恢复的状态下被接受，接受条件归 [runcontroller](../design-runcontroller.md)。看守进程收到 `TokenRotate` 后整体替换本地令牌组与接入票据公钥集合，新令牌组的 `cnf.jkt` 不变。替换之前，看守进程不向 `llmgateway`、`connectorhub`、`humanchannel` 与平台出口代理发请求，以免使用过期令牌。
 
-`Activity` 按固定周期发送，与流是否刚重连无关；控制面以样本判断忙闲与冻结状态。`Shutdown{graceful=true}` 时看守进程停止接受新的 `Deliver`，按正常退出路径关闭 Agent，并在 `deadline` 之前结束；`Shutdown{graceful=false}` 时直接终止进程树。
+`Activity` 是遥测帧，按 `T_activity` 采样，只在已建立的流上发送，未连接、握手中都丢弃当期样本，不等待上行消息的重放，规则见[活动度采集](#活动度采集)。
+
+### 下行消息的处理完成点
+
+下行应用消息串行处理：前一条达到[处理完成点](#术语表)之后，看守进程才推进下行接收位置、确认它并派发下一条。各消息的处理完成点如下表；耗时的动作在完成点之后继续，与此后下行消息的处理并行，结果以此后的上行应用消息上报。完成点之后的动作失败不撤回确认，按该动作的失败语义处理。
+
+| 消息 | 处理完成点 | 完成点之后继续的动作 |
+| --- | --- | --- |
+| `Deliver` | 首次应用沙箱侧配置之前：暂存。此后：批次所需的 `accepted{seq}` 同步写入并发出 `Accepted`，或发出 `DeliveryFailed` | 按 `target` 喂入 Agent（需要时启动 Agent 主进程）、观察回合开始、写 `consumed` 并发出 `Consumed`，见[投递处理与投递意图日志](#投递处理与投递意图日志) |
+| `StartAgent` | 首次应用沙箱侧配置之前：暂存。此后：核对到 Agent 主进程已在运行或已登记为启动中，或以停止态创建 Agent 主进程并登记为启动中 | `AdoptAgent` 与让进程继续执行；启动失败以 `turn_ended{agent_exited=true}` 上报，见 [StartAgent 的处理](#startagent-的处理) |
+| `SandboxConfig` | 按 `revision` 应用并以原子替换生效，或忽略不大于已应用版本的配置 | 首次应用之后按到达顺序处理暂存的 `Deliver` 与 `StartAgent` |
+| `PrepareSuspend` | 按[挂起尝试记录](#挂起尝试记录)登记新尝试并开始动作、附着到进行中的尝试，或发出重发与拒绝的应答 | 前置条件核对、冻结、等待 Agent 退出与持久化确认；结果以 `ReadyToSuspend` 或 `Busy` 上报，见[冻结与解冻](#冻结与解冻) |
+| `CancelSuspend` | 按挂起尝试记录中止尚未越过不可撤销点的动作、记下取消墓碑并发出 `Busy{reason=cancelled}`，或重发已有应答；已越过不可撤销点的进行中尝试只核对，不改变 | 已越过不可撤销点的尝试照常完成并应答 |
+| `Thaw` | 关闭上游载荷检测；`signal` 变体另向冻结执行记录中尚未解冻的 PID 发送 `SIGCONT`（背压冻结仍在停止的除外）、记 `thawed=true` 并发出 `Thawed` | `cgroup` 变体读到 `agent/cgroup.events` 的 `frozen=0` 后发出 `Thawed` |
+| `Resumed` | 挂起尝试转为已结束；`drain=true` 时记下 DRAIN 标志；通知本地代理交付缓冲内容 | DRAIN 下等待中的调用按规则返回；本地代理交付缓冲内容 |
+| `LiveState` | 按 `as_of` 更新实时接入状态 | 无 |
+| `TokenRotate` | 整体替换进程内存中的令牌组与接入票据公钥集合 | 无 |
+| `ToolExecRequest` | 按 [ToolExec 执行记录](#toolexec-执行记录)登记并开始执行、附着到已有执行，或重发已记录的应答，或以 `exec_id_conflict` 应答 | 执行、输出分片与终态应答，见 [ToolExec 与文件访问](#toolexec-与文件访问) |
+| `ToolExecCancel` | 按执行记录发出终止信号或停止发送，或为尚无记录的 `exec_id` 记下 `cancelled` 应答并发出 | 进程退出后发出 `cancelled` 应答 |
+
+发送 `Hello` 之前，上一条连接上尚未达到处理完成点的处理或者继续到完成点，或者中止。中止只针对尚未达到处理完成点的处理：放弃本次处理、不确认，由 `runcontroller` 在接受 `Hello` 时按持久化状态重新产生；已产生的局部效果由该消息的幂等标识吸收，例如已追加的 `accepted{seq}` 条目按首次出现为准。已达到处理完成点的消息不受连接中断影响，完成点之后的动作照常进行：进行中的挂起尝试跨重连继续，重新产生的同一 `suspend_id` 的 `PrepareSuspend` 附着到它；进行中的 `ToolExec` 执行同样继续，重新发出的同一 `exec_id` 的请求附着到它。
+
+处理一条下行消息在达到完成点之前失败时，看守进程不确认该消息，主动断开连接并退避重连，该消息由控制面在下一次接受 `Hello` 时按持久化状态重新产生；`Deliver` 写投递意图日志失败以 `DeliveryFailed` 应答，不在此列。
+
+### 校时
+
+看守进程对外使用的时刻都取本地单调时钟加时钟偏移，包括 `RenewLease` 持有证明的 `iat`、`Activity.sampled_at` 与样本中的其他时刻、`ReadyToSuspend.frozen_at`、`ToolExecRequest.deadline` 的比较，以及自唤醒条目 `fire_at` 等由本地时刻换算的时刻。时钟偏移为服务端时刻减本地单调时钟：每次收到 `Challenge` 时以 `server_now` 重新计算；收到首个 `Challenge` 之前以本地墙钟初始化；`RenewLease` 以 `proof_time_skew` 被拒时以错误详情中的 `server_now` 重新计算。`Resumed.wall_clock_now` 只用于核对：它与校时后的当前时刻之差超过 `T_proof_skew` 时计数告警，不据以修改偏移。
+
+快照恢复与长时间冻结之后，看守进程按固定顺序恢复：先调用 `RenewLease`，以 `proof_time_skew` 被拒时按错误详情中的 `server_now` 校时后重试（连续被拒时按可重试错误退避重试，见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)），这一步同时完成校时；续约成功、租约持有者恢复为本沙箱之后重建出站流的传输；收到 `Challenge` 并按 `server_now` 再校时；发送 `Hello`。首次续约成功之后才发 `Hello` 的规则对初次领取之后、快照恢复与长时间冻结之后同样适用，唯一的例外是首次续约以不可重试错误失败，见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)；快照恢复后的其余处理见[快照恢复后的校时与连接清理](#快照恢复后的校时与连接清理)。
+
+### 出站流背压
+
+窗口按 [agentprotocol](../design-agentprotocol.md) 的定义计：上行重放缓冲中的条数达到 `W_replay_msgs` 或编码字节数达到 `W_replay_bytes` 时窗口满，`Send` 返回背压错误，不分配序号。看守进程把此时产生的上行应用消息放进[待发队列](#术语表)；待发队列非空期间新产生的消息同样入队，窗口回收后按入队顺序分配序号发送，消息的相对顺序因而不变。出站流背压只涉及出站流的窗口，与[本地代理](design-warden-llmproxy.md)在 LLM 流式转发中对上游连接施加的背压无关。
+
+待发队列里下列消息只保留最新值，其余消息全部保留并保持相对顺序：
+
+- `bg_jobs_changed`：只留最新一条。
+- `self_wake_changed`：`crons_synced=true` 的新集合替换队列里此前全部 `self_wake_changed`；`crons_synced=false` 的与队列里前一条 `self_wake_changed` 按协议的合并规则合成一条：`entries` 取新一条的非 `cron` 条目，加上两条的 `cron` 条目按 `entry_id` 合并、新一条覆盖，`crons_synced` 取前一条的取值。接收方处理合成后的一条，与依次处理两条的结果相同。
+- `intent_observed`：按 `(ref_kind, ref)` 只留最新一条。
+- `llm.first_token`：不进入待发队列，窗口满时产生的直接丢弃。
+
+被取代的较早消息从队列中删除，新消息照常排在队尾。
+
+待发队列的编码字节数达到 `Q_pending_bytes` 时，看守进程对 Agent 进程树执行[背压冻结](#术语表)，使其不再产生事件；队列降到 `Q_pending_bytes` 的一半以下时解除。背压冻结由看守进程自行发起和解除，不经控制面，执行方式与 `Freeze{signal}` 相同：按运行实例 uid 扫描 `/proc` 并迭代 `SIGSTOP`，解除时对它停止的 PID 发送 `SIGCONT`。背压冻结期间 `Activity.frozen_by=backpressure`；`Activity.frozen` 与 `freeze_id` 只反映挂起冻结，不因背压冻结改变，两种冻结可以同时成立。控制面不把背压冻结判定为本代沙箱作废，`suspendpolicy` 把 `frozen_by=backpressure` 的样本作为忙信号，不据以挂起（[suspendpolicy](../design-suspendpolicy.md#静止证据与忙信号)）；背压冻结不登记冻结执行记录，也不写入 `Hello.agent_state` 的冻结字段。背压冻结与冻结类挂起尝试的冻结同时存在时，任一方解除都不让另一方停止的进程继续：解除背压冻结时，不向 `signal` 变体冻结执行记录中尚未解冻的 PID 发送 `SIGCONT`；执行 `Thaw`、按 `HelloAck.active_suspend_id` 结束挂起尝试而恢复 Agent 执行或取消进行中的 `signal` 变体冻结时，都不向背压冻结仍在停止的 PID 发送 `SIGCONT`，`cgroup` 变体解冻后这些进程保持停止态，直到背压冻结解除。
+
+### 关闭帧的处理
+
+关闭帧的格式与关闭状态闭集由 [agentprotocol](../design-agentprotocol.md) 定义。看守进程按下表处理；表中的强制终止指对 Agent 进程树发送 `SIGTERM`、杀死 Bash 进程树并执行 `SessionEnd` hook，退出见[退出原因](#退出原因)。
+
+| 关闭帧 | 看守进程的动作 |
+| --- | --- |
+| `HelloAck.fenced{current_generation, reason}`、`Fenced{current_generation, reason}` | 停止投递与副作用，停止工作区写入，强制终止 Agent 进程树，不再重连，以 `fenced` 退出；`reason` 写入日志 |
+| `Shutdown{graceful=true, reason, deadline}` | 停止接受新的 `Deliver`，关闭 Agent 的 stdin，按正常退出路径结束 Agent，`deadline` 到达仍未退出时强制终止；Agent 结束之后停止工作区写入，不再重连，以 `shutdown` 退出 |
+| `Shutdown{graceful=false, reason}` | 停止投递，停止工作区写入，强制终止 Agent 进程树，不再重连，以 `shutdown` 退出 |
+| `Close{state=retryable, reason, retry_after}` | 不终止 Agent 进程树，保留上行重放缓冲；在 `retry_after` 之前不重连，此后按退避重连；当前副本不支持本代协议版本时同样以它关闭，重连可落到其他副本 |
+| `Close{state=auth_failed, reason}` | 停止工作区写入，强制终止 Agent 进程树，不再重连，以 `auth_failed` 退出 |
+| `Close{state=version_unsupported, supported{min, max}}` | 停止工作区写入，强制终止 Agent 进程树，不再重连，以 `version_unsupported` 退出；`supported` 写入日志 |
+| `Close{state=protocol_violation, reason, msg_seq}` | 停止工作区写入，强制终止 Agent 进程树，不再重连，以 `protocol_violation` 退出 |
+
+看守进程自己判定控制面协议违规时（例如下行序号缺口、下行消息无法按本代协议版本解码），先发 `Close{state=protocol_violation, reason, msg_seq}`（流可用时），`msg_seq` 为触发违规的下行帧序号，没有时为 0，再按上表最后一行处理。上行重放缓冲与待发队列随进程退出丢弃，控制面在新代按状态对账继续。
 
 ### 投递处理与投递意图日志
 
@@ -544,7 +709,7 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 1. 校验信封的代与当前代一致；不一致时丢弃并计入旧代拒绝。
 2. 对批次中的每个 `inbox_seq`，若日志中已有 `consumed` 条目则跳过；否则追加 `accepted{seq}` 并同步写入。同步写入失败时不回 `Accepted`、不喂事件，回 `DeliveryFailed{retryable=true}`。
 3. 按日志去重后若没有需要喂入的事件，回 `Accepted{delivery_id, through_seq, fed=false}`，不为本批启动 Agent。
-4. 若存在需要喂入的事件，先回 `Accepted{delivery_id, through_seq, fed=true}`，再按 `target` 翻译为 Agent 原生输入：`next_user_message` 作为下一条用户消息，`tool_result{call_id}` 作为工具结果，`permission_decision{id, input_hash}` 作为权限决定，`input_hash` 为[审批内容摘要](../../../glossary.md)，驱动器在交付决定前按当前工具输入重算并比对。
+4. 若存在需要喂入的事件，先回 `Accepted{delivery_id, through_seq, fed=true}`，再按 `target` 翻译为 Agent 原生输入：`next_user_message` 作为下一条用户消息，`tool_result{call_id}` 作为工具结果，`permission_decision{id, input_hash}` 作为权限决定，`input_hash` 为[审批内容摘要](../../../glossary.md)，驱动器在交付决定前以首次 `PreToolUse` 所用的同一规范编码函数 `CanonicalJSON` 按当前工具输入重算并比对，工具输入无法规范编码时拒绝该次调用，见 [Claude Code 驱动器](design-warden-driver-claude-code.md#审批路径)。
 5. 对 `target=next_user_message` 的常规投递，观察到 `turn_started` 后追加 `consumed{seq, turn_id}` 并同步写入，写入成功后才发 `Consumed{through_seq, turn_id}`。定向投递与回合边界续接的消费只写日志，不发 `Consumed`。Agent 自行开始的回合（会话内定时触发的回合、任务通知回合）不对应投递，`turn_started.delivery_id` 为空，不写 `consumed` 条目。
 6. 目标等待点在沙箱内已失效（调用的 `tool_ended` 已发出、hook 已返回）时，回 `DeliveryFailed{reason=target_gone}`；控制面把事件回退为常规投递。
 
@@ -552,13 +717,40 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 
 ### 冻结与解冻
 
-`PrepareSuspend` 携带 `suspend_id`、`mode`、`variant`、`deadline`、`self_wake_cutoff` 与 `require{process_exit, no_bg_procs, no_ws_write_fds, sync}`；`self_wake_cutoff` 只在 `mode=destroy` 时非空，用于安全点的自唤醒条目检查，见[进程监督](#进程监督)。看守进程先核对 `require` 列出的前置条件：`process_exit` 要求 Agent 已正常退出；`no_bg_procs` 要求后台作业集合为空（静止冻结时控制面将其置为假，取值见 [runcontroller](../design-runcontroller.md)）；`no_ws_write_fds` 要求进程树没有工作区写文件描述符；`sync` 要求工作区持久化确认完成。任一不满足时回 `Busy{suspend_id, reason, retry_after}`，看守进程不为满足前置条件终止后台作业、残留进程或孤儿进程。
+`PrepareSuspend` 携带 `suspend_id`、`mode`、`variant`、`deadline`、`self_wake_cutoff` 与 `require{process_exit, no_bg_procs, no_ws_write_fds, sync}`；`self_wake_cutoff` 只在 `mode=destroy` 时非空，用于安全点的自唤醒条目检查，见[进程监督](#进程监督)。看守进程先核对 `require` 列出的前置条件：`process_exit` 要求 Agent 已正常退出；`no_bg_procs` 要求后台作业集合为空（静止冻结时控制面将其置为假，取值见 [runcontroller](../design-runcontroller.md)）；`no_ws_write_fds` 要求进程树没有工作区写文件描述符；`sync` 要求工作区持久化确认完成。任一不满足时回 `Busy{suspend_id, reason, retry_after}`，看守进程不为满足前置条件终止后台作业、残留进程或孤儿进程。冻结类模式随后按 `variant` 执行，见下文；`mode=destroy` 的正常退出路径见[进程监督](#进程监督)。
 
-`Freeze{cgroup}`：看守进程不写 cgroup，只上报 `ReadyToSuspend`；节点冻结代理在收到控制面的冻结调用后写 `agent/cgroup.freeze`；控制面以冻结确认作为 `Suspended` 的依据。看守进程轮询 `agent/cgroup.events`，读到 `frozen=1` 时写 `confirmed_at`，随即执行[入站数据唤醒](#入站数据唤醒)的接收队列检查并开启上游载荷检测。收到 `Thaw{suspend_id}` 后，看守进程读取 `agent/cgroup.events` 的 `frozen` 字段，观察到未冻结即上报 `Thawed{suspend_id}`；进程树从未冻结时立即上报。该变体由节点冻结代理解冻，看守进程在读到 `frozen=0` 或收到 `Thaw` 时关闭上游载荷检测，以先到者为准；两者之间到达的载荷可能产生一条迟到的 `conn.inbound`，控制面只在冻结类挂起尝试进行中或处于冻结态时据此唤醒，见 [runcontroller](../design-runcontroller.md)。
+看守进程按 `suspend_id` 维护[挂起尝试记录](#挂起尝试记录)。`PrepareSuspend` 的处理完成点是登记挂起尝试并开始动作（见[下行消息的处理完成点](#下行消息的处理完成点)）：前置条件核对、冻结、等待 Agent 退出与等待持久化确认都在完成点之后继续，`ReadyToSuspend` 与 `Busy` 异步上报；动作进行期间，`CancelSuspend`、`Thaw`、`Deliver` 与 `TokenRotate` 等下行消息照常派发。进行中的尝试不因连接中断而中止。收到 `PrepareSuspend{suspend_id}` 时按该标识的记录处理，规则穷举如下：
 
-`Freeze{signal}`：按运行实例 uid 扫描 `/proc`，对不在 `stopped_pids` 中的 PID 发送 `SIGSTOP`，直到连续两次扫描没有新 PID 且全部处于 T 态；每轮扫描后记录 `scan_rounds`。轮次上限由 `suspendpolicy` 的冻结参数给出；超限或截止到期时对已停止 PID 发送 `SIGCONT`，记录 `thawed=true`，回 `Busy{suspend_id, reason, retry_after}`。收敛后写 `confirmed_at`，上报 `ReadyToSuspend{suspend_id, frozen_at, procs_remaining}`，再执行接收队列检查并开启上游载荷检测。收到 `Thaw{suspend_id}` 后先关闭上游载荷检测，再对 `stopped_pids` 发送 `SIGCONT`，上报 `Thawed`。
+| 挂起尝试记录的 `state` | `PrepareSuspend` 的处理 |
+| --- | --- |
+| 没有记录 | 登记为 `preparing` 并开始动作 |
+| `preparing` | 附着到进行中的尝试，不重新开始；动作完成后只应答一次 |
+| `ready` | 重发同一 `ReadyToSuspend`，不重新执行动作 |
+| `busy` | 重发同一 `Busy`，不重新评估前置条件 |
+| `cancelled`（取消墓碑） | 不执行，回 `Busy{suspend_id, reason=cancelled}` |
+| `ended` | 不执行，回 `Busy{suspend_id, reason=cancelled}` 并计数 |
 
-`CancelSuspend`：未越过不可撤销点时回 `Busy{suspend_id, reason=cancelled}`；已越过时照常回 `ReadyToSuspend`，由控制面处理迟到应答。两种变体都以 `freeze_id` 幂等：已执行过解冻的标识不再接受冻结，迟到的冻结请求不生效；缩小请求的幂等由 `sandboxprovider` 按同一标识维护。
+重发沿用首次应答的内容，分配新的上行序号，控制面按 `suspend_id` 吸收重复。`busy` 的尝试不重新评估：控制面只在尚未提交这条 `Busy` 时再次发出同一 `suspend_id` 的 `PrepareSuspend`（重连后的重新产生与待就绪阶段截止时的重驱动都是如此），这条 `Busy` 已在上行重放缓冲或待发队列中，按上行顺序先于任何新应答到达控制面，控制面据它结束该尝试；重新评估得出的就绪应答对控制面已经过时，`signal` 变体的重新冻结还会让 Agent 进程树在 `Active` 中处于冻结。
+
+不可撤销点：`mode=destroy` 时为关闭 Agent 的 stdin（[Claude Code 驱动器](design-warden-driver-claude-code.md#安全点)的第 8 步），其余模式为发出 `ReadyToSuspend`。越过之前的动作都可以撤回：关闭 stdin 之前的安全点步骤与 `snapshot` 的前置条件都只是核对与等待，`signal` 变体已停止的进程可以由 `SIGCONT` 恢复。收到 `CancelSuspend{suspend_id}` 时按该标识的记录处理，规则穷举如下：
+
+| 挂起尝试记录的 `state` | `CancelSuspend` 的处理 |
+| --- | --- |
+| 没有记录、`busy` 或 `ended` | 回 `Busy{suspend_id, reason=cancelled}`，记录转为取消墓碑（没有记录时新建） |
+| `preparing`，尚未越过不可撤销点 | 中止动作：停止核对与等待，`signal` 变体对冻结执行记录中已停止的 PID 发送 `SIGCONT`（背压冻结仍在停止的除外）并记 `thawed=true`；回 `Busy{suspend_id, reason=cancelled}`，记录转为取消墓碑 |
+| `preparing`，已越过不可撤销点 | 不中止；动作完成后照常回 `ReadyToSuspend` 或 `Busy`，控制面按迟到应答处理 |
+| `ready` | 重发同一 `ReadyToSuspend`，控制面按迟到应答处理 |
+| `cancelled`（取消墓碑） | 重发 `Busy{suspend_id, reason=cancelled}` |
+
+取消墓碑保留到本代结束，代变化时随沙箱重建丢弃。`runcontroller` 以 `Busy{reason=cancelled}` 清空回退的尝试，包括看守进程从未收到其 `PrepareSuspend` 的尝试（见 [runcontroller](../design-runcontroller.md)）；墓碑使此后到达的同一 `suspend_id` 的 `PrepareSuspend` 不再执行。
+
+挂起尝试在下列情形转为 `ended`：收到该尝试的 `Resumed`；登记新的挂起尝试时，此前处于 `ready` 的尝试随之结束（冻结中升级以新的 `suspend_id` 发起，旧尝试的冻结已由 `Thaw` 解除）；重连后 `HelloAck.active_suspend_id` 不等于它时，按[出站流建立、重连与状态对账](#出站流建立重连与状态对账)的规则结束 `ReadyToSuspend` 已提交的 `ready` 尝试（为空时按收到 `Resumed{drain=false}`，非空时按新尝试取代旧尝试）。因被取代而结束的尝试写入 `superseded_by`，此时不通知本地代理交付缓冲内容：取代者准备期间 Agent 保持在被挂起时的等待之中，缓冲内容留到取代者了结时交付。取代者收到 `Resumed`，或重连时按收到 `Resumed{drain=false}` 结束，按 `Resumed` 的规则交付；取代者以 `Busy` 了结时控制面回到 `Active`，不为任何尝试发 `Resumed`，因此某个 `suspend_id` 由 `preparing` 转为 `busy` 或取消墓碑，或看守进程为没有记录的 `suspend_id` 新建取消墓碑时，若存在 `superseded_by` 等于它的记录，看守进程在发出这条 `Busy` 时通知本地代理交付缓冲内容。转为 `ended` 不删除冻结执行记录：`cgroup` 变体的冻结与解冻由节点冻结代理执行，看守进程照常观察，并按 `freeze_id` 应答 `Thaw`。`ended` 或没有记录的 `suspend_id` 收到 `Resumed` 时，看守进程只按 `drain` 记下 DRAIN 标志并通知本地代理交付缓冲内容。`preparing` 的尝试尚未应答时到达另一 `suspend_id` 的 `PrepareSuspend`，新尝试回 `Busy{suspend_id, reason=attempt_in_progress}`，原尝试不受影响；`runcontroller` 在上一次尝试了结之前不发起新尝试，这一情形只来自实现缺陷。
+
+`Freeze{cgroup}`：看守进程不写 cgroup，只上报 `ReadyToSuspend`；节点冻结代理在收到控制面的冻结调用后写 `agent/cgroup.freeze`；控制面以冻结确认作为 `Suspended` 的依据。看守进程轮询 `agent/cgroup.events`，读到 `frozen=1` 时写 `confirmed_at`，随即执行[入站数据唤醒](#入站数据唤醒)的接收队列检查并开启上游载荷检测。收到 `Thaw{freeze_id}` 后，看守进程读取 `agent/cgroup.events` 的 `frozen` 字段，观察到未冻结即上报 `Thawed{freeze_id}`；进程树从未冻结时立即上报。该变体由节点冻结代理解冻，看守进程在读到 `frozen=0` 或收到 `Thaw` 时关闭上游载荷检测，以先到者为准；两者之间到达的载荷可能产生一条迟到的 `conn.inbound`，控制面只在冻结类挂起尝试进行中或处于冻结态时据此唤醒，见 [runcontroller](../design-runcontroller.md)。
+
+`Freeze{signal}`：按运行实例 uid 扫描 `/proc`，对不在 `stopped_pids` 中的 PID 发送 `SIGSTOP`，直到连续两次扫描没有新 PID 且全部处于 T 态；每轮扫描后记录 `scan_rounds`。轮次上限由 `suspendpolicy` 的冻结参数给出；超限或截止到期时对已停止 PID 发送 `SIGCONT`，记录 `thawed=true`，回 `Busy{suspend_id, reason, retry_after}`。收敛后写 `confirmed_at`，上报 `ReadyToSuspend{suspend_id, frozen_at, procs_remaining}`，再执行接收队列检查并开启上游载荷检测。收到 `Thaw{freeze_id}` 后先关闭上游载荷检测，再对 `stopped_pids` 发送 `SIGCONT`，上报 `Thawed`。
+
+两种变体都以 `freeze_id` 幂等：已执行过解冻的标识不再接受冻结，迟到的冻结请求不生效；缩小请求的幂等由 `sandboxprovider` 按同一标识维护。
 
 复杂度：`Freeze{cgroup}` 为 O(1) 次 cgroup 文件读写；`Freeze{signal}` 每轮扫描为 O(P)，总复杂度 O(R·P)，P 为进程数、R 为轮次上限。
 
@@ -569,32 +761,35 @@ k8s 路径上看守进程所在容器的 capability 先 drop ALL，再显式添�
 1. 冻结确认时的接收队列检查：遍历 Agent 进程树各进程的 `/proc/<pid>/fd` 收集套接字 inode，读取 `/proc/net/tcp` 与 `/proc/net/tcp6` 并按这些 inode 过滤，再排除不承载外部输入的回环连接，其余套接字中任一 `rx_queue` 非零即视为有未读数据。排除的连接分三类：承载 LLM 请求的连接（Agent 到本地代理 LLM 端点），其进展由 `llm.first_token`、`llm.request.completed` 与 `llm.request.failed` 表达；Agent 与平台 MCP 服务器之间的连接，其进展由定向投递表达；两端都在 Agent 进程树内的回环连接（例如后台作业启动的本地服务与进程树内其客户端之间的连接），其进展由活动度判据负责。判定按以下顺序：对端地址为回环地址的套接字，在 `/proc/net/tcp` 与 `/proc/net/tcp6` 中查找本地地址与对端地址互换的行，该行的 inode 也在已收集的 inode 集合中，即对端套接字同样由 Agent 进程树持有时排除；对端地址为平台 MCP 服务器监听地址的套接字排除；对端地址为本地代理监听地址的套接字，以其本地地址与端口查询本地代理的连接用途记录，用途为 `llm` 的排除，用途为 `external` 或查不到记录的照常检查；其余套接字照常检查，透明拦截器接管的连接属于此类。记录的写入与查询见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。该检查覆盖冻结生效之前已到达、Agent 尚未读取的数据，包括本地代理已写入 Agent 侧外部转发连接（CONNECT 隧道与绝对 URI 转发）的字节；`conn.inbound` 因此只表达来自 Agent 进程树之外的输入。
 2. 冻结期间的上游载荷检测：本地代理的 CONNECT 隧道与 HTTP 前置请求、透明拦截器的拦截连接在上游一侧读到载荷字节时通知看守进程；LLM 请求的上游连接不参与，其数据到达由 `llm.*` 事件表达。连接侧的规则见 [design-warden-llmproxy.md](design-warden-llmproxy.md)。
 
-`freeze_id` 取该冻结尝试的 `suspend_id`。冻结执行记录的 `inbound_reported` 保证每个 `freeze_id` 至多发出一次：两条路径并发触发时只有先完成置位的一方发出，之后到达的载荷不触发发出；消息随出站流的重放送达，重放不构成第二次发出。判定只看读到的载荷字节：TCP 保活等无载荷报文由内核处理，既不进入接收队列也不被用户态读到，不计入；看守进程不终止外部系统主机的 TLS，无法区分 TLS 或应用层的保活帧与业务数据，由此产生的误唤醒按普通唤醒处理。冻结期间本地代理与透明拦截器照常转发字节，Agent 未读取的数据由 Agent 侧套接字缓冲承接，解冻后由 Agent 读取；入站数据唤醒不丢弃、不改写数据。控制面以 `conn.inbound` 写唤醒信号并按唤醒谓词恢复运行实例，见 [runcontroller](../design-runcontroller.md)。
+`conn.inbound` 携带该冻结的 `freeze_id`。冻结执行记录的 `inbound_reported` 保证每个 `freeze_id` 至多发出一次：两条路径并发触发时只有先完成置位的一方发出，之后到达的载荷不触发发出；消息与其他上行应用消息一样经上行重放缓冲发送，出站流中断后按原序号重放，重放不构成第二次发出。判定只看读到的载荷字节：TCP 保活等无载荷报文由内核处理，既不进入接收队列也不被用户态读到，不计入；看守进程不终止外部系统主机的 TLS，无法区分 TLS 或应用层的保活帧与业务数据，由此产生的误唤醒按普通唤醒处理。冻结期间本地代理与透明拦截器照常转发字节，Agent 未读取的数据由 Agent 侧套接字缓冲承接，解冻后由 Agent 读取；入站数据唤醒不丢弃、不改写数据。控制面以 `conn.inbound` 写唤醒信号并按唤醒谓词恢复运行实例，见 [runcontroller](../design-runcontroller.md)。
 
 复杂度：接收队列检查为 O(P·F + S)，P 为进程数、F 为每个进程的文件描述符数、S 为 `/proc/net/tcp` 与 `/proc/net/tcp6` 的行数；读取时按 `(本地地址, 对端地址)` 建立行索引，对端套接字的查找为 O(1)，连接用途记录按连接端点索引，每个套接字的查询为 O(1)；上游载荷检测为每次读取 O(1)。
 
 ### 活动度采集
 
-看守进程按固定周期读取 cgroup v2、`/proc` 与本地代理的观测记录，组装 `Activity` 样本：
+看守进程按周期 `T_activity` 读取 cgroup v2、`/proc` 与本地代理的观测记录，组装 `Activity` 样本：
 
 - `psi`：`agent` 子 cgroup 的 `cpu.pressure`、`io.pressure`、`memory.pressure` 中 `some` 行的 `total` 累计微秒值，原样上报累计值，由控制面取相邻样本差。
 - `cpu_usage_usec`：`agent` 子 cgroup 的 `cpu.stat` 中 `usage_usec` 的累计值，原样上报累计值，由控制面取相邻样本差。
 - `procs` 与 `mcp_procs`：Agent 进程树中 R、D、S、T、Z 态的计数与其中已声明的第三方 MCP 服务器进程数。
-- `timed_sleepers`：S 态且 `/proc/<pid>/wchan` 属 `nanosleep`、`hrtimer` 类符号的进程为定时睡眠进程。其中 `comm` 为 `sleep` 且 `/proc/<pid>/cmdline` 中的参数可按 coreutils 语法解析（数值加可选的 `s`、`m`、`h`、`d` 后缀，多个参数相加）的进程，到期时刻为进程启动时刻（`/proc/<pid>/stat` 的 `starttime`，按 `/proc/stat` 的 `btime` 换算为墙钟）加参数时长，取最早者为 `known_earliest_expiry`；其余定时睡眠进程计入 `unknown`。
+- `timed_sleepers`：S 态且 `/proc/<pid>/wchan` 属 `nanosleep`、`hrtimer` 类符号的进程为定时睡眠进程。其中 `comm` 为 `sleep` 且 `/proc/<pid>/cmdline` 中的参数可按 coreutils 语法解析（数值加可选的 `s`、`m`、`h`、`d` 后缀，多个参数相加）的进程，到期时刻为进程启动时刻（`/proc/<pid>/stat` 的 `starttime`，换算到本地单调时钟后加时钟偏移）加参数时长，取最早者为 `known_earliest_expiry`；其余定时睡眠进程计入 `unknown`。
 - `throttled_usec`：容器父 cgroup 的 `cpu.stat` 的累计值。
 - `last_fork_at`、`ws_write_fds`、`io_bytes`、`net_bytes`：最近 fork 时刻、工作区写文件描述符数量、累计 I/O 与网络字节。
 - `llm_last_request_at`、`llm_last_retryable_failure_at`：读取本地代理观测记录中的最新值。
-- `frozen`、`freeze_id`：`cgroup` 变体从 `agent/cgroup.events` 读取冻结状态，`signal` 变体从冻结执行记录读取。
+- `frozen`、`freeze_id`：只反映挂起冻结，`cgroup` 变体从 `agent/cgroup.events` 读取，`signal` 变体从冻结执行记录读取。`frozen_by`：从进程监督记录读取，背压冻结生效时为 `backpressure`，未生效时为空；它与 `frozen` 互相独立，可以同时成立。
+- `sample_seq`、`sampled_at`：进程内单调递增的样本序号与校时后的采样时刻。
 
-采集只上报观测值，不判断忙闲。忙信号规则与静默窗归 [suspendpolicy](../design-suspendpolicy.md#静止证据与忙信号)，静止证据与 L0 的空闲证据共用这套规则；其中 `cpu_usage_usec` 在静止窗内的增量超过 `U_quiet` 乘以窗口时长时静止证据不成立，定时睡眠进程按到期时刻是否已知区分，到期时刻已知的 `sleep` 进程不视为忙，其到期时刻经探测定时器进入唤醒集合，`unknown` 非零时静止证据不成立。采集周期由策略与配置共同约束。
+`Activity` 是遥测帧：不占 `msg_seq`，不进上行重放缓冲与待发队列，不确认，不重放；只在已建立的出站流上发送，未连接、握手中都直接丢弃当期样本，流建立后从下一个周期继续。控制面丢弃 `sample_seq` 不大于已收到最大值的样本，以相邻两个已收到样本的累计量之差除以 `sampled_at` 之差得到区间速率，中间丢失的样本不影响正确性。
+
+采集只上报观测值，不判断忙闲。忙信号规则与静默窗归 [suspendpolicy](../design-suspendpolicy.md#静止证据与忙信号)，静止证据与 L0 的空闲证据共用这套规则；其中 `cpu_usage_usec` 在静止窗内的增量超过 `U_quiet` 乘以窗口时长时静止证据不成立，定时睡眠进程按到期时刻是否已知区分，到期时刻已知的 `sleep` 进程不视为忙，其到期时刻经探测定时器进入唤醒集合，`unknown` 非零时静止证据不成立。采集与发送周期为 `T_activity`（默认 2 s），它与 PSI 更新粒度、`Q_quiet` 的匹配列入[技术验证](../../../milestone/verification.md)。
 
 采集复杂度为每次采样 O(P)，P 为进程数；采样与冻结、进程启动并发，可能观察到中间状态，控制面以连续样本与策略阈值判断。
 
 ### 工作区租约续约与 LeaseLost
 
-看守进程持有 `lease_id` 与代，按小于租约有效期的周期调用 `workspace.RenewLease(lease_id, generation, sandbox_id, proof)`，每次以实例私钥重新签名用途为 `renew` 的持有证明。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at` 未过，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。`workspace` 另要求持有证明中实例公钥的指纹等于租约的 `holder_jkt`、签名有效且 `iat` 在 `T_proof_skew` 之内，不满足时以不可重试错误拒绝，看守进程不重试该次拒绝，按无法续约处理。首次续约成功之后才发 `Hello`。
+看守进程持有 `lease_id` 与代，按小于租约有效期的周期调用 `workspace.RenewLease(lease_id, generation, sandbox_id, proof)`，每次以实例私钥重新签名用途为 `renew` 的持有证明，`iat` 取校时后的当前 Unix 秒。CAS 条件为 `lease_id` 与代匹配、`released=false`、`expires_at` 未过，且持有者为空或等于 `sandbox_id`；持有者为空时由本次续约绑定为该沙箱。`workspace` 另要求持有证明中实例公钥的指纹等于租约的 `holder_jkt`、签名有效且 `|now − iat| ≤ T_proof_skew`（60 s）。时窗不符时 `workspace` 以可重试错误 `proof_time_skew` 拒绝，错误详情的 `server_now` 字段为服务端当前时刻，看守进程据此校时（见[校时](#校时)）后立即重试：周期续约只重试一次，仍被拒才按无法续约处理，首次续约按下文的规则重试，不按无法续约处理；其余不符以不可重试错误拒绝，看守进程不重试该次拒绝，按无法续约处理。首次续约成功之后才发 `Hello`，这一规则对初次领取之后、快照恢复与长时间冻结之后同样适用：快照前持有者已被清空，续约使持有者恢复为本沙箱，`runcontroller` 的 `Hello` 核对要求租约持有者等于 `Hello.sandbox_id`。首次续约以可重试错误失败时，看守进程按退避重试，不建立出站流的传输；以 `proof_time_skew` 被拒时先按 `server_now` 校时后立即重试，连续被拒同样按可重试错误退避重试，每次重试前按最近一次的 `server_now` 校时，不按无法续约处理。以不可重试错误失败时，看守进程停止工作区写入，以与背压冻结相同的方式（按运行实例 uid 扫描 `/proc` 并迭代 `SIGSTOP`）冻结 Agent 进程树，初次领取之后 Agent 进程树尚未启动，无进程可冻结；随后仍然建立传输并发送 `Hello`，控制面按租约核对回 `HelloAck.fenced{reason=lease}`，看守进程按[关闭帧的处理](#关闭帧的处理)以 `fenced` 退出，这一情形不上报 `LeaseLost`。
 
-在租约到期前无法续约时，看守进程停止向工作区写入，冻结或杀死 Agent 进程树，并通过出站流上报 `LeaseLost{lease_id, expires_at}`；流不可用时继续重连，恢复后补发。租约的接管、释放与新代接管不属于本模块；看守进程不自行删除或改写租约记录。
+在租约到期前无法续约时，看守进程停止向工作区写入，冻结或杀死 Agent 进程树，并上报 `LeaseLost{lease_id, expires_at}`；出站流不可用时 `LeaseLost` 同样分配序号写入上行重放缓冲，重连后随重放送达。首次续约以不可重试错误失败时不经这条路径，不上报 `LeaseLost`。租约的接管、释放与新代接管不属于本模块；看守进程不自行删除或改写租约记录。
 
 ### 平台 MCP 服务器
 
@@ -633,13 +828,23 @@ hook 二进制随 Agent 进程树冻结，冻结期间未完成的查询在解�
 
 ### ToolExec 与文件访问
 
-控制面循环驱动器没有沙箱内 Agent 进程，通过 `ToolExec` 使用沙箱：`exec` 在运行实例 uid 下启动命令并返回退出码与输出流；文件读与文件写在运行实例子目录内进行；流式输出按偏移续传，支持断线后从上次偏移继续；后台作业可列出、查询与终止，未结束的作业计入后台作业集合，使回合边界不构成安全点。帧经该运行实例的出站流往返，由 `runcontroller` 从进程内驱动器转发；驱动器不持有运行实例令牌，帧的代按当前代校验；`Shutdown` 与 `Fenced` 到达后终止在途执行并拒绝新请求。
+控制面循环驱动器没有沙箱内 Agent 进程，通过 `ToolExec` 使用沙箱，各 `op` 的 `args`、结果与错误见 [ToolExec API](#toolexec-api)。帧经该运行实例的出站流往返，由 `runcontroller` 从进程内驱动器转发；驱动器不持有运行实例令牌。看守进程按以下顺序处理一条 `ToolExecRequest`：
 
-文件 API 以 `/files` 经入站路由提供界面对工作区文件的读取，请求由 `workspace` 原样转发，路径限定在运行实例子目录内，按接入票据（`channel=file`）与实时接入状态鉴权；看守进程按[入站端点](#入站端点)的规则校验票据，核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。文件访问会唤醒快照态与销毁态的沙箱，接入状态由 `runcontroller` 记录。
+1. 校验信封的代等于当前代。
+2. 按 `exec_id` 查 [ToolExec 执行记录](#toolexec-执行记录)：没有记录时登记 `op` 与 `args` 并开始执行；记录由 `ToolExecCancel` 先行建立（没有 `op` 与 `args`）时直接重发已记录的 `cancelled` 应答，不执行，也不以 `exec_id_conflict` 应答；其余记录的 `op`、`args` 与请求相同时，`running` 附着到已有执行，`finished` 重发已记录的应答，不同时以 `exec_id_conflict` 应答。
+3. 执行结束时先把终态应答写入记录，再与其他上行应用消息一样经上行重放缓冲发出。
+
+第 2 步完成即达到这条下行消息的[处理完成点](#下行消息的处理完成点)，看守进程随即确认它并派发下一条下行消息；执行本身在完成点之后继续，与此后下行消息的处理并行。连接中断时下行的 `ToolExecRequest` 与 `ToolExecCancel` 不跨连接重放，驱动器对未收到终态应答的请求以同一 `exec_id` 重新发出，对已发出取消的再发 `ToolExecCancel`，第 2 步与取消的幂等规则使它们不重复执行。`Shutdown` 与 `Fenced` 到达之后这条流不再有下行消息，看守进程终止在途执行并退出，见 [ToolExec API](#toolexec-api)。
+
+文件 API 以 `/files` 经入站路由提供界面对工作区文件的只读访问，请求由 `workspace` 原样转发，路径限定在运行实例子目录内，按接入票据（`channel=file`）与实时接入状态鉴权；看守进程按[入站端点](#入站端点)的规则校验票据，核对票据中的代等于本沙箱的代，并校验当前租约的持有者为自身；请求携带接入票据，不携带运行实例令牌。文件访问会唤醒快照态与销毁态的沙箱，接入状态由 `runcontroller` 记录。
 
 ### 快照恢复后的校时与连接清理
 
-快照恢复后，看守进程先按 `Resumed.wall_clock_now` 校准本地时钟，再主动断开 Agent 进程的旧 TCP 连接，最后通知 Agent 驱动器恢复。`Resumed` 只经重建后的出站流到达，校时因此在出站流重建之后进行，`/readyz` 不等待校时。旧连接可能处于半死状态，等待读超时会拖长恢复；主动断开使 Agent 重新建立连接。在途 LLM 请求的上游连接在快照时已断开，本地代理在恢复后按 `request_id` 向 `llmgateway` 取回已完成响应；取回完成之前不向 Agent 交付该请求的结果。
+快照恢复以 `/wake` 的恢复触发为标志。恢复后看守进程按固定顺序处理：先调用 `RenewLease`，以 `proof_time_skew` 被拒时按错误详情中的 `server_now` 校时后重试（连续被拒时按可重试错误退避重试，见[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)），这一步同时完成校时；续约成功、租约持有者恢复为本沙箱之后重建出站流的传输；收到 `Challenge` 并按 `server_now` 再校时；发送 `Hello`。
+
+这次续约失败时按[工作区租约续约与 LeaseLost](#工作区租约续约与-leaselost)中首次续约失败的规则处理，长时间冻结之后的首次续约同样适用。
+
+快照恢复后沙箱时钟是否被重置取决于提供者，看守进程不依赖它，持有证明与采样时刻都取校时后的时刻；`Resumed.wall_clock_now` 只用于核对时钟偏移，见[校时](#校时)。校时之后，看守进程主动断开 Agent 进程的旧 TCP 连接，最后通知 Agent 驱动器恢复；`/readyz` 不等待校时。旧连接可能处于半死状态，等待读超时会拖长恢复；主动断开使 Agent 重新建立连接。在途 LLM 请求的上游连接在快照时已断开，本地代理在恢复后按 `request_id` 向 `llmgateway` 取回已完成响应；取回完成之前不向 Agent 交付该请求的结果。
 
 快照恢复不重新领取：实例私钥、令牌组、`lease_id` 与接入票据公钥集合随进程内存进入快照，快照对象由 `objectstore-plugin` sidecar 访问、atelet 与 ate-api-server 主进程不直接持有存储凭据，这是 Substrate 路径的部署前提；看守进程在快照恢复后重新生成[合并信任库](#出口-ca-信任)；令牌在挂起期间过期时，由 `runcontroller` 的 `rotate_token` 效果经 `TokenRotate` 替换，替换之前按令牌过期的规则不发请求。
 
@@ -662,7 +867,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | `PrepareSuspend` 前置不满足 | 回 `Busy{reason, retry_after}`；看守进程不为满足前置条件终止后台作业、残留进程或孤儿进程；控制面回到 `Active`，由策略在 `retry_after` 之后复评 |
 | 以挂起为目的的销毁时进程树中存在 Agent 主进程与已声明的第三方 MCP 服务器进程之外的进程 | 回 `Busy`；不终止这些进程，由控制面在 `retry_after` 之后复评 |
 | 以挂起为目的的销毁时，`fire_at` 为空或不早于 `self_wake_cutoff` 的自唤醒条目中存在 `survives_resume=false` 的项 | 回 `Busy`；不取消、不改写 Agent 的定时；`fire_at` 早于 `self_wake_cutoff` 的过期自唤醒条目不参与该检查 |
-| `conn.inbound` 发出时出站流不可用 | 消息留在重放缓冲，重连后随重放送达；同一 `freeze_id` 不另生成第二条 |
+| `conn.inbound` 发出时出站流不可用 | 消息已分配序号并留在上行重放缓冲，重连后从 `HelloAck.committed_msg_seq` 之后随重放送达；同一 `freeze_id` 不另生成第二条 |
 | `PreToolUse` 的查询失败（IPC 端点不可达、对端认证或一次性核对被拒、查询超过截止时间或应答无法解析） | 二进制输出拒绝，`permissionDecision` 为 `deny`，原因为“平台审批暂不可用”，并计数；不放行该工具调用 |
 | `PreToolUse` 之外的托管 hook 查询失败（原因同上） | 二进制以空输出、退出码 0 退出并计数；不提示、不拒绝、不阻塞工具调用，`SubagentStart` 未注入规则时子代理仍可从工具描述读到同一组规则 |
 | 托管 hook IPC 端点的对端认证不通过（可执行文件不是托管策略设置中注册的托管 hook 二进制，或父进程不是 Agent 主进程） | 端点拒绝该连接的查询，计数并告警，不把内容交给驱动器；二进制按查询失败处理 |
@@ -672,46 +877,63 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 宿主侧分类请求失败或超时 | 驱动器保持规则分类结果，不重试；不上报 `llm.request.failed`，转发侧的处置见 [design-warden-llmproxy.md](design-warden-llmproxy.md#宿主侧分类请求) |
 | 平台 MCP 阻塞型调用被 Agent 自动转到后台 | 立即以转换结果结束该调用：`wait_for` 返回“已转为订阅”与 `sub_id`，`sleep_until` 先转为运行实例范围定时器再返回“已转为定时”；结果随 `task_notification` 到达 Agent |
 | `AdoptAgent` 被拒绝或不可达（节点冻结代理核验不通过、套接字不可连接或调用超时） | 该进程保持停止态，不继续执行；按退避重试，重试耗尽时回收这个尚未开始执行的进程并按启动失败上报：Agent 主进程按启动失败上报 `turn_ended{agent_exited=true}`，控制面计入 `start_failures`；`/terminal` 返回 503，不建立 shell；`ToolExec.exec` 以执行启动失败应答；计数并告警 |
-| `/terminal` 或 `/files` 的接入票据缺失或校验不通过（`alg`、`typ`、`kid`、签名、`aud`、`run_id`、`generation`、`channel`、有效期或 `jti` 任一项） | 返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；已接受过的 `jti` 再次出现时同样拒绝 |
+| `/terminal` 或 `/files` 的接入票据缺失或校验不通过（`alg`、`typ`、`kid`、签名、`aud`、`run_id`、`generation`、`channel`、有效期，或 `channel=terminal` 票据的 `jti` 任一项） | 返回 401，不启动 shell、不读文件，计数 `access_ticket_rejected`；`channel=terminal` 票据已接受过的 `jti` 再次出现时同样拒绝，`channel=file` 票据在有效期内的重复使用不拒绝 |
 | 入站连接的来源为回环地址或本 Pod 地址 | 拒绝该连接，不进入任何端点的处理 |
 | 合并信任库生成失败（出口 CA 的投射文件缺失或无法解析） | 保留上一次成功生成的信任库并计数告警；首次生成即失败时只以公共根证书与拦截 CA 的证书生成信任库，不推迟进程启动，`mitm` 主机的连接按上游 TLS 失败处理；投射文件恢复后重新生成 |
 | `SIGSTOP` 扫描超限或截止到期 | 对已停止 PID 发送 `SIGCONT`，记录已解冻，回 `Busy`；不留下部分冻结的进程树 |
-| `CancelSuspend` | 未越过不可撤销点时回 `Busy{reason=cancelled}`；已越过时回 `ReadyToSuspend`，由控制面按迟到应答处理 |
-| 工作区租约无法续约，含 `workspace` 以持有证明不符不可重试地拒绝续约 | 停止工作区写入，冻结或杀死 Agent 进程树，上报 `LeaseLost`；流不可用时重连后补发；持有证明被拒时不重试该次续约 |
-| 出站流断开 | 退避重连，重放未确认消息；不终止 Agent 进程树；控制面以 `Hello` 对账恢复一致 |
-| 可重试关闭 | 不终止 Agent 进程树；退避重连后重放未确认消息 |
-| `Fenced` | 停止投递与副作用，对 Agent 进程树执行强制终止；不再接受本代消息 |
-| `Shutdown{graceful=false}` | 停止投递，强制终止 Agent 进程树并关闭流；不再接受本代消息 |
-| `Shutdown{graceful=true}` | 停止接受新 `Deliver`，关闭 stdin，按正常退出路径结束，在 `deadline` 之前完成 |
-| 不可重试认证失败（令牌签名、受众、`run_id` 或代不符，实例公钥指纹与令牌 `cnf.jkt` 或租约 `holder_jkt` 不符，持有证明无效，或令牌到期时刻低于可接受下界） | 停止重连并上报；不回 `HelloAck`，不携带当前代 |
+| `CancelSuspend` 指向没有记录、已回非取消 `Busy` 或已结束的挂起尝试 | 回 `Busy{reason=cancelled}`，记下取消墓碑 |
+| `CancelSuspend` 到达时挂起尝试进行中 | 未越过不可撤销点时中止动作（`signal` 变体对已停止的 PID 发送 `SIGCONT`），回 `Busy{reason=cancelled}` 并记下取消墓碑；已越过时不中止，动作完成后照常应答，由控制面按迟到应答处理 |
+| `CancelSuspend` 到达时挂起尝试已就绪 | 重发同一 `ReadyToSuspend`，由控制面按迟到应答处理 |
+| 同一 `suspend_id` 的 `PrepareSuspend` 再次到达（重连后重新产生或截止时重驱动） | 进行中时附着，已就绪时重发 `ReadyToSuspend`，已回非取消 `Busy` 时重发同一 `Busy`，取消墓碑与已结束时回 `Busy{reason=cancelled}`；不重复执行动作 |
+| 重连后当前挂起尝试已就绪且其 `ReadyToSuspend` 已提交，而 `HelloAck.active_suspend_id` 不等于它 | 为空（该尝试的 `Resumed` 丢失，或该尝试已被中止）：结束该尝试并恢复 Agent 执行，效果等同于收到 `Resumed{drain=false}`，不向背压冻结仍在停止的 PID 发送 `SIGCONT`；`drain=true` 的 `Resumed` 由控制面重新产生。非空（新尝试已取代该尝试）：结束该尝试，做法同登记新尝试时结束旧尝试，写入 `superseded_by`，本地代理此时不交付缓冲内容，留到取代者了结时交付，冻结状态按 `desired_state` 与随后的消息对齐。`active_suspend_id` 等于它时保持该尝试，本地代理不交付缓冲内容 |
+| 取代了其他挂起尝试的尝试以 `Busy` 了结（由 `preparing` 转为 `busy` 或取消墓碑，或为没有记录的 `suspend_id` 新建取消墓碑） | 控制面回到 `Active`，不为任何尝试发 `Resumed`；看守进程发出这条 `Busy` 时通知本地代理交付缓冲内容，被取代的尝试留下的缓冲内容随之交付，不等此后的 `Resumed` |
+| `RenewLease` 以 `proof_time_skew` 被拒 | 按错误详情中的 `server_now` 校时后立即重试。周期续约只重试一次，仍被拒时按无法续约处理；首次续约（初次领取之后、快照恢复与长时间冻结之后）连续被拒时按可重试错误退避重试，每次重试前按 `server_now` 校时，不按无法续约处理，不建立出站流的传输 |
+| 工作区租约无法续约，含 `workspace` 以持有证明不符不可重试地拒绝续约（首次续约除外） | 停止工作区写入，冻结或杀死 Agent 进程树，上报 `LeaseLost`；流不可用时 `LeaseLost` 留在上行重放缓冲，重连后随重放送达；持有证明以时窗之外的原因被拒时不重试该次续约 |
+| 首次续约（初次领取之后、快照恢复与长时间冻结之后）以可重试错误失败，含连续以 `proof_time_skew` 被拒 | 按退避重试，`proof_time_skew` 的每次重试前按 `server_now` 校时；不建立出站流的传输，不按无法续约处理 |
+| 首次续约（初次领取之后、快照恢复与长时间冻结之后）以不可重试错误失败 | 停止工作区写入，冻结 Agent 进程树（初次领取之后 Agent 进程树尚未启动，无进程可冻结），仍建立传输并发送 `Hello`；控制面回 `HelloAck.fenced{reason=lease}`，以退出原因 `fenced` 退出；不上报 `LeaseLost` |
+| 出站流断开，或没有收到关闭帧而流结束 | 按传输中断处理：从 `T_reconnect_min` 起退避重连，收到 `Challenge` 校时后发 `Hello`，按 `HelloAck.committed_msg_seq` 裁剪并重放上行消息，下行接收位置重置为 0；不终止 Agent 进程树；控制面以 `Hello` 对账恢复一致 |
+| 处理一条下行消息在达到处理完成点之前失败（`Deliver` 写投递意图日志失败除外） | 不确认该消息，主动断开连接并退避重连；该消息由控制面在下一次接受 `Hello` 时按持久化状态重新产生 |
+| 窗口满（上行重放缓冲达到 `W_replay_msgs` 或 `W_replay_bytes`） | `Send` 不分配序号，消息进入待发队列并按最新值规则合并；窗口回收后按入队顺序发送 |
+| 待发队列达到 `Q_pending_bytes` | 对 Agent 进程树执行背压冻结，`Activity.frozen_by=backpressure`，`frozen` 与 `freeze_id` 不变；队列降到上限一半以下时解除；控制面不判定本代沙箱作废 |
+| `Close{state=retryable}` | 不终止 Agent 进程树；在 `retry_after` 之前不重连，此后退避重连并重放上行消息 |
+| `Fenced` 或 `HelloAck.fenced` | 停止投递与副作用，停止工作区写入，对 Agent 进程树执行强制终止，不再重连；以退出原因 `fenced` 退出 |
+| `Shutdown{graceful=false}` | 停止投递，停止工作区写入，强制终止 Agent 进程树，不再重连；以退出原因 `shutdown` 退出 |
+| `Shutdown{graceful=true}` | 停止接受新 `Deliver`，关闭 stdin，按正常退出路径结束 Agent，`deadline` 到达仍未退出时强制终止；Agent 结束之后停止工作区写入，不再重连；以退出原因 `shutdown` 退出 |
+| `Close{state=auth_failed}`（令牌签名、受众、`run_id` 或代不符，实例公钥指纹与令牌 `cnf.jkt` 或租约 `holder_jkt` 不符，持有证明无效，或令牌到期时刻低于可接受下界） | 停止工作区写入，强制终止 Agent 进程树，不再重连；以退出原因 `auth_failed` 退出 |
+| `Close{state=version_unsupported}` | 停止工作区写入，强制终止 Agent 进程树，不再重连；以退出原因 `version_unsupported` 退出，控制面以当前镜像重建沙箱 |
+| 收到 `Close{state=protocol_violation}`，或看守进程判定控制面协议违规（下行序号缺口、下行消息无法按本代协议版本解码） | 判定方为看守进程时先发 `Close{state=protocol_violation}`（流可用时）；停止工作区写入，强制终止 Agent 进程树，不再重连；以退出原因 `protocol_violation` 退出 |
 | 令牌过期且未收到 `TokenRotate` | 不向 `llmgateway`、`connectorhub` 与 `humanchannel` 发请求；等待轮换后恢复 |
 | 领取返回 401（凭据无效或 audience 不符） | 停止退避重试；此后 k8s 路径收到 `/wake`、Substrate 路径尚未领取时读到 `actor-name` 变化，仍立即领取一次，Substrate 路径的这次领取同时恢复从 1 s 起的退避重试（这次领取发生在 `wakeupProbe` 探测期间，actor 处于 `RESUMING`，出口网关已放行，见[启动与领取](#启动与领取)）；领取成功之前不发送 `Hello`，不启动 Agent 主进程；Substrate 构建模板快照的 actor 停在这一状态，并随模板快照进入新 actor |
 | 领取返回 404（没有对应记录） | 退避重试；k8s 的预热 Pod 在认领之前停在等待领取的状态 |
 | 领取返回 409（已领取） | 停止领取，不启动 Agent 主进程；`runcontroller` 按沙箱丢失以新代重建 |
-| 领取返回 410（该代已销毁或运行实例已释放） | 看守进程退出 |
+| 领取返回 410（该代已销毁或运行实例已释放） | 以退出原因 `claim_gone` 退出 |
 | 领取返回 503（`secrets` 或存储不可达，或 Substrate 出口网关因 Substrate 控制面暂时不可达取不到 actor JWT） | 退避重试 |
 | 领取请求没有到达引导接口（出口默认拒绝、actor 没有 EgressPolicy 时出口网关返回 403、连接失败或超时），或得到引导接口错误码之外的状态码（例如 Substrate 出口网关返回的 403、500） | 退避重试，与 404 相同；Substrate 构建模板快照的 actor 停在等待领取的状态 |
 | 预热认领的 `/wake` 通知未送达 | 由退避领取兜底，领取延迟不超过退避上限 30 s |
 | `SandboxConfig` 内容无法解析 | 保留上一次成功应用的配置并计数；从未成功应用时按 `modes`、`tool_profile` 与 `wait_signatures` 均为空、`intent` 的两个开关均关闭处理，并启动 Agent 主进程 |
-| 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递“回合被中断”；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径下 kubelet 在同一 Pod 内重启容器时，新的看守进程领取得到 409，停止领取、不启动 Agent 主进程，`runcontroller` 按沙箱丢失以新代重建 |
-| 快照恢复后时钟跳变 | 以 `Resumed.wall_clock_now` 校时，再通知驱动器；恢复期间的超时以校时后的时钟计算 |
+| 看守进程崩溃 | 沙箱崩溃，控制面按沙箱丢失处理，重建并投递“回合被中断”；看守进程不就地重启（[ADR-warden-is-pid1](../../../adr/adr-warden-is-pid1.md)）；k8s 路径的 Pod `restartPolicy` 为 `Never`，kubelet 不在同一 Pod 内重启容器，主容器终止后该 Pod 不再运行，提供者在 `ListSandboxes` 与 `GetSandbox` 中报告沙箱丢失，`runcontroller` 以新代重建（[k8s 子模块](../sandboxprovider/design-sandboxprovider-k8s.md#销毁与重建)）；崩溃时不写退出原因 |
+| 快照恢复后时钟跳变 | 先以 `RenewLease` 校时，重建传输后以 `Challenge.server_now` 再校时，再通知驱动器；恢复期间的超时以校时后的时钟计算 |
+| `Resumed.wall_clock_now` 与校时后的当前时刻相差超过 `T_proof_skew` | 计数告警；不据以修改时钟偏移 |
+| `ToolExecRequest` 的 `exec_id` 已有记录而 `op` 或 `args` 不同 | 以 `status=failed`、`error=exec_id_conflict` 应答，不记录；已有执行不受影响 |
 | MCP 传输定时器（首字节、idle）或 per-server timeout 到期 | 工具返回错误结果，不无限占用回合；阻塞型等待已转为订阅或定时时按转换结果返回 |
 
-接口层的错误语义见外部接口契约：`Shutdown`、`Fenced` 与不可重试认证失败是三种终止语义；可重试关闭不终止 Agent；`Busy` 与 `DeliveryFailed` 都携带重试依据。
+接口层的错误语义见外部接口契约：`Fenced`、`Shutdown` 与 `Close` 的各关闭状态是不同的终止语义，不可恢复的关闭以[退出原因](#退出原因)退出；可重试关闭不终止 Agent；`Busy` 与 `DeliveryFailed` 都携带重试依据。
 
 ## 并发与事务边界
 
 看守进程不参与控制面数据库事务。它的持久化边界是工作区内的投递意图日志同步写入、Agent 自身的会话记录，以及 `workspace` 的租约 CAS；控制面 PostgreSQL 是运行实例状态的唯一事实源，但看守进程不读写它。
 
-- **出站流单写者**：同一时刻只有一条出站流被处理；`msg_seq` 单调递增，未确认消息在重连后重放。`Hello` 与 `HelloAck` 的交换不与普通消息并发。
-- **进程监督串行**：Agent 的启动（含 `StartAgent` 触发的启动）、正常退出、强制终止与冻结共用进程监督锁；持有该锁时不执行网络调用与日志同步写入。`StartAgent` 在持锁时核对 Agent 进程是否运行，运行中即返回，重复到达的 `StartAgent` 因而不启动第二个进程。停止态的进程在锁内登记为启动中，`AdoptAgent` 调用与其退避在锁外进行，收到移入完成或重试耗尽后再取锁让进程继续或回收它；登记为启动中的 Agent 主进程按运行中处理，期间到达的 `StartAgent` 与 `Deliver` 不再启动进程。冻结与解冻按 `freeze_id` 串行，`Thaw` 只作用于已记录的冻结。
+- **出站流单写者**：同一时刻只有一条连接被处理；上行 `msg_seq` 的分配、上行重放缓冲与待发队列的写入在同一把锁内完成，序号在本代内严格递增，未确认消息在重连后按原序号重放。下行消息串行处理，前一条达到处理完成点之后才派发下一条，完成点之后的动作与此后下行消息的处理并行；发送 `Hello` 之前，上一条连接上尚未达到处理完成点的处理继续到完成点或中止，中止的含义见[下行消息的处理完成点](#下行消息的处理完成点)。`Hello` 与 `HelloAck` 的交换不与应用消息并发，重放完成之前不发送新分配的消息。`Activity` 不经这把锁排序，与应用消息之间没有顺序约束。
+- **ToolExec 执行**：执行记录按 `exec_id` 加锁，同一 `exec_id` 的重复请求与取消串行，并发到达时只有先登记者启动执行；执行在下行消息的串行处理之外进行，不同 `exec_id` 之间并发。
+- **进程监督串行**：Agent 的启动（含 `StartAgent` 触发的启动）、正常退出、强制终止与冻结共用进程监督锁；持有该锁时不执行网络调用与日志同步写入。`StartAgent` 在持锁时核对 Agent 进程是否运行，运行中即返回，重复到达的 `StartAgent` 因而不启动第二个进程。停止态的进程在锁内登记为启动中，`AdoptAgent` 调用与其退避在锁外进行，收到移入完成或重试耗尽后再取锁让进程继续或回收它；登记为启动中的 Agent 主进程按运行中处理，期间到达的 `StartAgent` 与 `Deliver` 不再启动进程。冻结与解冻按 `freeze_id` 串行，`Thaw` 只作用于已记录的冻结；背压冻结的发起与解除同样持有进程监督锁，与冻结类挂起尝试的冻结和解冻串行，两者各自记录停止的 PID。
+- **挂起尝试**：挂起尝试记录的登记、状态转移、不可撤销点的越过与应答的发出都在进程监督锁内完成；前置条件核对、等待 Agent 退出与等待持久化确认在锁外进行。动作在越过不可撤销点之前于锁内核对尝试仍为 `preparing`，再置 `irrevocable`；`signal` 变体每轮扫描之前同样核对。`CancelSuspend` 在锁内中止尚未越过不可撤销点的尝试。取消与动作完成并发时以先取得锁者为准，一次 `preparing` 只结束于一条首次应答（`ReadyToSuspend`、`Busy` 或 `Busy{reason=cancelled}`）；附着的 `PrepareSuspend` 不另产生应答，此后的重发沿用这条应答的内容。
 - **入站数据唤醒至多一次**：`inbound_reported` 按 `freeze_id` 以原子比较交换置位；接收队列检查、本地代理与透明拦截器的各连接并发触发时，只有置位成功者发出 `conn.inbound`。上游载荷检测的开启与关闭由冻结执行记录驱动，连接协程只读取当前生效的 `freeze_id`。接收队列检查读取本地代理连接用途记录的当前值：Agent 进程树已冻结，检查期间不产生新的请求，尚未完成分类的连接没有记录，按外部连接照常检查。进程树内部连接的判定使用同一次读取的 inode 集合与 `/proc/net/tcp`、`/proc/net/tcp6` 内容，Agent 进程树已冻结，两端套接字在检查期间不由 Agent 侧新建或关闭。
 - **投递串行**：同一时刻只有一个投递批被喂入 Agent；追加 `accepted`、喂入、追加 `consumed` 与发送确认按固定顺序执行，日志写入串行化。不同批的 `Deliver` 在流上按到达顺序处理。
-- **租约续约独立**：续约周期任务独立于投递与冻结；续约失败只触发一次本地保护动作与一次 `LeaseLost`，后续由控制面的重建路径接管。
+- **租约续约独立**：续约周期任务独立于投递与冻结，首次续约（初次领取之后、快照恢复与长时间冻结之后）排在出站流建立之前；续约失败只触发一次本地保护动作与一次 `LeaseLost`，后续由控制面的重建路径接管；首次续约以不可重试错误失败时不发 `LeaseLost`，由 `Hello` 得到的代失效关闭接管。
 - **本地代理不被冻结**：本地代理、平台 MCP 服务器与活动度采集在看守进程内继续运行；被冻结的只有 `agent` 子 cgroup 中的进程树。本地代理在冻结期间持有上游连接并缓冲或直通响应，并在非 LLM 上游连接上观察入站载荷（[ADR-two-tier-llm-proxy](../../../adr/adr-two-tier-llm-proxy.md)）。
 - **托管 hook 查询**：IPC 端点并发接受查询，每个连接在读取查询之前完成对端认证，父进程按当时的 `agent_pid` 核对；一次性核对在驱动器锁内执行，同一事件标识的查询并发到达时只有先完成标记的一方通过，其余按核对不通过处理；各查询由驱动器按当前生效的沙箱侧配置快照与意图状态应答；同一情境提示只交付一次，`PostToolUse` 与 `PostToolBatch` 的查询并发到达时只有先完成标记的一方得到该提示。`SandboxConfig` 的应用以原子替换生效，与查询并发时查询读取替换前或替换后的完整配置，不读取部分更新。查询不持有进程监督锁，不与投递、冻结和出站流发送串行。
 - **DRAIN 标志**：DRAIN 按 `suspend_id` 幂等设置；设置之后到达的阻塞型调用按 DRAIN 规则返回，设置之前已进入等待的调用同样被唤醒并按规则返回。
-- **入站与出站协调**：`/wake` 在出站流建立或重建之后才返回，并发调用合并为同一次处理；`/readyz` 在领取之前反映看守进程可服务；领取之后，k8s 路径上反映出站流与关键组件的就绪状态，Substrate 路径上只反映关键组件的就绪状态。入站请求与出站消息并发时，`/terminal` 与 `/files` 以接入票据、代与租约持有者的校验结果为准；`jti` 记录以原子插入判重，同一 `jti` 的并发请求只有一个通过。`TokenRotate` 对接入票据公钥集合的替换以原子引用生效，校验读取替换前或替换后的完整集合。
+- **入站与出站协调**：`/wake` 在出站流建立或重建之后才返回，并发调用合并为同一次处理；`/readyz` 在领取之前反映看守进程可服务；领取之后，k8s 路径上反映出站流与关键组件的就绪状态，Substrate 路径上只反映关键组件的就绪状态。入站请求与出站消息并发时，`/terminal` 与 `/files` 以接入票据、代与租约持有者的校验结果为准；`channel=terminal` 票据的 `jti` 记录以原子插入判重，同一 `jti` 的并发请求只有一个通过；`channel=file` 票据不记录 `jti`。`TokenRotate` 对接入票据公钥集合的替换以原子引用生效，校验读取替换前或替换后的完整集合。
 - **领取串行**：同一时刻至多一个领取请求在途。退避到期与 `/wake` 触发的领取在已有请求在途时并入该请求，不另发请求；`actor-name` 变化触发的领取先放弃在途请求及其连接，再在新连接上发出：在途请求可能随模板快照进入新 actor，Substrate 的内存快照恢复不保证旧 TCP 连接可被及时察觉为失效，而构建模板快照的 actor 没有引导记录，被放弃的请求不会领取成功。看守进程自身的并发领取因而不会得到 409。
 
 ## 扩展点
@@ -745,6 +967,7 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | 进程监督 | 未实现 | — |
 | `Freeze{signal}` 降级路径 | 未实现 | — |
 | 冻结协调与解冻确认 | 未实现 | — |
+| 挂起尝试记录与取消墓碑 | 未实现 | — |
 | 入站数据唤醒 | 未实现 | — |
 | `StartAgent` 处理 | 未实现 | — |
 | 活动度采集 | 未实现 | — |
@@ -756,6 +979,9 @@ DRAIN 不约束回合时长；控制面在 `Draining` 截止时按 `T_drain` 周
 | `ToolExec` API | 未实现 | — |
 | 文件 API | 未实现 | — |
 | 出站流与重连 | 未实现 | — |
+| 出站流背压与待发队列 | 未实现 | — |
+| 关闭帧处理与看守进程退出 | 未实现 | — |
+| 校时与时钟偏移 | 未实现 | — |
 | 令牌轮换 | 未实现 | — |
 | 快照恢复后的校时与连接清理 | 未实现 | — |
 | DRAIN 处置 | 未实现 | — |
