@@ -41,7 +41,7 @@ func ValidateWardenFrame(f *agentprotocolv1.WardenFrame) error {
 		if body.Accepted == nil {
 			return errors.New("agentprotocol: warden frame has an empty accepted body")
 		}
-		return nil
+		return validateAccepted(body.Accepted)
 	default:
 		return errors.New("agentprotocol: warden frame has no body")
 	}
@@ -127,6 +127,20 @@ func validateHelloAck(a *agentprotocolv1.HelloAck) error {
 	if _, ok := agentprotocolv1.LLMCredentialKind_name[int32(a.GetLlmCredential().GetKind())]; !ok {
 		return fmt.Errorf("agentprotocol: hello_ack llm_credential kind %d is not defined",
 			a.GetLlmCredential().GetKind())
+	}
+	return nil
+}
+
+func validateAccepted(a *agentprotocolv1.Accepted) error {
+	if a == nil {
+		return errors.New("agentprotocol: accepted is nil")
+	}
+	if a.GetDeliveryId() == "" {
+		return errors.New("agentprotocol: accepted has an empty delivery_id")
+	}
+	if a.GetThroughSeq() < 1 {
+		return fmt.Errorf("agentprotocol: accepted through_seq %d, must be at least 1",
+			a.GetThroughSeq())
 	}
 	return nil
 }

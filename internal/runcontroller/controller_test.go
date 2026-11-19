@@ -203,7 +203,9 @@ func acceptedFrame(runID string, throughSeq int64) *agentprotocolv1.WardenFrame 
 	return &agentprotocolv1.WardenFrame{
 		RunId: runID,
 		Body: &agentprotocolv1.WardenFrame_Accepted{
-			Accepted: &agentprotocolv1.Accepted{ThroughSeq: throughSeq},
+			// The protocol requires a non-empty delivery_id; the control plane
+			// only uses through_seq.
+			Accepted: &agentprotocolv1.Accepted{DeliveryId: "delivery-1", ThroughSeq: throughSeq},
 		},
 	}
 }

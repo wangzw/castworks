@@ -229,6 +229,38 @@ func TestValidateWardenFrame(t *testing.T) {
 			},
 			want: "empty accepted body",
 		},
+		{
+			name: "accepted with empty delivery_id",
+			frame: &agentprotocolv1.WardenFrame{
+				RunId: "run-1",
+				Body: &agentprotocolv1.WardenFrame_Accepted{Accepted: &agentprotocolv1.Accepted{
+					ThroughSeq: 3,
+				}},
+			},
+			want: "empty delivery_id",
+		},
+		{
+			name: "accepted with through_seq zero",
+			frame: &agentprotocolv1.WardenFrame{
+				RunId: "run-1",
+				Body: &agentprotocolv1.WardenFrame_Accepted{Accepted: &agentprotocolv1.Accepted{
+					DeliveryId: "delivery-1",
+					ThroughSeq: 0,
+				}},
+			},
+			want: "through_seq 0, must be at least 1",
+		},
+		{
+			name: "accepted with negative through_seq",
+			frame: &agentprotocolv1.WardenFrame{
+				RunId: "run-1",
+				Body: &agentprotocolv1.WardenFrame_Accepted{Accepted: &agentprotocolv1.Accepted{
+					DeliveryId: "delivery-1",
+					ThroughSeq: -1,
+				}},
+			},
+			want: "through_seq -1, must be at least 1",
+		},
 	}
 
 	for _, tt := range tests {
