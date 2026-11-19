@@ -1,0 +1,24 @@
+# The development host's address behind the selectorless Service
+# castworks-dev. 10.12.72.11 is the host's own IP; port 9090 is the control
+# plane's gRPC (h2c) port.
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: castworks-dev
+  namespace: castworks-system
+  labels:
+    kubernetes.io/service-name: castworks-dev
+    endpointslice.kubernetes.io/managed-by: castworks-dev-setup
+    app.kubernetes.io/part-of: castworks
+addressType: IPv4
+ports:
+- name: grpc
+  port: 9090
+  protocol: TCP
+endpoints:
+- addresses:
+  - 10.12.72.11
+  conditions:
+    ready: true
+    serving: true
+    terminating: false

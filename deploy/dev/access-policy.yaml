@@ -1,0 +1,7 @@
+# Access policy of atespace castworks-dev: the sandboxprovider ServiceAccount
+# may create, update and delete actors, actor templates and egress policies
+# there. metadata is omitted on create and added by setup.sh on update.
+bindings:
+- role: editor
+  members:
+  - user:system:serviceaccount:castworks-system:sandboxprovider

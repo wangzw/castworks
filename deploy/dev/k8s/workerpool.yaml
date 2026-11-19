@@ -1,0 +1,32 @@
+# The gVisor worker pool that hosts castworks actors. The labels on the
+# WorkerPool object are mirrored onto each Worker, so
+# castworks.dev/pool: castworks is what an ActorTemplate selects with
+# worker_selector.
+#
+# Worker capacity comes from the limits. The gVisor worker reserves 64 MiB of
+# its memory limit for itself, so the memory limit is 3 GiB: that leaves about
+# 2.94 GiB of capacity, enough for the 2 CPU / 2 GiB ActorTemplate with room to
+# spare. CPU capacity is the limit unchanged, and 2 CPU matches the template
+# exactly. The CPU request is kept below the limit so the pod is easy to place,
+# while memory is not compressible and its request matches the limit.
+apiVersion: ate.dev/v1
+kind: WorkerPool
+metadata:
+  name: castworks
+  namespace: castworks-system
+  labels:
+    castworks.dev/pool: castworks
+    app.kubernetes.io/part-of: castworks
+spec:
+  replicas: 1
+  workerImage: registry.zhanwei.wang/ateworker-gvisor@sha256:ab9d4bb12e923d8846628b156c7339767224ddb8c000415668105b8a6a1be42b
+  sandboxClasses:
+  - name: gvisor
+  template:
+    resources:
+      limits:
+        cpu: "2"
+        memory: 3Gi
+      requests:
+        cpu: 500m
+        memory: 3Gi

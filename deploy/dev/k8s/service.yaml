@@ -1,0 +1,18 @@
+# A selectorless Service: its endpoints are the EndpointSlice in
+# endpointslice.yaml, which points at the development host. Actors reach the
+# control plane through this name, so it must stay
+# castworks-dev.castworks-system.svc.cluster.local.
+apiVersion: v1
+kind: Service
+metadata:
+  name: castworks-dev
+  namespace: castworks-system
+  labels:
+    app.kubernetes.io/part-of: castworks
+spec:
+  type: ClusterIP
+  ports:
+  - name: grpc
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
