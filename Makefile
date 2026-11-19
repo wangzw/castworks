@@ -141,11 +141,13 @@ actor-image-smoke: actor-image
 # The image names and paths come from the command line: none of them has a
 # default here. ACTOR_IMAGE is the actor image under test, and each target
 # that needs it checks it before starting anything.
+# BALLAST_IMAGE is the image the memory-ballast test provisions. It is
+# required on its own and does not default to ACTOR_IMAGE.
 CREDENTIAL_FILE ?=
 CLAUDE_BIN ?=
 KUBE_CONTEXT ?=
 
-.PHONY: acceptance-dryrun acceptance-substrate acceptance-clean check-database-url
+.PHONY: acceptance-dryrun acceptance-substrate acceptance-ballast acceptance-clean check-database-url
 
 ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
 
@@ -172,7 +174,7 @@ acceptance-dryrun: check-jobs check-database-url
 	@mkdir -p /tmp/castworks-acceptance; \
 	log=/tmp/castworks-acceptance/acceptance-dryrun-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
 	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
-	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestDryRun$$|^TestSnapshotSizeUnit$$|^TestChildProcessIsolation$$|^TestCleanupSavesActorBeforeEnd$$|^TestStopRecordedProcessMatchesExecutablePath$$|^TestWaitLoggedAddrReadsEveryLog$$|^TestDoSetsJSONContentTypeOnBodylessPost$$|^TestFakeClaudeEmitsSessionStateEvents$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 10m -run '^TestDryRun$$|^TestSnapshotSizeUnit$$|^TestBallastStatsUnit$$|^TestChildProcessIsolation$$|^TestCleanupSavesActorBeforeEnd$$|^TestStopRecordedProcessMatchesExecutablePath$$|^TestWaitLoggedAddrReadsEveryLog$$|^TestDoSetsJSONContentTypeOnBodylessPost$$|^TestFakeClaudeEmitsSessionStateEvents$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-dryrun: the -run pattern matched no test; failing instead of reporting success" >&2; \
@@ -196,6 +198,29 @@ acceptance-substrate: check-jobs check-database-url
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-substrate: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
+
+# acceptance-ballast provisions the memory-ballast actor and runs five
+# snapshot/restore cycles. It starts no control plane and spends no LLM quota,
+# but it serves actor reports on the development host's 9090, the same address
+# a control plane uses, so it must not overlap with one. The test context
+# expires at 45m; -timeout 60m lets a deadline fail the test and run its
+# cleanup instead of letting go test panic. It needs no credential file; its
+# image comes from BALLAST_IMAGE, which has no default.
+acceptance-ballast: check-jobs check-database-url
+	@if [ -z "$(BALLAST_IMAGE)" ]; then \
+		echo "BALLAST_IMAGE is not set; run make acceptance-ballast JOBS=<n> BALLAST_IMAGE=<ref>" >&2; \
+		exit 1; \
+	fi
+	@mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-ballast-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) CASTWORKS_ACC_BALLAST_IMAGE="$(BALLAST_IMAGE)" $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 60m -run '^TestBallastSuspendResume$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-ballast: the -run pattern matched no test; failing instead of reporting success" >&2; \
 		exit 1; \
 	fi; \
 	exit "$$status"
