@@ -122,3 +122,10 @@ actor-image-push:
 		exit 1; \
 	fi
 	images/actor/build.sh --push --tag $(ACTOR_IMAGE_REPO):$$(git rev-parse --short HEAD)
+
+# actor-image-smoke 在本地镜像上验证 Claude Code 版本、actor 模式的就绪探针、
+# PID 1 与运行用户、关停耗时和退出码，以及非法 actor-name 的退出状态。
+.PHONY: actor-image-smoke
+
+actor-image-smoke: actor-image
+	images/actor/smoke.sh --image $(ACTOR_IMAGE)
