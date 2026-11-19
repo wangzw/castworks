@@ -182,7 +182,7 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 	fs.StringVar(&cfg.SubstrateAtespace, "substrate-atespace", defaultSubstrateAtespace, "Substrate 的 atespace 名")
 	fs.StringVar(&cfg.SubstrateImage, "substrate-image", "", "actor 镜像的 linux/arm64 清单 digest，格式 name@sha256:<64 位十六进制>；--provider substrate 时必填")
 	fs.StringVar(&cfg.SubstrateControlPlane, "substrate-control-plane", defaultSubstrateControlPlane, "写进 actor 模板的 CASTWORKS_CONTROL_PLANE，格式 host:port")
-	fs.StringVar(&cfg.SubstrateServiceAccount, "substrate-service-account", defaultSubstrateServiceAccount, "actor 使用的 ServiceAccount，格式 namespace/name")
+	fs.StringVar(&cfg.SubstrateServiceAccount, "substrate-service-account", defaultSubstrateServiceAccount, "控制面调用 ate-api 时用 TokenRequest 签发令牌的身份，格式 namespace/name")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
