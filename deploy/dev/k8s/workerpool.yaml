@@ -9,6 +9,9 @@
 # spare. CPU capacity is the limit unchanged, and 2 CPU matches the template
 # exactly. The CPU request is kept below the limit so the pod is easy to place,
 # while memory is not compressible and its request matches the limit.
+#
+# Two workers are requested so two integration tests can each occupy one worker
+# at the same time: one worker fits the 2 CPU ActorTemplate exactly.
 apiVersion: ate.dev/v1
 kind: WorkerPool
 metadata:
@@ -18,7 +21,7 @@ metadata:
     castworks.dev/pool: castworks
     app.kubernetes.io/part-of: castworks
 spec:
-  replicas: 1
+  replicas: 2
   workerImage: registry.zhanwei.wang/ateworker-gvisor@sha256:ab9d4bb12e923d8846628b156c7339767224ddb8c000415668105b8a6a1be42b
   sandboxClasses:
   - name: gvisor

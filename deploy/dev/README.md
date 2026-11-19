@@ -49,12 +49,12 @@ teardown.sh 先确认 atespace 中没有 actor 与模板，再删除 atespace；
 | `k8s/serviceaccount.yaml` | ServiceAccount `castworks-system/sandboxprovider` | 控制面以 TokenRequest 为它签发令牌，经端口转发调用 ate-api |
 | `k8s/service.yaml` | Service `castworks-system/castworks-dev` | 不带 selector，给 actor 一个访问开发机的稳定名字 |
 | `k8s/endpointslice.yaml` | EndpointSlice `castworks-system/castworks-dev` | 把上面的 Service 指向 `10.12.72.11:9090` |
-| `k8s/workerpool.yaml` | WorkerPool `castworks-system/castworks` | 运行 actor 的 gVisor 池，1 个 worker，单个 worker 上限 2 CPU、3 GiB |
+| `k8s/workerpool.yaml` | WorkerPool `castworks-system/castworks` | 运行 actor 的 gVisor 池，2 个 worker，单个 worker 上限 2 CPU、3 GiB |
 | `access-policy.yaml` | atespace `castworks-dev` 的访问策略 | 授予 `sandboxprovider` 在 `castworks-dev` 中的 `editor` 角色 |
 
 setup.sh 还用 `kubectl ate create atespace` 建立 atespace `castworks-dev`，actor 都创建在这里。
 
-WorkerPool 的标签 `castworks.dev/pool: castworks` 会复制到每个 worker 上，actor 模板用 `worker_selector.match_labels` 选中这个池。worker 镜像按 digest 引用 `registry.zhanwei.wang/ateworker-gvisor`，与 counter demo 使用的是同一个 Substrate v1.0.0 构建。gVisor worker 会从内存上限中保留 64 MiB 给自己，所以内存上限取 3 GiB，让 2 GiB 的 actor 仍有足够容量。
+WorkerPool 的副本数取 2：每个 worker 的 2 CPU 只容得下模板里的一个 actor，两个集成测试的 actor 可以同时各占一个 worker。标签 `castworks.dev/pool: castworks` 会复制到每个 worker 上，actor 模板用 `worker_selector.match_labels` 选中这个池。worker 镜像按 digest 引用 `registry.zhanwei.wang/ateworker-gvisor`，与 counter demo 使用的是同一个 Substrate v1.0.0 构建。gVisor worker 会从内存上限中保留 64 MiB 给自己，所以内存上限取 3 GiB，让 2 GiB 的 actor 仍有足够容量。
 
 ### Worker 镜像
 
