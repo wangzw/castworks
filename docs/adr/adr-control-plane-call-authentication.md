@@ -8,6 +8,8 @@
 
 Agent 进程不持有[运行实例令牌](../glossary.md)，对外交互只经回环上的[本地代理](../glossary.md)与[透明拦截器](../glossary.md)等中介，这一约束来自 [ADR-host-owns-external-wake-sources](adr-host-owns-external-wake-sources.md)（架构不变量 I1、I6）；网络层没有强制手段时，它只是纸面声明。`secrets` 以 mTLS 与 SPIFFE 工作负载身份（[REF-spiffe](../references.md)）授权调用方，按调用方身份限定可换取的凭据种类与外部系统。
 
+Substrate 的 Pod 身份签发方（PodCertificateRequest 签发方 `podidentity.podcert.ate.dev/identity`）签出的身份为 `spiffe://<信任域>/ns/<命名空间>/sa/<ServiceAccount>`。Substrate 安装缺省以这个签发方的信任包校验路由器的入站客户端证书，并按入站白名单精确匹配证书中的 SPIFFE 身份；ate-api 要求客户端证书链到同一信任包，以证书的第一个 URI SAN 为调用方主体（[REF-substrate](../references.md)）。
+
 ## 考虑过的选项
 
 ### 只依靠网络隔离
@@ -26,6 +28,10 @@ Agent 进程不持有[运行实例令牌](../glossary.md)，对外交互只经�
 
 采用它意味着看守进程为 Agent 进程创建只经 veth 连到看守进程的独立网络命名空间，Agent 进程只能到达看守进程。**不作为基线**：主容器需要 `NET_ADMIN` 才能创建并配置命名空间，扩大看守进程的权限；Substrate actor 内能否创建网络命名空间未知。它与按 uid 的出站规则达到同等效果，可作为替换实现。
 
+### 身份路径由 castworks 自定
+
+采用它意味着身份取 `spiffe://<信任域>/castworks/<名称>` 这类不含命名空间与 ServiceAccount 的路径，由按登记条目签发任意路径的签发方签发。**被拒**：Substrate 的 Pod 身份签发方签不出这种路径，Substrate 部署须为 castworks 另设签发方，路由器的入站客户端 CA 与 `secrets` 都要同时信任两个签发方，castworks 的证书也不能用于调用 ate-api；名称与运行它的 ServiceAccount 之间还要另行登记对应关系。
+
 ### 内部调用以 SPIFFE mTLS 认证并按方法授权，面向沙箱的端点分开监听，按 uid 约束 Agent 出站
 
 采用它意味着每条内部调用都以 SPIFFE 身份做 mTLS 并按方法授权；看守进程调用的[面向沙箱的端点](../glossary.md)与内部接口分开监听，各自要求 Agent 进程不持有的凭据；k8s 路径由 init 容器安装按 uid 的出站规则，使 Agent 进程的网络出站只到回环。**采用**：见决策。
@@ -34,7 +40,8 @@ Agent 进程不持有[运行实例令牌](../glossary.md)，对外交互只经�
 
 采用内部调用以 SPIFFE mTLS 认证并按方法授权、Agent 网络出站收敛到回环的方案：
 
-- 控制面内部接口与提供者层组件的接口只在内部监听器上提供：只接受 mTLS 对端，对端身份形如 `spiffe://<spiffe_trust_domain>/castworks/<名称>`，且须在按方法授权表的允许集合内；不接受非 SPIFFE 对端，不对沙箱网段开放。不在授权表中的对端或方法以不可重试的未授权错误拒绝并写审计。按方法授权表由架构文档维护。
+- 控制面内部接口与提供者层组件的接口只在内部监听器上提供：只接受 mTLS 对端，对端身份形如 `spiffe://<spiffe_trust_domain>/ns/<命名空间>/sa/<名称>`，且须在按方法授权表的允许集合内；不接受非 SPIFFE 对端，不对沙箱网段开放。不在授权表中的对端或方法以不可重试的未授权错误拒绝并写审计。按方法授权表由架构文档维护。
+- 身份路径由命名空间与 ServiceAccount 构成：名称即同名的 ServiceAccount，命名空间由部署配置给出。任何按这种路径签发身份的签发方都可以签发；Substrate 部署复用 Substrate 的 Pod 身份签发方，castworks 与 Substrate 组件同属一个信任域。
 - 调用方声明的来源类字段一律由服务端按对端身份写入，请求中的同名值被忽略；发起用户只在对端为人类通道时接受。
 - 看守进程可调用的端点收敛为[面向沙箱的端点](../glossary.md)集合，部署在与内部监听器不同的主机名与端口上，每个端点都要求 Agent 进程不持有的凭据。
 - k8s 路径由沙箱 Pod 中唯一具备 `NET_ADMIN` 的 init 容器在 Pod 网络命名空间安装规则：uid 非 0 的进程发出的报文只允许发往回环地址，其余一律拒绝；规则对 uid 0 不生效，不依赖具体运行实例 uid，预热 Pod 同样安装；主容器不具备 `NET_ADMIN`。
@@ -46,7 +53,7 @@ Agent 进程的外部流量本身经回环上的本地代理与透明拦截器�
 
 本决策使项目承担以下义务，穷举如下：
 
-- 每个控制面进程与提供者层组件必须取得 SPIFFE 工作负载身份；Substrate 出口网关与 Substrate 路由器使用 Substrate 信任域中的身份，按部署白名单登记。
+- 每个控制面进程与 castworks 自身的提供者层组件必须以与其身份名称同名的 ServiceAccount 运行，并取得 SPIFFE 工作负载身份；Substrate 出口网关与 Substrate 路由器的身份是 Substrate 命名空间中的 ServiceAccount，按部署白名单登记。
 - 内部监听器只接受授权表中的对端；每个内部方法都必须登记在授权表中，未登记的方法一律拒绝。
 - 来源类字段由服务端按对端身份写入，任何接口不得以调用方自报的来源判定事件归属。
 - 面向沙箱的端点集合闭合，部署配置给出每个端点的主机名、端口与地址；看守进程按配置的地址直连，不经 DNS 解析控制面主机名。
@@ -57,6 +64,7 @@ Agent 进程的外部流量本身经回环上的本地代理与透明拦截器�
 承担的代价穷举如下：
 
 - 需要部署 SPIFFE 签发基础设施，并承担证书轮换与签发服务的可用性风险；签发服务长时间不可用时，证书到期的进程无法完成内部调用。
+- 身份由命名空间与 ServiceAccount 决定：能在 castworks 所在命名空间以某个 ServiceAccount 运行 Pod 或为其申请证书的主体即取得对应身份，这些命名空间的 RBAC 因此属于身份边界。
 - 每条内部调用增加 mTLS 握手与身份校验开销。
 - 授权表随接口演进维护；漏登记的方法表现为调用被拒。
 - 面向沙箱的端点需要第二套主机名、端口与证书。

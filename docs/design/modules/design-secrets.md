@@ -59,7 +59,7 @@
 
 ### 调用方授权
 
-本模块的全部方法以 mTLS 暴露，只在内部监听器上提供，不对沙箱网段开放；调用方身份即客户端证书中的 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)），形如 `spiffe://<spiffe_trust_domain>/castworks/<名称>`，下文以名称指代。每个方法允许的调用方取[认证与授权边界](../architecture.md#认证与授权边界)按方法授权表中的 `secrets` 行，穷举如下：
+本模块的全部方法以 mTLS 暴露，只在内部监听器上提供，不对沙箱网段开放；调用方身份即客户端证书中的 SPIFFE 工作负载身份（[REF-spiffe](../../references.md)），形如 `spiffe://<spiffe_trust_domain>/ns/<命名空间>/sa/<名称>`，名称即同名的 ServiceAccount，命名空间由部署配置给出，下文以名称指代。每个方法允许的调用方取[认证与授权边界](../architecture.md#认证与授权边界)按方法授权表中的 `secrets` 行，穷举如下：
 
 | 方法 | 允许的调用方 |
 | --- | --- |
@@ -70,7 +70,7 @@
 | `AccessTicketKeys` | `sandboxprovider`、`runcontroller` |
 | `ListCredentialPrincipals` | `humanchannel` |
 | `ReportDenial` | `llmgateway`、`connectorhub`、`egress-proxy`、`humanchannel` |
-| 凭据提供者 `ResolveCredential` | Substrate 出口网关（Substrate 信任域中的身份，按部署白名单登记） |
+| 凭据提供者 `ResolveCredential` | Substrate 出口网关（Substrate 命名空间中 ServiceAccount 的身份，按部署白名单登记） |
 
 - 身份缺失由 mTLS 在握手阶段拒绝，不进应用层。对端身份不在该方法的允许集合时，以不可重试的未授权错误拒绝，写 `denied` 审计（`operation` 取被拒绝的方法名，`usage_id` 取本模块为该次调用生成的请求标识，`run_id` 与 `generation` 取请求中可解析的值），不执行方法、不暴露凭据对象是否存在。
 - `VerifyRunToken` 只允许调用方校验与其身份对应的受众：`runcontroller` 取 `runcontroller`，`llmgateway` 取 `llmgateway`，`connectorhub` 取 `connectorhub`，`egress-proxy` 取 `egress`，`humanchannel` 取 `humanchannel`；以其他受众调用按未授权拒绝，不解析令牌。
