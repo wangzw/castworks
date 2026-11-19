@@ -100,6 +100,9 @@ func (d *Driver) handleMessageLocked(msg *streamMessage) {
 		d.handleResultLocked(msg)
 	case "user":
 		// 工具结果等用户消息不改变回合位置。
+	case "rate_limit_event":
+		// 限流状态是信息类消息，不构成回合边界，也不改变会话阶段。
+		d.log.Debug("claudecode: rate limit event")
 	default:
 		d.log.Warn("claudecode: ignored stdout message", "type", msg.Type)
 	}
