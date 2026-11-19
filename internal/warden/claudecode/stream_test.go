@@ -9,8 +9,8 @@ import (
 	"github.com/wangzw/castworks/internal/warden/agent"
 )
 
-// rateLimitEventLine 是验收运行（castworks-acceptance/20261119T194056Z/
-// TestLocal/stream.jsonl）中捕获的真实 rate_limit_event 行。
+// rateLimitEventLine 是 testdata/recorded/local_turn01_deliver.jsonl 第 4 行的
+// 真实 rate_limit_event 消息。
 const rateLimitEventLine = `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795132800,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"group_zero_credit_limit","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.03,"resetsAt":1795132800,"status":"allowed"},"seven_day":{"utilization":0.56,"resetsAt":1795136400,"status":"allowed"}}},"uuid":"52b0f98b-fb79-471e-b95b-4fe35e480656","session_id":"e89e59ed-657e-4c5d-8a03-8627fe5bb5ad"}`
 
 // logRecorder 记录经过 Logger 的全部记录，供测试核对级别。
