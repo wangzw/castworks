@@ -25,6 +25,11 @@ Supplements the `commit-convention` skill.
 - `references`: `docs/references.md`
 - `milestone`: `docs/milestone/`
 - `faq`: `docs/faq/`
+- a module name for that module's code as well: `runcontroller`, `agentprotocol`, `warden`, `sandboxprovider`, `humanchannel`
+- `controlplane`: `cmd/castworks-controlplane`
+- `cli`: `cmd/castworks`
+- `deploy`: `deploy/`
+- `build`: `Makefile`, `go.mod`, lint and code generation configuration, `images/`
 - `repo`: `CLAUDE.md`, `.markdownlint.jsonc` and other repository-level configuration
 
 ### Types
