@@ -44,6 +44,10 @@ const (
 	pollInterval           = 250 * time.Millisecond
 	httpTimeout            = 30 * time.Second
 	actorGoneTimeout       = 2 * time.Minute
+	// cleanupKubectlTimeout bounds each kubectl call cleanup makes directly.
+	// Cleanup runs with a context that has no deadline, so without this a
+	// wedged API server would hang the test until go test's own timeout.
+	cleanupKubectlTimeout = 30 * time.Second
 )
 
 // loggedAddr matches the addr attribute of a slog text line. slog writes it
@@ -796,9 +800,18 @@ func kubectlAte(ctx context.Context, kubeContext string, args ...string) (string
 	full = append(full, args...)
 
 	cmd := exec.CommandContext(ctx, "kubectl", full...)
-	out, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return string(out), fmt.Errorf("kubectl %s: %w: %s", strings.Join(full, " "), err, strings.TrimSpace(string(out)))
+		detail := strings.TrimSpace(string(out))
+		if warning := strings.TrimSpace(stderr.String()); warning != "" {
+			if detail != "" {
+				detail += "\n"
+			}
+			detail += warning
+		}
+		return string(out), fmt.Errorf("kubectl %s: %w: %s", strings.Join(full, " "), err, detail)
 	}
 	return string(out), nil
 }
@@ -821,7 +834,7 @@ func waitActorGone(ctx context.Context, kubeContext, actor string, timeout time.
 
 	var lastErr error
 	for {
-		_, err := kubectlAte(waitCtx, kubeContext, "get", "actor", actor, "-a", ateSpace, "-o", "name")
+		_, err := kubectlAte(waitCtx, kubeContext, "get", "actor", actor, "-a", ateSpace, "-o", "json")
 		switch {
 		case err == nil:
 			lastErr = fmt.Errorf("actor %s still exists", actor)
@@ -842,6 +855,11 @@ func waitActorGone(ctx context.Context, kubeContext, actor string, timeout time.
 // working directory before the actor is deleted.
 func (h *harness) saveActorState(ctx context.Context, actor string) {
 	h.t.Helper()
+
+	// The caller may pass a context without a deadline, as cleanup does; bound
+	// the kubectl calls here so neither one can hang forever.
+	ctx, cancel := context.WithTimeout(ctx, cleanupKubectlTimeout)
+	defer cancel()
 
 	out, err := kubectlAte(ctx, h.kubeCtx, "get", "actor", actor, "-a", ateSpace, "-o", "json")
 	if err != nil {
@@ -913,7 +931,10 @@ func (h *harness) cleanup() {
 	if actor != "" {
 		if err := waitActorGoneFn(context.Background(), h.kubeCtx, actor, actorGoneTimeout); err != nil {
 			h.t.Errorf("cleanup: %v; deleting the actor directly", err)
-			if _, deleteErr := kubectlAte(context.Background(), h.kubeCtx, "delete", "actor", actor, "-a", ateSpace); deleteErr != nil {
+			deleteCtx, cancelDelete := context.WithTimeout(context.Background(), cleanupKubectlTimeout)
+			_, deleteErr := kubectlAte(deleteCtx, h.kubeCtx, "delete", "actor", actor, "-a", ateSpace)
+			cancelDelete()
+			if deleteErr != nil {
 				h.t.Errorf("cleanup: delete actor %s: %v", actor, deleteErr)
 			}
 		}
@@ -1060,7 +1081,7 @@ func TestClean(t *testing.T) {
 
 	for _, runID := range substrateRunIDs(entries) {
 		actor := sandboxprovider.ActorName(runID)
-		if _, err := kubectlAte(ctx, kubeContext, "get", "actor", actor, "-a", ateSpace, "-o", "name"); err != nil {
+		if _, err := kubectlAte(ctx, kubeContext, "get", "actor", actor, "-a", ateSpace, "-o", "json"); err != nil {
 			if isActorMissing(err) {
 				continue
 			}

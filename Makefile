@@ -145,7 +145,7 @@ CREDENTIAL_FILE ?=
 CLAUDE_BIN ?=
 KUBE_CONTEXT ?=
 
-.PHONY: acceptance-dryrun acceptance-clean check-database-url
+.PHONY: acceptance-dryrun acceptance-substrate acceptance-clean check-database-url
 
 ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
 
@@ -176,6 +176,26 @@ acceptance-dryrun: check-jobs check-database-url
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-dryrun: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
+
+acceptance-substrate: check-jobs check-database-url
+	@if [ -z "$(CREDENTIAL_FILE)" ]; then \
+		echo "CREDENTIAL_FILE is not set; run make acceptance-substrate JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(ACTOR_IMAGE)" ]; then \
+		echo "ACTOR_IMAGE is not set; run make acceptance-substrate JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref>" >&2; \
+		exit 1; \
+	fi
+	@mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-substrate-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 30m -run '^TestSubstrateTwoTurns$$' ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-substrate: the -run pattern matched no test; failing instead of reporting success" >&2; \
 		exit 1; \
 	fi; \
 	exit "$$status"
