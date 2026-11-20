@@ -1,0 +1,20 @@
+kind: ExternalSystem
+name: extsim
+access:
+  mode: passthrough
+  upstreams: [extsim.castworks-system.svc.cluster.local]
+events:
+  sources:
+    - type: webhook
+      path: /hooks/extsim
+      signature: hmac-sha256
+      delivery_id: X-Extsim-Delivery
+      event_types: [job.completed]
+  correlation_keys: [job.project, job.id]
+  identity_keys: [job.id]
+  project_binding: job.project
+  dedup_key: [event_type, job.id, job.conclusion]
+  ordering: {occurred_at: job.updated_at}
+  completions:
+    - event: job.completed
+      verify: {api: extsim-job, terminal: [succeeded, failed]}
