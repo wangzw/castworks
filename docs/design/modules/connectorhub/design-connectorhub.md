@@ -686,7 +686,7 @@ sequenceDiagram
 | `completes_on` | json | `{event, match}`，可空；非空只与 `once` 组合 | 完成条件；`until_cancelled` 的该字段为空，按 `filter` 与 `correlation` 逐事件匹配 |
 | `verify` | json | `{api, terminal}`，取自 `events.completions` 中该事件的条目，可空 | 登记时与轮询时核对对象当前状态；只用于 `once` 订阅 |
 | `lifetime` | string | 闭集 `once`、`until_cancelled` | `once` 完成后终止匹配；`until_cancelled` 每次匹配继续 |
-| `since_cursor` | bigint | 回溯游标 | 取登记事务开始时连接器事件日志的下一个追加序号；回溯扫描 `append_seq < since_cursor` 的事件，实时匹配从 `append_seq >= since_cursor` 开始 |
+| `since_cursor` | bigint | 回溯游标 | 取登记事务取得咨询锁之后连接器事件日志的下一个追加序号；回溯扫描 `append_seq < since_cursor` 的事件，实时匹配从 `append_seq >= since_cursor` 开始 |
 | `timeout_at` | time | 可空 | 为空表示无订阅超时；非空时到期置 `expired` |
 | `dedup_spec` | json | 登记时 `events.dedup_key` 的副本 | 定义变更不影响已登记订阅的去重字段 |
 | `status` | string | 闭集见状态一览 | 订阅生命周期状态 |
@@ -758,7 +758,7 @@ sequenceDiagram
 
 初始状态：运行实例 `R` 属于项目 `P`，当前代为 3；`github` 定义的项目归属键为 `repository.full_name`，项目绑定配置为 `project_binding(P, github, [acme/repo])`，`github` 属于 `P` 的可用外部系统；Agent 通过第三方工具（例如 `gh pr create`）经出口代理创建 PR，返回 `pull_request.number=42` 与 `head.sha=abc123`；连接器事件日志、订阅与收件箱中都没有对应记录。Agent 先调用 `list_events(system=github)`，取得 `check_suite.completed` 的 `correlation_keys`、`identity_keys` 与 `terminal`，得知 `lifetime: once` 至少需要 `check_suite.head_sha` 或 `pull_request.number`。
 
-1. Agent 调用 `subscribe_event`，参数为 `event=check_suite.completed`、`correlation={repository.full_name=acme/repo, check_suite.head_sha=abc123}`、`lifetime=once` 与超时 `T`；平台 MCP 服务器附 `connectorhub` 受众的令牌发往面向沙箱的端点 `connector`。`connectorhub` 以 `VerifyRunToken(token, connectorhub)` 校验令牌，经 `Generations.Current` 校验代，经 `RunService.Get` 取得 `RunView.project_id=P`；校验 `github` 属于 `P` 的可用外部系统、项目归属键取值 `acme/repo` 属于 `P` 的绑定值、关联键身份键（`check_suite.head_sha` 属于 `identity_keys`），事务插入订阅 `S`，`project_id=P`，`status=active`，`since_cursor` 取登记事务开始时连接器事件日志的下一个追加序号 `e0`；按 `(github, P, 关联键路径, 规范化值)` 回溯连接器事件日志未命中。落库：`subscription(S, project_id=P, active, since_cursor=e0)`。
+1. Agent 调用 `subscribe_event`，参数为 `event=check_suite.completed`、`correlation={repository.full_name=acme/repo, check_suite.head_sha=abc123}`、`lifetime=once` 与超时 `T`；平台 MCP 服务器附 `connectorhub` 受众的令牌发往面向沙箱的端点 `connector`。`connectorhub` 以 `VerifyRunToken(token, connectorhub)` 校验令牌，经 `Generations.Current` 校验代，经 `RunService.Get` 取得 `RunView.project_id=P`；校验 `github` 属于 `P` 的可用外部系统、项目归属键取值 `acme/repo` 属于 `P` 的绑定值、关联键身份键（`check_suite.head_sha` 属于 `identity_keys`）；登记事务先按字典序对 `(github, check_suite.head_sha, abc123)` 与 `(github, repository.full_name, acme/repo)` 取得咨询锁，再插入订阅 `S`，`project_id=P`，`status=active`，`since_cursor` 取加锁之后连接器事件日志的下一个追加序号 `e0`；按 `(github, P, 关联键路径, 规范化值)` 回溯连接器事件日志未命中。落库：`subscription(S, project_id=P, active, since_cursor=e0)`。
 2. `connectorhub` 按 `events.completions` 中 `check_suite.completed` 的 `verify` 查询检查套件，返回 `queued`，不属于 `verify.terminal`；不写完成事件。看守进程把 `sub_id` 返回给 Agent，Agent 结束本回合。落库状态不变。
 3. 外部系统投递 webhook `D1`：`check_suite.completed`、`conclusion=success`、`repository.full_name=Acme/Repo`、`check_suite.head_sha=abc123`。`connectorhub` 校验签名，`delivery_id=D1` 未出现；项目归属键取值规范化为 `acme/repo`，出现在 `P` 的绑定值中，`project_ids={P}`；与日志行同一事务写入并提交，返回 200，追加序号为 `e0`。落库：`event(D1, project_ids={P}, append_seq=e0, claimed_by_sub=∅)`。
 4. 匹配事务：`D1` 的 `project_ids` 包含 `S` 的 `project_id=P`，关联键命中订阅 `S`；同一事务把 `S` 从 `active` CAS 到 `completed`，写入 `terminal=success`。CAS 成功后把原始负载写入附件 `ATT1`，复制 `project_ids={P}`，`content_hash` 为内容哈希；构造完成事件：`event_id=(S, success)`，`dedup_key=H(S, H(D1 的 dedup_spec 字段值))`，`subscription_status=completed`，`payload` 含 `ATT1` 的 URI、内容哈希与大小，长度不超过 `S_max`；同一事务写入状态为 `pending` 的完成事件投递记录。落库：`subscription(S, completed, success)`、`attachment(ATT1, project_ids={P}, expires_at=created_at+R_attachment)`、`completion_delivery(S, event_id=(S,success), dedup_key=…, pending)`。
@@ -779,8 +779,8 @@ sequenceDiagram
 
 1. 校验令牌：`secrets.VerifyRunToken(token, connectorhub)` 验证签名、过期时间、`run_id` 与受众，受众不是 `connectorhub` 时按令牌无效拒绝；`Generations.Current` 比较代、终态与本代作废状态。订阅登记不使用缓存的代。经 `RunService.Get` 取得 `RunView.project_id`，作为订阅的 `project_id`；请求中携带的项目标识被忽略。
 2. 校验定义与订阅参数：`system` 属于 `project_id` 所指项目的可用外部系统集合（与 `list_events`、出口策略同一投影），否则拒绝并审计；`correlation` 含该定义的项目归属键时，其规范化取值必须属于本项目在该外部系统上的绑定值，否则拒绝并审计；`lifetime` 属于 `once`、`until_cancelled`；`completes_on` 非空只与 `once` 组合，`until_cancelled` 的 `completes_on` 为空；`completes_on.event` 在 `events.completions` 中有对应条目时才执行 `verify`；`lifetime: once` 的 `correlation` 至少包含一个 `identity_keys`，否则拒绝并审计；`filter` 与 `correlation` 的字段路径可解析。
-3. 开启本模块事务。插入订阅行，`project_id` 取第 1 步的值，`status=active`，`dedup_spec` 取登记时的 `events.dedup_key` 副本。`since_cursor` 取登记事务开始时连接器事件日志的下一个追加序号。
-4. 扫描连接器事件日志中 `project_ids` 包含订阅 `project_id`、关联键匹配且 `append_seq < since_cursor` 的事件，逐条应用 `filter` 与 `completes_on`；命中事件以 `(sub_id, delivery_id)` 认领。`lifetime: once` 取 `occurred_at` 最早的一条作为完成事件；`until_cancelled` 把命中事件逐条构造为完成事件。
+3. 开启本模块事务，先按 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 以字典序取得事务级咨询锁，规则见[并发与事务边界](#并发与事务边界)；加锁之前不读取订阅与连接器事件日志。插入订阅行，`project_id` 取第 1 步的值，`status=active`，`dedup_spec` 取登记时的 `events.dedup_key` 副本。`since_cursor` 取加锁之后连接器事件日志的下一个追加序号。
+4. 以加锁之后取得的快照扫描连接器事件日志中 `project_ids` 包含订阅 `project_id`、关联键匹配且 `append_seq < since_cursor` 的事件，逐条应用 `filter` 与 `completes_on`；命中事件以 `(sub_id, delivery_id)` 认领。`lifetime: once` 取 `occurred_at` 最早的一条作为完成事件；`until_cancelled` 把命中事件逐条构造为完成事件。
 5. 提交事务。
 6. 若 `completes_on` 非空且事务内没有命中，按 `events.completions` 的 `verify` 核对对象当前状态。该核对与状态式轮询共用合并键、核对预算与按周期复用的凭据：同一对象本周期已核对时直接复用结果；该运行实例或项目本周期的核对预算已耗尽时跳过核对，订阅保持 `active`，由状态式轮询核对。对象已处于 `verify.terminal` 时，CAS `active` 到 `completed` 并合成完成事件；核对不可达时保持 `active`，由状态式轮询重试。`completes_on` 为空的 `until_cancelled` 订阅不执行该核对。
 7. 返回 `sub_id` 与 `since_cursor`。看守进程随后发出 `subscription_created{sub_id, since_cursor}`；`since_cursor` 是实时匹配的起点，Agent 不解析其数值。
@@ -799,7 +799,7 @@ sequenceDiagram
 4. 计算项目归属：取原始负载中 `events.project_binding` 所指字段的值，按 `correlation_normalization` 规范化，`project_ids` 为项目绑定配置中 `system` 相同且 `values` 含该取值的全部项目。字段缺失或没有项目声明该取值时 `project_ids` 为空：事件照常落盘，不参与任何匹配，计数 `connector_event_unbound` 并审计。
 5. 以 `(system, delivery_id)` 插入连接器事件日志，`project_ids` 与日志行同一事务写入。唯一键冲突表示重复投递，返回 200，不重复写入、不重复匹配。
 6. 提交事务后返回 200。
-7. 匹配活动订阅：在事件 `project_ids` 所含项目内，以 `(system, project_id, 关联键路径, 规范化值)` 定位候选订阅，逐条应用 `filter` 与 `completes_on`，以 `(sub_id, delivery_id)` 认领；`project_ids` 为空的事件跳过本步。`once` 订阅通过状态 CAS 完成；`until_cancelled` 订阅保持 `active`，每条命中事件各自构造完成事件并各写一条 `pending` 投递记录。投递记录提交后按“完成事件构造与投递”的每运行实例令牌桶发出，令牌桶无余量的记录保持 `pending`，由订阅对账扫描按速率重投。
+7. 匹配活动订阅：先按事件 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 以字典序取得事务级咨询锁，加锁之后才读取订阅；在事件 `project_ids` 所含项目内，以 `(system, project_id, 关联键路径, 规范化值)` 定位候选订阅，逐条应用 `filter` 与 `completes_on`，以 `(sub_id, delivery_id)` 认领；`project_ids` 为空的事件跳过本步。`once` 订阅通过状态 CAS 完成；`until_cancelled` 订阅保持 `active`，每条命中事件各自构造完成事件并各写一条 `pending` 投递记录。投递记录提交后按“完成事件构造与投递”的每运行实例令牌桶发出，令牌桶无余量的记录保持 `pending`，由订阅对账扫描按速率重投。
 8. 未命中任何订阅的事件留在连接器事件日志中，按 `R_event_log` 保存。
 
 webhook 的匹配复杂度与关联键命中的订阅数成正比，不对全部订阅做扫描。匹配失败不回滚已返回的 200；连接器事件日志保留，由状态式轮询与订阅对账扫描重驱动。
@@ -960,7 +960,7 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 
 去重依赖以下唯一索引：连接器事件日志的 `(system, delivery_id)`；认领记录的 `(sub_id, delivery_id)`；完成事件投递记录的 `(sub_id, dedup_key)`；收件箱的 `(run_id, dedup_key)`，由 `runcontroller` 维护。索引冲突按幂等命中处理，不产生重复行。
 
-对 `once` 订阅，webhook 匹配与状态式轮询的竞态由订阅状态 CAS 裁决：两者都从 `active` 出发，只有一个能把状态改为 `completed`；失败的一方不构造完成事件，连接器事件日志中的记录仍保留。订阅登记与 webhook 匹配的竞态按关联键串行化：登记事务对其 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 建立咨询锁，匹配事务对事件 `correlation` 的每一对建立咨询锁，两组按同一字典序加锁以避免死锁；子集订阅与超集事件因而至少共享一把锁。也可回退为按 `system` 的粗粒度咨询锁。登记事务提交后重扫 `append_seq >= since_cursor` 且本订阅尚无认领记录的匹配事件。订阅对账扫描按周期重新匹配仍在连接器事件日志保留期内的事件，为命中且对该事件尚无认领记录的活动订阅补写认领，作为兜底；最坏纠正时延不超过一个扫描周期。
+对 `once` 订阅，webhook 匹配与状态式轮询的竞态由订阅状态 CAS 裁决：两者都从 `active` 出发，只有一个能把状态改为 `completed`；失败的一方不构造完成事件，连接器事件日志中的记录仍保留。订阅登记与 webhook 匹配的竞态按关联键串行化：登记事务对其 `correlation` 的每一对 `(system, 关联键路径, 规范化值)` 建立咨询锁，匹配事务对事件 `correlation` 的每一对建立咨询锁，两组按同一字典序加锁以避免死锁；子集订阅与超集事件因而至少共享一把锁。也可回退为按 `system` 的粗粒度咨询锁。两种锁都要求加锁在先：登记事务在取得全部咨询锁之后才读取 `since_cursor` 并取得回溯扫描的快照，匹配事务在取得全部咨询锁之后才读取订阅。追加序号按分配顺序单调递增，提交顺序却可能不同，序号小于 `since_cursor` 的事件可以在登记读取游标之后才提交，回溯扫描与提交后的重扫都覆盖不到它；加锁在先保证这样的事件要么在登记加锁之前已经提交，回溯扫描看得到，要么它的匹配事务等登记提交并释放锁之后才读取订阅，看得到新订阅。快照在加锁之前取得时（例如可重复读隔离下，事务的第一条语句早于加锁），这条保证不成立，事件只能等订阅对账扫描补上。登记事务提交后重扫 `append_seq >= since_cursor` 且本订阅尚无认领记录的匹配事件。订阅对账扫描按周期重新匹配仍在连接器事件日志保留期内的事件，为命中且对该事件尚无认领记录的活动订阅补写认领，作为兜底；最坏纠正时延不超过一个扫描周期。
 
 对 `once` 订阅，订阅超时与完成同时发生时，CAS 只允许一个成功：完成先成功则超时不再写事件；超时先成功则后续 webhook 作为已终止订阅的事件丢弃并审计。`until_cancelled` 订阅的匹配与超时以订阅行锁串行，超时先提交则后续匹配看到 `expired` 并丢弃。订阅取消与完成同时发生时，取消先成功则完成事件不写入；完成先成功则取消不改写订阅状态，已记录的完成事件保留。
 
@@ -971,6 +971,7 @@ Substrate 路径的出口网关不逐请求查询代，按以（运行实例，�
 | webhook 先于订阅登记 | webhook 先提交连接器事件日志；订阅登记事务回溯匹配命中 | 完成事件写入收件箱，I2 成立 |
 | 订阅登记先于 webhook | 订阅登记事务未命中；webhook 匹配事务看到已提交订阅 | 完成事件写入收件箱 |
 | 登记与匹配并发 | 登记与匹配按 `(system, 关联键路径, 规范化值)` 逐对咨询锁串行，子集订阅与超集事件至少共享一把锁；登记提交后重扫，订阅对账扫描兜底 | 后开始的一方看到先提交的一方，不丢事件 |
+| 序号较小的事件晚提交 | 事件 `E` 在登记读取 `since_cursor` 之前分得较小的 `append_seq`，在登记读取游标之后才提交；登记加锁在先，`E` 的匹配事务在登记持锁期间等待，登记提交后才读取订阅；提交后的重扫只看 `append_seq >= since_cursor`，覆盖不到 `E` | `E` 由它自己的匹配事务命中新订阅，不丢事件；若登记在加锁之前取得快照，`E` 只能由订阅对账扫描补上 |
 | 跨项目订阅 | 项目 `B` 的运行实例以项目 `A` 的对象登记订阅，项目 `A` 的 webhook 先于或晚于登记到达：关联键含项目归属键时登记校验拒绝；关联键不含项目归属键时，事件的 `project_ids` 不含 `B`，回溯、实时与对账匹配都不命中 | `B` 收不到 `A` 的事件，也取不回其附件；两种到达顺序结论相同 |
 | 同一对象被多个订阅引用时的轮询核对 | 同一周期按合并键只调用一次 `verify.api`，结果扇出后各订阅独立 CAS | 每个订阅至多完成一次，`verify.api` 调用数不随订阅数增长 |
 | webhook 与状态式轮询同时完成 | 对同一 `once` 订阅，两者都 CAS `active` 到 `completed`，只有一个成功 | 成功者写完成事件，失败者不写 |
