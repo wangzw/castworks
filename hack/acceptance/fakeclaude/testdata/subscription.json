@@ -1,0 +1,116 @@
+{
+  "owner": "fakeclaude",
+  "default_reply": "fakeclaude: no scripted rule matched this message.",
+  "rules": [
+    {
+      "name": "subscription-completion",
+      "match": "\\[castworks\\] Subscription ",
+      "outcomes": {
+        "failed": [
+          {
+            "type": "write",
+            "path": "job.json",
+            "content": "${content}"
+          },
+          {
+            "type": "command",
+            "command": "extsim job submit --file job.json",
+            "description": "Resubmit the corrected content",
+            "capture": "second_job_id"
+          },
+          {
+            "type": "mcp",
+            "tool": "subscribe_event",
+            "arguments": {
+              "system": "extsim",
+              "event": "job.completed",
+              "correlation": {
+                "job.id": "${second_job_id}"
+              }
+            }
+          },
+          {
+            "type": "reply",
+            "text": "The first job ${first_job_id} failed: ${failure_reason}. Corrected the content and resubmitted as ${second_job_id}."
+          }
+        ],
+        "succeeded": [
+          {
+            "type": "reply",
+            "text": "The first job ${first_job_id} failed: ${failure_reason}. The initial content marker was ${marker}. The second job ${second_job_id} succeeded."
+          }
+        ]
+      }
+    },
+    {
+      "name": "background-watch",
+      "match": "(?i)background",
+      "steps": [
+        {
+          "type": "write",
+          "path": "watch.json",
+          "content": "{\"owner\":\"fakeclaude\"}"
+        },
+        {
+          "type": "command",
+          "command": "extsim job submit --file watch.json",
+          "description": "Submit the job to watch",
+          "capture": "watch_job_id"
+        },
+        {
+          "type": "background",
+          "command": "extsim job watch ${watch_job_id}",
+          "description": "Watch the job",
+          "reply": "The watched job ${watch_job_id} finished with exit code ${exit_code}."
+        },
+        {
+          "type": "reply",
+          "text": "Watching ${watch_job_id} in the background."
+        }
+      ]
+    },
+    {
+      "name": "submit-and-subscribe",
+      "match": "(?i)extsim",
+      "capture": {
+        "marker": "marker[^A-Za-z0-9_-]+([A-Za-z0-9_-]+)",
+        "content": "(?s)\\{.*?\\}"
+      },
+      "steps": [
+        {
+          "type": "write",
+          "path": "job.json",
+          "content": "${content}"
+        },
+        {
+          "type": "command",
+          "command": "extsim job submit --file job.json",
+          "description": "Submit the initial content",
+          "capture": "first_job_id"
+        },
+        {
+          "type": "mcp",
+          "tool": "list_events",
+          "arguments": {
+            "system": "extsim"
+          }
+        },
+        {
+          "type": "mcp",
+          "tool": "subscribe_event",
+          "arguments": {
+            "system": "extsim",
+            "event": "job.completed",
+            "correlation": {
+              "job.id": "${first_job_id}"
+            }
+          }
+        },
+        {
+          "type": "reply",
+          "text": "Submitted ${first_job_id} and subscribed to job.completed."
+        }
+      ]
+    }
+  ]
+}
