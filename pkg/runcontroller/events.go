@@ -2,6 +2,8 @@ package runcontroller
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
 	"google.golang.org/grpc/codes"
@@ -89,9 +91,13 @@ func (c *Controller) onStreamClosed(_ context.Context, conn *conn) {
 	runID := conn.runID()
 	// Record the disconnect time only while this conn is still the current
 	// stream. A newer stream has already cleared the record through its Hello.
-	if !c.streams.disconnectedIfCurrent(runID, conn, c.clock.Now()) {
+	// The same timestamp goes to the log line and the in-memory record.
+	at := c.clock.Now()
+	if !c.streams.disconnectedIfCurrent(runID, conn, at) {
 		return
 	}
+	slog.Default().Info("runcontroller: control stream closed",
+		"run_id", runID, "disconnected_at", at.Format(time.RFC3339Nano))
 	// The stream context is already gone; the close must still be persisted.
 	c.applyEventRetry(context.Background(), runID, evStreamClosed{},
 		applyOpts{requireCurrent: conn}, c.streamCloseLimit())
