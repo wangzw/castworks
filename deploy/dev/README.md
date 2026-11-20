@@ -58,6 +58,62 @@ export CASTWORKS_TEST_DATABASE_URL='postgres://castworks:castworks@127.0.0.1:554
 
 `make db-up` 同时启动两个服务并等到健康检查通过，`make db-down` 一起停止。`postgres-test` 的数据只在内存里，测试建删库不会影响 `postgres` 中控制面使用的数据。
 
+## 运行控制面
+
+控制面是开发机上的普通进程。先起数据库，把连接串指向持久化的 `postgres`（55432）：
+
+```sh
+make db-up
+export CASTWORKS_DATABASE_URL='postgres://castworks:castworks@127.0.0.1:55432/castworks_test?sslmode=disable'
+```
+
+开发集群上的演示与挂起测试用 Substrate 提供者：
+
+```sh
+go run ./cmd/castworks-controlplane \
+  --provider substrate \
+  --grpc-addr 10.12.72.11:9090 \
+  --substrate-image registry.zhanwei.wang/castworks/actor@sha256:<digest> \
+  --llm-credential-kind oauth_token \
+  --llm-credential-file /path/to/credential \
+  --suspend
+```
+
+`--grpc-addr` 取开发机的网卡地址，actor 经 Service 与 EndpointSlice 拨回这里；`--substrate-image` 必须是带完整 sha256 digest 的 arm64 清单。`--suspend` 打开挂起扫描，默认回合边界空闲 30 s 后挂起。凭据文件的种类由 `--llm-credential-kind` 指明，取 `api_key` 或 `oauth_token`，文件内容只有令牌本身。
+
+本地模式不碰集群，也不需要 Substrate，用本地提供者启动控制面：
+
+```sh
+go run ./cmd/castworks-controlplane \
+  --provider local \
+  --llm-credential-kind oauth_token \
+  --llm-credential-file /path/to/credential
+```
+
+`--provider local` 会强制关闭挂起，`Snapshot` 与 `RestoreSnapshot` 返回不支持。先创建运行实例，再在 `T_hello`（默认 60 s）内用返回的 `run_id` 启动看守进程：
+
+```sh
+go run ./cmd/castworks --server http://127.0.0.1:8080 run create '<prompt>'
+go run ./cmd/warden \
+  --run-id <run_id> \
+  --control-plane 127.0.0.1:9090 \
+  --home /tmp/castworks-home \
+  --claude-bin "$(command -v claude)"
+```
+
+`--home` 指定的目录存放 Claude Code 的工作目录与 stream-json 记录，本地模式不使用开发者自己的主目录。看守进程连上控制面之前，控制面从本地提供者的 `Provision` 返回起算 `T_hello`。
+
+`make acceptance-*` 把上述步骤封装成端到端测试，运行记录写到 `/tmp/castworks-acceptance/`，除 `acceptance-clean` 外都需要 `CASTWORKS_TEST_DATABASE_URL` 指向 `postgres-test`（55433）：
+
+| 目标 | 用途 |
+| --- | --- |
+| `make acceptance-dryrun JOBS=<n>` | 本地提供者加假的 Claude Code，不花 LLM 额度，验证验收 harness |
+| `make acceptance-local JOBS=<n> CREDENTIAL_FILE=<path>` | 本地提供者加真实的 Claude Code，跑两个回合，并录制 stream-json 样本 |
+| `make acceptance-substrate JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref>` | Substrate 提供者，不启用挂起，两个回合后结束 |
+| `make acceptance-suspend JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>` | Substrate 提供者加 `--suspend`，跑演示场景与通过标准 |
+| `make acceptance-ballast JOBS=<n> BALLAST_IMAGE=<ref>` | 用压载镜像做快照恢复循环，不花 LLM 额度 |
+| `make acceptance-clean JOBS=<n>` | 清理验收留下的 actor 与模板 |
+
 ## 资源
 
 | 文件 | 对象 | 用途 |
