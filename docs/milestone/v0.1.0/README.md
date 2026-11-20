@@ -19,6 +19,16 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 - 同一运行实例连续挂起、恢复 10 次，每条消息恰好得到一次处理，不丢失，不重复。
 - 运行实例处于挂起状态时重启控制面，之后发来的消息仍能恢复该运行实例并得到处理。
 
+## 验收结果
+
+2026-11-19（UTC）在开发集群上重跑验收。actor 镜像为 `registry.zhanwei.wang/castworks/actor@sha256:8347ea189ec39bf58d9ceec7b788f3a67431fe62b9b25e8df89ee54f4dd2ff5c`，来源提交记为 `430f63a`：这个值取自 `measurements.json` 的 `repo_commit` 字段，该字段是操作者经 `ACTOR_COMMIT` 环境变量传入的，没有独立的构建记录。控制面与看守进程代码与提交 `0add82d` 相同；当时的验收代码还没有 `hello_at` 放宽，`hello_ms` 为空的挂起记录按失败计，判定比现在更严。`430f63a` 之后，看守进程自身的生产代码只有 `819141d` 一处改动：`internal/warden/claudecode/stream.go` 增加 3 行，把 `rate_limit_event` 按信息类消息处理，不再落入未知消息分支。所以镜像与验收时代码的看守进程行为相同，只差这条日志的级别。已采集的日志中 `ignored stdout message` WARN 出现 3 次，类型都是 `rate_limit_event`，原因就是镜像尚未包含这条改动；行为不受影响，没有重建镜像。另有运行目录 `20261119T234309Z` 单独跑过一次 `TestSuspendResume/Demo` 并通过，两个回合的 `is_error` 均为 false，第二个回合在恢复后完成；该次未计入[技术验证](../verification.md)的 12 个样本。`TestSubstrateTwoTurns` 一次通过（18.84 s），`TestSuspendResume` 的三个子测试全部通过。各项耗时、快照大小与样本数见[技术验证](../verification.md)。
+
+| 通过标准 | 结论 | 依据 |
+| --- | --- | --- |
+| 场景在开发集群上完整跑通，第 3 步的回复表明 Claude Code 保留了上一轮的上下文，上一轮写出的文件仍然存在 | 通过 | `TestSuspendResume/Demo`（54.66 s）。两个回合都经 `castworks` 命令行操作，`is_error` 均为 false。第一个回合写入含随机标记的文件，回复不回显文件内容；第二个回合在恢复后完成，输出 `file=8c7ab221bfa93786`、`pass=pass-dmzl5esbn0ks`、`mtime=1795131905`，与第一个回合写入的文件一致。回合结束到挂起开始间隔 34580 ms，不小于 `G_idle` 的 30 s；actor 进入 `SUSPENDED` 后不再占用 worker。挂起记录 1 条，`snapshot_ms=1040`、`restore_ms=270`、`hello_ms=939`。 |
+| 同一运行实例连续挂起、恢复 10 次，每条消息恰好得到一次处理，不丢失，不重复 | 通过 | `TestSuspendResume/TenCycles`（449.36 s）。11 个回合全部 `is_error=false`，10 次挂起都在 `suspended` 状态下由新消息触发恢复，`sent_while_suspended` 都为 true。第 k 次恢复后的回合输出 `count=k+1`、`last=k`（k=1～10）；最后一个回合回复的 `counter.txt` 为 `0,1,2,3,4,5,6,7,8,9,10`。收件箱的 11 条消息与 11 个回合按 `delivery_id` 一一对应，没有重复投递，也没有丢失；计数放在运行实例再次进入挂起之后，给重复投递留出一个扫描周期的机会。 |
+| 运行实例处于挂起状态时重启控制面，之后发来的消息仍能恢复该运行实例并得到处理 | 通过 | `TestSuspendResume/RestartWhileSuspended`（55.52 s）。第一个回合结束后 actor 为 `SUSPENDED`，控制面收到 `SIGTERM` 以 0 退出，actor 保持挂起。用同一数据库重启控制面后，发消息前运行实例仍为 `suspended`；消息触发恢复并完成第二个回合，输出 `file=9d80471d6b669804`、`pass=pass-dmzlbu97ln0i`。挂起记录 1 条，`snapshot_ms=975`、`restore_ms=237`、`hello_ms=968`。 |
+
 ## 挂起机制
 
 挂起只用 Substrate 的 MEMORY 快照，时机是回合边界。快照保存了 Claude Code 进程的内存和 actor 的文件系统，恢复后进程从挂起处继续运行，所以 v0.1.0 不需要工作区持久化、Claude Code 的 `--resume` 续接、跨代去重与引导接口。
@@ -70,7 +80,7 @@ Substrate 把 actor 的全部 TCP 出站送到出口网关，EgressPolicy 没有
 - `api.anthropic.com:443` 以 `tls_passthrough` 规则透传，出口网关不终止 TLS，Claude Code 不需要信任出口网关的 CA。
 - 控制面的 gRPC 端口以 `http` 规则放行，看守进程与控制面之间是明文 gRPC（h2c）。actor 的域名解析只应答出口策略中列出的主机，所以控制面在集群里以一个不带 selector 的 Service 出现，全限定名为 `castworks-dev.castworks-system.svc.cluster.local`，它的 EndpointSlice 指向开发机的地址；规则与看守进程拨号都使用这个全限定名，见 [sandboxprovider](sandboxprovider.md#网络)。
 
-Claude Code 以 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 运行，不发出遥测一类的非必要流量。两种 LLM 凭据下 Claude Code 是否只访问 `api.anthropic.com`，在实现顺序第 4 步的本地运行中观察确认；需要其他主机时加入出口策略。演示任务只在 actor 本地读写文件，不访问其他主机。
+Claude Code 以 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 运行，不发出遥测一类的非必要流量。验收只在 `oauth_token` 凭据下观察到 Claude Code 只访问 `api.anthropic.com`，`api_key` 凭据下尚未观察；出现其他主机时加入出口策略。演示任务只在 actor 本地读写文件，不访问其他主机。
 
 ## 模板快照
 

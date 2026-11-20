@@ -74,7 +74,7 @@ ate-api 只在集群内提供服务，控制面使用开发机的 kubeconfig 访
 | `wakeupProbe` 超时 | Substrate 把 actor 置为 `CRASHED`，按上一行处理 |
 | `SuspendActor` 失败 | 返回错误，由 `runcontroller` 稍后重试 |
 | `DeleteActor` 返回 `NOT_FOUND` | 视为成功 |
-| 除 `DeleteActor` 外的调用返回 `NOT_FOUND` | 包装为 `ErrNotFound`，调用方据此区分 actor 不存在与可重试的错误；写事件的重试遇到它即停止 |
+| 除 `DeleteActor` 外的调用返回 `NOT_FOUND` | 包装为 `ErrNotFound`；目前没有调用方据此分支 |
 
 ## 日志
 

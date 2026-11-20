@@ -82,8 +82,8 @@ stateDiagram-v2
 
 1. `RunService.Create` 写入 `provisioning` 状态的运行实例和收件箱第 1 条，提交后调用 `Provision`。失败时转 `failed`。
 2. 收到 `Hello`：
-   - 状态为 `provisioning`、`resuming` 或 `active` 时转 `active`，子状态按 `agent_state.phase` 取：`starting` 与 `boundary` 取 `boundary`，`in_turn` 取 `in_turn`；`exited` 转 `failed`，并以 `FailedPrecondition` 关闭这条流。
-   - 状态为 `suspending` 或 `suspended` 时只登记这条流，不改变状态、不投递。无论处于哪种状态，`Hello.last_accepted_seq` 都用来抬高 `delivered_through`，`Hello.turn_id` 与 `Hello.last_turn` 都用来补记回合的开始或结果。
+   - 状态为 `provisioning`、`resuming` 或 `active` 时转 `active`，子状态按 `agent_state.phase` 取：`starting` 与 `boundary` 取 `boundary`，`in_turn` 取 `in_turn`；`exited` 转 `failed`，并以 `FailedPrecondition` 关闭这条流，不登记这条流，也不应答 `HelloAck`。
+   - 状态为 `suspending` 或 `suspended` 时只登记这条流，不改变状态、不投递。上述非终态下，`Hello.last_accepted_seq` 都用来抬高 `delivered_through`；`phase` 为 `in_turn` 时用 `Hello.turn_id` 补记回合开始，`phase` 为 `boundary` 时用 `Hello.last_turn` 补记回合结果。
    - 应答 `HelloAck`，携带控制面配置的 LLM 凭据及其种类，见 [agentprotocol](agentprotocol.md)。
 3. 恢复时，从 `RestoreSnapshot` 返回起等待 `Hello`；预配时，从 `Provision` 返回起等待 `Hello`。等满 `T_hello` 仍未收到则转 `failed`。
 

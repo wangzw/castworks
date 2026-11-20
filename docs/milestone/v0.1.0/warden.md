@@ -60,7 +60,7 @@ stdin 在回合之间保持打开，下一批消息写入同一进程。
 
 ### 自发回合
 
-回合边界上出现 `session_state_changed: running`，或者出现 assistant 消息，表示 Claude Code 未收到投递就自行开始了回合。看守进程同样生成 `turn_id` 并发出 `turn_started`，`delivery_id` 留空。此后到达的投递并入这个回合，不另发 `turn_started`。
+回合边界（`boundary` 阶段）上出现 `session_state_changed: running`，或者出现 assistant 消息，表示 Claude Code 未收到投递就自行开始了回合。`starting` 阶段 Claude Code 尚未启动，不会出现自发回合。看守进程同样生成 `turn_id` 并发出 `turn_started`，`delivery_id` 留空。此后到达的投递并入这个回合，不另发 `turn_started`。
 
 ### 识别回合结束
 
