@@ -672,7 +672,10 @@ func (c *Controller) deliverFrame(runID string, messages []inboxMessage) (*agent
 	}
 	batch := make([]*agentprotocolv1.InboxMessage, len(messages))
 	for i, m := range messages {
-		batch[i] = &agentprotocolv1.InboxMessage{InboxSeq: m.Seq, Text: m.Text}
+		batch[i] = &agentprotocolv1.InboxMessage{
+			InboxSeq: m.Seq,
+			Content:  &agentprotocolv1.InboxMessage_Text{Text: m.Text},
+		}
 	}
 	return &agentprotocolv1.ControlFrame{
 		RunId: runID,

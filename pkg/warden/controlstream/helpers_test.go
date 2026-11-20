@@ -212,7 +212,10 @@ func deliverFrame(runID, deliveryID string, msgs ...*agentprotocolv1.InboxMessag
 }
 
 func inbox(seq int64, text string) *agentprotocolv1.InboxMessage {
-	return &agentprotocolv1.InboxMessage{InboxSeq: seq, Text: text}
+	return &agentprotocolv1.InboxMessage{
+		InboxSeq: seq,
+		Content:  &agentprotocolv1.InboxMessage_Text{Text: text},
+	}
 }
 
 // logCapture 收集默认 slog 日志器的输出。

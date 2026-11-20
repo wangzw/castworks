@@ -257,7 +257,10 @@ func helloAckFrame(kind agentprotocolv1.LLMCredentialKind, value string) *agentp
 func deliverFrame(deliveryID string, seqs ...int64) *agentprotocolv1.ControlFrame {
 	batch := make([]*agentprotocolv1.InboxMessage, len(seqs))
 	for i, seq := range seqs {
-		batch[i] = &agentprotocolv1.InboxMessage{InboxSeq: seq, Text: fmt.Sprintf("message %d", seq)}
+		batch[i] = &agentprotocolv1.InboxMessage{
+			InboxSeq: seq,
+			Content:  &agentprotocolv1.InboxMessage_Text{Text: fmt.Sprintf("message %d", seq)},
+		}
 	}
 	return &agentprotocolv1.ControlFrame{
 		RunId: testRunID,

@@ -172,7 +172,10 @@ func deliverFrame(runID string) *agentprotocolv1.ControlFrame {
 		RunId: runID,
 		Body: &agentprotocolv1.ControlFrame_Deliver{Deliver: &agentprotocolv1.Deliver{
 			DeliveryId: "d-1",
-			Batch:      []*agentprotocolv1.InboxMessage{{InboxSeq: 1, Text: "hello"}},
+			Batch: []*agentprotocolv1.InboxMessage{{
+				InboxSeq: 1,
+				Content:  &agentprotocolv1.InboxMessage_Text{Text: "hello"},
+			}},
 			ThroughSeq: 1,
 		}},
 	}

@@ -183,7 +183,10 @@ func deliverFrame(runID, deliveryID string, seq int64, text string) *agentprotoc
 		RunId: runID,
 		Body: &agentprotocolv1.ControlFrame_Deliver{Deliver: &agentprotocolv1.Deliver{
 			DeliveryId: deliveryID,
-			Batch:      []*agentprotocolv1.InboxMessage{{InboxSeq: seq, Text: text}},
+			Batch: []*agentprotocolv1.InboxMessage{{
+				InboxSeq: seq,
+				Content:  &agentprotocolv1.InboxMessage_Text{Text: text},
+			}},
 			ThroughSeq: seq,
 		}},
 	}

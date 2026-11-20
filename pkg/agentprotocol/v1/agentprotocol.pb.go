@@ -15,6 +15,7 @@ package agentprotocolv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -355,7 +356,10 @@ type Hello struct {
 	// Claude Code; it is 0 before anything was written.
 	LastAcceptedSeq int64 `protobuf:"varint,2,opt,name=last_accepted_seq,json=lastAcceptedSeq,proto3" json:"last_accepted_seq,omitempty"`
 	// last_turn carries the latest turn result when phase is PHASE_BOUNDARY.
-	LastTurn      *LastTurn `protobuf:"bytes,3,opt,name=last_turn,json=lastTurn,proto3" json:"last_turn,omitempty"`
+	LastTurn *LastTurn `protobuf:"bytes,3,opt,name=last_turn,json=lastTurn,proto3" json:"last_turn,omitempty"`
+	// bg_jobs is the warden's current background job set. It is empty before
+	// Claude Code starts and after it exits.
+	BgJobs        []string `protobuf:"bytes,4,rep,name=bg_jobs,json=bgJobs,proto3" json:"bg_jobs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -407,6 +411,13 @@ func (x *Hello) GetLastAcceptedSeq() int64 {
 func (x *Hello) GetLastTurn() *LastTurn {
 	if x != nil {
 		return x.LastTurn
+	}
+	return nil
+}
+
+func (x *Hello) GetBgJobs() []string {
+	if x != nil {
+		return x.BgJobs
 	}
 	return nil
 }
@@ -534,6 +545,7 @@ type AgentEvent struct {
 	//
 	//	*AgentEvent_TurnStarted
 	//	*AgentEvent_TurnEnded
+	//	*AgentEvent_BgJobsChanged
 	Kind          isAgentEvent_Kind `protobuf_oneof:"kind"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -601,6 +613,15 @@ func (x *AgentEvent) GetTurnEnded() *TurnEnded {
 	return nil
 }
 
+func (x *AgentEvent) GetBgJobsChanged() *BgJobsChanged {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentEvent_BgJobsChanged); ok {
+			return x.BgJobsChanged
+		}
+	}
+	return nil
+}
+
 type isAgentEvent_Kind interface {
 	isAgentEvent_Kind()
 }
@@ -613,9 +634,62 @@ type AgentEvent_TurnEnded struct {
 	TurnEnded *TurnEnded `protobuf:"bytes,3,opt,name=turn_ended,json=turnEnded,proto3,oneof"`
 }
 
+type AgentEvent_BgJobsChanged struct {
+	// bg_jobs_changed reports the complete set after a change. turn_id is the
+	// current turn during a turn and empty at turn boundaries.
+	BgJobsChanged *BgJobsChanged `protobuf:"bytes,4,opt,name=bg_jobs_changed,json=bgJobsChanged,proto3,oneof"`
+}
+
 func (*AgentEvent_TurnStarted) isAgentEvent_Kind() {}
 
 func (*AgentEvent_TurnEnded) isAgentEvent_Kind() {}
+
+func (*AgentEvent_BgJobsChanged) isAgentEvent_Kind() {}
+
+// BgJobsChanged reports the warden's complete background job set.
+type BgJobsChanged struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobIds        []string               `protobuf:"bytes,1,rep,name=job_ids,json=jobIds,proto3" json:"job_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BgJobsChanged) Reset() {
+	*x = BgJobsChanged{}
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BgJobsChanged) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BgJobsChanged) ProtoMessage() {}
+
+func (x *BgJobsChanged) ProtoReflect() protoreflect.Message {
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BgJobsChanged.ProtoReflect.Descriptor instead.
+func (*BgJobsChanged) Descriptor() ([]byte, []int) {
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BgJobsChanged) GetJobIds() []string {
+	if x != nil {
+		return x.JobIds
+	}
+	return nil
+}
 
 // TurnStarted reports that a turn began.
 type TurnStarted struct {
@@ -629,7 +703,7 @@ type TurnStarted struct {
 
 func (x *TurnStarted) Reset() {
 	*x = TurnStarted{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[6]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -641,7 +715,7 @@ func (x *TurnStarted) String() string {
 func (*TurnStarted) ProtoMessage() {}
 
 func (x *TurnStarted) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[6]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -654,7 +728,7 @@ func (x *TurnStarted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TurnStarted.ProtoReflect.Descriptor instead.
 func (*TurnStarted) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{6}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *TurnStarted) GetDeliveryId() string {
@@ -684,7 +758,7 @@ type TurnEnded struct {
 
 func (x *TurnEnded) Reset() {
 	*x = TurnEnded{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[7]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +770,7 @@ func (x *TurnEnded) String() string {
 func (*TurnEnded) ProtoMessage() {}
 
 func (x *TurnEnded) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[7]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +783,7 @@ func (x *TurnEnded) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TurnEnded.ProtoReflect.Descriptor instead.
 func (*TurnEnded) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{7}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *TurnEnded) GetOutput() string {
@@ -744,7 +818,7 @@ type Accepted struct {
 
 func (x *Accepted) Reset() {
 	*x = Accepted{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[8]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -756,7 +830,7 @@ func (x *Accepted) String() string {
 func (*Accepted) ProtoMessage() {}
 
 func (x *Accepted) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[8]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -769,7 +843,7 @@ func (x *Accepted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Accepted.ProtoReflect.Descriptor instead.
 func (*Accepted) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{8}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Accepted) GetDeliveryId() string {
@@ -796,7 +870,7 @@ type HelloAck struct {
 
 func (x *HelloAck) Reset() {
 	*x = HelloAck{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[9]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -808,7 +882,7 @@ func (x *HelloAck) String() string {
 func (*HelloAck) ProtoMessage() {}
 
 func (x *HelloAck) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[9]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -821,7 +895,7 @@ func (x *HelloAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HelloAck.ProtoReflect.Descriptor instead.
 func (*HelloAck) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{9}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *HelloAck) GetLlmCredential() *LLMCredential {
@@ -842,7 +916,7 @@ type LLMCredential struct {
 
 func (x *LLMCredential) Reset() {
 	*x = LLMCredential{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[10]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -854,7 +928,7 @@ func (x *LLMCredential) String() string {
 func (*LLMCredential) ProtoMessage() {}
 
 func (x *LLMCredential) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[10]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -867,7 +941,7 @@ func (x *LLMCredential) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LLMCredential.ProtoReflect.Descriptor instead.
 func (*LLMCredential) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{10}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *LLMCredential) GetKind() LLMCredentialKind {
@@ -898,7 +972,7 @@ type Deliver struct {
 
 func (x *Deliver) Reset() {
 	*x = Deliver{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[11]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -910,7 +984,7 @@ func (x *Deliver) String() string {
 func (*Deliver) ProtoMessage() {}
 
 func (x *Deliver) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[11]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -923,7 +997,7 @@ func (x *Deliver) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Deliver.ProtoReflect.Descriptor instead.
 func (*Deliver) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{11}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Deliver) GetDeliveryId() string {
@@ -947,18 +1021,25 @@ func (x *Deliver) GetThroughSeq() int64 {
 	return 0
 }
 
-// InboxMessage is one human message in a delivery batch.
+// InboxMessage is one inbox event in a delivery batch.
 type InboxMessage struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	InboxSeq      int64                  `protobuf:"varint,1,opt,name=inbox_seq,json=inboxSeq,proto3" json:"inbox_seq,omitempty"`
-	Text          string                 `protobuf:"bytes,2,opt,name=text,proto3" json:"text,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	InboxSeq int64                  `protobuf:"varint,1,opt,name=inbox_seq,json=inboxSeq,proto3" json:"inbox_seq,omitempty"`
+	// content carries exactly one of a human message text or a subscription
+	// completion event.
+	//
+	// Types that are valid to be assigned to Content:
+	//
+	//	*InboxMessage_Text
+	//	*InboxMessage_SubscriptionCompleted
+	Content       isInboxMessage_Content `protobuf_oneof:"content"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InboxMessage) Reset() {
 	*x = InboxMessage{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[12]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -970,7 +1051,7 @@ func (x *InboxMessage) String() string {
 func (*InboxMessage) ProtoMessage() {}
 
 func (x *InboxMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[12]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -983,7 +1064,7 @@ func (x *InboxMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InboxMessage.ProtoReflect.Descriptor instead.
 func (*InboxMessage) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{12}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *InboxMessage) GetInboxSeq() int64 {
@@ -993,11 +1074,162 @@ func (x *InboxMessage) GetInboxSeq() int64 {
 	return 0
 }
 
+func (x *InboxMessage) GetContent() isInboxMessage_Content {
+	if x != nil {
+		return x.Content
+	}
+	return nil
+}
+
 func (x *InboxMessage) GetText() string {
 	if x != nil {
-		return x.Text
+		if x, ok := x.Content.(*InboxMessage_Text); ok {
+			return x.Text
+		}
 	}
 	return ""
+}
+
+func (x *InboxMessage) GetSubscriptionCompleted() *SubscriptionCompleted {
+	if x != nil {
+		if x, ok := x.Content.(*InboxMessage_SubscriptionCompleted); ok {
+			return x.SubscriptionCompleted
+		}
+	}
+	return nil
+}
+
+type isInboxMessage_Content interface {
+	isInboxMessage_Content()
+}
+
+type InboxMessage_Text struct {
+	Text string `protobuf:"bytes,2,opt,name=text,proto3,oneof"`
+}
+
+type InboxMessage_SubscriptionCompleted struct {
+	SubscriptionCompleted *SubscriptionCompleted `protobuf:"bytes,3,opt,name=subscription_completed,json=subscriptionCompleted,proto3,oneof"`
+}
+
+func (*InboxMessage_Text) isInboxMessage_Content() {}
+
+func (*InboxMessage_SubscriptionCompleted) isInboxMessage_Content() {}
+
+// SubscriptionCompleted carries the fields of a completed subscription.
+type SubscriptionCompleted struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	SubId              string                 `protobuf:"bytes,1,opt,name=sub_id,json=subId,proto3" json:"sub_id,omitempty"`
+	System             string                 `protobuf:"bytes,2,opt,name=system,proto3" json:"system,omitempty"`
+	Event              string                 `protobuf:"bytes,3,opt,name=event,proto3" json:"event,omitempty"`
+	SubscriptionStatus string                 `protobuf:"bytes,4,opt,name=subscription_status,json=subscriptionStatus,proto3" json:"subscription_status,omitempty"`
+	Terminal           string                 `protobuf:"bytes,5,opt,name=terminal,proto3" json:"terminal,omitempty"`
+	Correlation        map[string]string      `protobuf:"bytes,6,rep,name=correlation,proto3" json:"correlation,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	OccurredAt         *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
+	Source             string                 `protobuf:"bytes,8,opt,name=source,proto3" json:"source,omitempty"`
+	Detail             string                 `protobuf:"bytes,9,opt,name=detail,proto3" json:"detail,omitempty"`
+	DetailTruncated    bool                   `protobuf:"varint,10,opt,name=detail_truncated,json=detailTruncated,proto3" json:"detail_truncated,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *SubscriptionCompleted) Reset() {
+	*x = SubscriptionCompleted{}
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubscriptionCompleted) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubscriptionCompleted) ProtoMessage() {}
+
+func (x *SubscriptionCompleted) ProtoReflect() protoreflect.Message {
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubscriptionCompleted.ProtoReflect.Descriptor instead.
+func (*SubscriptionCompleted) Descriptor() ([]byte, []int) {
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SubscriptionCompleted) GetSubId() string {
+	if x != nil {
+		return x.SubId
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetSystem() string {
+	if x != nil {
+		return x.System
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetEvent() string {
+	if x != nil {
+		return x.Event
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetSubscriptionStatus() string {
+	if x != nil {
+		return x.SubscriptionStatus
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetTerminal() string {
+	if x != nil {
+		return x.Terminal
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetCorrelation() map[string]string {
+	if x != nil {
+		return x.Correlation
+	}
+	return nil
+}
+
+func (x *SubscriptionCompleted) GetOccurredAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.OccurredAt
+	}
+	return nil
+}
+
+func (x *SubscriptionCompleted) GetSource() string {
+	if x != nil {
+		return x.Source
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetDetail() string {
+	if x != nil {
+		return x.Detail
+	}
+	return ""
+}
+
+func (x *SubscriptionCompleted) GetDetailTruncated() bool {
+	if x != nil {
+		return x.DetailTruncated
+	}
+	return false
 }
 
 // Shutdown tells the warden that the run has ended.
@@ -1010,7 +1242,7 @@ type Shutdown struct {
 
 func (x *Shutdown) Reset() {
 	*x = Shutdown{}
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[13]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1022,7 +1254,7 @@ func (x *Shutdown) String() string {
 func (*Shutdown) ProtoMessage() {}
 
 func (x *Shutdown) ProtoReflect() protoreflect.Message {
-	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[13]
+	mi := &file_agentprotocol_v1_agentprotocol_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1035,7 +1267,7 @@ func (x *Shutdown) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Shutdown.ProtoReflect.Descriptor instead.
 func (*Shutdown) Descriptor() ([]byte, []int) {
-	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{13}
+	return file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *Shutdown) GetReason() string {
@@ -1049,7 +1281,7 @@ var File_agentprotocol_v1_agentprotocol_proto protoreflect.FileDescriptor
 
 const file_agentprotocol_v1_agentprotocol_proto_rawDesc = "" +
 	"\n" +
-	"$agentprotocol/v1/agentprotocol.proto\x12\x10agentprotocol.v1\"\xcd\x01\n" +
+	"$agentprotocol/v1/agentprotocol.proto\x12\x10agentprotocol.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xcd\x01\n" +
 	"\vWardenFrame\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12/\n" +
 	"\x05hello\x18\x02 \x01(\v2\x17.agentprotocol.v1.HelloH\x00R\x05hello\x124\n" +
@@ -1061,12 +1293,13 @@ const file_agentprotocol_v1_agentprotocol_proto_rawDesc = "" +
 	"\thello_ack\x18\x02 \x01(\v2\x1a.agentprotocol.v1.HelloAckH\x00R\bhelloAck\x125\n" +
 	"\adeliver\x18\x03 \x01(\v2\x19.agentprotocol.v1.DeliverH\x00R\adeliver\x128\n" +
 	"\bshutdown\x18\x04 \x01(\v2\x1a.agentprotocol.v1.ShutdownH\x00R\bshutdownB\x06\n" +
-	"\x04body\"\xab\x01\n" +
+	"\x04body\"\xc4\x01\n" +
 	"\x05Hello\x12=\n" +
 	"\vagent_state\x18\x01 \x01(\v2\x1c.agentprotocol.v1.AgentStateR\n" +
 	"agentState\x12*\n" +
 	"\x11last_accepted_seq\x18\x02 \x01(\x03R\x0flastAcceptedSeq\x127\n" +
-	"\tlast_turn\x18\x03 \x01(\v2\x1a.agentprotocol.v1.LastTurnR\blastTurn\"T\n" +
+	"\tlast_turn\x18\x03 \x01(\v2\x1a.agentprotocol.v1.LastTurnR\blastTurn\x12\x17\n" +
+	"\abg_jobs\x18\x04 \x03(\tR\x06bgJobs\"T\n" +
 	"\n" +
 	"AgentState\x12-\n" +
 	"\x05phase\x18\x01 \x01(\x0e2\x17.agentprotocol.v1.PhaseR\x05phase\x12\x17\n" +
@@ -1074,14 +1307,17 @@ const file_agentprotocol_v1_agentprotocol_proto_rawDesc = "" +
 	"\bLastTurn\x12\x17\n" +
 	"\aturn_id\x18\x01 \x01(\tR\x06turnId\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\tR\x06output\x12\x19\n" +
-	"\bis_error\x18\x03 \x01(\bR\aisError\"\xaf\x01\n" +
+	"\bis_error\x18\x03 \x01(\bR\aisError\"\xfa\x01\n" +
 	"\n" +
 	"AgentEvent\x12\x17\n" +
 	"\aturn_id\x18\x01 \x01(\tR\x06turnId\x12B\n" +
 	"\fturn_started\x18\x02 \x01(\v2\x1d.agentprotocol.v1.TurnStartedH\x00R\vturnStarted\x12<\n" +
 	"\n" +
-	"turn_ended\x18\x03 \x01(\v2\x1b.agentprotocol.v1.TurnEndedH\x00R\tturnEndedB\x06\n" +
-	"\x04kind\"M\n" +
+	"turn_ended\x18\x03 \x01(\v2\x1b.agentprotocol.v1.TurnEndedH\x00R\tturnEnded\x12I\n" +
+	"\x0fbg_jobs_changed\x18\x04 \x01(\v2\x1f.agentprotocol.v1.BgJobsChangedH\x00R\rbgJobsChangedB\x06\n" +
+	"\x04kind\"(\n" +
+	"\rBgJobsChanged\x12\x17\n" +
+	"\ajob_ids\x18\x01 \x03(\tR\x06jobIds\"M\n" +
 	"\vTurnStarted\x12\x1f\n" +
 	"\vdelivery_id\x18\x01 \x01(\tR\n" +
 	"deliveryId\x12\x1d\n" +
@@ -1106,10 +1342,28 @@ const file_agentprotocol_v1_agentprotocol_proto_rawDesc = "" +
 	"deliveryId\x124\n" +
 	"\x05batch\x18\x02 \x03(\v2\x1e.agentprotocol.v1.InboxMessageR\x05batch\x12\x1f\n" +
 	"\vthrough_seq\x18\x03 \x01(\x03R\n" +
-	"throughSeq\"?\n" +
+	"throughSeq\"\xae\x01\n" +
 	"\fInboxMessage\x12\x1b\n" +
-	"\tinbox_seq\x18\x01 \x01(\x03R\binboxSeq\x12\x12\n" +
-	"\x04text\x18\x02 \x01(\tR\x04text\"\"\n" +
+	"\tinbox_seq\x18\x01 \x01(\x03R\binboxSeq\x12\x14\n" +
+	"\x04text\x18\x02 \x01(\tH\x00R\x04text\x12`\n" +
+	"\x16subscription_completed\x18\x03 \x01(\v2'.agentprotocol.v1.SubscriptionCompletedH\x00R\x15subscriptionCompletedB\t\n" +
+	"\acontent\"\xdd\x03\n" +
+	"\x15SubscriptionCompleted\x12\x15\n" +
+	"\x06sub_id\x18\x01 \x01(\tR\x05subId\x12\x16\n" +
+	"\x06system\x18\x02 \x01(\tR\x06system\x12\x14\n" +
+	"\x05event\x18\x03 \x01(\tR\x05event\x12/\n" +
+	"\x13subscription_status\x18\x04 \x01(\tR\x12subscriptionStatus\x12\x1a\n" +
+	"\bterminal\x18\x05 \x01(\tR\bterminal\x12Z\n" +
+	"\vcorrelation\x18\x06 \x03(\v28.agentprotocol.v1.SubscriptionCompleted.CorrelationEntryR\vcorrelation\x12;\n" +
+	"\voccurred_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"occurredAt\x12\x16\n" +
+	"\x06source\x18\b \x01(\tR\x06source\x12\x16\n" +
+	"\x06detail\x18\t \x01(\tR\x06detail\x12)\n" +
+	"\x10detail_truncated\x18\n" +
+	" \x01(\bR\x0fdetailTruncated\x1a>\n" +
+	"\x10CorrelationEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\"\n" +
 	"\bShutdown\x12\x16\n" +
 	"\x06reason\x18\x01 \x01(\tR\x06reason*k\n" +
 	"\x05Phase\x12\x15\n" +
@@ -1138,47 +1392,55 @@ func file_agentprotocol_v1_agentprotocol_proto_rawDescGZIP() []byte {
 }
 
 var file_agentprotocol_v1_agentprotocol_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_agentprotocol_v1_agentprotocol_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_agentprotocol_v1_agentprotocol_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_agentprotocol_v1_agentprotocol_proto_goTypes = []any{
-	(Phase)(0),             // 0: agentprotocol.v1.Phase
-	(LLMCredentialKind)(0), // 1: agentprotocol.v1.LLMCredentialKind
-	(*WardenFrame)(nil),    // 2: agentprotocol.v1.WardenFrame
-	(*ControlFrame)(nil),   // 3: agentprotocol.v1.ControlFrame
-	(*Hello)(nil),          // 4: agentprotocol.v1.Hello
-	(*AgentState)(nil),     // 5: agentprotocol.v1.AgentState
-	(*LastTurn)(nil),       // 6: agentprotocol.v1.LastTurn
-	(*AgentEvent)(nil),     // 7: agentprotocol.v1.AgentEvent
-	(*TurnStarted)(nil),    // 8: agentprotocol.v1.TurnStarted
-	(*TurnEnded)(nil),      // 9: agentprotocol.v1.TurnEnded
-	(*Accepted)(nil),       // 10: agentprotocol.v1.Accepted
-	(*HelloAck)(nil),       // 11: agentprotocol.v1.HelloAck
-	(*LLMCredential)(nil),  // 12: agentprotocol.v1.LLMCredential
-	(*Deliver)(nil),        // 13: agentprotocol.v1.Deliver
-	(*InboxMessage)(nil),   // 14: agentprotocol.v1.InboxMessage
-	(*Shutdown)(nil),       // 15: agentprotocol.v1.Shutdown
+	(Phase)(0),                    // 0: agentprotocol.v1.Phase
+	(LLMCredentialKind)(0),        // 1: agentprotocol.v1.LLMCredentialKind
+	(*WardenFrame)(nil),           // 2: agentprotocol.v1.WardenFrame
+	(*ControlFrame)(nil),          // 3: agentprotocol.v1.ControlFrame
+	(*Hello)(nil),                 // 4: agentprotocol.v1.Hello
+	(*AgentState)(nil),            // 5: agentprotocol.v1.AgentState
+	(*LastTurn)(nil),              // 6: agentprotocol.v1.LastTurn
+	(*AgentEvent)(nil),            // 7: agentprotocol.v1.AgentEvent
+	(*BgJobsChanged)(nil),         // 8: agentprotocol.v1.BgJobsChanged
+	(*TurnStarted)(nil),           // 9: agentprotocol.v1.TurnStarted
+	(*TurnEnded)(nil),             // 10: agentprotocol.v1.TurnEnded
+	(*Accepted)(nil),              // 11: agentprotocol.v1.Accepted
+	(*HelloAck)(nil),              // 12: agentprotocol.v1.HelloAck
+	(*LLMCredential)(nil),         // 13: agentprotocol.v1.LLMCredential
+	(*Deliver)(nil),               // 14: agentprotocol.v1.Deliver
+	(*InboxMessage)(nil),          // 15: agentprotocol.v1.InboxMessage
+	(*SubscriptionCompleted)(nil), // 16: agentprotocol.v1.SubscriptionCompleted
+	(*Shutdown)(nil),              // 17: agentprotocol.v1.Shutdown
+	nil,                           // 18: agentprotocol.v1.SubscriptionCompleted.CorrelationEntry
+	(*timestamppb.Timestamp)(nil), // 19: google.protobuf.Timestamp
 }
 var file_agentprotocol_v1_agentprotocol_proto_depIdxs = []int32{
 	4,  // 0: agentprotocol.v1.WardenFrame.hello:type_name -> agentprotocol.v1.Hello
 	7,  // 1: agentprotocol.v1.WardenFrame.event:type_name -> agentprotocol.v1.AgentEvent
-	10, // 2: agentprotocol.v1.WardenFrame.accepted:type_name -> agentprotocol.v1.Accepted
-	11, // 3: agentprotocol.v1.ControlFrame.hello_ack:type_name -> agentprotocol.v1.HelloAck
-	13, // 4: agentprotocol.v1.ControlFrame.deliver:type_name -> agentprotocol.v1.Deliver
-	15, // 5: agentprotocol.v1.ControlFrame.shutdown:type_name -> agentprotocol.v1.Shutdown
+	11, // 2: agentprotocol.v1.WardenFrame.accepted:type_name -> agentprotocol.v1.Accepted
+	12, // 3: agentprotocol.v1.ControlFrame.hello_ack:type_name -> agentprotocol.v1.HelloAck
+	14, // 4: agentprotocol.v1.ControlFrame.deliver:type_name -> agentprotocol.v1.Deliver
+	17, // 5: agentprotocol.v1.ControlFrame.shutdown:type_name -> agentprotocol.v1.Shutdown
 	5,  // 6: agentprotocol.v1.Hello.agent_state:type_name -> agentprotocol.v1.AgentState
 	6,  // 7: agentprotocol.v1.Hello.last_turn:type_name -> agentprotocol.v1.LastTurn
 	0,  // 8: agentprotocol.v1.AgentState.phase:type_name -> agentprotocol.v1.Phase
-	8,  // 9: agentprotocol.v1.AgentEvent.turn_started:type_name -> agentprotocol.v1.TurnStarted
-	9,  // 10: agentprotocol.v1.AgentEvent.turn_ended:type_name -> agentprotocol.v1.TurnEnded
-	12, // 11: agentprotocol.v1.HelloAck.llm_credential:type_name -> agentprotocol.v1.LLMCredential
-	1,  // 12: agentprotocol.v1.LLMCredential.kind:type_name -> agentprotocol.v1.LLMCredentialKind
-	14, // 13: agentprotocol.v1.Deliver.batch:type_name -> agentprotocol.v1.InboxMessage
-	2,  // 14: agentprotocol.v1.AgentStream.Connect:input_type -> agentprotocol.v1.WardenFrame
-	3,  // 15: agentprotocol.v1.AgentStream.Connect:output_type -> agentprotocol.v1.ControlFrame
-	15, // [15:16] is the sub-list for method output_type
-	14, // [14:15] is the sub-list for method input_type
-	14, // [14:14] is the sub-list for extension type_name
-	14, // [14:14] is the sub-list for extension extendee
-	0,  // [0:14] is the sub-list for field type_name
+	9,  // 9: agentprotocol.v1.AgentEvent.turn_started:type_name -> agentprotocol.v1.TurnStarted
+	10, // 10: agentprotocol.v1.AgentEvent.turn_ended:type_name -> agentprotocol.v1.TurnEnded
+	8,  // 11: agentprotocol.v1.AgentEvent.bg_jobs_changed:type_name -> agentprotocol.v1.BgJobsChanged
+	13, // 12: agentprotocol.v1.HelloAck.llm_credential:type_name -> agentprotocol.v1.LLMCredential
+	1,  // 13: agentprotocol.v1.LLMCredential.kind:type_name -> agentprotocol.v1.LLMCredentialKind
+	15, // 14: agentprotocol.v1.Deliver.batch:type_name -> agentprotocol.v1.InboxMessage
+	16, // 15: agentprotocol.v1.InboxMessage.subscription_completed:type_name -> agentprotocol.v1.SubscriptionCompleted
+	18, // 16: agentprotocol.v1.SubscriptionCompleted.correlation:type_name -> agentprotocol.v1.SubscriptionCompleted.CorrelationEntry
+	19, // 17: agentprotocol.v1.SubscriptionCompleted.occurred_at:type_name -> google.protobuf.Timestamp
+	2,  // 18: agentprotocol.v1.AgentStream.Connect:input_type -> agentprotocol.v1.WardenFrame
+	3,  // 19: agentprotocol.v1.AgentStream.Connect:output_type -> agentprotocol.v1.ControlFrame
+	19, // [19:20] is the sub-list for method output_type
+	18, // [18:19] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_agentprotocol_v1_agentprotocol_proto_init() }
@@ -1199,6 +1461,11 @@ func file_agentprotocol_v1_agentprotocol_proto_init() {
 	file_agentprotocol_v1_agentprotocol_proto_msgTypes[5].OneofWrappers = []any{
 		(*AgentEvent_TurnStarted)(nil),
 		(*AgentEvent_TurnEnded)(nil),
+		(*AgentEvent_BgJobsChanged)(nil),
+	}
+	file_agentprotocol_v1_agentprotocol_proto_msgTypes[13].OneofWrappers = []any{
+		(*InboxMessage_Text)(nil),
+		(*InboxMessage_SubscriptionCompleted)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1206,7 +1473,7 @@ func file_agentprotocol_v1_agentprotocol_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_agentprotocol_v1_agentprotocol_proto_rawDesc), len(file_agentprotocol_v1_agentprotocol_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   14,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

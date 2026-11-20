@@ -7,6 +7,8 @@ syntax = "proto3";
 
 package agentprotocol.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/wangzw/castworks/pkg/agentprotocol/v1;agentprotocolv1";
 
 // AgentStream is the only service on the warden connection.
@@ -44,6 +46,9 @@ message Hello {
   int64 last_accepted_seq = 2;
   // last_turn carries the latest turn result when phase is PHASE_BOUNDARY.
   LastTurn last_turn = 3;
+  // bg_jobs is the warden's current background job set. It is empty before
+  // Claude Code starts and after it exits.
+  repeated string bg_jobs = 4;
 }
 
 // Phase is the warden's view of the agent at the time the stream opened.
@@ -76,7 +81,15 @@ message AgentEvent {
   oneof kind {
     TurnStarted turn_started = 2;
     TurnEnded turn_ended = 3;
+    // bg_jobs_changed reports the complete set after a change. turn_id is the
+    // current turn during a turn and empty at turn boundaries.
+    BgJobsChanged bg_jobs_changed = 4;
   }
+}
+
+// BgJobsChanged reports the warden's complete background job set.
+message BgJobsChanged {
+  repeated string job_ids = 1;
 }
 
 // TurnStarted reports that a turn began.
@@ -127,10 +140,30 @@ message Deliver {
   int64 through_seq = 3;
 }
 
-// InboxMessage is one human message in a delivery batch.
+// InboxMessage is one inbox event in a delivery batch.
 message InboxMessage {
   int64 inbox_seq = 1;
-  string text = 2;
+
+  // content carries exactly one of a human message text or a subscription
+  // completion event.
+  oneof content {
+    string text = 2;
+    SubscriptionCompleted subscription_completed = 3;
+  }
+}
+
+// SubscriptionCompleted carries the fields of a completed subscription.
+message SubscriptionCompleted {
+  string sub_id = 1;
+  string system = 2;
+  string event = 3;
+  string subscription_status = 4;
+  string terminal = 5;
+  map<string, string> correlation = 6;
+  google.protobuf.Timestamp occurred_at = 7;
+  string source = 8;
+  string detail = 9;
+  bool detail_truncated = 10;
 }
 
 // Shutdown tells the warden that the run has ended.

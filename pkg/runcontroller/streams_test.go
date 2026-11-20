@@ -21,7 +21,10 @@ func streamTestDeliver(deliveryID string) *agentprotocolv1.ControlFrame {
 		RunId: "run-1",
 		Body: &agentprotocolv1.ControlFrame_Deliver{Deliver: &agentprotocolv1.Deliver{
 			DeliveryId: deliveryID,
-			Batch:      []*agentprotocolv1.InboxMessage{{InboxSeq: 1, Text: "hello"}},
+			Batch: []*agentprotocolv1.InboxMessage{{
+				InboxSeq: 1,
+				Content:  &agentprotocolv1.InboxMessage_Text{Text: "hello"},
+			}},
 			ThroughSeq: 1,
 		}},
 	}
@@ -104,7 +107,10 @@ func TestStreamConnEnqueueRejectsInvalidFrames(t *testing.T) {
 		"deliver without delivery id": {
 			RunId: "run-1",
 			Body: &agentprotocolv1.ControlFrame_Deliver{Deliver: &agentprotocolv1.Deliver{
-				Batch:      []*agentprotocolv1.InboxMessage{{InboxSeq: 1, Text: "x"}},
+				Batch: []*agentprotocolv1.InboxMessage{{
+					InboxSeq: 1,
+					Content:  &agentprotocolv1.InboxMessage_Text{Text: "x"},
+				}},
 				ThroughSeq: 1,
 			}},
 		},

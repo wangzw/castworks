@@ -21,6 +21,10 @@ import (
 // in reverse; keep the two definitions in sync by hand.
 const maxTextBytes = 64 << 10
 
+// maxDetailBytes is the largest detail the protocol allows in one
+// subscription completion event.
+const maxDetailBytes = 48 << 10
+
 // ValidateWardenFrame checks one frame sent by the warden to the control
 // plane. It returns nil when the frame is valid and a descriptive error
 // otherwise.
@@ -87,6 +91,25 @@ func validateHello(h *agentprotocolv1.Hello) error {
 		return fmt.Errorf("agentprotocol: hello agent_state phase %d is not defined",
 			h.GetAgentState().GetPhase())
 	}
+	if err := validateStringSet("hello bg_jobs", h.GetBgJobs()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateStringSet checks that every element of values is non-empty and that
+// no element repeats. Order is not checked.
+func validateStringSet(what string, values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for i, v := range values {
+		if v == "" {
+			return fmt.Errorf("agentprotocol: %s entry %d is empty", what, i)
+		}
+		if _, ok := seen[v]; ok {
+			return fmt.Errorf("agentprotocol: %s entry %d repeats %q", what, i, v)
+		}
+		seen[v] = struct{}{}
+	}
 	return nil
 }
 
@@ -94,21 +117,30 @@ func validateAgentEvent(e *agentprotocolv1.AgentEvent) error {
 	if e == nil {
 		return errors.New("agentprotocol: event is nil")
 	}
-	if e.GetTurnId() == "" {
-		return errors.New("agentprotocol: event has an empty turn_id")
-	}
 
 	switch kind := e.GetKind().(type) {
 	case *agentprotocolv1.AgentEvent_TurnStarted:
 		if kind.TurnStarted == nil {
 			return errors.New("agentprotocol: event has an empty turn_started kind")
 		}
+		if e.GetTurnId() == "" {
+			return errors.New("agentprotocol: event has an empty turn_id")
+		}
 		return nil
 	case *agentprotocolv1.AgentEvent_TurnEnded:
 		if kind.TurnEnded == nil {
 			return errors.New("agentprotocol: event has an empty turn_ended kind")
 		}
+		if e.GetTurnId() == "" {
+			return errors.New("agentprotocol: event has an empty turn_id")
+		}
 		return nil
+	case *agentprotocolv1.AgentEvent_BgJobsChanged:
+		// turn_id may be empty at a turn boundary, so it is not checked.
+		if kind.BgJobsChanged == nil {
+			return errors.New("agentprotocol: event has an empty bg_jobs_changed kind")
+		}
+		return validateStringSet("bg_jobs_changed job_ids", kind.BgJobsChanged.GetJobIds())
 	default:
 		return errors.New("agentprotocol: event has no kind")
 	}
@@ -166,9 +198,18 @@ func validateDeliver(d *agentprotocolv1.Deliver) error {
 			return fmt.Errorf("agentprotocol: deliver batch entry %d has inbox_seq %d, must be at least 1",
 				i, msg.GetInboxSeq())
 		}
-		if len(msg.GetText()) > maxTextBytes {
-			return fmt.Errorf("agentprotocol: deliver batch entry %d text is %d bytes, over the %d byte limit",
-				i, len(msg.GetText()), maxTextBytes)
+		switch content := msg.GetContent().(type) {
+		case *agentprotocolv1.InboxMessage_Text:
+			if len(content.Text) > maxTextBytes {
+				return fmt.Errorf("agentprotocol: deliver batch entry %d text is %d bytes, over the %d byte limit",
+					i, len(content.Text), maxTextBytes)
+			}
+		case *agentprotocolv1.InboxMessage_SubscriptionCompleted:
+			if err := validateSubscriptionCompleted(content.SubscriptionCompleted); err != nil {
+				return fmt.Errorf("agentprotocol: deliver batch entry %d: %w", i, err)
+			}
+		default:
+			return fmt.Errorf("agentprotocol: deliver batch entry %d has neither text nor subscription_completed", i)
 		}
 		if i > 0 && msg.GetInboxSeq() <= previous {
 			return fmt.Errorf("agentprotocol: deliver batch is not in strictly increasing inbox_seq order at entry %d", i)
@@ -179,6 +220,45 @@ func validateDeliver(d *agentprotocolv1.Deliver) error {
 	if last := batch[len(batch)-1].GetInboxSeq(); d.GetThroughSeq() != last {
 		return fmt.Errorf("agentprotocol: deliver through_seq %d does not equal the last inbox_seq %d",
 			d.GetThroughSeq(), last)
+	}
+	return nil
+}
+
+// validateSubscriptionCompleted checks the required fields and the detail
+// limit of one subscription completion event. correlation and detail may be
+// empty: a subscription always carries correlation keys in practice, but the
+// document sets no per-field rule for it, and a completion event may have no
+// detail. detail_truncated is informational and is not cross-checked.
+func validateSubscriptionCompleted(s *agentprotocolv1.SubscriptionCompleted) error {
+	if s == nil {
+		return errors.New("subscription_completed is nil")
+	}
+
+	required := []struct {
+		name  string
+		value string
+	}{
+		{"sub_id", s.GetSubId()},
+		{"system", s.GetSystem()},
+		{"event", s.GetEvent()},
+		{"subscription_status", s.GetSubscriptionStatus()},
+		{"terminal", s.GetTerminal()},
+		{"source", s.GetSource()},
+	}
+	for _, f := range required {
+		if f.value == "" {
+			return fmt.Errorf("subscription_completed has an empty %s", f.name)
+		}
+	}
+	if s.GetOccurredAt() == nil {
+		return errors.New("subscription_completed has no occurred_at")
+	}
+	if err := s.GetOccurredAt().CheckValid(); err != nil {
+		return fmt.Errorf("subscription_completed has an invalid occurred_at: %w", err)
+	}
+	if len(s.GetDetail()) > maxDetailBytes {
+		return fmt.Errorf("subscription_completed detail is %d bytes, over the %d byte limit",
+			len(s.GetDetail()), maxDetailBytes)
 	}
 	return nil
 }
