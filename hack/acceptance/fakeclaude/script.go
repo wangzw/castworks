@@ -387,6 +387,20 @@ func sanitizeVarName(key string) string {
 	return strings.ReplaceAll(key, ".", "_")
 }
 
+// FailureReason 从订阅完成事件的 detail 中取出作业失败原因。extsim 的 detail
+// 是回调负载，原因嵌在 job.reason；不是这种形状时原样返回 detail。
+func FailureReason(detail string) string {
+	var payload struct {
+		Job struct {
+			Reason string `json:"reason"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal([]byte(detail), &payload); err == nil && payload.Job.Reason != "" {
+		return payload.Job.Reason
+	}
+	return detail
+}
+
 // CorrectContent 在内容是 JSON 对象时补上 owner，其余情况原样返回。
 func CorrectContent(content, owner string) string {
 	var object map[string]any

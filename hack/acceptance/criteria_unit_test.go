@@ -200,6 +200,15 @@ func TestJudgeTwoRoundTrips(t *testing.T) {
 		}
 	})
 
+	t.Run("satisfied without suspension records", func(t *testing.T) {
+		c := criteriaRoundTripCase(t)
+		c.DryRun = true
+		c.Suspensions = nil
+		if mismatch := judgeRoundTrip(c); mismatch != "" {
+			t.Fatalf("dry-run records were rejected: %s", mismatch)
+		}
+	})
+
 	counterexamples := []struct {
 		name   string
 		mutate func(*testing.T, *criteriaCase)
@@ -307,6 +316,28 @@ func TestJudgeTwoRoundTrips(t *testing.T) {
 				c.Suspensions = c.Suspensions[:1]
 			},
 			want: "want 2",
+		},
+		{
+			// DryRun skips the suspension checks, not the inbox checks.
+			name: "dry run with an extra completion row",
+			mutate: func(t *testing.T, c *criteriaCase) {
+				c.DryRun = true
+				c.Inbox = append(c.Inbox, criteriaTestInboxRow(4, criteriaKindSubscriptionCompleted, "",
+					criteriaTestBase().Add(140*time.Second),
+					criteriaTestCompletionPayload(t, "sub-3", "job-cccc",
+						criteriaTerminalSucceeded, criteriaSourceWebhook)))
+			},
+			want: "want 2",
+		},
+		{
+			// The callback check in the DryRun branch must still run: every
+			// round trip needs a successful callback from extsim.
+			name: "dry run without a successful callback",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.DryRun = true
+				delete(c.ExtsimDeliveries, "job-aaaa")
+			},
+			want: "no successful callback",
 		},
 	}
 
@@ -987,6 +1018,44 @@ func TestJudgeBackgroundJob(t *testing.T) {
 			want: "precondition not met",
 		},
 		{
+			// A turn that starts after the boundary and is still running when
+			// bg_jobs empties interrupts the idle period. The hold cannot be
+			// measured across it, so the precondition does not hold.
+			name: "a turn interrupted the idle period",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.Turns = append(c.Turns, criteriaTestTurn("turn-mid", "delivery-mid",
+					criteriaTestBase().Add(40*time.Second), criteriaTestBase().Add(65*time.Second),
+					"ran while the background watch was still running"))
+			},
+			want: "precondition not met",
+		},
+		{
+			// The spontaneous turn must start within one sampling interval of
+			// the recorded empty time. A turn starting two seconds before it,
+			// beyond the one-second tolerance, cannot be that turn. The second
+			// non-empty stretch keeps the hold precondition satisfied through
+			// its own boundary so the spontaneous-turn check decides.
+			name: "the spontaneous turn started 2 s before the recorded empty time",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.BGJobs = []bgJobsChange{
+					criteriaTestBGChange(criteriaTestBase()),
+					criteriaTestBGChange(criteriaTestBase().Add(5*time.Second), "job-bg"),
+					criteriaTestBGChange(criteriaTestBase().Add(40 * time.Second)),
+					criteriaTestBGChange(criteriaTestBase().Add(50*time.Second), "job-bg-2"),
+					criteriaTestBGChange(criteriaTestBase().Add(120 * time.Second)),
+				}
+				c.Turns = []turn{
+					criteriaTestTurn("turn-1", "delivery-1", criteriaTestBase(),
+						criteriaTestBase().Add(10*time.Second), "started the background watch"),
+					criteriaTestTurn("turn-early", "delivery-early",
+						criteriaTestBase().Add(38*time.Second), criteriaTestBase().Add(55*time.Second),
+						"was already running when the first background job ended"),
+				}
+				c.Suspensions[0].StartedAt = criteriaTestBase().Add(200 * time.Second)
+			},
+			want: "no spontaneous turn",
+		},
+		{
 			name: "no spontaneous turn after the set emptied",
 			mutate: func(_ *testing.T, c *criteriaCase) {
 				c.Turns = c.Turns[:1]
@@ -1061,5 +1130,32 @@ func TestJudgeBackgroundJob(t *testing.T) {
 				t.Fatalf("mismatch %q does not contain %q", mismatch, tc.want)
 			}
 		})
+	}
+}
+
+// TestJudgeBackgroundJobHoldIgnoresTrailingTurn guards the sampling
+// resolution: the observer records the empty set up to one interval after it
+// happened, so the spontaneous turn can start and end just before the
+// recorded empty time. Such a turn, which started after the empty
+// observation's lower bound, is neither the boundary nor an interruption, so
+// the hold is measured from the earlier turn boundary inside the non-empty
+// stretch.
+func TestJudgeBackgroundJobHoldIgnoresTrailingTurn(t *testing.T) {
+	base := criteriaTestBase()
+	c := criteriaCase{
+		DryRun:           true,
+		BGJobsResolution: time.Second,
+		BGJobs: []bgJobsChange{
+			criteriaTestBGChange(base),
+			criteriaTestBGChange(base.Add(5*time.Second), "job-bg"),
+			criteriaTestBGChange(base.Add(60 * time.Second)),
+		},
+		Turns: []turn{
+			criteriaTestTurn("turn-1", "delivery-1", base, base.Add(10*time.Second), "started the background watch"),
+			criteriaTestTurn("turn-2", "delivery-2", base.Add(59500*time.Millisecond), base.Add(59900*time.Millisecond), "reported the result"),
+		},
+	}
+	if mismatch := judgeBackgroundJob(c); mismatch != "" {
+		t.Fatalf("satisfied records were rejected: %s", mismatch)
 	}
 }

@@ -111,6 +111,16 @@ type criteriaCase struct {
 
 	// BGJobs is the bg_jobs observer's change list in observation order.
 	BGJobs []bgJobsChange
+	// BGJobsResolution is the observer's sampling interval. Zero means
+	// defaultBGJobsInterval. The observer timestamps a change when it reads it,
+	// so a transition happened somewhere between the previous read and the
+	// recorded one; the background-job criterion allows for that resolution.
+	BGJobsResolution time.Duration
+
+	// DryRun is set by TestDryRunSubscription. Local mode forces suspension
+	// off, so the dry run skips only the suspension checks; every other check
+	// of the same criterion still runs on the real records.
+	DryRun bool
 
 	Times  criteriaTimes
 	Expect criteriaExpectations
@@ -173,48 +183,62 @@ func judgeRoundTrip(c criteriaCase) string {
 		}
 	}
 
-	if len(c.Suspensions) != 2 {
-		return fmt.Sprintf("run has %d suspension records, want 2", len(c.Suspensions))
-	}
-	for i, record := range c.Suspensions {
-		if record.Error != "" {
-			return fmt.Sprintf("suspension %d failed: %s", i+1, record.Error)
+	if !c.DryRun {
+		if len(c.Suspensions) != 2 {
+			return fmt.Sprintf("run has %d suspension records, want 2", len(c.Suspensions))
 		}
-		if record.SnapshotMS == nil || record.RestoreMS == nil || record.HelloMS == nil {
-			return fmt.Sprintf("suspension %d is missing snapshot_ms, restore_ms or hello_ms", i+1)
+		for i, record := range c.Suspensions {
+			if record.Error != "" {
+				return fmt.Sprintf("suspension %d failed: %s", i+1, record.Error)
+			}
+			if record.SnapshotMS == nil || record.RestoreMS == nil || record.HelloMS == nil {
+				return fmt.Sprintf("suspension %d is missing snapshot_ms, restore_ms or hello_ms", i+1)
+			}
 		}
-	}
 
-	for i, record := range c.Suspensions {
-		jobID := criteriaJobID(c.Subscriptions[i])
-		if jobID == "" {
-			return fmt.Sprintf("subscription %d has no job.id in its correlation", i+1)
+		for i, record := range c.Suspensions {
+			jobID := criteriaJobID(c.Subscriptions[i])
+			if jobID == "" {
+				return fmt.Sprintf("subscription %d has no job.id in its correlation", i+1)
+			}
+			callback, ok := criteriaFirstSuccess(c.ExtsimDeliveries[jobID])
+			if !ok {
+				return fmt.Sprintf("extsim has no successful callback for job %s", jobID)
+			}
+			snapshotDone := record.StartedAt.Add(time.Duration(*record.SnapshotMS) * time.Millisecond)
+			if !callback.SentAt.After(snapshotDone) {
+				return fmt.Sprintf("the first 2xx callback for job %s was sent at %s, not after the snapshot completed at %s",
+					jobID, criteriaFormatTime(callback.SentAt), criteriaFormatTime(snapshotDone))
+			}
+			restoreStart, mismatch := criteriaRestoreStart(record)
+			if mismatch != "" {
+				return fmt.Sprintf("suspension %d: %s", i+1, mismatch)
+			}
+			if !restoreStart.After(callback.SentAt) {
+				return fmt.Sprintf("the restore for suspension %d started at %s, not after the first 2xx callback at %s",
+					i+1, criteriaFormatTime(restoreStart), criteriaFormatTime(callback.SentAt))
+			}
+			previous, ok := criteriaLastTurnEndedAtOrBefore(c.Turns, record.StartedAt)
+			if !ok {
+				return fmt.Sprintf("no turn ended before suspension %d started at %s", i+1, criteriaFormatTime(record.StartedAt))
+			}
+			if idle := record.StartedAt.Sub(*previous.EndedAt); idle < criteriaIdleGrace {
+				return fmt.Sprintf("suspension %d started at %s, %s after turn %s ended at %s; want at least G_idle %s",
+					i+1, criteriaFormatTime(record.StartedAt), idle, previous.TurnID,
+					criteriaFormatTime(*previous.EndedAt), criteriaIdleGrace)
+			}
 		}
-		callback, ok := criteriaFirstSuccess(c.ExtsimDeliveries[jobID])
-		if !ok {
-			return fmt.Sprintf("extsim has no successful callback for job %s", jobID)
-		}
-		snapshotDone := record.StartedAt.Add(time.Duration(*record.SnapshotMS) * time.Millisecond)
-		if !callback.SentAt.After(snapshotDone) {
-			return fmt.Sprintf("the first 2xx callback for job %s was sent at %s, not after the snapshot completed at %s",
-				jobID, criteriaFormatTime(callback.SentAt), criteriaFormatTime(snapshotDone))
-		}
-		restoreStart, mismatch := criteriaRestoreStart(record)
-		if mismatch != "" {
-			return fmt.Sprintf("suspension %d: %s", i+1, mismatch)
-		}
-		if !restoreStart.After(callback.SentAt) {
-			return fmt.Sprintf("the restore for suspension %d started at %s, not after the first 2xx callback at %s",
-				i+1, criteriaFormatTime(restoreStart), criteriaFormatTime(callback.SentAt))
-		}
-		previous, ok := criteriaLastTurnEndedAtOrBefore(c.Turns, record.StartedAt)
-		if !ok {
-			return fmt.Sprintf("no turn ended before suspension %d started at %s", i+1, criteriaFormatTime(record.StartedAt))
-		}
-		if idle := record.StartedAt.Sub(*previous.EndedAt); idle < criteriaIdleGrace {
-			return fmt.Sprintf("suspension %d started at %s, %s after turn %s ended at %s; want at least G_idle %s",
-				i+1, criteriaFormatTime(record.StartedAt), idle, previous.TurnID,
-				criteriaFormatTime(*previous.EndedAt), criteriaIdleGrace)
+	} else {
+		// The callback itself is not a suspension-only fact: every round trip
+		// still needs a successful callback from extsim.
+		for i, sub := range c.Subscriptions {
+			jobID := criteriaJobID(sub)
+			if jobID == "" {
+				return fmt.Sprintf("subscription %d has no job.id in its correlation", i+1)
+			}
+			if _, ok := criteriaFirstSuccess(c.ExtsimDeliveries[jobID]); !ok {
+				return fmt.Sprintf("extsim has no successful callback for job %s", jobID)
+			}
 		}
 	}
 
@@ -437,13 +461,15 @@ func judgeRestartWhileSuspended(c criteriaCase) string {
 		c.Times.WebhookListeningAt.IsZero() {
 		return "the criterion input is missing the control plane stop, restart or webhook listening moment"
 	}
-	if c.Times.RunStateAtStop == "" {
-		return fmt.Sprintf("the run state at the control plane stop at %s was not recorded",
-			criteriaFormatTime(c.Times.ControlPlaneStoppedAt))
-	}
-	if c.Times.RunStateAtStop != criteriaStateSuspended {
-		return fmt.Sprintf("the run was %q when the control plane stopped at %s, want %q",
-			c.Times.RunStateAtStop, criteriaFormatTime(c.Times.ControlPlaneStoppedAt), criteriaStateSuspended)
+	if !c.DryRun {
+		if c.Times.RunStateAtStop == "" {
+			return fmt.Sprintf("the run state at the control plane stop at %s was not recorded",
+				criteriaFormatTime(c.Times.ControlPlaneStoppedAt))
+		}
+		if c.Times.RunStateAtStop != criteriaStateSuspended {
+			return fmt.Sprintf("the run was %q when the control plane stopped at %s, want %q",
+				c.Times.RunStateAtStop, criteriaFormatTime(c.Times.ControlPlaneStoppedAt), criteriaStateSuspended)
+		}
 	}
 
 	sub, ok := criteriaSubscriptionForJob(c.Subscriptions, c.Expect.JobID)
@@ -496,16 +522,18 @@ func judgeRestartWhileSuspended(c criteriaCase) string {
 			criteriaFormatTime(rows[0].CreatedAt), criteriaFormatTime(c.Times.ControlPlaneRestartedAt))
 	}
 
-	suspendedBefore := false
-	for _, record := range c.Suspensions {
-		if record.StartedAt.Before(c.Times.ControlPlaneStoppedAt) {
-			suspendedBefore = true
-			break
+	if !c.DryRun {
+		suspendedBefore := false
+		for _, record := range c.Suspensions {
+			if record.StartedAt.Before(c.Times.ControlPlaneStoppedAt) {
+				suspendedBefore = true
+				break
+			}
 		}
-	}
-	if !suspendedBefore {
-		return fmt.Sprintf("no suspension started before the control plane stopped at %s",
-			criteriaFormatTime(c.Times.ControlPlaneStoppedAt))
+		if !suspendedBefore {
+			return fmt.Sprintf("no suspension started before the control plane stopped at %s",
+				criteriaFormatTime(c.Times.ControlPlaneStoppedAt))
+		}
 	}
 	if _, mismatch := criteriaTurnProcessingEvent(c.Turns, rows[0].CreatedAt, c.Expect.TurnDeadline); mismatch != "" {
 		return mismatch
@@ -521,21 +549,28 @@ func judgeBackgroundJob(c criteriaCase) string {
 		return fmt.Sprintf("run has %d subscriptions, want none in the background-job criterion", len(c.Subscriptions))
 	}
 
-	for i, record := range c.Suspensions {
-		jobs, ok := criteriaBGJobsAt(c.BGJobs, record.StartedAt)
-		if !ok {
-			return fmt.Sprintf("no bg_jobs observation covers suspension %d's start at %s",
-				i+1, criteriaFormatTime(record.StartedAt))
-		}
-		if len(jobs) != 0 {
-			return fmt.Sprintf("suspension %d started at %s while bg_jobs was non-empty: %v",
-				i+1, criteriaFormatTime(record.StartedAt), jobs)
+	resolution := c.BGJobsResolution
+	if resolution <= 0 {
+		resolution = defaultBGJobsInterval
+	}
+
+	if !c.DryRun {
+		for i, record := range c.Suspensions {
+			jobs, ok := criteriaBGJobsAt(c.BGJobs, record.StartedAt)
+			if !ok {
+				return fmt.Sprintf("no bg_jobs observation covers suspension %d's start at %s",
+					i+1, criteriaFormatTime(record.StartedAt))
+			}
+			if len(jobs) != 0 {
+				return fmt.Sprintf("suspension %d started at %s while bg_jobs was non-empty: %v",
+					i+1, criteriaFormatTime(record.StartedAt), jobs)
+			}
 		}
 	}
 
-	held, ok := criteriaBackgroundHoldAtBoundary(criteriaNonEmptyIntervals(c.BGJobs), c.Turns)
+	held, ok := criteriaBackgroundHoldAtBoundary(criteriaNonEmptyIntervals(c.BGJobs), c.Turns, resolution)
 	if !ok {
-		return "precondition not met: bg_jobs was never non-empty across a turn boundary, so the no-suspend rule was not observed"
+		return "precondition not met: no turn boundary held until bg_jobs became empty without another turn starting in between, so the no-suspend rule was not observed"
 	}
 	if held < criteriaBackgroundHold {
 		return fmt.Sprintf("precondition not met: bg_jobs stayed non-empty at a turn boundary for %s, want at least G_idle + P_scan + 10 s = %s",
@@ -546,10 +581,17 @@ func judgeBackgroundJob(c criteriaCase) string {
 	if !ok {
 		return "bg_jobs never became empty after being non-empty"
 	}
-	spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedAt)
+	// The observer timestamps a change when it reads it, so the transition
+	// happened after the previous read, which is at most one sampling
+	// interval before the recorded empty time. A turn the driver started right
+	// after the empty push can therefore carry a start time just before the
+	// recorded empty time; the previous read is the strictest moment the
+	// observation supports.
+	emptiedNoEarlierThan := emptiedAt.Add(-resolution)
+	spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedNoEarlierThan)
 	if !ok {
-		return fmt.Sprintf("no spontaneous turn started after bg_jobs became empty at %s",
-			criteriaFormatTime(emptiedAt))
+		return fmt.Sprintf("no spontaneous turn started after bg_jobs became empty (observed at %s, not before %s)",
+			criteriaFormatTime(emptiedAt), criteriaFormatTime(emptiedNoEarlierThan))
 	}
 	// A turn the control plane starts from a background task notification is
 	// not answering an inbox row, so it carries no delivery_id. A turn with
@@ -562,22 +604,24 @@ func judgeBackgroundJob(c criteriaCase) string {
 		return fmt.Sprintf("the spontaneous turn %s started after bg_jobs became empty at %s, but it has not ended",
 			spontaneous.TurnID, criteriaFormatTime(emptiedAt))
 	}
-	suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt)
-	if !ok {
-		return fmt.Sprintf("no suspension started after bg_jobs became empty at %s", criteriaFormatTime(emptiedAt))
-	}
-	if !suspension.StartedAt.After(emptiedAt) {
-		return fmt.Sprintf("suspension started at %s, not after bg_jobs became empty at %s",
-			criteriaFormatTime(suspension.StartedAt), criteriaFormatTime(emptiedAt))
-	}
-	if suspension.Error != "" {
-		return fmt.Sprintf("suspension 1 failed: %s", suspension.Error)
-	}
-	grace := spontaneous.EndedAt.Add(criteriaIdleGrace)
-	if suspension.StartedAt.Before(grace) {
-		return fmt.Sprintf("suspension started at %s, %s after the spontaneous turn %s ended at %s; want at least G_idle %s",
-			criteriaFormatTime(suspension.StartedAt), suspension.StartedAt.Sub(*spontaneous.EndedAt),
-			spontaneous.TurnID, criteriaFormatTime(*spontaneous.EndedAt), criteriaIdleGrace)
+	if !c.DryRun {
+		suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt)
+		if !ok {
+			return fmt.Sprintf("no suspension started after bg_jobs became empty at %s", criteriaFormatTime(emptiedAt))
+		}
+		if !suspension.StartedAt.After(emptiedAt) {
+			return fmt.Sprintf("suspension started at %s, not after bg_jobs became empty at %s",
+				criteriaFormatTime(suspension.StartedAt), criteriaFormatTime(emptiedAt))
+		}
+		if suspension.Error != "" {
+			return fmt.Sprintf("suspension 1 failed: %s", suspension.Error)
+		}
+		grace := spontaneous.EndedAt.Add(criteriaIdleGrace)
+		if suspension.StartedAt.Before(grace) {
+			return fmt.Sprintf("suspension started at %s, %s after the spontaneous turn %s ended at %s; want at least G_idle %s",
+				criteriaFormatTime(suspension.StartedAt), suspension.StartedAt.Sub(*spontaneous.EndedAt),
+				spontaneous.TurnID, criteriaFormatTime(*spontaneous.EndedAt), criteriaIdleGrace)
+		}
 	}
 	return ""
 }
@@ -932,27 +976,68 @@ func criteriaNonEmptyIntervals(changes []bgJobsChange) []criteriaBGJobsInterval 
 	return intervals
 }
 
-// criteriaBackgroundHoldAtBoundary returns the longest time bg_jobs stayed
-// non-empty after a turn ended inside a non-empty stretch. It is the duration
-// the criterion calls "bg_jobs non-empty at a turn boundary".
-func criteriaBackgroundHoldAtBoundary(intervals []criteriaBGJobsInterval, turns []turn) (time.Duration, bool) {
+// criteriaBackgroundHoldAtBoundary returns the longest guaranteed idle span
+// that starts at a turn boundary inside a non-empty stretch and lasts until
+// the stretch emptied. A stretch that another turn interrupts contributes
+// nothing: the criterion asks whether the run stayed idle past G_idle with
+// bg_jobs non-empty, and an intervening turn restarts the idle period, so the
+// rule was never exercised over that span.
+//
+// resolution is the observer's sampling interval: the recorded change time is
+// when the observer read it, so the set may have emptied up to one interval
+// before the recorded empty time. One interval before that time is the latest
+// moment the observation guarantees the set was still non-empty. A turn that
+// started after that moment may be the spontaneous turn that ran after the
+// set emptied, read slightly early, so it is neither a boundary nor an
+// interruption. Among the remaining turns, the last one to end before that
+// moment is the boundary: an earlier turn is followed by a later turn, which
+// restarts the idle period, so no single idle span runs from it to the empty
+// transition. The stretch's recorded start is uncertain in the same way, so a
+// turn that ended up to one interval before it can still have ended with the
+// set non-empty.
+func criteriaBackgroundHoldAtBoundary(intervals []criteriaBGJobsInterval, turns []turn, resolution time.Duration) (time.Duration, bool) {
+	if resolution < 0 {
+		resolution = 0
+	}
 	var longest time.Duration
 	found := false
 	for _, interval := range intervals {
-		var boundary *time.Time
+		windowStart := interval.Start.Add(-resolution)
+		windowEnd := interval.End.Add(-resolution)
+
+		var boundary *turn
 		for i := range turns {
 			ended := turns[i].EndedAt
-			if ended == nil || ended.Before(interval.Start) || ended.After(interval.End) {
+			if ended == nil || ended.Before(windowStart) || ended.After(windowEnd) {
 				continue
 			}
-			if boundary == nil || ended.After(*boundary) {
-				boundary = ended
+			if turns[i].StartedAt.After(windowEnd) {
+				continue
+			}
+			if boundary == nil || ended.After(*boundary.EndedAt) {
+				boundary = &turns[i]
 			}
 		}
 		if boundary == nil {
 			continue
 		}
-		held := interval.End.Sub(*boundary)
+
+		interrupted := false
+		for i := range turns {
+			if &turns[i] == boundary {
+				continue
+			}
+			started := turns[i].StartedAt
+			if started.After(*boundary.EndedAt) && !started.After(windowEnd) {
+				interrupted = true
+				break
+			}
+		}
+		if interrupted {
+			continue
+		}
+
+		held := windowEnd.Sub(*boundary.EndedAt)
 		if !found || held > longest {
 			longest = held
 			found = true

@@ -1,0 +1,47 @@
+{
+  "owner": "fakeclaude",
+  "default_reply": "fakeclaude: no scripted rule matched this message.",
+  "rules": [
+    {
+      "name": "subscription-completion",
+      "match": "\\[castworks\\] Subscription ",
+      "steps": [
+        {
+          "type": "reply",
+          "text": "The subscription completed."
+        }
+      ]
+    },
+    {
+      "name": "precreated-job",
+      "match": "(job-[a-z2-7]{12})",
+      "capture": {
+        "job_id": "(job-[a-z2-7]{12})"
+      },
+      "steps": [
+        {
+          "type": "mcp",
+          "tool": "list_events",
+          "arguments": {
+            "system": "extsim"
+          }
+        },
+        {
+          "type": "mcp",
+          "tool": "subscribe_event",
+          "arguments": {
+            "system": "extsim",
+            "event": "job.completed",
+            "correlation": {
+              "job.id": "${job_id}"
+            }
+          }
+        },
+        {
+          "type": "reply",
+          "text": "Subscribed to ${job_id}."
+        }
+      ]
+    }
+  ]
+}

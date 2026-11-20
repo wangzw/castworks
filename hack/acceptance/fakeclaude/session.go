@@ -182,8 +182,9 @@ func (s *session) turn(text string) error {
 				s.vars[name] = value
 			}
 			if completion.Outcome == "failed" {
-				// 失败原因要在后续回合的报告里继续可用，单独保留。
-				s.vars["failure_reason"] = completion.Detail
+				// 失败原因要在后续回合的报告里继续可用，单独保留。detail 是
+				// extsim 的回调负载，报告要用负载里的原因原文。
+				s.vars["failure_reason"] = FailureReason(completion.Detail)
 				// 第一次提交不通过时，按 extsim 的规则补上 owner 再重交。
 				s.vars["content"] = CorrectContent(s.vars["content"], s.script.OwnerName())
 			}

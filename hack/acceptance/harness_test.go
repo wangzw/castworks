@@ -230,6 +230,22 @@ type harness struct {
 	// started with a connectorhub configuration.
 	connectorAddr string
 	webhookAddr   string
+	// webhookListeningAt is when the harness observed the webhook listener
+	// line. The restart criterion compares extsim's successful retry against
+	// it, so it is taken as soon as the line appears, not after every listener
+	// has come up.
+	webhookListeningAt time.Time
+
+	// extsimJobsAddr and extsimControlAddr are the addresses extsim reported
+	// for its two listeners.
+	extsimJobsAddr    string
+	extsimControlAddr string
+	extsimCtl         *extsimControl
+
+	// signingKeyFile is the per-run HMAC key shared by the control plane and
+	// extsim. signingKey is its content after the trailing newline is removed.
+	signingKeyFile string
+	signingKey     []byte
 
 	// generatedFiles are removed by cleanup and recorded in the ledger.
 	generatedFiles []string
@@ -653,11 +669,13 @@ func (h *harness) startControlPlane(ctx context.Context, args ...string) {
 	if h.database != "" {
 		full = append(full, "--database-url", h.database)
 	}
+	h.webhookListeningAt = time.Time{}
 	h.control = h.startChild("controlplane", filepath.Join(h.binDir, "castworks-controlplane"), full)
 	h.setControlPlaneHTTPAddr(h.waitLoggedAddr(ctx, "http listening"))
 	h.grpcAddr = h.waitLoggedAddr(ctx, "grpc listening")
 	if hasFlag(args, "--connectorhub-config") {
 		h.webhookAddr = h.waitLoggedAddr(ctx, "webhook listening")
+		h.webhookListeningAt = time.Now().UTC()
 		h.connectorAddr = h.waitLoggedAddr(ctx, "connector listening")
 	}
 }
@@ -1087,6 +1105,23 @@ func (h *harness) cleanup() {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			h.t.Errorf("cleanup: remove generated file %s: %v", path, err)
 		}
+	}
+}
+
+// recordGeneratedFiles records files cleanup removes and acceptance-clean can
+// remove after a killed run.
+func (h *harness) recordGeneratedFiles(paths ...string) {
+	h.t.Helper()
+	h.generatedFiles = append(h.generatedFiles, paths...)
+	entry := ledgerEntry{
+		Time:     time.Now().UTC(),
+		RunID:    h.runID,
+		WorkDir:  h.workDir,
+		Provider: h.provider,
+		Files:    paths,
+	}
+	if err := appendLedger(entry); err != nil {
+		h.t.Fatalf("acceptance: record generated files in ledger: %v", err)
 	}
 }
 

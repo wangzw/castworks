@@ -203,6 +203,43 @@ content accepted`
 	}
 }
 
+// TestFailureReasonFromCallbackPayload guards the dry-run report: the
+// subscription completion detail is extsim's JSON callback payload, so the
+// report must use the job's reason as extsim states it, not the raw payload
+// with its JSON escapes.
+func TestFailureReasonFromCallbackPayload(t *testing.T) {
+	script, err := parseScript("failure-reason", []byte(`{
+		"rules":[{
+			"name":"completion",
+			"match":"\\[castworks\\] Subscription ",
+			"outcomes":{"failed":[{"type":"reply","text":"reason: ${failure_reason}"}]}
+		}]
+	}`))
+	if err != nil {
+		t.Fatalf("parseScript: %v", err)
+	}
+
+	var out bytes.Buffer
+	sess := newTestSession(t, script, &fakeRunner{}, &fakeCaller{}, &out)
+	completion := `[castworks] Subscription sub-abc completed.
+system: extsim
+event: job.completed
+outcome: failed
+correlation: job.id=job-1, job.project=demo
+occurred_at: 2026-11-20T01:00:00Z
+source: webhook
+detail:
+{"job":{"id":"job-1","project":"demo","status":"completed","conclusion":"failed","reason":"missing required field \"owner\""}}`
+	if err := sess.HandleText(completion); err != nil {
+		t.Fatalf("failed completion turn: %v", err)
+	}
+
+	text := resultText(t, decodeLines(t, splitLines(t, out.Bytes())))
+	if !strings.Contains(text, `missing required field "owner"`) {
+		t.Fatalf("report %q does not state the reason without JSON escaping", text)
+	}
+}
+
 func correlationJobID(args map[string]any) string {
 	correlation, _ := args["correlation"].(map[string]any)
 	if correlation == nil {
