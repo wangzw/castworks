@@ -14,7 +14,7 @@ v0.1.0 中，看守进程在 actor 里作为 PID 1 运行，维持到控制面�
 
 | 方式 | 身份来源 | 控制面地址 | 用途 |
 | --- | --- | --- | --- |
-| actor 模式 | `systemInfo` 卷投射的 `/run/ate/actor-name` 文件 | 环境变量 `CASTWORKS_CONTROL_PLANE`，取不带 selector 的 Service 的全限定名加端口 | 演示场景与挂起恢复测试 |
+| actor 模式 | `system-info` 卷投射的 `/run/ate/actor-name` 文件 | 环境变量 `CASTWORKS_CONTROL_PLANE`，取不带 selector 的 Service 的全限定名加端口 | 演示场景与挂起恢复测试 |
 | 本地模式 | 命令行参数 `--run-id` | 命令行参数 `--control-plane`，例如 `127.0.0.1:9090` | 在开发机上调试协议与 Claude Code 的驱动 |
 
 两种方式的代码路径只在身份与地址的来源上不同。本地模式下看守进程不是 PID 1，Claude Code 以当前用户运行，主目录取命令行参数 `--home` 指定的目录，工作目录与 stream-json 记录文件都在其下，不使用开发者自己的主目录。
@@ -54,9 +54,13 @@ actor 模式下，看守进程与 Claude Code 都以镜像的 `USER`，即非 ro
 2. Claude Code 尚未启动时先启动。
 3. 把这些消息的文本以空行连接，作为一条 stream-json 用户消息写成 stdin 上的一行，例如 `{"type":"user","message":{"role":"user","content":"……"}}`。一批消息因此只开始一个回合。
 4. `last_accepted_seq` 取 `through_seq`，回 `Accepted`。
-5. 生成新的 `turn_id`，发出 `turn_started{delivery_id, session_id}`。`session_id` 取自 Claude Code 启动时输出的 `system` 初始化消息。
+5. 投递发生在回合边界（`starting` 或 `boundary`）时开始一个回合：生成新的 `turn_id`，发出 `turn_started{delivery_id, session_id}`，`delivery_id` 取这批投递的标识。回合进行中收到投递时只回 `Accepted`，不另发 `turn_started`，这次投递并入当前回合。`session_id` 取自 Claude Code 启动时输出的 `system` 初始化消息。
 
 stdin 在回合之间保持打开，下一批消息写入同一进程。
+
+### 自发回合
+
+回合边界上出现 `session_state_changed: running`，或者出现 assistant 消息，表示 Claude Code 未收到投递就自行开始了回合。看守进程同样生成 `turn_id` 并发出 `turn_started`，`delivery_id` 留空。此后到达的投递并入这个回合，不另发 `turn_started`。
 
 ### 识别回合结束
 
@@ -65,7 +69,7 @@ stdin 在回合之间保持打开，下一批消息写入同一进程。
 - 发出 `turn_ended{output, is_error, agent_exited=false}`。`output` 取 `result` 消息的结果文本，`is_error` 取它的同名字段。
 - 把这个回合的 `turn_id`、`output` 与 `is_error` 保存为 `last_turn`，供下一次 `Hello` 携带。
 
-Claude Code 在回合中退出，或者写入 stdin 失败时，发出 `turn_ended{agent_exited=true}`，`phase` 变为 `exited`。v0.1.0 不重启 Claude Code。
+Claude Code 在回合中退出，或者回合进行中写入 stdin 失败时，发出 `turn_ended{agent_exited=true}`，`phase` 变为 `exited`。退出发生在回合之外（没有进行中的回合）时，先补发一对 `turn_started`（`delivery_id` 为空）与 `turn_ended{agent_exited=true}`，使控制面在没有进行中的回合可配对时也能看到退出。v0.1.0 不重启 Claude Code。
 
 ## 出站流
 
@@ -86,7 +90,7 @@ Claude Code 在回合中退出，或者写入 stdin 失败时，发出 `turn_end
 ## 镜像
 
 - 只构建 arm64。
-- Claude Code 的版本固定为不低于 2.1.318 的某个版本，镜像构建时写死。
+- Claude Code 的版本固定为 2.1.328，镜像构建时写死。
 - `USER` 为非 root 用户 `agent`，主目录为 `/home/agent`；包含演示任务所需的基本工具，例如 git。
 - 入口是看守进程。
 - 推送到镜像仓库后按 digest 引用，见 [sandboxprovider](sandboxprovider.md#actor-模板)。
@@ -98,6 +102,7 @@ Claude Code 在回合中退出，或者写入 stdin 失败时，发出 `turn_end
 - 不采集活动度，不登记后台作业与自唤醒源，不解析等待意图。
 - 不经引导接口领取令牌与租约，没有实例密钥。
 - 快照恢复后不校时，也不主动断开 Claude Code 的旧连接，见 [v0.1.0 的已知限制](README.md#已知限制)。
+- `/readyz` 监听 8081，设计取 80；actor 模板的 `wakeup_probe` 也指向 8081。
 - 不处理挂起相关的消息：挂起由控制面直接调用 Substrate 完成，看守进程不参与。
 
 ## 测试

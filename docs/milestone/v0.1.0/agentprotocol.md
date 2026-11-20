@@ -40,7 +40,7 @@ message ControlFrame {
 | 消息 | 字段 | 语义 |
 | --- | --- | --- |
 | `Hello` | `agent_state{phase, turn_id}`、`last_accepted_seq`、`last_turn{turn_id, output, is_error}` | 每条流的首帧。`phase` 取 `starting`、`in_turn`、`boundary`、`exited`；`last_accepted_seq` 是看守进程已写入 Claude Code 的最大 `inbox_seq`，尚未写入过为 0；`phase=boundary` 时 `last_turn` 携带最近一个回合的结果 |
-| `AgentEvent` | `turn_id`，`kind` 为 `turn_started{delivery_id, session_id}` 或 `turn_ended{output, is_error, agent_exited}` | 回合开始与结束。`turn_id` 由看守进程生成，同一运行实例内唯一；`output` 是该回合 `result` 消息的结果文本，超过 1 MiB 时截断并在末尾注明 |
+| `AgentEvent` | `turn_id`，`kind` 为 `turn_started{delivery_id, session_id}` 或 `turn_ended{output, is_error, agent_exited}` | 回合开始与结束。`turn_id` 由看守进程生成，同一运行实例内唯一；`output` 是该回合 `result` 消息的结果文本，超过 1 MiB 时截断并在末尾注明；`turn_started.delivery_id` 在自发回合与回合外退出时为空。回合外退出时，看守进程补发一对 `turn_started`（空 `delivery_id`）与 `turn_ended{agent_exited=true}`，见 [warden](warden.md#识别回合结束) |
 | `Accepted` | `delivery_id`、`through_seq` | 一批投递已写入 Claude Code 的 stdin |
 
 控制面到看守进程：
@@ -57,10 +57,13 @@ message ControlFrame {
 
 ### 建立与替换
 
-- 看守进程发出的首帧必须是 `Hello`，控制面校验 `run_id` 之后回 `HelloAck`。同一条流上后续帧的 `run_id` 与首帧不同时，控制面以 `InvalidArgument` 关闭该流。
+- 看守进程发出的首帧必须是 `Hello`，控制面校验 `run_id` 之后回 `HelloAck`。首帧不是 `Hello`，任一帧校验失败，或者同一条流上后续帧的 `run_id` 与首帧不同时，控制面以 `InvalidArgument` 关闭该流。
 - `run_id` 不存在时，控制面以 `NotFound` 关闭流，看守进程退避后重试。从[模板快照](../../glossary.md)启动、尚未属于任何运行实例的看守进程就走这条路径。
 - 运行实例已经结束时，控制面以 `FailedPrecondition` 关闭流，看守进程收到后退出。
-- 同一运行实例已有一条流时，新到的 `Hello` 取代旧流，控制面关闭旧流。快照恢复后，旧流所在的连接已经失效，但控制面未必察觉，取代规则保证新流立即生效。
+- `Hello` 的 `phase` 为 `exited` 时，控制面把运行实例转为 `failed`，并以 `FailedPrecondition` 关闭这条流。运行实例处于 `suspending` 或 `suspended` 时只登记流，不转 `failed`，见 [runcontroller](runcontroller.md#创建与接入)。
+- 同一运行实例已有一条流时，新到的 `Hello` 取代旧流，控制面以 `Aborted` 关闭旧流。快照恢复后，旧流所在的连接已经失效，但控制面未必察觉，取代规则保证新流立即生效。
+- 处理期间出现内部错误，或者事务提交结果无法确定时，控制面以 `Unavailable` 关闭流，看守进程重连后用下一条 `Hello` 对账。
+- `Accepted.through_seq` 必须等于这条流上最近一次 `Deliver` 的 `through_seq`；没有收到过 `Deliver` 或取值不相等时，控制面以 `InvalidArgument` 关闭流。
 
 ### 断线检测与重连
 

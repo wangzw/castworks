@@ -32,7 +32,7 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 | 组成部分 | 运行位置与内容 |
 | --- | --- |
 | 控制面进程 | 开发机上的普通进程，包含 `runcontroller`、`sandboxprovider` 与 `humanchannel` 的 HTTP API |
-| PostgreSQL | 开发机上的 docker 容器，保存运行实例与收件箱；测试也使用它 |
+| PostgreSQL | 开发机上的 docker 容器，保存运行实例与收件箱；控制面用 55432 的 `postgres`，测试用 55433 的 `postgres-test` |
 | 命令行 | 在开发机上运行，调用控制面 HTTP API |
 | actor 镜像 | 看守进程与 Claude Code，只构建 arm64，由 Substrate 运行 |
 
@@ -48,7 +48,7 @@ v0.1.0 是概念验证，不上生产。它只证明一件事：在 Substrate �
 | `suspendpolicy` | 不单独实现，挂起规则写在 `runcontroller` 中 | 全部 |
 | `agentprotocol` | 看守进程到控制面的一条 gRPC 双向流，消息为 `Hello`、`HelloAck`、`AgentEvent`（回合开始与回合结束，结束时携带输出）、`Deliver`、`Accepted` 与 `Shutdown` | 协议版本协商、流上的序号与重放、令牌 |
 | `warden` | 作为 PID 1 运行；以 stream-json 输入输出启动常驻的 `claude -p`，Claude Code 以非 root 用户运行；转发回合开始与结束；把投递的消息写入 Claude Code 的 stdin；快照恢复后重新连接控制面 | 活动度采集、本地代理、本地 DNS 与透明拦截器、平台 MCP 服务器、hooks、后台作业登记、自唤醒源镜像、等待意图 |
-| `sandboxprovider` | 只实现 Substrate 提供者：直接调用 ate-api 完成 actor 模板、actor 的创建、挂起、恢复与删除，以及每个 actor 的 EgressPolicy | k8s 提供者、能力集合、引导接口、路由器唤醒、出口策略的按代落地与撤销 |
+| `sandboxprovider` | Substrate 提供者调用 ate-api 完成 actor 模板、actor 的创建、挂起、恢复与删除，以及每个 actor 的 EgressPolicy；另有本地提供者，只用于实现顺序第 4 步的本地模式，不创建资源，不挂起 | k8s 提供者、能力集合、引导接口、路由器唤醒、出口策略的按代落地与撤销 |
 | `humanchannel` | 控制面 HTTP API 与命令行：创建运行实例、发消息、查看输出、结束运行实例 | 界面、OIDC 认证、项目角色、即时通讯与 Issue 评论、审批、终端与文件访问 |
 | `llmgateway` | 不实现，Claude Code 直接连接 Anthropic | 全部 |
 | `connectorhub` | 不实现 | 全部 |
@@ -74,7 +74,7 @@ Claude Code 以 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 运行，不发出�
 
 ## 模板快照
 
-Substrate 的新 actor 默认从[模板快照](../../glossary.md)恢复。v0.1.0 在 actor 模板中关闭模板快照，新 actor 冷启动，理由见 [sandboxprovider](sandboxprovider.md#actor-模板)。看守进程启动时从 `systemInfo` 卷投射的 actor 名得知所属的运行实例。
+Substrate 的新 actor 默认从[模板快照](../../glossary.md)恢复。v0.1.0 在 actor 模板中关闭模板快照，新 actor 冷启动，理由见 [sandboxprovider](sandboxprovider.md#actor-模板)。看守进程启动时从 `system-info` 卷投射的 actor 名得知所属的运行实例。
 
 ## 实现顺序
 
@@ -92,7 +92,7 @@ Substrate 的新 actor 默认从[模板快照](../../glossary.md)恢复。v0.1.0
 v0.1.0 只保留以下三项：
 
 - Substrate 自带的 gVisor 隔离。
-- 控制面的 HTTP API 只监听开发机的 `127.0.0.1`。
+- 控制面的 HTTP API 只监听开发机的回环地址，即 `127.0.0.1` 或 `[::1]`。
 - LLM 凭据不进代码仓库，不打进镜像。
 
 以下让步在生产环境中都不可接受：
@@ -108,6 +108,7 @@ v0.1.0 只保留以下三项：
 - 控制面在挂起中、恢复中这类过渡状态重启时，运行实例可能停在该状态，需要人工处理。通过标准只要求已挂起状态下的重启。
 - Claude Code 的后台任务与会话内定时随快照一起停住，到点不会唤醒 actor，要等下一条消息恢复 actor 之后才继续。
 - 恢复后，Claude Code 在挂起前建立的 HTTPS 连接已经失效。v0.1.0 依靠 Claude Code 自身的重试处理，第一次 LLM 请求可能因此失败一次。
+- `turn_ended` 在断线中丢失，而重连前 Claude Code 已开始自发回合时，`Hello` 的 `phase` 是 `in_turn`，不带 `last_turn`，上一回合的结果补不回来。
 - 只有一个用户，所有运行实例互相可见。
 
 ## 不在范围内

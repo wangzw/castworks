@@ -1,6 +1,6 @@
 # sandboxprovider（v0.1.0）
 
-v0.1.0 只实现 Substrate 提供者。它在控制面进程中经 ate-api 管理 actor 模板、actor 与 actor 的 EgressPolicy。下文的 Substrate 事实依据 Substrate v1.0.0 的 API 定义与源码（[REF-substrate](../../references.md)）。版本范围见 [v0.1.0](README.md)。
+v0.1.0 的沙箱提供者有两个实现。本地提供者只用于实现顺序第 4 步的本地模式：它不创建资源，`Provision` 与 `Destroy` 是空操作，`GetSandbox` 恒报运行中，快照与恢复返回不支持，因此不挂起。Substrate 提供者是唯一在集群上使用的实现，它在控制面进程中经 ate-api 管理 actor 模板、actor 与 actor 的 EgressPolicy。下文的 Substrate 事实依据 Substrate v1.0.0 的 API 定义与源码（[REF-substrate](../../references.md)）。版本范围见 [v0.1.0](README.md)。
 
 ## 职责
 
@@ -15,7 +15,7 @@ v0.1.0 只实现 Substrate 提供者。它在控制面进程中经 ate-api 管�
 | 方法 | ate-api 调用 | 说明 |
 | --- | --- | --- |
 | `Provision(run_id)` | `CreateActor`，`CreateActorEgressPolicy`，`ResumeActor` | 新建的 actor 处于 `ACTOR_STATE_SUSPENDED`，先建出口策略，再以 `ResumeActor` 冷启动；`ResumeActor` 等到 `wakeupProbe` 返回 200 才返回 |
-| `Snapshot(actor)` | `SuspendActor`，`mode=DURABILITY_MODE_SYNCHRONOUS` | 阻塞到快照在对象存储中写完 |
+| `Snapshot(actor)` | `SuspendActor`，`mode=DURABILITY_MODE_SYNCHRONOUS`，必要时 `GetActor` | 阻塞到快照在对象存储中写完；同步调用返回后仍轮询 `GetActor`，最多 60 s 确认最新一代快照已持久化；`SnapshotBytes` 恒为 0 |
 | `RestoreSnapshot(actor)` | `ResumeActor` | 阻塞到 `wakeupProbe` 返回 200 |
 | `Destroy(actor)` | `DeleteActor` | EgressPolicy 随 actor 一起删除；actor 不存在视为成功 |
 | `GetSandbox(actor)` | `GetActor` | 返回 `status.state` |
@@ -24,7 +24,7 @@ actor 名为 `cw-<run_id>`，在 atespace `castworks-dev` 中创建。Substrate 
 
 ## actor 模板
 
-模板创建后不能修改，所以模板名由镜像 digest 派生，形如 `cw-<digest 前 12 位>`。控制面启动时按配置的镜像查找模板，不存在就创建。Substrate 删除模板时不检查是否还有 actor 引用它，被引用的模板删除后，这些 actor 恢复时会失败，所以 v0.1.0 不自动删除模板。
+模板创建后不能修改，所以模板名只由镜像 digest 派生，形如 `cw-<digest 前 12 位>`。控制面启动时按这个名称查找模板，不存在就创建；已存在则逐项核对镜像、`CASTWORKS_CONTROL_PLANE`、探针、卷与资源上限，任一不符就报错。因此模板里的控制面地址变了时，控制面启动会失败，需要手工删除旧模板再启动。Substrate 删除模板时不检查是否还有 actor 引用它，被引用的模板删除后，这些 actor 恢复时会失败，所以 v0.1.0 不自动删除模板。
 
 | 字段 | 取值 | 原因 |
 | --- | --- | --- |
@@ -32,7 +32,7 @@ actor 名为 `cw-<run_id>`，在 atespace `castworks-dev` 中创建。Substrate 
 | `containers[0].image` | castworks 镜像，按 `name@sha256:…` 写 digest | Substrate 要求镜像带 digest |
 | `containers[0].env` | `CASTWORKS_CONTROL_PLANE=castworks-dev.castworks-system.svc.cluster.local:9090` | 看守进程的控制面地址，见[网络](#网络) |
 | `containers[0].volume_mounts` | 卷 `system-info` 挂在 `/run/ate` | |
-| `containers[0].wakeup_probe` | `http_get`，端口 8081，路径 `/readyz` | `ResumeActor` 以它判断 actor 就绪 |
+| `containers[0].wakeup_probe` | `http_get`，端口 8081，路径 `/readyz`，超时 120 s | `ResumeActor` 以它判断 actor 就绪；探针在 120 s 内没有返回 200 时 Substrate 把 actor 置为 `CRASHED` |
 | `volumes` | 名为 `system-info`、类型字段为 `system_info` 的卷，`actor_metadata` 把 `ACTOR_METADATA_FIELD_NAME` 写到 `actor-name` | 看守进程从 `/run/ate/actor-name` 读出 actor 名；Substrate 按 DNS 标签校验卷名，不接受下划线 |
 | `resources.limits` | CPU 2000 millicores，内存 2 GiB | 初始值，按 Claude Code 的实测占用调整 |
 | `snapshot_config.preferred_fidelity` | MEMORY | 快照保存进程内存与根文件系统的写入 |
@@ -74,6 +74,7 @@ ate-api 只在集群内提供服务，控制面使用开发机的 kubeconfig 访
 | `wakeupProbe` 超时 | Substrate 把 actor 置为 `CRASHED`，按上一行处理 |
 | `SuspendActor` 失败 | 返回错误，由 `runcontroller` 稍后重试 |
 | `DeleteActor` 返回 `NOT_FOUND` | 视为成功 |
+| 除 `DeleteActor` 外的调用返回 `NOT_FOUND` | 包装为 `ErrNotFound`，调用方据此区分 actor 不存在与可重试的错误；写事件的重试遇到它即停止 |
 
 ## 日志
 
@@ -94,5 +95,5 @@ ate-api 只在集群内提供服务，控制面使用开发机的 kubeconfig 访
 
 - 模板查找与创建是幂等的，重复启动控制面不会重复创建模板。
 - `Provision`、`Snapshot`、`RestoreSnapshot` 与 `Destroy` 的完整循环；`Snapshot` 前在 actor 中写入的文件与进程状态在恢复后仍在。
-- 记录冷启动、快照与恢复的耗时，以及快照大小，写回[技术验证](../verification.md)的当前验证结论。
+- 记录冷启动、快照与恢复的耗时，写回[技术验证](../verification.md)的当前验证结论。ate-api v1.0.0 不上报快照大小，提供者的 `SnapshotBytes` 恒为 0，快照大小由验收测试单独统计。
 - `Destroy` 重复调用不报错；对已删除的 actor 调用 `GetSandbox` 返回不存在。
