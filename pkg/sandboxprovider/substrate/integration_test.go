@@ -2,7 +2,8 @@
 
 // The integration tests exercise the provider against the development
 // cluster's castworks-dev atespace, following
-// docs/milestone/v0.1.0/sandboxprovider.md "测试". They need an actor image
+// docs/milestone/v0.1.0/sandboxprovider.md "测试" and the v0.2.0 changes in
+// docs/milestone/v0.2.0/sandboxprovider.md "测试". They need an actor image
 // built by hack/providertest/build.sh and a reachable cluster; the commands
 // and prerequisites are in the milestone document and deploy/dev/README.md.
 //
@@ -39,9 +40,15 @@ import (
 const (
 	integrationAtespace       = "castworks-dev"
 	integrationControlPlane   = "castworks-dev.castworks-system.svc.cluster.local:9090"
+	integrationConnector      = "castworks-dev.castworks-system.svc.cluster.local:9091"
 	integrationServiceAccount = "castworks-system/sandboxprovider"
 	integrationDefaultListen  = "10.12.72.11:9090"
 	integrationReportPath     = "/report"
+
+	// integrationOtherConnector differs from integrationConnector in the port
+	// only, so a test can change nothing but Config.Connector. Nothing dials it;
+	// it exists to give the content-derived template name a different input.
+	integrationOtherConnector = "castworks-dev.castworks-system.svc.cluster.local:19091"
 
 	integrationReportBodyLimit = 1 << 20
 )
@@ -100,12 +107,17 @@ func newIntegrationState() (*integrationState, error) {
 		Atespace:       integrationAtespace,
 		Image:          image,
 		ControlPlane:   integrationControlPlane,
+		Connector:      integrationConnector,
 		ServiceAccount: integrationServiceAccount,
 	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
-	templateName, err := actorTemplateName(image)
+	template, err := buildActorTemplate(cfg.Atespace, cfg.Image, cfg.ControlPlane, cfg.Connector)
+	if err != nil {
+		return nil, err
+	}
+	templateName, err := actorTemplateName(template)
 	if err != nil {
 		return nil, err
 	}
@@ -183,37 +195,44 @@ func (s *integrationState) teardown() {
 	if s.templateExisted {
 		return
 	}
+	deleteTemplateUnlessReferenced(s.cfg, s.templateName)
+}
 
+// deleteTemplateUnlessReferenced deletes the named actor template when no
+// actor in the atespace still uses it. Substrate has no template update RPC,
+// and deleting a template an actor still references breaks the actor's later
+// resumes, so a referenced template is left in place with a log line instead.
+func deleteTemplateUnlessReferenced(cfg Config, name string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	client, closeClient, err := newAteAPIClient(ctx, ateAPIConnConfig{
-		Kubeconfig:     s.cfg.Kubeconfig,
-		KubeContext:    s.cfg.KubeContext,
-		ServiceAccount: s.cfg.ServiceAccount,
+		Kubeconfig:     cfg.Kubeconfig,
+		KubeContext:    cfg.KubeContext,
+		ServiceAccount: cfg.ServiceAccount,
 	})
 	if err != nil {
 		slog.Default().Warn("leave the actor template in place: connect to ate-api",
-			"template", s.templateName, "error", err)
+			"template", name, "error", err)
 		return
 	}
 	defer func() { _ = closeClient() }()
 
-	referencing, err := actorReferencingTemplate(ctx, client, s.cfg.Atespace, s.templateName)
+	referencing, err := actorReferencingTemplate(ctx, client, cfg.Atespace, name)
 	if err != nil {
 		slog.Default().Warn("leave the actor template in place: list actors",
-			"template", s.templateName, "error", err)
+			"template", name, "error", err)
 		return
 	}
 	if referencing != "" {
 		slog.Default().Info("leave the actor template in place: an actor still references it",
-			"template", s.templateName, "actor", referencing)
+			"template", name, "actor", referencing)
 		return
 	}
 
 	if _, err := client.DeleteActorTemplate(ctx, &ateapi.DeleteActorTemplateRequest{
-		ActorTemplate: &ateapi.ObjectRef{Atespace: s.cfg.Atespace, Name: s.templateName},
+		ActorTemplate: &ateapi.ObjectRef{Atespace: cfg.Atespace, Name: name},
 	}); err != nil && status.Code(err) != codes.NotFound {
-		slog.Default().Warn("delete the actor template", "template", s.templateName, "error", err)
+		slog.Default().Warn("delete the actor template", "template", name, "error", err)
 	}
 }
 
@@ -333,6 +352,74 @@ func TestTemplateIsIdempotent(t *testing.T) {
 		t.Errorf("actor template create_time changed from %v to %v; the second New recreated it",
 			beforeTime.AsTime(), afterTime.AsTime())
 	}
+}
+
+// TestTemplateNameFollowsConnector shows that changing only Config.Connector
+// yields a different content-derived template name, and that a provider built
+// from that configuration creates the other template. The template this test
+// creates is deleted after the provider closes; one that already existed is
+// left alone.
+func TestTemplateNameFollowsConnector(t *testing.T) {
+	state := integrationFor(t)
+
+	other := state.cfg
+	other.Connector = integrationOtherConnector
+
+	template, err := buildActorTemplate(other.Atespace, other.Image, other.ControlPlane, other.Connector)
+	if err != nil {
+		t.Fatalf("buildActorTemplate: %v", err)
+	}
+	otherName, err := actorTemplateName(template)
+	if err != nil {
+		t.Fatalf("actorTemplateName: %v", err)
+	}
+	if otherName == state.templateName {
+		t.Fatalf("template name %q is unchanged after changing only Connector from %q to %q; the name does not track the content",
+			otherName, state.cfg.Connector, other.Connector)
+	}
+
+	existed, err := templateExists(other, otherName)
+	if err != nil {
+		t.Fatalf("check whether actor template %s exists: %v", otherName, err)
+	}
+	if !existed {
+		// Registered before the provider is built so that the provider closes
+		// first: cleanups run in reverse order.
+		t.Cleanup(func() { deleteTemplateUnlessReferenced(other, otherName) })
+	}
+
+	p := newProviderFor(t, other, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	got, err := p.client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{
+		ActorTemplate: &ateapi.ObjectRef{Atespace: other.Atespace, Name: otherName},
+	})
+	if err != nil {
+		t.Fatalf("get actor template %s: %v", otherName, err)
+	}
+	if name := got.GetMetadata().GetName(); name != otherName {
+		t.Errorf("actor template metadata name = %q, want %q", name, otherName)
+	}
+	if value := templateEnvValue(got, templateContainerName, templateConnector); value != other.Connector {
+		t.Errorf("actor template %s environment variable %s = %q, want %q",
+			otherName, templateConnector, value, other.Connector)
+	}
+}
+
+// templateEnvValue returns the value of the named environment variable on the
+// named container, or "" when either is missing.
+func templateEnvValue(tpl *ateapi.ActorTemplate, container, env string) string {
+	for _, c := range tpl.GetContainers() {
+		if c.GetName() != container {
+			continue
+		}
+		for _, e := range c.GetEnv() {
+			if e.GetName() == env {
+				return e.GetValue()
+			}
+		}
+	}
+	return ""
 }
 
 // TestFullCycle provisions an actor, receives its reports, snapshots and
@@ -471,9 +558,17 @@ func TestCrash(t *testing.T) {
 // of the test.
 func (s *integrationState) newProvider(t *testing.T, timeout time.Duration) *Provider {
 	t.Helper()
+	return newProviderFor(t, s.cfg, timeout)
+}
+
+// newProviderFor builds a provider for cfg and closes it at the end of the
+// test. A test that varies one Config field uses it without changing the
+// shared state.
+func newProviderFor(t *testing.T, cfg Config, timeout time.Duration) *Provider {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	p, err := New(ctx, s.cfg)
+	p, err := New(ctx, cfg)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
