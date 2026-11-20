@@ -35,6 +35,7 @@ const (
 	defaultShutdownTimeout         = 10 * time.Second
 	defaultSubstrateAtespace       = "castworks-dev"
 	defaultSubstrateControlPlane   = "castworks-dev.castworks-system.svc.cluster.local:9090"
+	defaultSubstrateConnector      = "castworks-dev.castworks-system.svc.cluster.local:9091"
 	defaultSubstrateServiceAccount = "castworks-system/sandboxprovider"
 )
 
@@ -57,6 +58,8 @@ type Config struct {
 	SubstrateAtespace       string
 	SubstrateImage          string
 	SubstrateControlPlane   string
+	SubstrateConnector      string
+	SubstrateEgressHTTP     []string
 	SubstrateServiceAccount string
 }
 
@@ -182,6 +185,11 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 	fs.StringVar(&cfg.SubstrateAtespace, "substrate-atespace", defaultSubstrateAtespace, "Substrate 的 atespace 名")
 	fs.StringVar(&cfg.SubstrateImage, "substrate-image", "", "actor 镜像的 linux/arm64 清单 digest，格式 name@sha256:<64 位十六进制>；--provider substrate 时必填")
 	fs.StringVar(&cfg.SubstrateControlPlane, "substrate-control-plane", defaultSubstrateControlPlane, "写进 actor 模板的 CASTWORKS_CONTROL_PLANE，格式 host:port")
+	fs.StringVar(&cfg.SubstrateConnector, "substrate-connector", defaultSubstrateConnector, "写进 actor 模板的 CASTWORKS_CONNECTOR，格式 host:port")
+	fs.Func("substrate-egress-http", "额外的明文 HTTP 出口，格式 host:port，可重复给出", func(value string) error {
+		cfg.SubstrateEgressHTTP = append(cfg.SubstrateEgressHTTP, value)
+		return nil
+	})
 	fs.StringVar(&cfg.SubstrateServiceAccount, "substrate-service-account", defaultSubstrateServiceAccount, "控制面调用 ate-api 时用 TokenRequest 签发令牌的身份，格式 namespace/name")
 
 	if err := fs.Parse(args); err != nil {
@@ -298,6 +306,14 @@ func (c *Config) validate(visited map[string]bool) error {
 	if err := validateHostPort(c.SubstrateControlPlane); err != nil {
 		return fmt.Errorf("--substrate-control-plane: %w", err)
 	}
+	if err := validateHostPort(c.SubstrateConnector); err != nil {
+		return fmt.Errorf("--substrate-connector: %w", err)
+	}
+	for _, addr := range c.SubstrateEgressHTTP {
+		if err := validateHostPort(addr); err != nil {
+			return fmt.Errorf("--substrate-egress-http %q: %w", addr, err)
+		}
+	}
 	if err := validateServiceAccount(c.SubstrateServiceAccount); err != nil {
 		return fmt.Errorf("--substrate-service-account: %w", err)
 	}
@@ -311,6 +327,8 @@ var substrateFlagNames = []string{
 	"substrate-atespace",
 	"substrate-image",
 	"substrate-control-plane",
+	"substrate-connector",
+	"substrate-egress-http",
 	"substrate-service-account",
 }
 
@@ -369,6 +387,8 @@ func validateGRPCAddr(addr string) error {
 }
 
 // validateHostPort 要求 host 非空、端口是 1 到 65535 的整数；主机可以是域名。
+// splitHostPort 允许端口 0（由内核分配临时端口），validateHostPort 不接受它：
+// 这些地址要写进 actor 模板或出口策略，必须是具体的端口。
 func validateHostPort(addr string) error {
 	host, port, err := splitHostPort(addr)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -104,12 +105,16 @@ func TestConfigDefaults(t *testing.T) {
 		{"SubstrateAtespace", cfg.SubstrateAtespace, "castworks-dev"},
 		{"SubstrateImage", cfg.SubstrateImage, ""},
 		{"SubstrateControlPlane", cfg.SubstrateControlPlane, "castworks-dev.castworks-system.svc.cluster.local:9090"},
+		{"SubstrateConnector", cfg.SubstrateConnector, "castworks-dev.castworks-system.svc.cluster.local:9091"},
 		{"SubstrateServiceAccount", cfg.SubstrateServiceAccount, "castworks-system/sandboxprovider"},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
 			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
 		}
+	}
+	if len(cfg.SubstrateEgressHTTP) != 0 {
+		t.Errorf("SubstrateEgressHTTP = %v, want empty", cfg.SubstrateEgressHTTP)
 	}
 }
 
@@ -349,6 +354,8 @@ func TestConfigLocalRejectsSubstrateFlags(t *testing.T) {
 		"substrate-atespace":        "other",
 		"substrate-image":           configTestImage,
 		"substrate-control-plane":   "10.12.72.11:9090",
+		"substrate-connector":       "castworks-dev.castworks-system.svc.cluster.local:9091",
+		"substrate-egress-http":     "extsim.castworks-system.svc.cluster.local:9100",
 		"substrate-service-account": "ns/name",
 	}
 	for name, value := range flags {
@@ -427,6 +434,78 @@ func TestConfigSubstrateControlPlane(t *testing.T) {
 	} {
 		t.Run("reject/"+addr, func(t *testing.T) {
 			configWantError(t, argsFor(addr), "--substrate-control-plane")
+		})
+	}
+}
+
+func TestConfigSubstrateConnector(t *testing.T) {
+	argsFor := func(addr string) []string {
+		args := append(configBaseArgs(ProviderSubstrate), "--substrate-image", configTestImage)
+		return append(args, "--substrate-connector", addr)
+	}
+	for _, addr := range []string{
+		"castworks-dev.castworks-system.svc.cluster.local:9091",
+		"connector.example:1",
+	} {
+		t.Run("accept/"+addr, func(t *testing.T) {
+			cfg := configMustParse(t, argsFor(addr)...)
+			if cfg.SubstrateConnector != addr {
+				t.Errorf("SubstrateConnector = %q, want %q", cfg.SubstrateConnector, addr)
+			}
+		})
+	}
+	for _, addr := range []string{
+		"",
+		":9091",
+		"host",
+		"host:0",
+		"host:65536",
+		"host:notaport",
+	} {
+		t.Run("reject/"+addr, func(t *testing.T) {
+			configWantError(t, argsFor(addr), "--substrate-connector")
+		})
+	}
+}
+
+func TestConfigSubstrateEgressHTTP(t *testing.T) {
+	base := func() []string {
+		return append(configBaseArgs(ProviderSubstrate), "--substrate-image", configTestImage)
+	}
+
+	t.Run("empty by default", func(t *testing.T) {
+		cfg := configMustParse(t, base()...)
+		if len(cfg.SubstrateEgressHTTP) != 0 {
+			t.Errorf("SubstrateEgressHTTP = %v, want empty", cfg.SubstrateEgressHTTP)
+		}
+	})
+
+	t.Run("repeated values are collected in order", func(t *testing.T) {
+		want := []string{
+			"extsim.castworks-system.svc.cluster.local:9100",
+			"metrics.castworks-system.svc.cluster.local:9200",
+		}
+		args := base()
+		for _, addr := range want {
+			args = append(args, "--substrate-egress-http", addr)
+		}
+		cfg := configMustParse(t, args...)
+		if !slices.Equal(cfg.SubstrateEgressHTTP, want) {
+			t.Errorf("SubstrateEgressHTTP = %v, want %v", cfg.SubstrateEgressHTTP, want)
+		}
+	})
+
+	for _, addr := range []string{
+		"",
+		":9100",
+		"host",
+		"host:0",
+		"host:65536",
+		"host:notaport",
+	} {
+		t.Run("reject/"+addr, func(t *testing.T) {
+			args := append(base(), "--substrate-egress-http", addr)
+			configWantError(t, args, "--substrate-egress-http")
 		})
 	}
 }
