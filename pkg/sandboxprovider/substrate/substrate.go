@@ -1,9 +1,10 @@
 // Package substrate implements sandboxprovider.Provider on Substrate v1.0.0.
 //
 // It covers docs/milestone/v0.1.0/sandboxprovider.md's "职责", "接口",
-// "actor 模板", "网络", "调用 ate-api" and "错误处理" sections: it keeps the
-// actor template for the configured image and creates, suspends, resumes and
-// deletes one actor per run through ate-api.
+// "actor 模板", "网络", "调用 ate-api" and "错误处理" sections, with the
+// v0.2.0 changes in docs/milestone/v0.2.0/sandboxprovider.md: it keeps the
+// actor template for the configured image and addresses, and creates,
+// suspends, resumes and deletes one actor per run through ate-api.
 //
 // The connection code in conn.go, the template creation in template.go and
 // the RPC sequence in actor.go are adapted from Substrate v1.0.0 under the
@@ -12,6 +13,7 @@ package substrate
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,6 +35,7 @@ type Config struct {
 	Atespace       string // castworks-dev
 	Image          string // name@sha256:...
 	ControlPlane   string // 写进模板 env 的 CASTWORKS_CONTROL_PLANE，host:port
+	Connector      string // 写进模板 env 的 CASTWORKS_CONNECTOR，host:port
 	ServiceAccount string // castworks-system/sandboxprovider
 }
 
@@ -54,7 +57,7 @@ var _ sandboxprovider.Provider = (*Provider)(nil)
 // that no cluster is needed.
 type providerDeps struct {
 	newClient      func(ctx context.Context, cfg ateAPIConnConfig) (ateapi.ControlClient, func() error, error)
-	ensureTemplate func(ctx context.Context, client ateapi.ControlClient, atespace, image, controlPlane string) (string, error)
+	ensureTemplate func(ctx context.Context, client ateapi.ControlClient, atespace, image, controlPlane, connector string) (string, error)
 }
 
 var defaultProviderDeps = providerDeps{
@@ -84,7 +87,7 @@ func newProvider(ctx context.Context, cfg Config, deps providerDeps) (*Provider,
 		return nil, fmt.Errorf("substrate: connect to ate-api: %w", err)
 	}
 
-	template, err := deps.ensureTemplate(ctx, client, cfg.Atespace, cfg.Image, cfg.ControlPlane)
+	template, err := deps.ensureTemplate(ctx, client, cfg.Atespace, cfg.Image, cfg.ControlPlane, cfg.Connector)
 	if err != nil {
 		if closeErr := closeClient(); closeErr != nil {
 			slog.Default().WarnContext(ctx, "close ate-api connection after template setup failed",
@@ -144,7 +147,10 @@ func validateConfig(cfg Config) error {
 	if err := validateImage(cfg.Image); err != nil {
 		return err
 	}
-	if err := validateControlPlane(cfg.ControlPlane); err != nil {
+	if err := validateAddress("Config.ControlPlane", cfg.ControlPlane); err != nil {
+		return err
+	}
+	if err := validateAddress("Config.Connector", cfg.Connector); err != nil {
 		return err
 	}
 	if _, _, err := splitServiceAccount(cfg.ServiceAccount); err != nil {
@@ -154,31 +160,41 @@ func validateConfig(cfg Config) error {
 }
 
 // validateImage requires <name>@sha256:<64 lowercase hexadecimal digits>.
-// actorTemplateName owns the digest rules; this function adds the requirement
-// that the image name is not empty and names the Config field in the error.
 func validateImage(image string) error {
 	const marker = "@sha256:"
-	if i := strings.LastIndex(image, marker); i <= 0 {
+	i := strings.LastIndex(image, marker)
+	if i <= 0 {
 		return fmt.Errorf("substrate: Config.Image %q is not of the form <name>%s<64 lowercase hexadecimal digits>", image, marker)
 	}
-	if _, err := actorTemplateName(image); err != nil {
-		return fmt.Errorf("substrate: Config.Image %q: %w", image, err)
+	digest := image[i+len(marker):]
+	if len(digest) != 64 {
+		return fmt.Errorf("substrate: Config.Image %q has a sha256 digest of %d hexadecimal digits, want 64", image, len(digest))
+	}
+	if digest != strings.ToLower(digest) {
+		return fmt.Errorf("substrate: Config.Image %q has an uppercase sha256 digest", image)
+	}
+	if _, err := hex.DecodeString(digest); err != nil {
+		return fmt.Errorf("substrate: Config.Image %q has a malformed sha256 digest: %w", image, err)
 	}
 	return nil
 }
 
-// validateControlPlane requires host:port with a numeric port.
-func validateControlPlane(address string) error {
+// validateAddress requires field to be host:port with a non-empty host and a
+// numeric port.
+func validateAddress(field, address string) error {
+	if address == "" {
+		return fmt.Errorf("substrate: %s is empty", field)
+	}
 	host, portText, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("substrate: Config.ControlPlane %q is not host:port: %w", address, err)
+		return fmt.Errorf("substrate: %s %q is not host:port: %w", field, address, err)
 	}
 	if host == "" {
-		return fmt.Errorf("substrate: Config.ControlPlane %q has an empty host", address)
+		return fmt.Errorf("substrate: %s %q has an empty host", field, address)
 	}
 	port, err := strconv.ParseInt(portText, 10, 32)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("substrate: Config.ControlPlane %q has port %q, want a number from 1 to 65535", address, portText)
+		return fmt.Errorf("substrate: %s %q has port %q, want a number from 1 to 65535", field, address, portText)
 	}
 	return nil
 }

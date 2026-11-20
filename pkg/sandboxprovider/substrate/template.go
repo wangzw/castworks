@@ -1,34 +1,36 @@
 // The actor template this file creates follows
-// docs/milestone/v0.1.0/sandboxprovider.md "actor 模板". It is created
-// through ate-api, never updated and never deleted: Substrate has no update
-// RPC for templates, and deleting a template that actors still reference
-// breaks their later resumes. The template creation is adapted from Substrate
-// v1.0.0's cmd/ate-setup/internal/steps/substrate.go and is used under the
-// Apache License, Version 2.0.
+// docs/milestone/v0.1.0/sandboxprovider.md "actor 模板" and the v0.2.0
+// additions in docs/milestone/v0.2.0/sandboxprovider.md "actor 模板". It is
+// created through ate-api, never updated and never deleted: Substrate has no
+// update RPC for templates, and deleting a template that actors still
+// reference breaks their later resumes. The template creation is adapted from
+// Substrate v1.0.0's cmd/ate-setup/internal/steps/substrate.go and is used
+// under the Apache License, Version 2.0.
 
 package substrate
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // Fixed values of the actor template. They are not configurable through
-// Config: the pool, the actor size and the probe are the same for every actor
-// in v0.1.0.
+// Config: the pool, the actor size and the probe are the same for every actor.
 const (
 	templateNamePrefix = "cw-"
 
 	templateContainerName = "warden"
 	templateControlPlane  = "CASTWORKS_CONTROL_PLANE"
+	templateConnector     = "CASTWORKS_CONNECTOR"
 	templateVolumeName    = "system-info"
 	templateVolumePath    = "/run/ate"
 
@@ -43,44 +45,44 @@ const (
 	templateMemoryBytes   = int64(2 << 30) // 2 GiB
 )
 
-// actorTemplateName derives the template name from the image digest: "cw-"
-// followed by the first 12 hexadecimal digits. The image must be pinned by a
-// full sha256 digest.
-func actorTemplateName(image string) (string, error) {
-	const marker = "@sha256:"
-	i := strings.LastIndex(image, marker)
-	if i < 0 {
-		return "", fmt.Errorf("image %q is not pinned by a sha256 digest", image)
+// actorTemplateName derives the template name from the template content:
+// "cw-" followed by the first 12 hexadecimal digits of the SHA-256 digest of
+// the deterministic protobuf encoding of the template with its name cleared.
+// The image digest is part of the content, and so are the control-plane and
+// connector addresses; a configuration change therefore yields a new name
+// instead of a mismatch against an immutable existing template.
+func actorTemplateName(tpl *ateapi.ActorTemplate) (string, error) {
+	if tpl.GetMetadata() == nil {
+		return "", errors.New("actor template has no metadata")
 	}
-	digest := image[i+len(marker):]
-	if len(digest) != 64 {
-		return "", fmt.Errorf("image %q has a sha256 digest of %d hexadecimal digits, want 64", image, len(digest))
+	name := tpl.GetMetadata().GetName()
+	tpl.GetMetadata().Name = ""
+	data, err := proto.MarshalOptions{Deterministic: true}.Marshal(tpl)
+	tpl.GetMetadata().Name = name
+	if err != nil {
+		return "", fmt.Errorf("marshal actor template for its content digest: %w", err)
 	}
-	if digest != strings.ToLower(digest) {
-		return "", fmt.Errorf("image %q has an uppercase sha256 digest", image)
-	}
-	if _, err := hex.DecodeString(digest); err != nil {
-		return "", fmt.Errorf("image %q has a malformed sha256 digest: %w", image, err)
-	}
-	return templateNamePrefix + digest[:12], nil
+	digest := sha256.Sum256(data)
+	return templateNamePrefix + hex.EncodeToString(digest[:])[:12], nil
 }
 
-// ensureActorTemplate returns the name of the actor template for image,
-// creating the template when it does not exist. An existing template is never
-// modified or deleted; instead its key fields are checked against the values
-// this provider would create, and a mismatch is an error. A create that
-// loses a race with another process (ALREADY_EXISTS) is followed by a read of
-// the winning template.
-func ensureActorTemplate(ctx context.Context, client ateapi.ControlClient, atespace, image, controlPlane string) (string, error) {
-	name, err := actorTemplateName(image)
+// ensureActorTemplate returns the name of the actor template for the given
+// image and addresses, creating the template when it does not exist. An
+// existing template is never modified or deleted; instead its key fields are
+// checked against the values this provider would create, and a mismatch is an
+// error. A create that loses a race with another process (ALREADY_EXISTS) is
+// followed by a read of the winning template.
+func ensureActorTemplate(ctx context.Context, client ateapi.ControlClient, atespace, image, controlPlane, connector string) (string, error) {
+	tpl, err := buildActorTemplate(atespace, image, controlPlane, connector)
 	if err != nil {
 		return "", err
 	}
+	name := tpl.GetMetadata().GetName()
 	ref := &ateapi.ObjectRef{Atespace: atespace, Name: name}
 
-	tpl, err := client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: ref})
+	tpl, err = client.GetActorTemplate(ctx, &ateapi.GetActorTemplateRequest{ActorTemplate: ref})
 	if err == nil {
-		if err := checkActorTemplate(tpl, image, controlPlane); err != nil {
+		if err := checkActorTemplate(tpl, image, controlPlane, connector); err != nil {
 			return "", err
 		}
 		return name, nil
@@ -89,7 +91,10 @@ func ensureActorTemplate(ctx context.Context, client ateapi.ControlClient, atesp
 		return "", fmt.Errorf("get actor template %s/%s: %w", atespace, name, err)
 	}
 
-	tpl = buildActorTemplate(atespace, name, image, controlPlane)
+	tpl, err = buildActorTemplate(atespace, image, controlPlane, connector)
+	if err != nil {
+		return "", err
+	}
 	if _, err := client.CreateActorTemplate(ctx, &ateapi.CreateActorTemplateRequest{ActorTemplate: tpl}); err != nil {
 		if status.Code(err) != codes.AlreadyExists {
 			return "", fmt.Errorf("create actor template %s/%s: %w", atespace, name, err)
@@ -99,7 +104,7 @@ func ensureActorTemplate(ctx context.Context, client ateapi.ControlClient, atesp
 		if err != nil {
 			return "", fmt.Errorf("get actor template %s/%s after a concurrent create: %w", atespace, name, err)
 		}
-		if err := checkActorTemplate(tpl, image, controlPlane); err != nil {
+		if err := checkActorTemplate(tpl, image, controlPlane, connector); err != nil {
 			return "", err
 		}
 		return name, nil
@@ -109,12 +114,13 @@ func ensureActorTemplate(ctx context.Context, client ateapi.ControlClient, atesp
 	return name, nil
 }
 
-// buildActorTemplate returns the template for image. Its fields are the table
+// buildActorTemplate returns the template for image, controlPlane and
+// connector, with its name derived from the content. Its fields are the tables
 // in sandboxprovider.md "actor 模板"; checkActorTemplate verifies the ones
 // that would break a running provider if an existing template disagreed.
-func buildActorTemplate(atespace, name, image, controlPlane string) *ateapi.ActorTemplate {
-	return &ateapi.ActorTemplate{
-		Metadata: &ateapi.ResourceMetadata{Atespace: atespace, Name: name},
+func buildActorTemplate(atespace, image, controlPlane, connector string) (*ateapi.ActorTemplate, error) {
+	tpl := &ateapi.ActorTemplate{
+		Metadata: &ateapi.ResourceMetadata{Atespace: atespace},
 		WorkerSelector: &ateapi.Selector{MatchLabels: map[string]string{
 			templatePoolLabelKey: templatePoolLabelValue,
 		}},
@@ -124,6 +130,9 @@ func buildActorTemplate(atespace, name, image, controlPlane string) *ateapi.Acto
 			Env: []*ateapi.EnvVar{{
 				Name:  templateControlPlane,
 				Value: controlPlane,
+			}, {
+				Name:  templateConnector,
+				Value: connector,
 			}},
 			WakeupProbe: &ateapi.WakeupProbe{
 				HttpGet: &ateapi.HttpGetAction{
@@ -163,12 +172,18 @@ func buildActorTemplate(atespace, name, image, controlPlane string) *ateapi.Acto
 			},
 		},
 	}
+	name, err := actorTemplateName(tpl)
+	if err != nil {
+		return nil, err
+	}
+	tpl.Metadata.Name = name
+	return tpl, nil
 }
 
 // checkActorTemplate compares the key fields of an existing template with the
 // values buildActorTemplate would create. Every mismatch is reported with the
 // field it was found in.
-func checkActorTemplate(tpl *ateapi.ActorTemplate, image, controlPlane string) error {
+func checkActorTemplate(tpl *ateapi.ActorTemplate, image, controlPlane, connector string) error {
 	var errs []error
 	name := tpl.GetMetadata().GetName()
 	field := func(path string, want, got any) {
@@ -189,19 +204,25 @@ func checkActorTemplate(tpl *ateapi.ActorTemplate, image, controlPlane string) e
 			field("containers["+templateContainerName+"].image", image, container.GetImage())
 		}
 
-		var controlPlaneValue string
-		foundControlPlane := false
-		for _, env := range container.GetEnv() {
-			if env.GetName() == templateControlPlane {
-				controlPlaneValue = env.GetValue()
-				foundControlPlane = true
-				break
+		for _, want := range []struct {
+			name  string
+			value string
+		}{
+			{templateControlPlane, controlPlane},
+			{templateConnector, connector},
+		} {
+			value, found := "", false
+			for _, env := range container.GetEnv() {
+				if env.GetName() == want.name {
+					value, found = env.GetValue(), true
+					break
+				}
 			}
-		}
-		if !foundControlPlane {
-			errs = append(errs, fmt.Errorf("actor template %s: environment variable %s is missing", name, templateControlPlane))
-		} else if controlPlaneValue != controlPlane {
-			field("containers["+templateContainerName+"].env["+templateControlPlane+"]", controlPlane, controlPlaneValue)
+			if !found {
+				errs = append(errs, fmt.Errorf("actor template %s: environment variable %s is missing", name, want.name))
+			} else if value != want.value {
+				field("containers["+templateContainerName+"].env["+want.name+"]", want.value, value)
+			}
 		}
 
 		probe := container.GetWakeupProbe()

@@ -2,6 +2,7 @@ package substrate
 
 import (
 	"context"
+	"encoding/hex"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +18,24 @@ const (
 	testDigest       = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	testImage        = "registry.zhanwei.wang/castworks/providertest@sha256:" + testDigest
 	testControlPlane = "castworks-dev.castworks-system.svc.cluster.local:9090"
-	testTemplateName = "cw-0123456789ab"
+	testConnector    = "castworks-dev.castworks-system.svc.cluster.local:9091"
 )
+
+// expectedTemplate builds the template for the standard test configuration and
+// returns it with its content-derived name.
+func expectedTemplate(t *testing.T) *ateapi.ActorTemplate {
+	t.Helper()
+	tpl, err := buildActorTemplate(testAtespace, testImage, testControlPlane, testConnector)
+	if err != nil {
+		t.Fatalf("buildActorTemplate: %v", err)
+	}
+	return tpl
+}
+
+func expectedTemplateName(t *testing.T) string {
+	t.Helper()
+	return expectedTemplate(t).GetMetadata().GetName()
+}
 
 // templateClient is a ControlClient that stores at most one actor template.
 // It records successful creations and creation attempts separately, because
@@ -70,53 +87,152 @@ func (c *templateClient) counts() (gets, attempts, created int) {
 }
 
 func TestActorTemplateName(t *testing.T) {
-	tests := []struct {
-		name  string
-		image string
-		want  string
-	}{
-		{"digest", testImage, testTemplateName},
-		{"name with port and tag", "registry.example:5000/x/y:v1@sha256:" + testDigest, testTemplateName},
+	build := func(controlPlane, connector string) *ateapi.ActorTemplate {
+		t.Helper()
+		tpl, err := buildActorTemplate(testAtespace, testImage, controlPlane, connector)
+		if err != nil {
+			t.Fatalf("buildActorTemplate: %v", err)
+		}
+		return tpl
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := actorTemplateName(tt.image)
+
+	base := build(testControlPlane, testConnector)
+	name := base.GetMetadata().GetName()
+	if !strings.HasPrefix(name, templateNamePrefix) {
+		t.Fatalf("name = %q, want the %q prefix", name, templateNamePrefix)
+	}
+	if len(name) != len(templateNamePrefix)+12 {
+		t.Fatalf("name = %q, want %q plus 12 hexadecimal digits", name, templateNamePrefix)
+	}
+	if _, err := hex.DecodeString(name[len(templateNamePrefix):]); err != nil {
+		t.Fatalf("name %q does not end in hexadecimal digits: %v", name, err)
+	}
+
+	t.Run("same configuration", func(t *testing.T) {
+		if got := build(testControlPlane, testConnector).GetMetadata().GetName(); got != name {
+			t.Fatalf("name = %q, want %q", got, name)
+		}
+	})
+
+	t.Run("repeated calculation", func(t *testing.T) {
+		for i := 0; i < 10; i++ {
+			got, err := actorTemplateName(base)
 			if err != nil {
 				t.Fatalf("actorTemplateName: %v", err)
 			}
-			if got != tt.want {
-				t.Fatalf("actorTemplateName = %q, want %q", got, tt.want)
+			if got != name {
+				t.Fatalf("call %d: name = %q, want %q", i+1, got, name)
 			}
-		})
+		}
+	})
+
+	t.Run("name field is excluded", func(t *testing.T) {
+		renamed := build(testControlPlane, testConnector)
+		renamed.Metadata.Name = "cw-ffffffffffff"
+		got, err := actorTemplateName(renamed)
+		if err != nil {
+			t.Fatalf("actorTemplateName: %v", err)
+		}
+		if got != name {
+			t.Fatalf("name = %q, want %q", got, name)
+		}
+	})
+
+	t.Run("control plane changes the name", func(t *testing.T) {
+		got := build("castworks-dev.castworks-system.svc.cluster.local:9099", testConnector).GetMetadata().GetName()
+		if got == name {
+			t.Fatalf("name = %q after changing the control plane, want a different name", got)
+		}
+	})
+
+	t.Run("connector changes the name", func(t *testing.T) {
+		got := build(testControlPlane, "castworks-dev.castworks-system.svc.cluster.local:9092").GetMetadata().GetName()
+		if got == name {
+			t.Fatalf("name = %q after changing the connector, want a different name", got)
+		}
+	})
+
+	t.Run("image changes the name", func(t *testing.T) {
+		tpl, err := buildActorTemplate(testAtespace, "registry.example/other@sha256:"+strings.Repeat("a", 64), testControlPlane, testConnector)
+		if err != nil {
+			t.Fatalf("buildActorTemplate: %v", err)
+		}
+		if got := tpl.GetMetadata().GetName(); got == name {
+			t.Fatalf("name = %q after changing the image, want a different name", got)
+		}
+	})
+}
+
+// TestActorTemplateNameIgnoresMapOrder checks that the content digest does not
+// depend on the order in which the worker selector's labels are inserted. The
+// template carries eight labels, and the name is computed 25 times for the
+// same labels in both forward and reverse insertion order; a map encoding that
+// followed Go's randomized iteration order would almost surely disagree with
+// the fixed name below at least once.
+//
+// want was computed with the recipe actorTemplateName documents, for exactly
+// the labels in labelPairs: build the standard test template, replace its
+// worker_selector.match_labels with those labels, clear metadata.name, marshal
+// the template with proto.MarshalOptions{Deterministic: true}, take the SHA-256
+// digest of those bytes, and use "cw-" plus the first 12 hexadecimal digits of
+// the digest.
+func TestActorTemplateNameIgnoresMapOrder(t *testing.T) {
+	const want = "cw-cd26443166d6"
+
+	labelPairs := []struct {
+		key, value string
+	}{
+		{"castworks.dev/pool", "castworks"},
+		{"castworks.dev/a", "1"},
+		{"castworks.dev/b", "2"},
+		{"castworks.dev/c", "3"},
+		{"castworks.dev/d", "4"},
+		{"castworks.dev/e", "5"},
+		{"castworks.dev/f", "6"},
+		{"castworks.dev/g", "7"},
+	}
+	buildWithLabels := func(reverse bool) string {
+		t.Helper()
+		tpl, err := buildActorTemplate(testAtespace, testImage, testControlPlane, testConnector)
+		if err != nil {
+			t.Fatalf("buildActorTemplate: %v", err)
+		}
+		labels := make(map[string]string, len(labelPairs))
+		for i := range labelPairs {
+			j := i
+			if reverse {
+				j = len(labelPairs) - 1 - i
+			}
+			labels[labelPairs[j].key] = labelPairs[j].value
+		}
+		tpl.WorkerSelector.MatchLabels = labels
+		name, err := actorTemplateName(tpl)
+		if err != nil {
+			t.Fatalf("actorTemplateName: %v", err)
+		}
+		return name
 	}
 
-	bad := []struct {
-		name  string
-		image string
-	}{
-		{"no digest", "registry.example/castworks"},
-		{"tag instead of digest", "registry.example/castworks:v1"},
-		{"short digest", "registry.example/castworks@sha256:0123456789ab"},
-		{"uppercase digest", "registry.example/castworks@sha256:" + strings.ToUpper(testDigest)},
-		{"non-hex digest", "registry.example/castworks@sha256:" + strings.Repeat("zz", 32)},
-	}
-	for _, tt := range bad {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := actorTemplateName(tt.image); err == nil {
-				t.Fatalf("actorTemplateName(%q) succeeded, want error", tt.image)
-			}
-		})
+	for i := 0; i < 25; i++ {
+		forward, reverse := buildWithLabels(false), buildWithLabels(true)
+		if forward != reverse {
+			t.Fatalf("round %d: names differ for the same labels inserted in a different order: %q != %q", i+1, forward, reverse)
+		}
+		if forward != want {
+			t.Fatalf("round %d: name = %q, want the fixed %q", i+1, forward, want)
+		}
 	}
 }
 
 func TestEnsureActorTemplateCreates(t *testing.T) {
+	wantName := expectedTemplateName(t)
 	client := &templateClient{}
-	name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+	name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 	if err != nil {
 		t.Fatalf("ensureActorTemplate: %v", err)
 	}
-	if name != testTemplateName {
-		t.Fatalf("template name = %q, want %q", name, testTemplateName)
+	if name != wantName {
+		t.Fatalf("template name = %q, want %q", name, wantName)
 	}
 	if gets, attempts, created := client.counts(); gets != 1 || attempts != 1 || created != 1 {
 		t.Fatalf("gets/attempts/created = %d/%d/%d, want 1/1/1", gets, attempts, created)
@@ -126,8 +242,8 @@ func TestEnsureActorTemplateCreates(t *testing.T) {
 	if got := tpl.GetMetadata().GetAtespace(); got != testAtespace {
 		t.Errorf("atespace = %q, want %q", got, testAtespace)
 	}
-	if got := tpl.GetMetadata().GetName(); got != testTemplateName {
-		t.Errorf("name = %q, want %q", got, testTemplateName)
+	if got := tpl.GetMetadata().GetName(); got != wantName {
+		t.Errorf("name = %q, want %q", got, wantName)
 	}
 	if got := tpl.GetWorkerSelector().GetMatchLabels(); len(got) != 1 || got["castworks.dev/pool"] != "castworks" {
 		t.Errorf("worker_selector.match_labels = %v, want castworks.dev/pool=castworks", got)
@@ -144,11 +260,21 @@ func TestEnsureActorTemplateCreates(t *testing.T) {
 	if got := container.GetImage(); got != testImage {
 		t.Errorf("container image = %q, want %q", got, testImage)
 	}
-	if got := container.GetEnv()[0].GetName(); got != "CASTWORKS_CONTROL_PLANE" {
-		t.Errorf("env name = %q, want CASTWORKS_CONTROL_PLANE", got)
+	env := container.GetEnv()
+	if len(env) != 2 {
+		t.Fatalf("env = %d entries, want 2", len(env))
 	}
-	if got := container.GetEnv()[0].GetValue(); got != testControlPlane {
+	if got := env[0].GetName(); got != "CASTWORKS_CONTROL_PLANE" {
+		t.Errorf("env[0] name = %q, want CASTWORKS_CONTROL_PLANE", got)
+	}
+	if got := env[0].GetValue(); got != testControlPlane {
 		t.Errorf("CASTWORKS_CONTROL_PLANE = %q, want %q", got, testControlPlane)
+	}
+	if got := env[1].GetName(); got != "CASTWORKS_CONNECTOR" {
+		t.Errorf("env[1] name = %q, want CASTWORKS_CONNECTOR", got)
+	}
+	if got := env[1].GetValue(); got != testConnector {
+		t.Errorf("CASTWORKS_CONNECTOR = %q, want %q", got, testConnector)
 	}
 	probe := container.GetWakeupProbe()
 	if got := probe.GetHttpGet().GetPort(); got != 8081 {
@@ -198,14 +324,15 @@ func TestEnsureActorTemplateCreates(t *testing.T) {
 }
 
 func TestEnsureActorTemplateIsIdempotent(t *testing.T) {
+	wantName := expectedTemplateName(t)
 	client := &templateClient{}
 	for i := 0; i < 2; i++ {
-		name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+		name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 		if err != nil {
 			t.Fatalf("ensureActorTemplate call %d: %v", i+1, err)
 		}
-		if name != testTemplateName {
-			t.Fatalf("call %d: template name = %q, want %q", i+1, name, testTemplateName)
+		if name != wantName {
+			t.Fatalf("call %d: template name = %q, want %q", i+1, name, wantName)
 		}
 	}
 	if _, attempts, created := client.counts(); attempts != 1 || created != 1 {
@@ -214,6 +341,7 @@ func TestEnsureActorTemplateIsIdempotent(t *testing.T) {
 }
 
 func TestEnsureActorTemplateConcurrentCreate(t *testing.T) {
+	wantName := expectedTemplateName(t)
 	client := &templateClient{}
 	const goroutines = 8
 	var wg sync.WaitGroup
@@ -223,7 +351,7 @@ func TestEnsureActorTemplateConcurrentCreate(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			names[i], errs[i] = ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+			names[i], errs[i] = ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 		}(i)
 	}
 	wg.Wait()
@@ -231,8 +359,8 @@ func TestEnsureActorTemplateConcurrentCreate(t *testing.T) {
 		if errs[i] != nil {
 			t.Fatalf("goroutine %d: %v", i, errs[i])
 		}
-		if names[i] != testTemplateName {
-			t.Fatalf("goroutine %d: name = %q, want %q", i, names[i], testTemplateName)
+		if names[i] != wantName {
+			t.Fatalf("goroutine %d: name = %q, want %q", i, names[i], wantName)
 		}
 	}
 	if _, _, created := client.counts(); created != 1 {
@@ -258,6 +386,20 @@ func TestEnsureActorTemplateRejectsMismatch(t *testing.T) {
 			field: "CASTWORKS_CONTROL_PLANE",
 			mutate: func(tpl *ateapi.ActorTemplate) {
 				tpl.Containers[0].Env[0].Value = "other:9090"
+			},
+		},
+		{
+			name:  "connector",
+			field: "CASTWORKS_CONNECTOR",
+			mutate: func(tpl *ateapi.ActorTemplate) {
+				tpl.Containers[0].Env[1].Value = "other:9091"
+			},
+		},
+		{
+			name:  "missing connector",
+			field: "CASTWORKS_CONNECTOR",
+			mutate: func(tpl *ateapi.ActorTemplate) {
+				tpl.Containers[0].Env = tpl.Containers[0].Env[:1]
 			},
 		},
 		{
@@ -363,11 +505,11 @@ func TestEnsureActorTemplateRejectsMismatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tpl := buildActorTemplate(testAtespace, testTemplateName, testImage, testControlPlane)
+			tpl := expectedTemplate(t)
 			tt.mutate(tpl)
 			client := &templateClient{template: tpl}
 
-			_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+			_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 			if err == nil {
 				t.Fatal("ensureActorTemplate succeeded, want a mismatch error")
 			}
@@ -384,7 +526,7 @@ func TestEnsureActorTemplateRejectsMismatch(t *testing.T) {
 func TestEnsureActorTemplateErrors(t *testing.T) {
 	t.Run("get fails", func(t *testing.T) {
 		client := &templateClient{getErr: status.Error(codes.Internal, "boom")}
-		_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+		_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 		if err == nil || status.Code(err) != codes.Internal {
 			t.Fatalf("err = %v, want code Internal", err)
 		}
@@ -392,7 +534,7 @@ func TestEnsureActorTemplateErrors(t *testing.T) {
 
 	t.Run("create fails", func(t *testing.T) {
 		client := &templateClient{createErr: status.Error(codes.InvalidArgument, "bad template")}
-		_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+		_, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 		if err == nil || status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("err = %v, want code InvalidArgument", err)
 		}
@@ -400,14 +542,14 @@ func TestEnsureActorTemplateErrors(t *testing.T) {
 }
 
 func TestEnsureActorTemplateReadsBackAfterAlreadyExists(t *testing.T) {
-	tpl := buildActorTemplate(testAtespace, testTemplateName, testImage, testControlPlane)
+	tpl := expectedTemplate(t)
 	client := &appearingTemplateClient{templateClient: &templateClient{}, tpl: tpl}
-	name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane)
+	name, err := ensureActorTemplate(context.Background(), client, testAtespace, testImage, testControlPlane, testConnector)
 	if err != nil {
 		t.Fatalf("ensureActorTemplate: %v", err)
 	}
-	if name != testTemplateName {
-		t.Fatalf("name = %q, want %q", name, testTemplateName)
+	if want := tpl.GetMetadata().GetName(); name != want {
+		t.Fatalf("name = %q, want %q", name, want)
 	}
 	if _, attempts, created := client.counts(); attempts != 1 || created != 0 {
 		t.Fatalf("attempts/created = %d/%d, want 1/0", attempts, created)

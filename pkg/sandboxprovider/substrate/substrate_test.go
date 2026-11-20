@@ -22,6 +22,7 @@ func providerTestConfig() Config {
 		Atespace:       "castworks-dev",
 		Image:          providerTestImage,
 		ControlPlane:   "castworks-dev.castworks-system.svc.cluster.local:9090",
+		Connector:      "castworks-dev.castworks-system.svc.cluster.local:9091",
 		ServiceAccount: "castworks-system/sandboxprovider",
 	}
 }
@@ -42,6 +43,7 @@ type providerTestDeps struct {
 	gotAtespace     string
 	gotImage        string
 	gotControlPlane string
+	gotConnector    string
 }
 
 func (d *providerTestDeps) deps() providerDeps {
@@ -56,9 +58,9 @@ func (d *providerTestDeps) deps() providerDeps {
 				return d.closeErr
 			}, nil
 		},
-		ensureTemplate: func(_ context.Context, _ ateapi.ControlClient, atespace, image, controlPlane string) (string, error) {
+		ensureTemplate: func(_ context.Context, _ ateapi.ControlClient, atespace, image, controlPlane, connector string) (string, error) {
 			d.ensureTemplateCalls.Add(1)
-			d.gotAtespace, d.gotImage, d.gotControlPlane = atespace, image, controlPlane
+			d.gotAtespace, d.gotImage, d.gotControlPlane, d.gotConnector = atespace, image, controlPlane, connector
 			if d.ensureTemplateErr != nil {
 				return "", d.ensureTemplateErr
 			}
@@ -135,6 +137,36 @@ func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 			wantField: "Config.ControlPlane",
 		},
 		{
+			name:      "empty connector",
+			mutate:    func(c *Config) { c.Connector = "" },
+			wantField: "Config.Connector",
+		},
+		{
+			name:      "connector without port",
+			mutate:    func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc.cluster.local" },
+			wantField: "Config.Connector",
+		},
+		{
+			name:      "connector with empty host",
+			mutate:    func(c *Config) { c.Connector = ":9091" },
+			wantField: "Config.Connector",
+		},
+		{
+			name:      "connector with non-numeric port",
+			mutate:    func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc.cluster.local:connector" },
+			wantField: "Config.Connector",
+		},
+		{
+			name:      "connector with port zero",
+			mutate:    func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc.cluster.local:0" },
+			wantField: "Config.Connector",
+		},
+		{
+			name:      "connector with port above 65535",
+			mutate:    func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc.cluster.local:70000" },
+			wantField: "Config.Connector",
+		},
+		{
 			name:      "service account without namespace",
 			mutate:    func(c *Config) { c.ServiceAccount = "sandboxprovider" },
 			wantField: "Config.ServiceAccount",
@@ -200,9 +232,11 @@ func TestNewWiresProviderAndManager(t *testing.T) {
 	if p.manager.controlPlane != cfg.ControlPlane {
 		t.Errorf("manager controlPlane = %q, want %q", p.manager.controlPlane, cfg.ControlPlane)
 	}
-	if deps.gotAtespace != cfg.Atespace || deps.gotImage != cfg.Image || deps.gotControlPlane != cfg.ControlPlane {
-		t.Errorf("ensureTemplate got (%q, %q, %q), want (%q, %q, %q)",
-			deps.gotAtespace, deps.gotImage, deps.gotControlPlane, cfg.Atespace, cfg.Image, cfg.ControlPlane)
+	if deps.gotAtespace != cfg.Atespace || deps.gotImage != cfg.Image ||
+		deps.gotControlPlane != cfg.ControlPlane || deps.gotConnector != cfg.Connector {
+		t.Errorf("ensureTemplate got (%q, %q, %q, %q), want (%q, %q, %q, %q)",
+			deps.gotAtespace, deps.gotImage, deps.gotControlPlane, deps.gotConnector,
+			cfg.Atespace, cfg.Image, cfg.ControlPlane, cfg.Connector)
 	}
 
 	status, err := p.GetSandbox(context.Background(), "cw-run0")
