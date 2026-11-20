@@ -2,14 +2,21 @@ package runcontroller_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
 	"github.com/wangzw/castworks/pkg/runcontroller"
 	"github.com/wangzw/castworks/pkg/sandboxprovider/fakeprovider"
 )
+
+// deliverBatchLimit mirrors the documented 1 MiB bound on one Deliver batch.
+const deliverBatchLimit = 1 << 20
 
 // delivers returns the Deliver frames recorded on the stream, in order.
 func (r *controlRecorder) delivers() []*agentprotocolv1.Deliver {
@@ -72,6 +79,64 @@ func waitDeliver(t *testing.T, rec *controlRecorder, n int) *agentprotocolv1.Del
 		return true
 	})
 	return got
+}
+
+// inTurnRun walks a fresh run to active/in_turn on its first stream: the first
+// message is delivered and accepted, and the turn it opened is recorded. The
+// returned recorder drains every frame the control plane sends on the stream.
+func inTurnRun(t *testing.T, h *harness) (string, agentprotocolv1.AgentStream_ConnectClient, *controlRecorder) {
+	t.Helper()
+
+	runID := h.createRun("first")
+	h.waitCalls(fakeprovider.OpProvision, 1)
+
+	stream := h.openStream()
+	rec := recordControl(stream)
+	send(t, stream, helloFrame(runID, agentprotocolv1.Phase_PHASE_STARTING, "", 0, nil))
+	first := waitDeliver(t, rec, 1)
+	send(t, stream, acceptedFrameFor(runID, first))
+	h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateInTurn)
+	send(t, stream, turnStartedFrame(runID, "turn-1", first.GetDeliveryId()))
+	h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateInTurn)
+
+	return runID, stream, rec
+}
+
+// subscriptionProto is the protocol message the controller must build for sc:
+// every field is mapped and OccurredAt becomes a Timestamp.
+func subscriptionProto(sc *runcontroller.SubscriptionCompletion) *agentprotocolv1.SubscriptionCompleted {
+	return &agentprotocolv1.SubscriptionCompleted{
+		SubId:              sc.SubID,
+		System:             sc.System,
+		Event:              sc.Event,
+		SubscriptionStatus: sc.SubscriptionStatus,
+		Terminal:           sc.Terminal,
+		Correlation:        sc.Correlation,
+		OccurredAt:         timestamppb.New(sc.OccurredAt),
+		Source:             sc.Source,
+		Detail:             sc.Detail,
+		DetailTruncated:    sc.DetailTruncated,
+	}
+}
+
+// subscriptionProtoCost is the number of bytes one subscription completion
+// accounts for against the batch limit: its detail plus the encoded size of
+// the other fields, i.e. the serialized size of the whole message.
+func subscriptionProtoCost(sc *runcontroller.SubscriptionCompletion) int {
+	return proto.Size(subscriptionProto(sc))
+}
+
+// subscriptionEventWithDetail returns a subscription completion event with the
+// given dedup key and detail.
+func subscriptionEventWithDetail(dedupKey, detail string) runcontroller.InboxEvent {
+	sc := testSubscriptionCompletion()
+	sc.Detail = detail
+	return runcontroller.InboxEvent{
+		Kind:         runcontroller.KindSubscriptionCompleted,
+		EventID:      "evt-" + dedupKey,
+		DedupKey:     dedupKey,
+		Subscription: sc,
+	}
 }
 
 // boundaryRun walks a fresh run to active/boundary on its first stream: the
@@ -231,5 +296,257 @@ func TestHelloBeforeRestoreLeavesHelloMSUnmeasured(t *testing.T) {
 	_, helloMS = h.suspensionHello(runID)
 	if helloMS != nil {
 		t.Fatalf("RestoreSnapshot 返回后 hello_ms = %d, 想要保持未测得（NULL）", *helloMS)
+	}
+}
+
+// TestDeliverMixedInboxKinds covers “人类消息与订阅完成事件交替写入，同一批
+// Deliver 按 inbox_seq 排列两种事件”. Both kinds are appended while the run is
+// in a turn, so neither is delivered on its own; the turn end delivers one
+// batch in inbox order.
+func TestDeliverMixedInboxKinds(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, testConfig())
+	runID, stream, rec := inTurnRun(t, h)
+	ctx := context.Background()
+
+	texts := []string{"human-1", "human-2"}
+	dedupKeys := []string{"mixed-1", "mixed-2"}
+	for i := range texts {
+		if _, err := appendHuman(h.ctrl, ctx, runID, texts[i]); err != nil {
+			t.Fatalf("AppendInbox 人类消息 %d: %v", i, err)
+		}
+		if _, _, err := h.ctrl.AppendInbox(ctx, runID, testSubscriptionEvent(dedupKeys[i])); err != nil {
+			t.Fatalf("AppendInbox 订阅完成 %d: %v", i, err)
+		}
+	}
+
+	send(t, stream, turnEndedFrame(runID, "turn-1"))
+
+	d := waitDeliver(t, rec, 2)
+	batch := d.GetBatch()
+	if len(batch) != 2*len(texts) {
+		t.Fatalf("同一批消息数 = %d, 想要 %d", len(batch), 2*len(texts))
+	}
+	for i, m := range batch {
+		if want := int64(2 + i); m.GetInboxSeq() != want {
+			t.Fatalf("第 %d 条 inbox_seq = %d, 想要 %d", i, m.GetInboxSeq(), want)
+		}
+	}
+	for i := range texts {
+		human := batch[2*i]
+		if got := human.GetText(); got != texts[i] {
+			t.Fatalf("第 %d 条文本 = %q, 想要 %q", 2*i, got, texts[i])
+		}
+		if human.GetSubscriptionCompleted() != nil {
+			t.Fatalf("第 %d 条同时带了 subscription_completed", 2*i)
+		}
+
+		sub := batch[2*i+1].GetSubscriptionCompleted()
+		if sub == nil {
+			t.Fatalf("第 %d 条落到了 text，想要 subscription_completed", 2*i+1)
+		}
+		if want := subscriptionProto(testSubscriptionCompletion()); !proto.Equal(sub, want) {
+			t.Fatalf("第 %d 条订阅完成 = %v, 想要 %v", 2*i+1, sub, want)
+		}
+	}
+	if want := int64(2*len(texts) + 1); d.GetThroughSeq() != want {
+		t.Fatalf("through_seq = %d, 想要 %d", d.GetThroughSeq(), want)
+	}
+}
+
+// TestDeliverBatchSubscriptionDetailLimit covers “含大 detail 的事件按上限
+// 分批”. A subscription completion counts its detail plus the other fields
+// against the shared 1 MiB limit.
+func TestDeliverBatchSubscriptionDetailLimit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("subscriptions split at the limit", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, testConfig())
+		runID, stream, rec := inTurnRun(t, h)
+		ctx := context.Background()
+
+		detail := strings.Repeat("d", runcontroller.MaxDetailBytes)
+		unit := subscriptionProtoCost(subscriptionEventWithDetail("unit", detail).Subscription)
+		if unit <= 0 || unit >= deliverBatchLimit {
+			t.Fatalf("单条事件的成本 = %d, 想要在 (0, %d) 内", unit, deliverBatchLimit)
+		}
+
+		// Enough full-size events that the limit is crossed partway through.
+		const count = 22
+		if count*unit <= deliverBatchLimit {
+			t.Fatalf("测试前提不成立：%d 条事件成本 %d 未超过 %d", count, count*unit, deliverBatchLimit)
+		}
+		var (
+			wantFirst int
+			total     int
+		)
+		for wantFirst < count {
+			if wantFirst > 0 && total+unit > deliverBatchLimit {
+				break
+			}
+			total += unit
+			wantFirst++
+		}
+
+		for i := 0; i < count; i++ {
+			ev := subscriptionEventWithDetail(fmt.Sprintf("detail-%d", i), detail)
+			if _, _, err := h.ctrl.AppendInbox(ctx, runID, ev); err != nil {
+				t.Fatalf("AppendInbox %d: %v", i, err)
+			}
+		}
+		send(t, stream, turnEndedFrame(runID, "turn-1"))
+
+		first := waitDeliver(t, rec, 2)
+		if got := len(first.GetBatch()); got != wantFirst {
+			t.Fatalf("第一批消息数 = %d, 想要 %d（上限内）", got, wantFirst)
+		}
+		for i, m := range first.GetBatch() {
+			if m.GetSubscriptionCompleted() == nil {
+				t.Fatalf("第一批第 %d 条不是 subscription_completed", i)
+			}
+			if want := int64(2 + i); m.GetInboxSeq() != want {
+				t.Fatalf("第一批第 %d 条 inbox_seq = %d, 想要 %d", i, m.GetInboxSeq(), want)
+			}
+		}
+		if want := int64(1 + wantFirst); first.GetThroughSeq() != want {
+			t.Fatalf("第一批 through_seq = %d, 想要 %d", first.GetThroughSeq(), want)
+		}
+
+		send(t, stream, acceptedFrameFor(runID, first))
+		h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateInTurn)
+		send(t, stream, turnStartedFrame(runID, "turn-2", first.GetDeliveryId()))
+		send(t, stream, turnEndedFrame(runID, "turn-2"))
+
+		second := waitDeliver(t, rec, 3)
+		if got, want := len(second.GetBatch()), count-wantFirst; got != want {
+			t.Fatalf("第二批消息数 = %d, 想要 %d", got, want)
+		}
+		if got, want := second.GetBatch()[0].GetInboxSeq(), int64(2+wantFirst); got != want {
+			t.Fatalf("第二批首条 inbox_seq = %d, 想要 %d", got, want)
+		}
+	})
+
+	t.Run("exact limit then one more byte", func(t *testing.T) {
+		t.Parallel()
+
+		h := newHarness(t, testConfig())
+		runID, stream, rec := inTurnRun(t, h)
+		ctx := context.Background()
+
+		detail := strings.Repeat("d", runcontroller.MaxDetailBytes)
+		unit := subscriptionProtoCost(subscriptionEventWithDetail("unit", detail).Subscription)
+
+		// Fill the batch with full-size subscription completions, then one
+		// human message that makes the total exactly the limit.
+		n := (deliverBatchLimit - 1) / unit
+		for n > 0 && deliverBatchLimit-n*unit > runcontroller.MaxTextBytes {
+			n--
+		}
+		remainder := deliverBatchLimit - n*unit
+		if n < 1 || remainder < 1 || remainder > runcontroller.MaxTextBytes {
+			t.Fatalf("无法构造恰好填满上限的批次: n=%d remainder=%d", n, remainder)
+		}
+
+		for i := 0; i < n; i++ {
+			ev := subscriptionEventWithDetail(fmt.Sprintf("exact-%d", i), detail)
+			if _, _, err := h.ctrl.AppendInbox(ctx, runID, ev); err != nil {
+				t.Fatalf("AppendInbox %d: %v", i, err)
+			}
+		}
+		if _, err := appendHuman(h.ctrl, ctx, runID, strings.Repeat("h", remainder)); err != nil {
+			t.Fatalf("AppendInbox 填充消息: %v", err)
+		}
+		if _, err := appendHuman(h.ctrl, ctx, runID, "x"); err != nil {
+			t.Fatalf("AppendInbox 超限消息: %v", err)
+		}
+		send(t, stream, turnEndedFrame(runID, "turn-1"))
+
+		first := waitDeliver(t, rec, 2)
+		if got, want := len(first.GetBatch()), n+1; got != want {
+			t.Fatalf("恰好上限的批次消息数 = %d, 想要 %d", got, want)
+		}
+		if got := n*unit + remainder; got != deliverBatchLimit {
+			t.Fatalf("第一批总字节 = %d, 想要 %d", got, deliverBatchLimit)
+		}
+		if got, want := first.GetThroughSeq(), int64(n+2); got != want {
+			t.Fatalf("第一批 through_seq = %d, 想要 %d", got, want)
+		}
+		last := first.GetBatch()[n]
+		if got := len(last.GetText()); got != remainder {
+			t.Fatalf("填充消息长度 = %d, 想要 %d", got, remainder)
+		}
+		if last.GetSubscriptionCompleted() != nil {
+			t.Fatal("填充消息被投递成 subscription_completed")
+		}
+
+		// The one byte over the limit is delivered in the next batch.
+		send(t, stream, acceptedFrameFor(runID, first))
+		h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateInTurn)
+		send(t, stream, turnStartedFrame(runID, "turn-2", first.GetDeliveryId()))
+		send(t, stream, turnEndedFrame(runID, "turn-2"))
+
+		second := waitDeliver(t, rec, 3)
+		if got, want := len(second.GetBatch()), 1; got != want {
+			t.Fatalf("超限批次消息数 = %d, 想要 %d", got, want)
+		}
+		if got, want := second.GetBatch()[0].GetInboxSeq(), int64(n+3); got != want {
+			t.Fatalf("超限消息 inbox_seq = %d, 想要 %d", got, want)
+		}
+		if got := second.GetBatch()[0].GetText(); got != "x" {
+			t.Fatalf("超限消息文本 = %q, 想要 %q", got, "x")
+		}
+	})
+}
+
+// TestDeliverSubscriptionCompletedAfterRestore covers “恢复后以
+// subscription_completed 项投递，字段与写入时一致”.
+func TestDeliverSubscriptionCompletedAfterRestore(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, testConfig())
+	runID, _ := h.stepToBoundary()
+
+	h.clock.Advance(testConfig().IdleGrace + time.Second)
+	if err := runcontroller.TrySuspendNow(h.ctrl, runID); err != nil {
+		t.Fatalf("TrySuspendNow: %v", err)
+	}
+	h.waitState(runID, runcontroller.StateSuspended, runcontroller.SubstateSnapshotted)
+
+	release := h.provider.Hold(fakeprovider.OpRestore)
+	t.Cleanup(release)
+
+	ev := testSubscriptionEvent("restore-deliver")
+	seq, duplicate, err := h.ctrl.AppendInbox(context.Background(), runID, ev)
+	if err != nil {
+		t.Fatalf("AppendInbox: %v", err)
+	}
+	if duplicate || seq != 2 {
+		t.Fatalf("AppendInbox = (%d, %v), 想要 (2, false)", seq, duplicate)
+	}
+	h.waitCalls(fakeprovider.OpRestore, 1)
+
+	// The Hello after restore delivers the stored event. It is sent before
+	// RestoreSnapshot returns, which the state machine accepts.
+	stream := h.openStream()
+	rec := recordControl(stream)
+	send(t, stream, helloFrame(runID, agentprotocolv1.Phase_PHASE_BOUNDARY, "", 1, nil))
+
+	d := waitDeliver(t, rec, 1)
+	if got := len(d.GetBatch()); got != 1 {
+		t.Fatalf("恢复后投递的消息数 = %d, 想要 1", got)
+	}
+	m := d.GetBatch()[0]
+	if m.GetInboxSeq() != 2 {
+		t.Fatalf("恢复后投递的 inbox_seq = %d, 想要 2", m.GetInboxSeq())
+	}
+	got := m.GetSubscriptionCompleted()
+	if got == nil {
+		t.Fatal("恢复后投递的项不是 subscription_completed")
+	}
+	if want := subscriptionProto(ev.Subscription); !proto.Equal(got, want) {
+		t.Fatalf("恢复后投递的字段 = %v, 想要 %v", got, want)
 	}
 }

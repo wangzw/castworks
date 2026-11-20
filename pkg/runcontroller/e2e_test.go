@@ -862,6 +862,36 @@ func TestE2ERestartWhileSuspended(t *testing.T) {
 	}
 }
 
+// TestE2ESubscriptionCompletionWakesSuspended covers the v0.2.0 test
+// “订阅完成事件唤醒已挂起的运行实例” through the fake warden.
+func TestE2ESubscriptionCompletionWakesSuspended(t *testing.T) {
+	t.Parallel()
+
+	h := newE2E(t, e2eConfig())
+	h.startRun()
+
+	runID := h.createRun("first")
+	w := h.warden(runID)
+	h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateBoundary)
+	h.waitWritten(w, 1)
+
+	h.suspendNow(runID)
+
+	seq, duplicate, err := h.controller().AppendInbox(
+		context.Background(), runID, testSubscriptionEvent("e2e-sub-1"))
+	if err != nil {
+		t.Fatalf("AppendInbox: %v", err)
+	}
+	if duplicate || seq != 2 {
+		t.Fatalf("AppendInbox = (%d, %v), 想要 (2, false)", seq, duplicate)
+	}
+
+	h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateBoundary)
+	h.waitWritten(w, 2)
+	assertWritten(t, w.Written(), 2)
+	assertDeliverCounts(t, w, 2)
+}
+
 // TestE2EFailureTransitions covers “Snapshot 失败、RestoreSnapshot 失败与等待
 // Hello 超时三种情形的状态转移符合上文”.
 func TestE2EFailureTransitions(t *testing.T) {

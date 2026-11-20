@@ -2,6 +2,7 @@ package runcontroller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,7 +11,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/wangzw/castworks/pkg/agentprotocol"
 	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
 	"github.com/wangzw/castworks/pkg/sandboxprovider"
 	"google.golang.org/grpc"
@@ -29,9 +33,11 @@ const (
 	// runIDAlphabet is the lowercase base32 alphabet a run_id is drawn from.
 	runIDAlphabet = "abcdefghijklmnopqrstuvwxyz234567"
 
-	// maxDeliverBytes bounds the total text of one Deliver batch. The rest is
-	// delivered at the next turn boundary, keeping the frame under the gRPC
-	// default 4 MiB message limit.
+	// maxDeliverBytes bounds the total size of one Deliver batch. A human
+	// message counts its text; a subscription completion counts its detail
+	// plus the encoded size of the other fields. The rest is delivered at the
+	// next turn boundary, keeping the frame under the gRPC default 4 MiB
+	// message limit.
 	maxDeliverBytes = 1 << 20
 )
 
@@ -702,7 +708,8 @@ func (c *Controller) helloAckFrame(runID string) *agentprotocolv1.ControlFrame {
 }
 
 // deliverFrame builds a Deliver frame from the batch selected out of the
-// inbox.
+// inbox. Each entry is encoded by its kind and the whole frame is checked
+// against the protocol before it is sent.
 func (c *Controller) deliverFrame(runID string, messages []inboxMessage) (*agentprotocolv1.ControlFrame, error) {
 	deliveryID, err := randomID(runIDLength)
 	if err != nil {
@@ -710,12 +717,13 @@ func (c *Controller) deliverFrame(runID string, messages []inboxMessage) (*agent
 	}
 	batch := make([]*agentprotocolv1.InboxMessage, len(messages))
 	for i, m := range messages {
-		batch[i] = &agentprotocolv1.InboxMessage{
-			InboxSeq: m.Seq,
-			Content:  &agentprotocolv1.InboxMessage_Text{Text: m.Text},
+		msg, err := inboxMessageProto(m)
+		if err != nil {
+			return nil, err
 		}
+		batch[i] = msg
 	}
-	return &agentprotocolv1.ControlFrame{
+	frame := &agentprotocolv1.ControlFrame{
 		RunId: runID,
 		Body: &agentprotocolv1.ControlFrame_Deliver{
 			Deliver: &agentprotocolv1.Deliver{
@@ -724,7 +732,77 @@ func (c *Controller) deliverFrame(runID string, messages []inboxMessage) (*agent
 				ThroughSeq: messages[len(messages)-1].Seq,
 			},
 		},
-	}, nil
+	}
+	if err := agentprotocol.ValidateControlFrame(frame); err != nil {
+		return nil, fmt.Errorf("runcontroller: validate deliver frame for %s: %w", runID, err)
+	}
+	return frame, nil
+}
+
+// inboxMessageProto builds the InboxMessage the warden receives for one inbox
+// row. A human message carries its text; a subscription completion is decoded
+// from the JSON payload stored at write time and mapped field by field.
+func inboxMessageProto(m inboxMessage) (*agentprotocolv1.InboxMessage, error) {
+	msg := &agentprotocolv1.InboxMessage{InboxSeq: m.Seq}
+	switch m.Kind {
+	case KindHumanMessage:
+		msg.Content = &agentprotocolv1.InboxMessage_Text{Text: m.Text}
+	case KindSubscriptionCompleted:
+		sc, err := decodeSubscriptionCompletion(m)
+		if err != nil {
+			return nil, err
+		}
+		msg.Content = &agentprotocolv1.InboxMessage_SubscriptionCompleted{
+			SubscriptionCompleted: subscriptionCompletedProto(sc),
+		}
+	default:
+		return nil, fmt.Errorf("runcontroller: inbox %d has unknown kind %q", m.Seq, m.Kind)
+	}
+	return msg, nil
+}
+
+// inboxMessageCost is the number of bytes m accounts for against
+// maxDeliverBytes. A human message counts its text. A subscription completion
+// counts its detail plus the serialized size of the other fields, which is
+// the encoded size of the whole subscription_completed message.
+func inboxMessageCost(m inboxMessage) (int, error) {
+	msg, err := inboxMessageProto(m)
+	if err != nil {
+		return 0, err
+	}
+	if sc := msg.GetSubscriptionCompleted(); sc != nil {
+		return proto.Size(sc), nil
+	}
+	return len(msg.GetText()), nil
+}
+
+// decodeSubscriptionCompletion reads the payload written by newAppendEvent.
+func decodeSubscriptionCompletion(m inboxMessage) (*SubscriptionCompletion, error) {
+	if len(m.Payload) == 0 {
+		return nil, fmt.Errorf("runcontroller: inbox %d is subscription_completed without a payload", m.Seq)
+	}
+	var sc SubscriptionCompletion
+	if err := json.Unmarshal(m.Payload, &sc); err != nil {
+		return nil, fmt.Errorf("runcontroller: decode inbox %d subscription completion: %w", m.Seq, err)
+	}
+	return &sc, nil
+}
+
+// subscriptionCompletedProto converts a stored subscription completion into
+// its protocol message. OccurredAt is carried as a Timestamp.
+func subscriptionCompletedProto(sc *SubscriptionCompletion) *agentprotocolv1.SubscriptionCompleted {
+	return &agentprotocolv1.SubscriptionCompleted{
+		SubId:              sc.SubID,
+		System:             sc.System,
+		Event:              sc.Event,
+		SubscriptionStatus: sc.SubscriptionStatus,
+		Terminal:           sc.Terminal,
+		Correlation:        sc.Correlation,
+		OccurredAt:         timestamppb.New(sc.OccurredAt),
+		Source:             sc.Source,
+		Detail:             sc.Detail,
+		DetailTruncated:    sc.DetailTruncated,
+	}
 }
 
 func shutdownFrame(runID string) *agentprotocolv1.ControlFrame {

@@ -30,7 +30,9 @@ type runRow struct {
 // inboxMessage 是 inbox 表中的一行。
 type inboxMessage struct {
 	Seq       int64
+	Kind      InboxKind
 	Text      string
+	Payload   []byte // 只有 subscription_completed 事件有
 	CreatedAt time.Time
 }
 
@@ -382,10 +384,11 @@ func (t *storeTx) inboxSeqByDedupKey(runID, dedupKey string) (seq int64, found b
 	return seq, true, nil
 }
 
-// inboxRange 按 inbox_seq 升序取 [from, through] 内的消息。累计文本字节数超过
-// maxBytes 前停止，但至少返回一条。
+// inboxRange 按 inbox_seq 升序取 [from, through] 内的消息。累计字节数超过
+// maxBytes 前停止，但至少返回一条。字节数按 inboxMessageCost 计算：人类消息
+// 计文本，订阅完成事件计 Detail 加其余字段的序列化开销。
 func (t *storeTx) inboxRange(runID string, from, through int64, maxBytes int) ([]inboxMessage, error) {
-	rows, err := t.tx.Query(t.ctx, `SELECT inbox_seq, text, created_at
+	rows, err := t.tx.Query(t.ctx, `SELECT inbox_seq, kind, text, payload, created_at
 		FROM inbox
 		WHERE run_id = $1 AND inbox_seq >= $2 AND inbox_seq <= $3
 		ORDER BY inbox_seq ASC`, runID, from, through)
@@ -398,13 +401,17 @@ func (t *storeTx) inboxRange(runID string, from, through int64, maxBytes int) ([
 	total := 0
 	for rows.Next() {
 		var m inboxMessage
-		if err := rows.Scan(&m.Seq, &m.Text, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.Seq, &m.Kind, &m.Text, &m.Payload, &m.CreatedAt); err != nil {
 			return nil, fmt.Errorf("runcontroller: scan inbox %s: %w", runID, err)
 		}
-		if len(messages) > 0 && total+len(m.Text) > maxBytes {
+		cost, err := inboxMessageCost(m)
+		if err != nil {
+			return nil, err
+		}
+		if len(messages) > 0 && total+cost > maxBytes {
 			break
 		}
-		total += len(m.Text)
+		total += cost
 		messages = append(messages, m)
 	}
 	if err := rows.Err(); err != nil {
