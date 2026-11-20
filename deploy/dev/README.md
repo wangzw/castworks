@@ -133,7 +133,7 @@ go run ./cmd/warden \
   --claude-bin "$(command -v claude)"
 ```
 
-`--connector` 取控制面 `--connector-addr` 的地址，看守进程在它上面启动平台 MCP 服务器；不给出时不启动，参数与 v0.1.0 相同。本地模式下 Claude Code 沿用看守进程的 `PATH`，开发机上的 `extsim` 命令行要在这个 `PATH` 中。actor 镜像里的 `/etc/extsim.json` 在本地不存在，Agent 用的 `extsim` 取默认地址 `127.0.0.1:9100`，与 `extsim` 默认监听的 `0.0.0.0:9100` 对应。
+`--connector` 取控制面 `--connector-addr` 的地址，平台 MCP 服务器把工具调用转发到这里；服务器监听 `--mcp-addr`，默认由系统分配端口；不给出时不启动，参数与 v0.1.0 相同。本地模式下 Claude Code 沿用看守进程的 `PATH`，开发机上的 `extsim` 命令行要在这个 `PATH` 中。actor 镜像里的 `/etc/extsim.json` 在本地不存在，Agent 用的 `extsim` 取默认地址 `127.0.0.1:9100`，与 `extsim` 默认监听的 `0.0.0.0:9100` 对应。
 
 `--home` 指定的目录存放 Claude Code 的工作目录与 stream-json 记录，本地模式不使用开发者自己的主目录。看守进程连上控制面之前，控制面从本地提供者的 `Provision` 返回起算 `T_hello`。
 
