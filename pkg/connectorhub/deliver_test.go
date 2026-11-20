@@ -301,6 +301,53 @@ func TestDeliverPendingRetriesTransientError(t *testing.T) {
 	}
 }
 
+// TestDeliverPendingClaimsEachRecordOnce 断言同一记录同一时刻只由一个投递者
+// 处理：一个投递者持有认领时，另一个扫描跳过这条记录。
+func TestDeliverPendingClaimsEachRecordOnce(t *testing.T) {
+	t.Parallel()
+
+	pool := migratedPool(t)
+	ctx := t.Context()
+	now := testNow()
+
+	completion := testCompletion("sub-1")
+	insertTestCompletion(t, ctx, pool, "run-1", completion)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	runs := newFakeDeliveryRuns()
+	runs.appendFn = func(context.Context, string, Completion) (bool, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		return false, nil
+	}
+	d := newDeliverer(pool, runs, time.Hour, func() time.Time { return now })
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- d.deliverPending(ctx) }()
+	<-started
+
+	// 第一个投递者还在 AppendCompletion 里，记录仍是 pending，但已被认领。
+	if err := d.deliverPending(ctx); err != nil {
+		t.Fatalf("second deliverPending: %v", err)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first deliverPending: %v", err)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("AppendCompletion calls = %d, want 1", got)
+	}
+	state := readTestDeliveryState(t, ctx, pool, completion.SubID, completion.DedupKey)
+	if state.Status != "delivered" || state.Attempts != 1 {
+		t.Fatalf("delivery = %q attempts %d, want delivered/1", state.Status, state.Attempts)
+	}
+}
+
 func TestScanCancelsSubscriptionsOfTerminatedRuns(t *testing.T) {
 	t.Parallel()
 

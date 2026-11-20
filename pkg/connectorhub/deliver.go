@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/wangzw/castworks/pkg/runcontroller"
@@ -37,6 +38,7 @@ type deliverer struct {
 	runs   deliveryRuns
 	period time.Duration
 	now    func() time.Time
+	logger *slog.Logger
 }
 
 // newDeliverer 构造一个投递器。
@@ -47,7 +49,7 @@ func newDeliverer(pool *pgxpool.Pool, runs deliveryRuns, period time.Duration, n
 	if now == nil {
 		now = time.Now
 	}
-	return &deliverer{pool: pool, runs: runs, period: period, now: now}
+	return &deliverer{pool: pool, runs: runs, period: period, now: now, logger: slog.Default()}
 }
 
 // pendingDelivery 是 completion_delivery 中一条待投递的记录。
@@ -91,76 +93,122 @@ func (d *deliverer) scan(ctx context.Context) {
 	}
 }
 
-// deliverPending 重投全部 pending 的完成事件投递记录。调用方在匹配事务
-// 提交之后立即调用它，即为“投递记录提交后立即投递”；后台扫描也调用同一
-// 函数重投遗留的 pending 记录。
-//
-// 单条记录的暂时性错误记入 attempts 与 last_error，不返回错误；数据库或
-// 记录内容的错误汇总返回，其余记录照常尝试。
-func (d *deliverer) deliverPending(ctx context.Context) error {
-	rows, err := d.pool.Query(ctx,
-		`SELECT sub_id, run_id, dedup_key, event
-		   FROM completion_delivery
-		  WHERE status = 'pending'
-		  ORDER BY created_at, sub_id, dedup_key`)
-	if err != nil {
-		return fmt.Errorf("connectorhub: list pending completions: %w", err)
-	}
-
-	var pending []pendingDelivery
-	for rows.Next() {
-		var p pendingDelivery
-		if err := rows.Scan(&p.subID, &p.runID, &p.dedupKey, &p.event); err != nil {
-			rows.Close()
-			return fmt.Errorf("connectorhub: scan pending completion: %w", err)
-		}
-		pending = append(pending, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("connectorhub: read pending completions: %w", err)
-	}
-
+// deliverRecords 投递给定的记录。不存在、已不是 pending 或已被其他投递者
+// 认领的记录直接跳过。请求结束后用它只投递本次请求写入的记录。
+func (d *deliverer) deliverRecords(ctx context.Context, keys []deliveryKey) error {
 	var errs []error
-	for _, p := range pending {
+	for _, key := range keys {
 		if ctx.Err() != nil {
 			break
 		}
-		if err := d.deliverOne(ctx, p); err != nil {
+		if err := d.deliverOne(ctx, key); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// deliverOne 投递一条记录并按结果更新它的状态。
-func (d *deliverer) deliverOne(ctx context.Context, p pendingDelivery) error {
+// deliverPending 重投全部 pending 的完成事件投递记录，是后台扫描的入口。
+// 每条记录由 deliverOne 在自己的事务里认领，两个扫描或立即投递同时取到
+// 同一条记录时只有一个会投递它。
+//
+// 单条记录的暂时性错误记入 attempts 与 last_error，不返回错误；数据库或
+// 记录内容的错误汇总返回，其余记录照常尝试。
+func (d *deliverer) deliverPending(ctx context.Context) error {
+	rows, err := d.pool.Query(ctx,
+		`SELECT sub_id, dedup_key
+		   FROM completion_delivery
+		  WHERE status = 'pending'
+		  ORDER BY created_at, sub_id, dedup_key`)
+	if err != nil {
+		return fmt.Errorf("connectorhub: list pending completions: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []deliveryKey
+	for rows.Next() {
+		var key deliveryKey
+		if err := rows.Scan(&key.subID, &key.dedupKey); err != nil {
+			return fmt.Errorf("connectorhub: scan pending completion: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("connectorhub: read pending completions: %w", err)
+	}
+	return d.deliverRecords(ctx, keys)
+}
+
+// deliverOne 在一个事务里认领并投递一条记录。SELECT ... FOR UPDATE SKIP
+// LOCKED 保证同一记录同一时刻只有一个投递者在处理：另一方的扫描或立即投递
+// 会跳过它。事务覆盖 AppendCompletion 调用，认领因此持续到状态更新提交。
+func (d *deliverer) deliverOne(ctx context.Context, key deliveryKey) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("connectorhub: begin completion delivery: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	var p pendingDelivery
+	err = tx.QueryRow(ctx,
+		`SELECT sub_id, run_id, dedup_key, event
+		   FROM completion_delivery
+		  WHERE sub_id = $1 AND dedup_key = $2 AND status = 'pending'
+		  FOR UPDATE SKIP LOCKED`,
+		key.subID, key.dedupKey,
+	).Scan(&p.subID, &p.runID, &p.dedupKey, &p.event)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// 已被其他投递者认领，或已不在 pending。
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("connectorhub: claim completion %s: %w", key.subID, err)
+	}
+
 	var completion Completion
 	if err := json.Unmarshal(p.event, &completion); err != nil {
 		return fmt.Errorf("connectorhub: decode completion for subscription %s: %w", p.subID, err)
 	}
 
-	_, err := d.runs.AppendCompletion(ctx, p.runID, completion)
+	now := d.now()
+	_, appendErr := d.runs.AppendCompletion(ctx, p.runID, completion)
 	switch {
-	case err == nil:
+	case appendErr == nil:
 		// 成功与 duplicate 都表示收件箱已有该去重键的事件。
-		return d.markDelivered(ctx, p)
-	case errors.Is(err, runcontroller.ErrNotFound), errors.Is(err, runcontroller.ErrTerminated):
-		return d.reject(ctx, p, err)
+		if err := markDelivered(ctx, tx, p, now); err != nil {
+			return err
+		}
+	case errors.Is(appendErr, runcontroller.ErrNotFound), errors.Is(appendErr, runcontroller.ErrTerminated):
+		if err := reject(ctx, tx, p, appendErr, now); err != nil {
+			return err
+		}
+	case errors.Is(appendErr, runcontroller.ErrInvalidEvent):
+		// 这是构造缺陷，不会自愈：记录保持 pending 并按其他错误计数，
+		// 另记一行错误日志供排查。
+		if err := recordFailure(ctx, tx, p, appendErr); err != nil {
+			return err
+		}
+		d.logger.Error("connectorhub: runcontroller rejected the completion event as invalid",
+			"sub_id", p.subID, "run_id", p.runID, "error", appendErr)
 	default:
-		return d.recordFailure(ctx, p, err)
+		if err := recordFailure(ctx, tx, p, appendErr); err != nil {
+			return err
+		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("connectorhub: commit completion delivery for %s: %w", p.subID, err)
+	}
+	return nil
 }
 
-// markDelivered 把记录置为 delivered，并记入成功时刻。状态条件更新使并发的
-// 重复扫描不覆盖对方的结果。
-func (d *deliverer) markDelivered(ctx context.Context, p pendingDelivery) error {
-	if _, err := d.pool.Exec(ctx,
+// markDelivered 把记录置为 delivered，并记入成功时刻。
+func markDelivered(ctx context.Context, tx pgx.Tx, p pendingDelivery, at time.Time) error {
+	if _, err := tx.Exec(ctx,
 		`UPDATE completion_delivery
 		    SET status = 'delivered', attempts = attempts + 1,
 		        last_error = '', delivered_at = $3
 		  WHERE sub_id = $1 AND dedup_key = $2 AND status = 'pending'`,
-		p.subID, p.dedupKey, d.now()); err != nil {
+		p.subID, p.dedupKey, at); err != nil {
 		return fmt.Errorf("connectorhub: mark completion %s delivered: %w", p.subID, err)
 	}
 	return nil
@@ -169,39 +217,29 @@ func (d *deliverer) markDelivered(ctx context.Context, p pendingDelivery) error 
 // reject 把记录置为 rejected，并在同一事务里把仍为 active 的订阅置为
 // cancelled：运行实例已结束、已失败或不存在，完成事件不会再被消费。订阅
 // 已 completed 时条件更新不命中，保持原状态。
-func (d *deliverer) reject(ctx context.Context, p pendingDelivery, cause error) error {
-	now := d.now()
-	tx, err := d.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("connectorhub: begin reject transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-
+func reject(ctx context.Context, tx pgx.Tx, p pendingDelivery, cause error, at time.Time) error {
 	if _, err := tx.Exec(ctx,
 		`UPDATE completion_delivery
 		    SET status = 'rejected', attempts = attempts + 1,
 		        last_error = $3, delivered_at = $4
 		  WHERE sub_id = $1 AND dedup_key = $2 AND status = 'pending'`,
-		p.subID, p.dedupKey, cause.Error(), now); err != nil {
+		p.subID, p.dedupKey, cause.Error(), at); err != nil {
 		return fmt.Errorf("connectorhub: mark completion %s rejected: %w", p.subID, err)
 	}
 	if _, err := tx.Exec(ctx,
 		`UPDATE subscription
 		    SET status = 'cancelled', completed_at = $2
 		  WHERE sub_id = $1 AND status = 'active'`,
-		p.subID, now); err != nil {
+		p.subID, at); err != nil {
 		return fmt.Errorf("connectorhub: cancel subscription %s: %w", p.subID, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("connectorhub: commit completion rejection for %s: %w", p.subID, err)
 	}
 	return nil
 }
 
 // recordFailure 记录一次暂时性失败：保持 pending，attempts 加一，写入
 // last_error，下一次扫描按同一 dedup_key 重试。
-func (d *deliverer) recordFailure(ctx context.Context, p pendingDelivery, cause error) error {
-	if _, err := d.pool.Exec(ctx,
+func recordFailure(ctx context.Context, tx pgx.Tx, p pendingDelivery, cause error) error {
+	if _, err := tx.Exec(ctx,
 		`UPDATE completion_delivery
 		    SET attempts = attempts + 1, last_error = $3
 		  WHERE sub_id = $1 AND dedup_key = $2 AND status = 'pending'`,
