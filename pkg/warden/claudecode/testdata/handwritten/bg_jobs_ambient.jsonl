@@ -1,0 +1,9 @@
+{"type":"system","subtype":"init","session_id":"ses-bg-jobs","uuid":"u-init"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"amb-1","task_type":"local_agent","ambient":true},{"task_id":"bg-1","task_type":"local_bash"}],"uuid":"u-bg-push-1","session_id":"ses-bg-jobs"}
+{"type":"system","subtype":"task_started","task_id":"amb-2","is_backgrounded":true,"ambient":true,"uuid":"u-task-amb","session_id":"ses-bg-jobs"}
+{"type":"system","subtype":"task_started","task_id":"bg-2","is_backgrounded":true,"uuid":"u-task-bg","session_id":"ses-bg-jobs"}
+{"type":"system","subtype":"task_started","task_id":"fg-1","is_backgrounded":false,"uuid":"u-task-fg","session_id":"ses-bg-jobs"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"amb-1","task_type":"local_agent","ambient":true},{"task_id":"bg-2","task_type":"local_bash"},{"task_id":"bg-3","task_type":"local_bash"}],"uuid":"u-bg-push-2","session_id":"ses-bg-jobs"}
+{"type":"assistant","session_id":"ses-bg-jobs","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"uuid":"u-assistant"}
+{"type":"result","subtype":"success","session_id":"ses-bg-jobs","result":"ok","is_error":false,"queued_turn_count":0,"uuid":"u-result"}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"ses-bg-jobs","uuid":"u-idle"}

@@ -37,6 +37,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -106,6 +107,9 @@ type Driver struct {
 	lastAcceptedSeq int64
 	sessionID       string
 	pendingStart    *pendingStart
+	// bgJobs 是当前的后台作业集合，键为任务标识。Claude Code 启动时为空，
+	// 退出时清空；ambient 为真的任务从不入内。
+	bgJobs map[string]struct{}
 
 	// 当前回合的边界信号。
 	idleSeen      bool
@@ -170,6 +174,7 @@ func New(cfg Config, sink agent.Sink, runner agent.ProcessRunner) *Driver {
 		runner:     runner,
 		log:        cfg.Logger,
 		phase:      agent.PhaseStarting,
+		bgJobs:     make(map[string]struct{}),
 		exitDone:   make(chan struct{}),
 		stdoutDone: make(chan struct{}),
 	}
@@ -200,6 +205,7 @@ func (d *Driver) Snapshot(fn func(agent.State)) {
 		Phase:           d.phase,
 		TurnID:          d.turnID,
 		LastAcceptedSeq: d.lastAcceptedSeq,
+		BgJobs:          sortedJobIDs(d.bgJobs),
 	}
 	if d.phase != agent.PhaseInTurn {
 		state.TurnID = ""
@@ -209,6 +215,87 @@ func (d *Driver) Snapshot(fn func(agent.State)) {
 		state.LastTurn = &last
 	}
 	fn(state)
+}
+
+// sortedJobIDs 返回集合中的任务标识，按字典序排列。调用方必须持有 d.mu。
+func sortedJobIDs(jobs map[string]struct{}) []string {
+	ids := make([]string, 0, len(jobs))
+	for id := range jobs {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// currentTurnIDLocked 返回事件所属的回合：回合中为当前 turn_id，回合边界上
+// 为空。调用方必须持有 d.mu。
+func (d *Driver) currentTurnIDLocked() string {
+	if d.phase != agent.PhaseInTurn {
+		return ""
+	}
+	return d.turnID
+}
+
+// replaceBgJobsLocked 以完整集合替换当前集合，只有成员变化时才报告。
+// 调用方必须持有 d.mu。
+func (d *Driver) replaceBgJobsLocked(next map[string]struct{}) {
+	if sameJobSet(d.bgJobs, next) {
+		return
+	}
+	d.bgJobs = next
+	d.reportBgJobsLocked()
+}
+
+// addBgJobLocked 加入一个任务，已在集合中时不报告。调用方必须持有 d.mu。
+func (d *Driver) addBgJobLocked(taskID string) {
+	if taskID == "" {
+		return
+	}
+	if _, ok := d.bgJobs[taskID]; ok {
+		return
+	}
+	d.bgJobs[taskID] = struct{}{}
+	d.reportBgJobsLocked()
+}
+
+// removeBgJobLocked 移除一个任务，不在集合中时不报告。调用方必须持有 d.mu。
+func (d *Driver) removeBgJobLocked(taskID string) {
+	if _, ok := d.bgJobs[taskID]; !ok {
+		return
+	}
+	delete(d.bgJobs, taskID)
+	d.reportBgJobsLocked()
+}
+
+// reportBgJobsLocked 把变化之后的完整集合报告给 Sink。调用方必须持有 d.mu。
+func (d *Driver) reportBgJobsLocked() {
+	d.sink.BgJobsChanged(d.currentTurnIDLocked(), sortedJobIDs(d.bgJobs))
+}
+
+// clearBgJobsLocked 清空后台作业集合，用于 Claude Code 退出。关停流程中不再
+// 调用 Sink；其余退出路径在集合由非空变空时报告。调用方必须持有 d.mu。
+func (d *Driver) clearBgJobsLocked() {
+	if len(d.bgJobs) == 0 {
+		return
+	}
+	d.bgJobs = make(map[string]struct{})
+	if d.shuttingDown {
+		return
+	}
+	d.reportBgJobsLocked()
+}
+
+// sameJobSet 判断两个集合的成员是否相同。
+func sameJobSet(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id := range a {
+		if _, ok := b[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Deliver 实现 agent.Agent。写 stdin 不持状态锁：读 stdout 的协程不会因写入
@@ -256,6 +343,7 @@ func (d *Driver) Deliver(b agent.Batch, cred agent.Credential) error {
 			d.turnID = ""
 			d.pendingStart = nil
 			d.pendingExit = nil
+			d.clearBgJobsLocked()
 			return fmt.Errorf("claudecode: write stdin: %w", writeErr)
 		}
 		if newTurn {
@@ -378,6 +466,7 @@ func (d *Driver) Shutdown(ctx context.Context) error {
 	d.phase = agent.PhaseExited
 	d.turnID = ""
 	d.pendingStart = nil
+	d.clearBgJobsLocked()
 	d.mu.Unlock()
 	d.closeStream()
 	return nil
@@ -430,6 +519,9 @@ func (d *Driver) startLocked(cred agent.Credential) error {
 	}
 	_ = stdinR.Close()
 	_ = stdoutW.Close()
+
+	// 每次启动都从空集起算：Claude Code 进程启动时不推送完整集合。
+	d.bgJobs = make(map[string]struct{})
 
 	d.stdin = stdinW
 	d.stdout = stdoutR
@@ -569,6 +661,8 @@ func (d *Driver) exitOutsideTurnLocked(status string) {
 	d.pendingStart = nil
 	d.turnID = ""
 	d.phase = agent.PhaseExited
+	// 回合外退出的事件不带 turn_id，清空集合也按回合外报告。
+	d.clearBgJobsLocked()
 	if d.shuttingDown {
 		return
 	}
@@ -584,12 +678,15 @@ func (d *Driver) exitInTurnLocked(status string) {
 	}
 	turnID := d.turnID
 	if d.shuttingDown {
+		d.clearBgJobsLocked()
 		d.pendingStart = nil
 		d.turnID = ""
 		d.phase = agent.PhaseExited
 		return
 	}
 	d.flushPendingTurnStartLocked()
+	// 集合清空属于本回合的最后一个事件，排在 turn_ended 之前。
+	d.clearBgJobsLocked()
 	d.sink.TurnEnded(turnID, exitOutput(status), true, true)
 	d.phase = agent.PhaseExited
 	d.turnID = ""

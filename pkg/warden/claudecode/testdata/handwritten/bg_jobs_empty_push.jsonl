@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"ses-bg-empty","uuid":"u-init"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bg-1","task_type":"local_bash"}],"uuid":"u-bg-push-1","session_id":"ses-bg-empty"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[],"uuid":"u-bg-push-empty","session_id":"ses-bg-empty"}
+{"type":"assistant","session_id":"ses-bg-empty","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"uuid":"u-assistant"}
+{"type":"result","subtype":"success","session_id":"ses-bg-empty","result":"ok","is_error":false,"queued_turn_count":0,"uuid":"u-result"}
+{"type":"system","subtype":"session_state_changed","state":"idle","session_id":"ses-bg-empty","uuid":"u-idle"}

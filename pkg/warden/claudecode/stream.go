@@ -9,6 +9,12 @@ import (
 	"github.com/wangzw/castworks/pkg/warden/agent"
 )
 
+// streamTask 是 background_tasks_changed 推送中的一个后台任务。
+type streamTask struct {
+	TaskID  string `json:"task_id"`
+	Ambient bool   `json:"ambient"`
+}
+
 // streamMessage 是驱动器从 stdout 关心的字段。其余字段不影响判定。
 type streamMessage struct {
 	Type            string `json:"type"`
@@ -18,6 +24,15 @@ type streamMessage struct {
 	Result          string `json:"result"`
 	IsError         bool   `json:"is_error"`
 	QueuedTurnCount *int   `json:"queued_turn_count"`
+
+	// 后台任务消息的字段。background_tasks_changed 用 Tasks；
+	// task_started 用 TaskID、IsBackgrounded 与 Ambient；
+	// task_notification 用 TaskID 与 Status。
+	Tasks          []streamTask `json:"tasks"`
+	TaskID         string       `json:"task_id"`
+	IsBackgrounded bool         `json:"is_backgrounded"`
+	Status         string       `json:"status"`
+	Ambient        bool         `json:"ambient"`
 }
 
 // readStdout 逐行读取 Claude Code 的 stdout：每行先原样追加到 stream.jsonl，
@@ -87,10 +102,17 @@ func (d *Driver) handleMessageLocked(msg *streamMessage) {
 
 	switch msg.Type {
 	case "system":
-		if msg.Subtype == "session_state_changed" {
+		switch msg.Subtype {
+		case "session_state_changed":
 			d.handleSessionStateLocked(msg.State)
+		case "background_tasks_changed":
+			d.replaceBgJobsFromPushLocked(msg.Tasks)
+		case "task_started":
+			d.noteTaskStartedLocked(msg)
+		case "task_notification":
+			d.noteTaskNotificationLocked(msg)
 		}
-		// 其余 system 消息（init、后台任务状态等）不改变回合位置。
+		// 其余 system 消息（init、task_updated 等）不改变回合位置与集合。
 	case "assistant":
 		// 回合边界上读到 assistant 消息，表示 Claude Code 自行开始了回合。
 		if d.phase == agent.PhaseBoundary {
@@ -172,6 +194,49 @@ func (d *Driver) handleResultLocked(msg *streamMessage) {
 	d.resultIsError = msg.IsError
 	d.resultQueued = queued
 	d.maybeEndTurnLocked()
+}
+
+// replaceBgJobsFromPushLocked 以 background_tasks_changed 推送的完整集合替换
+// 当前集合；ambient 为真的任务与缺少任务标识的条目不计入。调用方必须持有
+// d.mu。
+func (d *Driver) replaceBgJobsFromPushLocked(tasks []streamTask) {
+	next := make(map[string]struct{}, len(tasks))
+	for _, task := range tasks {
+		if task.TaskID == "" || task.Ambient {
+			continue
+		}
+		next[task.TaskID] = struct{}{}
+	}
+	d.replaceBgJobsLocked(next)
+}
+
+// noteTaskStartedLocked 在两次集合推送之间加入后台任务：只有 is_backgrounded
+// 为真的任务计入，ambient 为真时不计。调用方必须持有 d.mu。
+func (d *Driver) noteTaskStartedLocked(msg *streamMessage) {
+	if !msg.IsBackgrounded || msg.Ambient {
+		return
+	}
+	d.addBgJobLocked(msg.TaskID)
+}
+
+// noteTaskNotificationLocked 在两次集合推送之间移除报告终态的任务。调用方
+// 必须持有 d.mu。
+func (d *Driver) noteTaskNotificationLocked(msg *streamMessage) {
+	if !isTerminalTaskStatus(msg.Status) {
+		return
+	}
+	d.removeBgJobLocked(msg.TaskID)
+}
+
+// isTerminalTaskStatus 判断 task_notification 的报告是否表示任务已结束。
+// Claude Code 的 task_notification.status 是闭集 completed、failed、stopped。
+func isTerminalTaskStatus(status string) bool {
+	switch status {
+	case "completed", "failed", "stopped":
+		return true
+	default:
+		return false
+	}
 }
 
 // maybeEndTurnLocked 在 idle 与 queued_turn_count=0 的 result 都到齐时结束
