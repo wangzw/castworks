@@ -109,8 +109,10 @@ func TestControlPlanAppliesToHTTPSubmit(t *testing.T) {
 	if !ok {
 		t.Fatalf("job %s has no attached plan", job.ID)
 	}
-	if plan.Duration != 1500*time.Millisecond {
-		t.Errorf("plan duration = %s, want 1500ms", plan.Duration)
+	if plan.Duration == nil {
+		t.Errorf("plan duration is unset, want 1500ms")
+	} else if *plan.Duration != 1500*time.Millisecond {
+		t.Errorf("plan duration = %s, want 1500ms", *plan.Duration)
 	}
 	if plan.Callback.Callback != callbackDrop {
 		t.Errorf("plan callback = %q, want %q", plan.Callback.Callback, callbackDrop)
@@ -121,6 +123,86 @@ func TestControlPlanAppliesToHTTPSubmit(t *testing.T) {
 	completed := waitForAssemblyJob(t, asm.svc, job.ID, JobStatusCompleted)
 	if completed.Conclusion != JobConclusionSucceeded {
 		t.Errorf("conclusion = %q, want succeeded", completed.Conclusion)
+	}
+}
+
+// TestControlPlanExplicitZeroDuration checks that an explicit duration_ms of
+// zero completes the job at once instead of falling back to --job-duration.
+func TestControlPlanExplicitZeroDuration(t *testing.T) {
+	// The service default is one minute, so a job that falls back to it cannot
+	// complete while the fake clock stands still.
+	asm, _ := newTestAssembly(t)
+
+	rec := postControlPlan(t, asm, `{"duration_ms": 0, "callback": "drop"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /control/plans = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = submitJobHTTP(t, asm, `{"project": "demo", "content": "{\"owner\": \"tester\"}"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/jobs = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	job := decodeJob(t, rec.Body.Bytes())
+
+	// No clock advance: a zero duration is due immediately.
+	completed := waitForAssemblyJob(t, asm.svc, job.ID, JobStatusCompleted)
+	if completed.Conclusion != JobConclusionSucceeded {
+		t.Errorf("conclusion = %q, want %q", completed.Conclusion, JobConclusionSucceeded)
+	}
+}
+
+// TestControlPlanOmittedDurationUsesDefault checks that a plan that omits
+// duration_ms still runs its job for --job-duration.
+func TestControlPlanOmittedDurationUsesDefault(t *testing.T) {
+	asm, clock := newTestAssembly(t)
+
+	rec := postControlPlan(t, asm, `{"callback": "drop"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /control/plans = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = submitJobHTTP(t, asm, `{"project": "demo", "content": "{\"owner\": \"tester\"}"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/jobs = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	job := decodeJob(t, rec.Body.Bytes())
+	waitForAssemblyJob(t, asm.svc, job.ID, JobStatusRunning)
+
+	advanceAssemblyClock(t, clock, 1, time.Minute-time.Second)
+	if got, _ := asm.svc.Get(job.ID); got.Status != JobStatusRunning {
+		t.Fatalf("job status before the default duration = %s, want %s", got.Status, JobStatusRunning)
+	}
+	clock.Advance(time.Second)
+
+	if done := waitForAssemblyJob(t, asm.svc, job.ID, JobStatusCompleted); done.Conclusion != JobConclusionSucceeded {
+		t.Errorf("conclusion = %q, want %q", done.Conclusion, JobConclusionSucceeded)
+	}
+}
+
+// TestControlPlanCallbackDelayZero checks that an omitted callback_delay_ms and
+// an explicit zero both mean no delay: unlike duration_ms, the delay has no
+// startup default to fall back to.
+func TestControlPlanCallbackDelayZero(t *testing.T) {
+	asm, _ := newTestAssembly(t)
+
+	if rec := postControlPlan(t, asm, `{"callback": "drop"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("plan with omitted delay = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	if rec := postControlPlan(t, asm, `{"callback": "drop", "callback_delay_ms": 0}`); rec.Code != http.StatusCreated {
+		t.Fatalf("plan with explicit zero delay = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+
+	omitted := decodeJob(t, submitJobHTTP(t, asm, `{"project": "demo", "content": "{}"}`).Body.Bytes())
+	explicit := decodeJob(t, submitJobHTTP(t, asm, `{"project": "demo", "content": "{}"}`).Body.Bytes())
+
+	for name, id := range map[string]string{"omitted": omitted.ID, "explicit zero": explicit.ID} {
+		plan, ok := asm.jobPlanFor(id)
+		if !ok {
+			t.Fatalf("%s: job %s has no attached plan", name, id)
+		}
+		if plan.Callback.CallbackDelayMS != 0 {
+			t.Errorf("%s: callback_delay_ms = %d, want 0", name, plan.Callback.CallbackDelayMS)
+		}
 	}
 }
 
@@ -172,8 +254,10 @@ func TestControlRejectedSubmitKeepsPlan(t *testing.T) {
 	if !ok {
 		t.Fatalf("job %s did not receive the preserved plan", job.ID)
 	}
-	if plan.Duration != 250*time.Millisecond {
-		t.Errorf("plan duration = %s, want 250ms", plan.Duration)
+	if plan.Duration == nil {
+		t.Errorf("plan duration is unset, want 250ms")
+	} else if *plan.Duration != 250*time.Millisecond {
+		t.Errorf("plan duration = %s, want 250ms", *plan.Duration)
 	}
 	if got := asm.pendingPlans(); got != 0 {
 		t.Errorf("pending plans = %d after the valid submission, want 0", got)
@@ -197,14 +281,14 @@ func TestControlPlansOrderAndDelete(t *testing.T) {
 	third := decodeJob(t, submitJobHTTP(t, asm, `{"project": "demo", "content": "{}"}`).Body.Bytes())
 
 	firstPlan, ok := asm.jobPlanFor(first.ID)
-	if !ok || firstPlan.Duration != 100*time.Millisecond {
+	if !ok || firstPlan.Duration == nil || *firstPlan.Duration != 100*time.Millisecond {
 		t.Errorf("first job plan = %+v (attached %v), want the 100ms plan", firstPlan, ok)
 	}
 	secondPlan, ok := asm.jobPlanFor(second.ID)
 	if !ok {
 		t.Fatalf("second job has no plan")
 	}
-	if secondPlan.Duration != 200*time.Millisecond || secondPlan.Callback.CallbackDelayMS != 25 {
+	if secondPlan.Duration == nil || *secondPlan.Duration != 200*time.Millisecond || secondPlan.Callback.CallbackDelayMS != 25 {
 		t.Errorf("second job plan = %+v, want the 200ms plan with a 25ms callback delay", secondPlan)
 	}
 	if _, ok := asm.jobPlanFor(third.ID); ok {

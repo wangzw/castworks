@@ -41,3 +41,9 @@ func writeTestKey(t *testing.T, contents string) string {
 func discardTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+// durationPtr returns a pointer to d for tests that pass an explicit job
+// duration to JobService.Submit.
+func durationPtr(d time.Duration) *time.Duration {
+	return &d
+}

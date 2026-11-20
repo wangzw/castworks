@@ -25,22 +25,27 @@ const (
 const maxMilliseconds = int64(math.MaxInt64) / int64(time.Millisecond)
 
 // jobPlan is one queued plan: the job duration plus how its callback is sent.
+// Duration is nil when the request omitted duration_ms, meaning the service's
+// default duration; a non-nil zero means the job completes at once.
 type jobPlan struct {
-	Duration time.Duration
+	Duration *time.Duration
 	Callback callbackPlan
 }
 
 // planRequest is the JSON body of POST /control/plans. Every field may be
-// omitted.
+// omitted. DurationMS is a pointer so that an omitted field can be told apart
+// from an explicit zero: the former selects --job-duration, the latter makes
+// the job complete immediately. CallbackDelayMS has no startup default, so
+// omitting it and giving zero both mean no delay.
 type planRequest struct {
-	DurationMS      int    `json:"duration_ms"`
+	DurationMS      *int64 `json:"duration_ms"`
 	Callback        string `json:"callback"`
 	CallbackDelayMS int    `json:"callback_delay_ms"`
 }
 
 // planJSON is the JSON form returned by POST /control/plans.
 type planJSON struct {
-	DurationMS      int          `json:"duration_ms"`
+	DurationMS      int64        `json:"duration_ms"`
 	Callback        callbackKind `json:"callback"`
 	CallbackDelayMS int          `json:"callback_delay_ms"`
 }
@@ -139,11 +144,13 @@ func (a *serviceAssembly) appendPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := validateMilliseconds("duration_ms", req.DurationMS); err != nil {
-		writeJobError(w, http.StatusBadRequest, err.Error())
-		return
+	if req.DurationMS != nil {
+		if err := validateMilliseconds("duration_ms", *req.DurationMS); err != nil {
+			writeJobError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
-	if err := validateMilliseconds("callback_delay_ms", req.CallbackDelayMS); err != nil {
+	if err := validateMilliseconds("callback_delay_ms", int64(req.CallbackDelayMS)); err != nil {
 		writeJobError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -153,24 +160,27 @@ func (a *serviceAssembly) appendPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plan := jobPlan{
-		Duration: time.Duration(req.DurationMS) * time.Millisecond,
-		Callback: callback,
+	var durationMS int64
+	plan := jobPlan{Callback: callback}
+	if req.DurationMS != nil {
+		durationMS = *req.DurationMS
+		duration := time.Duration(durationMS) * time.Millisecond
+		plan.Duration = &duration
 	}
 	a.enqueuePlan(plan)
 	writeJobJSON(w, http.StatusCreated, planJSON{
-		DurationMS:      req.DurationMS,
+		DurationMS:      durationMS,
 		Callback:        plan.Callback.Callback,
 		CallbackDelayMS: plan.Callback.CallbackDelayMS,
 	})
 }
 
 // validateMilliseconds rejects negative and overflowing millisecond values.
-func validateMilliseconds(name string, value int) error {
+func validateMilliseconds(name string, value int64) error {
 	if value < 0 {
 		return fmt.Errorf("%s must not be negative", name)
 	}
-	if int64(value) > maxMilliseconds {
+	if value > maxMilliseconds {
 		return fmt.Errorf("%s is too large", name)
 	}
 	return nil

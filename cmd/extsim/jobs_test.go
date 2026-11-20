@@ -117,7 +117,7 @@ func TestJobValidation(t *testing.T) {
 			const duration = 5 * time.Second
 			svc, clk := newJobTestService(t, time.Minute)
 
-			job, err := svc.Submit("demo", tc.content, duration)
+			job, err := svc.Submit("demo", tc.content, durationPtr(duration))
 			if err != nil {
 				t.Fatalf("Submit: %v", err)
 			}
@@ -147,7 +147,7 @@ func TestJobLifecycle(t *testing.T) {
 	const duration = 2 * time.Second
 	svc, clk := newJobTestService(t, time.Minute)
 
-	job, err := svc.Submit("demo", `{"owner":"alice"}`, duration)
+	job, err := svc.Submit("demo", `{"owner":"alice"}`, durationPtr(duration))
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -196,13 +196,13 @@ func TestJobLifecycle(t *testing.T) {
 	}
 }
 
-// TestJobDefaultDuration checks that a zero submit duration selects the
-// service default and that the job runs for exactly that long.
+// TestJobDefaultDuration checks that a nil submit duration selects the service
+// default and that the job runs for exactly that long.
 func TestJobDefaultDuration(t *testing.T) {
 	const defaultDuration = 10 * time.Second
 	svc, clk := newJobTestService(t, defaultDuration)
 
-	job, err := svc.Submit("demo", `{"owner":"alice"}`, 0)
+	job, err := svc.Submit("demo", `{"owner":"alice"}`, nil)
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestJobHooks(t *testing.T) {
 	svc.SetOnStatusChange(func(job Job) { changes <- job.Status })
 	svc.SetOnComplete(func(job Job) { completions <- job })
 
-	job, err := svc.Submit("demo", `{"owner":"alice"}`, duration)
+	job, err := svc.Submit("demo", `{"owner":"alice"}`, durationPtr(duration))
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestJobIDFormat(t *testing.T) {
 
 	seen := make(map[string]bool)
 	for i := 0; i < 8; i++ {
-		job, err := svc.Submit("demo", `{"owner":"alice"}`, time.Hour)
+		job, err := svc.Submit("demo", `{"owner":"alice"}`, durationPtr(time.Hour))
 		if err != nil {
 			t.Fatalf("Submit: %v", err)
 		}

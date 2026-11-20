@@ -289,7 +289,7 @@ func (a *serviceAssembly) submit(project, content string) (Job, error) {
 	defer a.submitMu.Unlock()
 	plan := a.popPlan()
 	a.pending = plan
-	var duration time.Duration
+	var duration *time.Duration
 	if plan != nil {
 		duration = plan.Duration
 	}

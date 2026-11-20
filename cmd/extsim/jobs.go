@@ -132,10 +132,11 @@ func (j Job) MarshalJSON() ([]byte, error) {
 // JobService accepts jobs, runs them on its clock and serves the job HTTP
 // interface.
 //
-// Submit accepts an optional duration, zero meaning the service's default
-// duration. Every status change is reported to the status-change hook; a job
-// reaching completed is also passed to the completion hook, which the service
-// assembly uses to drive callbacks.
+// Submit accepts an optional duration: nil selects the service's default
+// duration, while a pointer to zero runs the job with no wait at all. Every
+// status change is reported to the status-change hook; a job reaching
+// completed is also passed to the completion hook, which the service assembly
+// uses to drive callbacks.
 type JobService struct {
 	clock           Clock
 	defaultDuration time.Duration
@@ -177,18 +178,20 @@ func (s *JobService) SetOnComplete(fn func(Job)) {
 	s.onComplete = fn
 }
 
-// Submit validates the job input, records a queued job and starts it. A zero
-// duration selects the service's default duration. The returned job is the
-// queued snapshot; the job moves to running immediately afterwards.
-func (s *JobService) Submit(project, content string, duration time.Duration) (Job, error) {
+// Submit validates the job input, records a queued job and starts it. A nil
+// duration selects the service's default duration; an explicit zero is used as
+// given, so the job completes immediately. The returned job is the queued
+// snapshot; the job moves to running immediately afterwards.
+func (s *JobService) Submit(project, content string, duration *time.Duration) (Job, error) {
 	if project == "" {
 		return Job{}, ErrJobProjectEmpty
 	}
 	if len(content) > maxJobContentBytes {
 		return Job{}, ErrJobContentTooLarge
 	}
-	if duration == 0 {
-		duration = s.defaultDuration
+	runFor := s.defaultDuration
+	if duration != nil {
+		runFor = *duration
 	}
 
 	now := s.clock.Now()
@@ -218,7 +221,7 @@ func (s *JobService) Submit(project, content string, duration time.Duration) (Jo
 	s.mu.Unlock()
 
 	notifyJobHook(onStatusChange, job)
-	go s.run(job.ID, duration)
+	go s.run(job.ID, runFor)
 	return job, nil
 }
 
@@ -362,7 +365,7 @@ func (s *JobService) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := s.Submit(req.Project, req.Content, 0)
+	job, err := s.Submit(req.Project, req.Content, nil)
 	switch {
 	case err == nil:
 		writeJobJSON(w, http.StatusCreated, job)
