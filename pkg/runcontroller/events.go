@@ -23,6 +23,7 @@ func (c *Controller) onHello(ctx context.Context, conn *conn, h *agentprotocolv1
 		turnID:          state.GetTurnId(),
 		lastAcceptedSeq: h.GetLastAcceptedSeq(),
 		lastTurn:        h.GetLastTurn(),
+		bgJobs:          h.GetBgJobs(),
 	}, applyOpts{registerConn: conn})
 	return err
 }
@@ -46,6 +47,9 @@ func (c *Controller) onWardenFrame(ctx context.Context, conn *conn, f *agentprot
 				isError:     te.GetIsError(),
 				agentExited: te.GetAgentExited(),
 			})
+		}
+		if bj := event.GetBgJobsChanged(); bj != nil {
+			return c.applyFrame(ctx, conn, evBgJobsChanged{jobIDs: bj.GetJobIds()})
 		}
 		return status.New(codes.InvalidArgument, "runcontroller: event has no kind").Err()
 	case *agentprotocolv1.WardenFrame_Accepted:

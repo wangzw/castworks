@@ -61,6 +61,10 @@ const (
 	// DropTurnEnded enters the turn boundary and saves last_turn but does not
 	// send turn_ended.
 	DropTurnEnded
+
+	// DropBgJobsChanged replaces the background job set but does not send
+	// bg_jobs_changed. The next Hello carries the new set.
+	DropBgJobsChanged
 )
 
 // Turn records one turn as the warden reported it.
@@ -91,6 +95,7 @@ type Warden struct {
 	phase        agentprotocolv1.Phase
 	lastAccepted int64
 	lastTurn     *agentprotocolv1.LastTurn
+	bgJobs       []string
 	turnCounter  int
 	curTurn      string
 	written      []int64
@@ -248,6 +253,32 @@ func (w *Warden) DropNext(kind DropKind) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.drop[kind]++
+}
+
+// SetBgJobs replaces the background job set without reporting it on the
+// current stream. The next Hello carries the new set, which models a change
+// made while disconnected.
+func (w *Warden) SetBgJobs(jobs []string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.bgJobs = append([]string(nil), jobs...)
+}
+
+// BgJobsChanged replaces the background job set and reports the complete new
+// set with bg_jobs_changed on the current stream. The event is dropped when a
+// DropBgJobsChanged is pending; the next Hello still carries the new set.
+func (w *Warden) BgJobsChanged(jobs []string) {
+	w.mu.Lock()
+	w.bgJobs = append([]string(nil), jobs...)
+	s := w.cur
+	var frames []*agentprotocolv1.WardenFrame
+	if w.drop[DropBgJobsChanged] > 0 {
+		w.drop[DropBgJobsChanged]--
+	} else if s != nil && w.phase != agentprotocolv1.Phase_PHASE_EXITED {
+		frames = append(frames, bgJobsChangedFrame(w.runID, w.bgJobs))
+	}
+	w.mu.Unlock()
+	enqueueAll(s, frames)
 }
 
 // Disconnect cancels the current stream and reconnects.
@@ -561,6 +592,7 @@ func (w *Warden) helloFrame() *agentprotocolv1.WardenFrame {
 	hello := &agentprotocolv1.Hello{
 		AgentState:      &agentprotocolv1.AgentState{Phase: w.phase},
 		LastAcceptedSeq: w.lastAccepted,
+		BgJobs:          append([]string(nil), w.bgJobs...),
 	}
 	if w.phase == agentprotocolv1.Phase_PHASE_IN_TURN {
 		hello.AgentState.TurnId = w.curTurn
@@ -817,6 +849,21 @@ func turnEndedFrame(runID, turnID, output string, isError, agentExited bool) *ag
 						Output:      output,
 						IsError:     isError,
 						AgentExited: agentExited,
+					},
+				},
+			},
+		},
+	}
+}
+
+func bgJobsChangedFrame(runID string, jobIDs []string) *agentprotocolv1.WardenFrame {
+	return &agentprotocolv1.WardenFrame{
+		RunId: runID,
+		Body: &agentprotocolv1.WardenFrame_Event{
+			Event: &agentprotocolv1.AgentEvent{
+				Kind: &agentprotocolv1.AgentEvent_BgJobsChanged{
+					BgJobsChanged: &agentprotocolv1.BgJobsChanged{
+						JobIds: append([]string(nil), jobIDs...),
 					},
 				},
 			},

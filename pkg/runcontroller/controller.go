@@ -753,6 +753,7 @@ func stateFromRow(r runRow) machineState {
 		Substate:            r.Substate,
 		NextInboxSeq:        r.NextInboxSeq,
 		DeliveredThrough:    r.DeliveredThrough,
+		BgJobs:              r.BgJobs,
 		IdleSince:           r.IdleSince,
 		ProvisionReturnedAt: r.ProvisionReturnedAt,
 		FailureReason:       r.FailureReason,
@@ -765,6 +766,7 @@ func rowFromState(r runRow, s machineState) runRow {
 	r.Substate = s.Substate
 	r.NextInboxSeq = s.NextInboxSeq
 	r.DeliveredThrough = s.DeliveredThrough
+	r.BgJobs = s.BgJobs
 	r.IdleSince = s.IdleSince
 	r.ProvisionReturnedAt = s.ProvisionReturnedAt
 	r.FailureReason = s.FailureReason
@@ -781,6 +783,8 @@ func eventName(ev machineEvent) string {
 		return "provision_done"
 	case evHello:
 		return "hello"
+	case evBgJobsChanged:
+		return "bg_jobs_changed"
 	case evAccepted:
 		return "accepted"
 	case evTurnStarted:

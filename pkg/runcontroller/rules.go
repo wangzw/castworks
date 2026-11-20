@@ -20,12 +20,22 @@ import (
 type machineState struct {
 	State               State
 	Substate            Substate
-	NextInboxSeq        int64 // 下一条收件箱消息的序号，从 1 起
-	DeliveredThrough    int64 // 已确认写入 Claude Code 的最大 inbox_seq
+	NextInboxSeq        int64    // 下一条收件箱消息的序号，从 1 起
+	DeliveredThrough    int64    // 已确认写入 Claude Code 的最大 inbox_seq
+	BgJobs              []string // 看守进程最近一次上报的后台作业集合
 	IdleSince           *time.Time
 	ProvisionReturnedAt *time.Time
 	FailureReason       string
 	EndedAt             *time.Time
+}
+
+// copyJobs 返回事件报告的后台作业集合的副本。空集合与 nil 统一为 nil，
+// 与数据库空数组扫描出的零值一致。
+func copyJobs(jobs []string) []string {
+	if len(jobs) == 0 {
+		return nil
+	}
+	return append([]string(nil), jobs...)
 }
 
 func (s machineState) terminated() bool {
@@ -69,7 +79,11 @@ type evHello struct {
 	turnID          string
 	lastAcceptedSeq int64
 	lastTurn        *agentprotocolv1.LastTurn
+	bgJobs          []string
 }
+
+// evBgJobsChanged 是看守进程上报的后台作业集合变化。
+type evBgJobsChanged struct{ jobIDs []string }
 
 type evAccepted struct{ throughSeq int64 }
 
@@ -107,6 +121,7 @@ type evHelloExpire struct{ returnedBefore time.Time }
 func (evAppend) isMachineEvent()        {}
 func (evProvisionDone) isMachineEvent() {}
 func (evHello) isMachineEvent()         {}
+func (evBgJobsChanged) isMachineEvent() {}
 func (evAccepted) isMachineEvent()      {}
 func (evTurnStarted) isMachineEvent()   {}
 func (evTurnEnded) isMachineEvent()     {}
@@ -230,6 +245,8 @@ func transition(cur machineState, ev machineEvent, env machineEnv) (machineResul
 		return transitionProvisionDone(cur, e, env)
 	case evHello:
 		return transitionHello(cur, e, env)
+	case evBgJobsChanged:
+		return transitionBgJobsChanged(cur, e, env)
 	case evAccepted:
 		return transitionAccepted(cur, e, env)
 	case evTurnStarted:
@@ -361,6 +378,13 @@ func transitionHello(cur machineState, e evHello, env machineEnv) (machineResult
 		cur.DeliveredThrough = e.lastAcceptedSeq
 	}
 
+	// 非终态下每次 Hello 都以其中的集合替换已保存的集合，包括只登记流的
+	// suspending 与 suspended。phase 为 exited 的 Hello 把运行实例转为
+	// failed，不更新集合。
+	if e.phase != agentprotocolv1.Phase_PHASE_EXITED {
+		cur.BgJobs = copyJobs(e.bgJobs)
+	}
+
 	// 对账：回合开始与结果由 Hello 补齐。
 	var effects []machineEffect
 	switch e.phase {
@@ -429,6 +453,23 @@ func transitionHello(cur machineState, e evHello, env machineEnv) (machineResult
 		}
 	}
 	return mkResult(cur, effects...), nil
+}
+
+// transitionBgJobsChanged 以 job_ids 替换已保存的后台作业集合。运行实例处于
+// active、boundary，且集合由非空变为空时，idle_since 置为当前时刻，让后台
+// 任务结束后处理任务通知的自发回合不会紧接着被挂起。
+func transitionBgJobsChanged(cur machineState, e evBgJobsChanged, env machineEnv) (machineResult, error) {
+	if cur.terminated() {
+		return mkResult(cur), ErrTerminated
+	}
+	hadJobs := len(cur.BgJobs) > 0
+	cur.BgJobs = copyJobs(e.jobIDs)
+	if hadJobs && len(cur.BgJobs) == 0 &&
+		cur.State == StateActive && cur.Substate == SubstateBoundary {
+		now := env.Now
+		cur.IdleSince = &now
+	}
+	return mkResult(cur), nil
 }
 
 func transitionAccepted(cur machineState, e evAccepted, env machineEnv) (machineResult, error) {
@@ -542,11 +583,15 @@ func transitionTrySuspend(cur machineState, e evTrySuspend, env machineEnv) (mac
 	if cur.terminated() {
 		return mkResult(cur), nil
 	}
-	// 只挂起 active/boundary、无未投递消息且 idle_since 早于截止时刻的运行实例。
+	// 只挂起 active/boundary、无未投递消息、没有后台作业且 idle_since 早于
+	// 截止时刻的运行实例。
 	if cur.State != StateActive || cur.Substate != SubstateBoundary {
 		return mkResult(cur), nil
 	}
 	if cur.DeliveredThrough < cur.NextInboxSeq-1 {
+		return mkResult(cur), nil
+	}
+	if len(cur.BgJobs) > 0 {
 		return mkResult(cur), nil
 	}
 	if cur.IdleSince == nil || !cur.IdleSince.Before(e.idleBefore) {

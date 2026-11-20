@@ -319,6 +319,58 @@ func TestTransitionHello(t *testing.T) {
 			},
 		},
 		{
+			name: "suspended hello replaces the background job set",
+			cur: machineState{
+				State: StateSuspended, Substate: SubstateSnapshotted,
+				NextInboxSeq: 2, BgJobs: []string{"old"},
+			},
+			ev:  evHello{phase: agentprotocolv1.Phase_PHASE_BOUNDARY, lastAcceptedSeq: 1, bgJobs: []string{"job-1", "job-2"}},
+			env: env,
+			want: machineState{
+				State: StateSuspended, Substate: SubstateSnapshotted,
+				NextInboxSeq: 2, DeliveredThrough: 1,
+				BgJobs: []string{"job-1", "job-2"},
+			},
+			effects: []machineEffect{
+				registerStream{},
+				sendHelloAck{},
+			},
+		},
+		{
+			name: "suspending hello replaces the background job set",
+			cur: machineState{
+				State: StateSuspending, NextInboxSeq: 2, BgJobs: []string{"old"},
+			},
+			ev:  evHello{phase: agentprotocolv1.Phase_PHASE_BOUNDARY, lastAcceptedSeq: 1, bgJobs: []string{"job-1"}},
+			env: env,
+			want: machineState{
+				State: StateSuspending, NextInboxSeq: 2, DeliveredThrough: 1,
+				BgJobs: []string{"job-1"},
+			},
+			effects: []machineEffect{
+				registerStream{},
+				sendHelloAck{},
+			},
+		},
+		{
+			name: "boundary hello with an empty set clears the background jobs",
+			cur: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 2, DeliveredThrough: 1, BgJobs: []string{"job-1"},
+			},
+			ev:  evHello{phase: agentprotocolv1.Phase_PHASE_BOUNDARY, lastAcceptedSeq: 1},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 2, DeliveredThrough: 1,
+				IdleSince: rulesTimePtr(rulesNow),
+			},
+			effects: []machineEffect{
+				registerStream{},
+				sendHelloAck{},
+			},
+		},
+		{
 			name: "suspending hello only registers the stream",
 			cur:  machineState{State: StateSuspending, NextInboxSeq: 2},
 			ev:   evHello{phase: agentprotocolv1.Phase_PHASE_BOUNDARY, lastAcceptedSeq: 1},
@@ -444,6 +496,29 @@ func TestTransitionHello(t *testing.T) {
 				DeliveredThrough: 1,
 				FailureReason:    "agent exited",
 				EndedAt:          rulesTimePtr(rulesNow),
+			},
+			effects: []machineEffect{
+				closeStream{code: codes.FailedPrecondition},
+			},
+		},
+		{
+			name: "exited hello does not update the background job set",
+			cur: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 1, BgJobs: []string{"job-a"},
+			},
+			ev: evHello{
+				phase:           agentprotocolv1.Phase_PHASE_EXITED,
+				lastAcceptedSeq: 0,
+				bgJobs:          []string{"job-b"},
+			},
+			env: env,
+			want: machineState{
+				State:         StateFailed,
+				NextInboxSeq:  1,
+				BgJobs:        []string{"job-a"},
+				FailureReason: "agent exited",
+				EndedAt:       rulesTimePtr(rulesNow),
 			},
 			effects: []machineEffect{
 				closeStream{code: codes.FailedPrecondition},
@@ -909,6 +984,100 @@ func TestTransitionEnd(t *testing.T) {
 	})
 }
 
+// TestTransitionBgJobsChanged 覆盖后台作业集合替换与空闲重计时的条件。
+func TestTransitionBgJobsChanged(t *testing.T) {
+	env := rulesEnv()
+	before := rulesNow.Add(-time.Minute)
+
+	rulesCheck(t, []rulesCase{
+		{
+			name: "a new non-empty set replaces the old one",
+			cur: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 1, BgJobs: []string{"old"}, IdleSince: &before,
+			},
+			ev:  evBgJobsChanged{jobIDs: []string{"a", "b"}},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 1, BgJobs: []string{"a", "b"}, IdleSince: &before,
+			},
+		},
+		{
+			name: "emptying at a boundary restarts the idle clock",
+			cur: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, BgJobs: []string{"a"}, IdleSince: &before,
+			},
+			ev:  evBgJobsChanged{},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, IdleSince: rulesTimePtr(rulesNow),
+			},
+		},
+		{
+			name: "emptying in a turn does not restart the idle clock",
+			cur: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 1, BgJobs: []string{"a"}, IdleSince: &before,
+			},
+			ev:  evBgJobsChanged{jobIDs: []string{}},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateInTurn,
+				NextInboxSeq: 1, IdleSince: &before,
+			},
+		},
+		{
+			name: "emptying while suspended does not restart the idle clock",
+			cur: machineState{
+				State: StateSuspended, Substate: SubstateSnapshotted,
+				NextInboxSeq: 1, BgJobs: []string{"a"},
+			},
+			ev:  evBgJobsChanged{},
+			env: env,
+			want: machineState{
+				State: StateSuspended, Substate: SubstateSnapshotted,
+				NextInboxSeq: 1,
+			},
+		},
+		{
+			name: "an already empty set keeps idle_since",
+			cur: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, IdleSince: &before,
+			},
+			ev:  evBgJobsChanged{},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, IdleSince: &before,
+			},
+		},
+		{
+			name: "a first non-empty set keeps idle_since",
+			cur: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, IdleSince: &before,
+			},
+			ev:  evBgJobsChanged{jobIDs: []string{"a"}},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, BgJobs: []string{"a"}, IdleSince: &before,
+			},
+		},
+		{
+			name:           "ended rejects the event",
+			cur:            machineState{State: StateEnded, NextInboxSeq: 1, EndedAt: rulesTimePtr(rulesNow)},
+			ev:             evBgJobsChanged{},
+			env:            env,
+			wantTerminated: true,
+		},
+	})
+}
+
 func TestTransitionTrySuspend(t *testing.T) {
 	env := rulesEnv()
 	idleBefore := rulesNow.Add(-30 * time.Second)
@@ -962,6 +1131,19 @@ func TestTransitionTrySuspend(t *testing.T) {
 			ev:   evTrySuspend{idleBefore: idleBefore},
 			env:  env,
 			want: machineState{State: StateActive, Substate: SubstateBoundary, NextInboxSeq: 1, IdleSince: &after},
+		},
+		{
+			name: "background jobs prevent suspension",
+			cur: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, BgJobs: []string{"job-1"}, IdleSince: &before,
+			},
+			ev:  evTrySuspend{idleBefore: idleBefore},
+			env: env,
+			want: machineState{
+				State: StateActive, Substate: SubstateBoundary,
+				NextInboxSeq: 1, BgJobs: []string{"job-1"}, IdleSince: &before,
+			},
 		},
 		{
 			name: "missing idle_since does not suspend",

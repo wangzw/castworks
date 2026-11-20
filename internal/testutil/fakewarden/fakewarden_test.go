@@ -293,6 +293,8 @@ func kinds(frames []*agentprotocolv1.WardenFrame) []string {
 			out = append(out, "turn_started")
 		case f.GetEvent() != nil && f.GetEvent().GetTurnEnded() != nil:
 			out = append(out, "turn_ended")
+		case f.GetEvent() != nil && f.GetEvent().GetBgJobsChanged() != nil:
+			out = append(out, "bg_jobs_changed")
 		default:
 			out = append(out, "unknown")
 		}
@@ -570,6 +572,59 @@ func TestDropNext(t *testing.T) {
 		}
 		if last := hello.GetLastTurn(); last == nil || last.GetTurnId() != turns[0].TurnID {
 			t.Errorf("hello last_turn = %+v, want turn %q", last, turns[0].TurnID)
+		}
+	})
+}
+
+func TestBgJobs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("hello carries the set and changes are reported", func(t *testing.T) {
+		t.Parallel()
+		ctx, _ := testContext(t)
+		s := newTestServer(t)
+		w := fakewarden.New(t, testRunID, s.dial)
+		w.SetBgJobs([]string{"job-1", "job-2"})
+		w.Start()
+		t.Cleanup(w.Stop)
+
+		ss := s.waitStream(t, ctx, 1)
+		hello := ss.waitHello(t, ctx)
+		if got := hello.GetBgJobs(); !slices.Equal(got, []string{"job-1", "job-2"}) {
+			t.Errorf("hello bg_jobs = %v, want [job-1 job-2]", got)
+		}
+
+		w.BgJobsChanged([]string{"job-3"})
+		f := ss.waitFrame(t, ctx, "bg_jobs_changed", func(f *agentprotocolv1.WardenFrame) bool {
+			return f.GetEvent().GetBgJobsChanged() != nil
+		})
+		if got := f.GetEvent().GetBgJobsChanged().GetJobIds(); !slices.Equal(got, []string{"job-3"}) {
+			t.Errorf("bg_jobs_changed job_ids = %v, want [job-3]", got)
+		}
+	})
+
+	t.Run("a dropped change is carried by the next hello", func(t *testing.T) {
+		t.Parallel()
+		ctx, _ := testContext(t)
+		h := startWarden(t, true)
+
+		h.warden.BgJobsChanged([]string{"job-1"})
+		h.stream.waitFrame(t, ctx, "bg_jobs_changed", func(f *agentprotocolv1.WardenFrame) bool {
+			return f.GetEvent().GetBgJobsChanged() != nil
+		})
+
+		h.warden.DropNext(fakewarden.DropBgJobsChanged)
+		h.warden.BgJobsChanged(nil)
+		time.Sleep(4 * reconnectSettle)
+		if got := countKind(h.stream.snapshot(), "bg_jobs_changed"); got != 1 {
+			t.Errorf("bg_jobs_changed frames = %d, want 1", got)
+		}
+
+		h.warden.Disconnect()
+		ss2 := h.server.waitStream(t, ctx, 2)
+		hello := ss2.waitHello(t, ctx)
+		if got := hello.GetBgJobs(); len(got) != 0 {
+			t.Errorf("hello bg_jobs = %v, want empty", got)
 		}
 	})
 }

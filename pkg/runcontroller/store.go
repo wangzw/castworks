@@ -19,6 +19,7 @@ type runRow struct {
 	ActorName           string
 	NextInboxSeq        int64
 	DeliveredThrough    int64
+	BgJobs              []string
 	IdleSince           *time.Time
 	ProvisionReturnedAt *time.Time
 	FailureReason       string
@@ -60,7 +61,7 @@ type suspensionUpdate struct {
 }
 
 const runSelectColumns = `run_id, state, substate, actor_name, next_inbox_seq, ` +
-	`delivered_through, idle_since, provision_returned_at, failure_reason, created_at, ended_at`
+	`delivered_through, bg_jobs, idle_since, provision_returned_at, failure_reason, created_at, ended_at`
 
 const suspensionSelectColumns = `seq, started_at, snapshot_ms, snapshot_bytes, ` +
 	`resume_requested_at, restore_ms, restore_returned_at, hello_at, hello_ms, error`
@@ -308,13 +309,20 @@ func (t *storeTx) updateRun(r runRow) error {
 	if err := t.requireLock(r.RunID); err != nil {
 		return err
 	}
+	// pgx encodes a nil string slice as SQL NULL, which the NOT NULL column
+	// rejects. An empty set is written as an empty array.
+	bgJobs := r.BgJobs
+	if bgJobs == nil {
+		bgJobs = []string{}
+	}
 	tag, err := t.tx.Exec(t.ctx, `UPDATE run SET
 		state = $2, substate = $3, actor_name = $4, next_inbox_seq = $5,
-		delivered_through = $6, idle_since = $7, provision_returned_at = $8,
-		failure_reason = $9, ended_at = $10, version = version + 1
+		delivered_through = $6, bg_jobs = $7, idle_since = $8,
+		provision_returned_at = $9, failure_reason = $10, ended_at = $11,
+		version = version + 1
 	WHERE run_id = $1`,
 		r.RunID, r.State, r.Substate, r.ActorName, r.NextInboxSeq,
-		r.DeliveredThrough, r.IdleSince, r.ProvisionReturnedAt,
+		r.DeliveredThrough, bgJobs, r.IdleSince, r.ProvisionReturnedAt,
 		r.FailureReason, r.EndedAt,
 	)
 	if err != nil {
@@ -596,10 +604,12 @@ func (s *store) listRuns(ctx context.Context) ([]RunSummary, error) {
 	return runs, nil
 }
 
-// suspendCandidates 返回 active/boundary 且 idle_since 早于 idleBefore 的运行实例。
+// suspendCandidates 返回 active/boundary、没有后台作业且 idle_since 早于
+// idleBefore 的运行实例。
 func (s *store) suspendCandidates(ctx context.Context, idleBefore time.Time) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT run_id FROM run
 		WHERE state = 'active' AND substate = 'boundary' AND idle_since < $1
+			AND cardinality(bg_jobs) = 0
 		ORDER BY run_id ASC`, idleBefore)
 	if err != nil {
 		return nil, fmt.Errorf("runcontroller: list suspend candidates: %w", err)
@@ -657,7 +667,7 @@ func scanRunRow(row pgx.Row) (runRow, error) {
 	var r runRow
 	err := row.Scan(
 		&r.RunID, &r.State, &r.Substate, &r.ActorName, &r.NextInboxSeq,
-		&r.DeliveredThrough, &r.IdleSince, &r.ProvisionReturnedAt,
+		&r.DeliveredThrough, &r.BgJobs, &r.IdleSince, &r.ProvisionReturnedAt,
 		&r.FailureReason, &r.CreatedAt, &r.EndedAt,
 	)
 	return r, err

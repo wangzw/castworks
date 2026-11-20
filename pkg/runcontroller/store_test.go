@@ -665,6 +665,7 @@ func TestStoreSuspendCandidates(t *testing.T) {
 	seedRun(t, st, "run-in-turn", idleBefore.Add(-time.Hour))
 	seedRun(t, st, "run-provisioning", idleBefore.Add(-time.Hour))
 	seedRun(t, st, "run-no-idle", idleBefore.Add(-time.Hour))
+	seedRun(t, st, "run-bg-jobs", idleBefore.Add(-time.Hour))
 
 	updateRunState(t, st, "run-ready-1", func(r *runRow) {
 		r.State = StateActive
@@ -698,6 +699,12 @@ func TestStoreSuspendCandidates(t *testing.T) {
 		r.State = StateActive
 		r.Substate = SubstateBoundary
 	})
+	updateRunState(t, st, "run-bg-jobs", func(r *runRow) {
+		r.State = StateActive
+		r.Substate = SubstateBoundary
+		r.IdleSince = &longAgo
+		r.BgJobs = []string{"job-1"}
+	})
 
 	got, err := st.suspendCandidates(ctx, idleBefore)
 	if err != nil {
@@ -706,6 +713,51 @@ func TestStoreSuspendCandidates(t *testing.T) {
 	want := []string{"run-ready-1", "run-ready-2"}
 	if !equalStrings(got, want) {
 		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+}
+
+// TestStoreBgJobsRoundTrip 验证后台作业集合按数组写入与读出，清空后是空数组
+// 而不是 NULL。
+func TestStoreBgJobsRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	st, pool := newTestStore(t)
+	ctx := t.Context()
+	seedRun(t, st, "run-bg", testTimestamp())
+
+	updateRunState(t, st, "run-bg", func(r *runRow) {
+		r.BgJobs = []string{"job-a", "job-b"}
+	})
+
+	var got []string
+	if err := st.inTx(ctx, func(tx *storeTx) error {
+		r, err := tx.lockRun("run-bg")
+		if err != nil {
+			return err
+		}
+		got = r.BgJobs
+		return nil
+	}); err != nil {
+		t.Fatalf("lock run: %v", err)
+	}
+	if !equalStrings(got, []string{"job-a", "job-b"}) {
+		t.Fatalf("bg_jobs = %v, want [job-a job-b]", got)
+	}
+
+	updateRunState(t, st, "run-bg", func(r *runRow) {
+		r.BgJobs = nil
+	})
+	var (
+		bgJobs []string
+		isNull bool
+	)
+	if err := pool.QueryRow(ctx,
+		`SELECT bg_jobs, bg_jobs IS NULL FROM run WHERE run_id = $1`, "run-bg").
+		Scan(&bgJobs, &isNull); err != nil {
+		t.Fatalf("read bg_jobs: %v", err)
+	}
+	if isNull || len(bgJobs) != 0 {
+		t.Fatalf("cleared bg_jobs = %v (null = %t), want an empty array", bgJobs, isNull)
 	}
 }
 
