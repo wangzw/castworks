@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	eventAccepted    = "Accepted"
-	eventTurnStarted = "TurnStarted"
-	eventTurnEnded   = "TurnEnded"
+	eventAccepted      = "Accepted"
+	eventTurnStarted   = "TurnStarted"
+	eventTurnEnded     = "TurnEnded"
+	eventBgJobsChanged = "BgJobsChanged"
 )
 
 type sinkEvent struct {
@@ -31,6 +32,7 @@ type sinkEvent struct {
 	Output      string
 	IsError     bool
 	AgentExited bool
+	JobIDs      []string
 }
 
 type recorder struct {
@@ -60,6 +62,15 @@ func (r *recorder) TurnEnded(turnID, output string, isError, agentExited bool) {
 	r.events = append(r.events, sinkEvent{
 		Kind: eventTurnEnded, TurnID: turnID, Output: output,
 		IsError: isError, AgentExited: agentExited,
+	})
+}
+
+func (r *recorder) BgJobsChanged(turnID string, jobIDs []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, sinkEvent{
+		Kind: eventBgJobsChanged, TurnID: turnID,
+		JobIDs: append([]string(nil), jobIDs...),
 	})
 }
 

@@ -3,6 +3,7 @@ package controlstream
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -27,6 +28,7 @@ func TestHello(t *testing.T) {
 		wantPhase  agentprotocolv1.Phase
 		wantTurnID string
 		wantLast   *agent.TurnResult
+		wantBgJobs []string
 	}{
 		{
 			name:      "starting",
@@ -35,9 +37,10 @@ func TestHello(t *testing.T) {
 		},
 		{
 			name:       "in_turn",
-			state:      agent.State{Phase: agent.PhaseInTurn, TurnID: "turn-1", LastAcceptedSeq: 4},
+			state:      agent.State{Phase: agent.PhaseInTurn, TurnID: "turn-1", LastAcceptedSeq: 4, BgJobs: []string{"job-a", "job-b"}},
 			wantPhase:  agentprotocolv1.Phase_PHASE_IN_TURN,
 			wantTurnID: "turn-1",
+			wantBgJobs: []string{"job-a", "job-b"},
 		},
 		{
 			name:      "boundary",
@@ -85,6 +88,9 @@ func TestHello(t *testing.T) {
 			if got := hello.GetLastAcceptedSeq(); got != tc.state.LastAcceptedSeq {
 				t.Errorf("hello last_accepted_seq = %d, want %d", got, tc.state.LastAcceptedSeq)
 			}
+			if got := hello.GetBgJobs(); !slices.Equal(got, tc.wantBgJobs) {
+				t.Errorf("hello bg_jobs = %v, want %v", got, tc.wantBgJobs)
+			}
 			if tc.wantLast == nil {
 				if hello.GetLastTurn() != nil {
 					t.Errorf("hello last_turn = %v, want nil", hello.GetLastTurn())
@@ -99,6 +105,181 @@ func TestHello(t *testing.T) {
 				t.Errorf("hello last_turn = %+v, want %+v", lt, tc.wantLast)
 			}
 		})
+	}
+}
+
+// TestBgJobsChangedEvent 验证 BgJobsChanged 发出的帧通过校验，且回合边界上
+// 空的 turn_id 合法。
+func TestBgJobsChangedEvent(t *testing.T) {
+	frames := make(chan *agentprotocolv1.WardenFrame, 1)
+	handler := func(st grpc.BidiStreamingServer[agentprotocolv1.WardenFrame, agentprotocolv1.ControlFrame], _ *agentprotocolv1.Hello, attempt int) error {
+		if attempt != 1 {
+			t.Errorf("unexpected reconnect, attempt %d", attempt)
+		}
+		if err := st.Send(helloAckFrame(testRunID, apiKey)); err != nil {
+			return err
+		}
+		f, err := st.Recv()
+		if err != nil {
+			return err
+		}
+		frames <- f
+		return st.Send(shutdownFrame(testRunID))
+	}
+	srv := newTestServer(t, testRunID, nil, handler)
+	c := New(Config{Address: srv.addr, RunID: testRunID, Backoff: []time.Duration{time.Millisecond}})
+	sink := c.Sink()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Run(ctx, newFakeAgent(agent.State{Phase: agent.PhaseBoundary})) }()
+
+	select {
+	case <-srv.attemptCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not connect")
+	}
+	sink.BgJobsChanged("", []string{"job-a", "job-b"})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var f *agentprotocolv1.WardenFrame
+	select {
+	case f = <-frames:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not receive the bg_jobs_changed frame")
+	}
+	if err := agentprotocol.ValidateWardenFrame(f); err != nil {
+		t.Errorf("invalid warden frame: %v", err)
+	}
+	ev := f.GetEvent()
+	if ev == nil {
+		t.Fatalf("frame body = %T, want an event", f.GetBody())
+	}
+	if ev.GetTurnId() != "" {
+		t.Errorf("event turn_id = %q, want an empty turn boundary id", ev.GetTurnId())
+	}
+	bg := ev.GetBgJobsChanged()
+	if bg == nil {
+		t.Fatalf("event kind = %T, want bg_jobs_changed", ev.GetKind())
+	}
+	if want := []string{"job-a", "job-b"}; !slices.Equal(bg.GetJobIds(), want) {
+		t.Errorf("bg_jobs_changed job_ids = %v, want %v", bg.GetJobIds(), want)
+	}
+}
+
+// TestBgJobsDuringDisconnectReconciledByHello 验证断线期间发出的 bg_jobs_changed
+// 被丢弃，重连后的 Hello 携带状态里的集合完成对账。
+func TestBgJobsDuringDisconnectReconciledByHello(t *testing.T) {
+	var (
+		sleepCh      = make(chan time.Duration, 8)
+		release      = make(chan struct{})
+		helloAcked   = make(chan struct{}, 1)
+		frameMu      sync.Mutex
+		secondFrames []*agentprotocolv1.WardenFrame
+	)
+
+	handler := func(st grpc.BidiStreamingServer[agentprotocolv1.WardenFrame, agentprotocolv1.ControlFrame], _ *agentprotocolv1.Hello, attempt int) error {
+		switch attempt {
+		case 1:
+			if err := st.Send(helloAckFrame(testRunID, apiKey)); err != nil {
+				return err
+			}
+			return status.Error(codes.Unavailable, "gone")
+		case 2:
+			if err := st.Send(helloAckFrame(testRunID, apiKey)); err != nil {
+				return err
+			}
+			helloAcked <- struct{}{}
+			f, err := st.Recv()
+			if err != nil {
+				return err
+			}
+			frameMu.Lock()
+			secondFrames = append(secondFrames, f)
+			frameMu.Unlock()
+			return st.Send(shutdownFrame(testRunID))
+		default:
+			t.Errorf("unexpected attempt %d", attempt)
+			return nil
+		}
+	}
+
+	srv := newTestServer(t, testRunID, nil, handler)
+	ag := newFakeAgent(agent.State{Phase: agent.PhaseStarting})
+	c := New(Config{Address: srv.addr, RunID: testRunID, Backoff: []time.Duration{time.Hour}})
+	c.sleep = func(ctx context.Context, d time.Duration) error {
+		sleepCh <- d
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	sink := c.Sink()
+
+	errCh := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() { errCh <- c.Run(ctx, ag) }()
+
+	select {
+	case <-sleepCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not enter backoff after the first stream failed")
+	}
+
+	// 断线期间集合变化：没有当前流可入队，事件应当被丢弃。
+	ag.setState(func(st *agent.State) {
+		st.BgJobs = []string{"job-a"}
+	})
+	sink.BgJobsChanged("", []string{"job-a"})
+	close(release)
+
+	select {
+	case <-helloAcked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not reconnect")
+	}
+	// 重连后的实时变化应当排在 Hello 之后正常发出。
+	sink.BgJobsChanged("turn-live", []string{"job-a", "job-b"})
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	hello := srv.helloAt(1)
+	if hello == nil {
+		t.Fatal("server did not receive the second hello")
+	}
+	if want := []string{"job-a"}; !slices.Equal(hello.GetBgJobs(), want) {
+		t.Errorf("second hello bg_jobs = %v, want %v", hello.GetBgJobs(), want)
+	}
+
+	frameMu.Lock()
+	defer frameMu.Unlock()
+	if len(secondFrames) != 1 {
+		t.Fatalf("server received %d frames after hello, want 1", len(secondFrames))
+	}
+	if err := agentprotocol.ValidateWardenFrame(secondFrames[0]); err != nil {
+		t.Errorf("invalid warden frame: %v", err)
+	}
+	ev := secondFrames[0].GetEvent()
+	if ev == nil {
+		t.Fatalf("frame body = %T, want an event", secondFrames[0].GetBody())
+	}
+	if ev.GetTurnId() != "turn-live" {
+		t.Errorf("event turn_id = %q, want turn-live", ev.GetTurnId())
+	}
+	bg := ev.GetBgJobsChanged()
+	if bg == nil {
+		t.Fatalf("event kind = %T, want bg_jobs_changed", ev.GetKind())
+	}
+	if want := []string{"job-a", "job-b"}; !slices.Equal(bg.GetJobIds(), want) {
+		t.Errorf("bg_jobs_changed job_ids = %v, want %v", bg.GetJobIds(), want)
 	}
 }
 

@@ -141,6 +141,20 @@ func (c *Client) TurnEnded(turnID, output string, isError, agentExited bool) {
 	})
 }
 
+// BgJobsChanged 实现 agent.Sink。jobIDs 按调用方的约定已是变化之后的完整
+// 集合且按字典序排列；这里复制一份，避免发送协程读取期间被调用方改写。
+func (c *Client) BgJobsChanged(turnID string, jobIDs []string) {
+	c.enqueue(&agentprotocolv1.WardenFrame{
+		RunId: c.runID,
+		Body: &agentprotocolv1.WardenFrame_Event{Event: &agentprotocolv1.AgentEvent{
+			TurnId: turnID,
+			Kind: &agentprotocolv1.AgentEvent_BgJobsChanged{BgJobsChanged: &agentprotocolv1.BgJobsChanged{
+				JobIds: append([]string(nil), jobIDs...),
+			}},
+		}},
+	})
+}
+
 // enqueue 把帧排入当前流。持有 c.mu 入队，使 Hello 的切换与事件的入队互斥：
 // Hello 一定先于切换之后产生的任何事件。
 func (c *Client) enqueue(f *agentprotocolv1.WardenFrame) {
@@ -309,6 +323,7 @@ func (c *Client) helloFrame(st agent.State) *agentprotocolv1.WardenFrame {
 			TurnId: st.TurnID,
 		},
 		LastAcceptedSeq: st.LastAcceptedSeq,
+		BgJobs:          append([]string(nil), st.BgJobs...),
 	}
 	if st.Phase == agent.PhaseBoundary && st.LastTurn != nil {
 		h.LastTurn = &agentprotocolv1.LastTurn{

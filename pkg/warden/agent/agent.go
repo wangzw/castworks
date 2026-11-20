@@ -43,6 +43,9 @@ type State struct {
 	LastTurn *TurnResult
 	// LastAcceptedSeq 是已写入 Claude Code stdin 的最大 inbox_seq，未写入过为 0。
 	LastAcceptedSeq int64
+	// BgJobs 是当前的后台作业集合，任务标识按字典序排列；Claude Code 尚未
+	// 启动或已退出时为空。
+	BgJobs []string
 }
 
 // CredentialKind 是启动 Claude Code 所用凭据的种类。
@@ -73,7 +76,7 @@ type Batch struct {
 	Texts []string
 }
 
-// Sink 接收驱动器在自己的状态锁内同步发出的事件。三个方法按调用顺序即
+// Sink 接收驱动器在自己的状态锁内同步发出的事件。四个方法按调用顺序即
 // 事件顺序；实现不得阻塞，不得回调 Agent。
 type Sink interface {
 	// Accepted 报告一批消息已写入 Claude Code stdin，throughSeq 是写入覆盖到的最大 inbox_seq。
@@ -82,6 +85,9 @@ type Sink interface {
 	TurnStarted(turnID, deliveryID, sessionID string)
 	// TurnEnded 报告一个回合结束；agentExited 表示 Claude Code 已退出。
 	TurnEnded(turnID, output string, isError, agentExited bool)
+	// BgJobsChanged 报告后台作业集合发生变化。jobIDs 是变化之后的完整集合，
+	// 按字典序排列；turnID 在回合中为当前回合，在回合边界上为空。
+	BgJobsChanged(turnID string, jobIDs []string)
 }
 
 // Agent 是看守进程内 Claude Code 驱动的接口。
