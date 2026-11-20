@@ -17,11 +17,11 @@
 - **引导接口**：在[面向沙箱的端点](../../../glossary.md) `bootstrap` 上以 HTTPS 暴露引导接口，按沙箱实例身份查引导记录，把领取请求携带的[实例密钥](../../../glossary.md)公钥指纹登记到工作区租约与引导记录，向看守进程一次性返回按受众划分的运行实例令牌组、`lease_id` 与[接入票据](../../../glossary.md)公钥集合；令牌组在领取时调用 `secrets.IssueRunToken` 签发并绑定实例公钥指纹，令牌在任何路径上都不进入提供者的持久记录。
 - **冻结与解冻**：按 `freeze_id` 执行 `Freeze{cgroup}`，并在 `InPlaceResize` 能力允许时缩小 CPU request；`Freeze{signal}` 的冻结与解冻由看守进程执行，本模块只声明该能力；已解冻的 `freeze_id` 不再接受冻结与缩小，冻结只作用于 Agent 子 cgroup，看守进程保持可运行（[ADR-freeze-via-node-agent](../../../adr/adr-freeze-via-node-agent.md)）。
 - **快照与快照恢复**：按 `suspend_id` 执行快照并报告快照保留期限；按 `resume_id` 在同一代内恢复快照并返回沙箱标识；快照不存在或已过期时明确报告；按 `suspend_id` 撤销尚未确认的快照尝试，撤销即墓碑。
-- **销毁与释放**：按 `(run_id, generation)` 整代销毁并返回携带被删除代的确认；按 `(generation, sandbox_id)` 单个销毁；整代销毁与单个销毁都只作用于该代的沙箱实例，不删除更新的代；按 `run_id` 幂等释放运行实例级资源，释放之后拒绝该运行实例的一切创建（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）；整代销毁在写入创建墓碑之后删除该代的引导记录，单个销毁删除该沙箱实例的引导记录，按运行实例释放在写入释放墓碑之后删除该运行实例的引导记录。
+- **销毁与释放**：按 `(run_id, generation)` 整代销毁并返回携带被删除代的确认，以挂起为目的的整代销毁另携带挂起尝试的 `suspend_id`，提供者据此区分两类销毁（substrate 子模块前者同步挂起、后者退回 actor）；按 `(generation, sandbox_id)` 单个销毁；整代销毁与单个销毁都只作用于该代的沙箱实例，不删除更新的代；按 `run_id` 幂等释放运行实例级资源，释放之后拒绝该运行实例的一切创建（[ADR-generation-fencing](../../../adr/adr-generation-fencing.md)）；整代销毁在写入创建墓碑之后删除该代的引导记录，单个销毁删除该沙箱实例的引导记录，按运行实例释放在写入释放墓碑之后删除该运行实例的引导记录。
 - **查询**：批量列举沙箱并返回每个沙箱的 `run_id`、代、`sandbox_id` 与放置位置；按 `sandbox_id` 查询单个沙箱；按节点查询冻结态内存、可分配内存与节点内存和 CPU 之比；查询原地放大的 `Deferred` 状态；按机制给出提供者侧的恢复时延估计。
 - **出口策略**：保存 `connectorhub` 推送的每运行实例出口策略；在预配与认领时按 `(run_id, generation)` 落地本代副本；推送的更新只同步到尚未撤销的代；按 `(run_id, generation)` 撤销该代副本，撤销即墓碑，已撤销的代拒绝此后的落地与更新。
 - **预热池**：为具备 `WarmPool` 的提供者维护按镜像、规格与节点池或可用区分片的预热池容量；认领时返回可用的沙箱；容量按 `N = λL + z_{1−ε}·√(λL) + B` 计算，分片的容量各自计算。
-- **恢复触发**：为 substrate 子模块的快照恢复经 Substrate 路由器调用 `/wake` 触发恢复，销毁态重建由 `Provision` 创建并激活新 actor；为 k8s 子模块执行解冻、把 Sandbox CR 改回 `Running` 或从预热池认领，认领预热 Pod 后经 wake-router 调用 `/wake` 通知看守进程领取；解冻以 `Thawed` 为完成观察，快照恢复与销毁态重建以同代或新代 `Hello` 为完成观察。
+- **恢复触发**：为 substrate 子模块的快照恢复经 Substrate 路由器调用 `/wake` 触发恢复，销毁态重建由 `Provision` 以运行实例 actor 的一次冷启动承载新代；为 k8s 子模块执行解冻、把 Sandbox CR 改回 `Running` 或从预热池认领，认领预热 Pod 后经 wake-router 调用 `/wake` 通知看守进程领取；解冻以 `Thawed` 为完成观察，快照恢复与销毁态重建以同代或新代 `Hello` 为完成观察。
 - **串行化与幂等**：对同一运行实例的 `Suspend`、`Resume` 与 `Destroy` 按到达顺序串行；每个调用以 `freeze_id`、`suspend_id`、`resume_id`、`(run_id, generation)` 或 `(generation, sandbox_id)` 幂等，重复调用返回首次结果。
 
 ### 非职责
@@ -70,7 +70,7 @@ type Provider interface {
     Snapshot(ctx context.Context, req SnapshotRequest) (SnapshotReceipt, error)
     RevokeSnapshot(ctx context.Context, suspendID string) error
     RestoreSnapshot(ctx context.Context, req RestoreRequest) (SandboxHandle, error)
-    Destroy(ctx context.Context, ref GenerationRef) (DestroyReceipt, error)
+    Destroy(ctx context.Context, req DestroyRequest) (DestroyReceipt, error)
     DestroySandbox(ctx context.Context, ref SandboxRef) error
     ReleaseRun(ctx context.Context, runID RunID) error
     ListSandboxes(ctx context.Context, filter SandboxFilter) ([]SandboxInfo, error)
@@ -149,6 +149,12 @@ type SnapshotReceipt struct {
     SnapshotExpiresAt time.Time
 }
 
+type DestroyRequest struct {
+    RunID      RunID
+    Generation int
+    SuspendID  string              // 以挂起为目的的销毁携带挂起尝试的 suspend_id；其余整代销毁为空
+}
+
 type DestroyReceipt struct {
     RunID      RunID
     Generation int
@@ -188,7 +194,7 @@ type EgressPolicyDocument struct {
 | `Snapshot` | `runcontroller` | `suspend_id` | `SnapshotReceipt`，含保留期限 | 快照撤销墓碑之后的迟到请求为确定性拒绝 |
 | `RevokeSnapshot` | `runcontroller` | `suspend_id` | 空 | 幂等；重复撤销返回成功，撤销即快照撤销墓碑 |
 | `RestoreSnapshot` | `runcontroller` | `(run_id, generation, attempt_id)` | `SandboxHandle` | 快照不存在或已过期为确定性；提供者不可达与提供者层容量耗尽为暂时性 |
-| `Destroy` | `runcontroller` | `(run_id, generation)` | `DestroyReceipt`，携带被删除代 | 幂等；重复调用返回首次确认 |
+| `Destroy` | `runcontroller` | `(run_id, generation)` | `DestroyReceipt`，携带被删除代 | 幂等；重复调用返回首次确认；`SuspendID` 不参与幂等键 |
 | `DestroySandbox` | `runcontroller` | `(generation, sandbox_id)` | 空 | 幂等；目标不存在返回成功 |
 | `ReleaseRun` | `runcontroller` | `run_id` | 空 | 幂等；重复调用返回成功 |
 | `PutEgressPolicy` | `connectorhub` | `run_id` | 空 | 释放墓碑拒绝与参数非法为确定性；存在已撤销的代不构成失败，更新只同步到尚未撤销的代；提供者不可达与超时为暂时性 |
@@ -206,7 +212,7 @@ type EgressPolicyDocument struct {
 - `runcontroller` 在挂起决策前读取 `Capabilities`，把能力集合作为上下文传给 `suspendpolicy.decide` 与 `review`；`suspendpolicy` 只返回能力集合允许的机制，没有可用机制时返回不挂起。
 - `Freeze{signal}` 只允许短冻结，冻结时长上限与升级梯由 `suspendpolicy` 定义；`FREEZE_SHRINK` 只与 `Freeze{cgroup}` 和 `InPlaceResize` 组合；`Snapshot` 只在提供者声明该能力时进入候选；`Destroy` 只在提供者声明该能力时进入候选。
 - `WarmPool` 与 `EgressInject` 不是挂起机制：`WarmPool` 影响销毁重建的恢复路径，`EgressInject` 影响出口路径；`WarmPool` 与 `EgressInject` 不进入 `decide` 的机制选择。
-- 能力缺失时由 `suspendpolicy` 降级，`sandboxprovider` 不把能力缺口暴露为运行时错误：substrate 子模块没有冻结，回合中只有不挂起与快照，没有 `WarmPool`，销毁重建的 `resume_mode` 取 `cold_start`，由 `Provision` 从[模板快照](../../../glossary.md)恢复新 actor；k8s 子模块没有快照，回合中冻结到上限后由 `suspendpolicy` 选择 `DRAIN`，回合边界仍可销毁重建。
+- 能力缺失时由 `suspendpolicy` 降级，`sandboxprovider` 不把能力缺口暴露为运行时错误：substrate 子模块没有冻结，回合中只有不挂起与快照，没有 `WarmPool`，销毁重建的 `resume_mode` 取 `cold_start`，由 `Provision` 冷启动运行实例的 actor（首代从[模板快照](../../../glossary.md)恢复，[ADR-substrate-actor-per-run](../../../adr/adr-substrate-actor-per-run.md)）；k8s 子模块没有快照，回合中冻结到上限后由 `suspendpolicy` 选择 `DRAIN`，回合边界仍可销毁重建。
 - 调用方把能力集合之外的机制传给 `sandboxprovider` 时，提供者以参数非法拒绝；这属于调用方缺陷，不是提供者的降级路径。
 
 ### 与 connectorhub 的出口策略接口
@@ -247,7 +253,7 @@ type EgressPolicyDocument struct {
 依赖穷举如下，方向与[模块依赖图](../../architecture.md#模块依赖图)一致：本模块依赖基础层的 `workspace`、`agentprotocol` 与 `secrets`，以及各提供者层的控制器、代理与存储；`runcontroller` 与 `connectorhub` 依赖本模块；本模块不依赖 `runcontroller`、`suspendpolicy` 与 `connectorhub`。
 
 - 调用身份：本模块调用 `secrets`、`workspace`、节点冻结代理、节点挂载代理与入站路由（k8s 的 wake-router、Substrate 路由器）时，一律以 `sandboxprovider` SPIFFE 身份做 mTLS，各被调用方按授权表只放行本模块被允许的方法；节点冻结代理以 `node-freeze-agent`、节点挂载代理以 `node-mount-agent` 的身份提供监听器，Substrate 路由器与出口网关的身份是 Substrate 命名空间中的 ServiceAccount，按部署白名单登记。
-- `workspace`：在预配与认领时调用 `BindingService.Bind` 绑定工作区，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`，把绑定交给沙箱；k8s 共享文件系统模式下 `Ensure` 由节点挂载代理执行，挂载根不进入任何 Pod，只有该运行实例的子目录经绑定挂载出现在沙箱 Pod 内（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）；`lease_id` 取自 `ProvisionRequest.LeaseID`，由 `runcontroller` 建立租约后随请求传入，不来自绑定，提供者把它写入引导记录；引导接口在领取时调用 `LeaseService.SetHolderKey(run_id, lease_id, generation, instance_jkt)`，把实例公钥指纹登记为租约的 `holder_jkt`，CAS 条件为 `lease_id` 与代匹配、租约未释放、`holder_jkt` 为空或相等；工作区持久化按提供者选择，k8s 子模块以共享文件系统为默认、块存储为退化配置，substrate 子模块优先外部 CSI 卷、`durableDir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。本模块不持有租约，续约与接管由 `workspace` 与看守进程完成；`on_suspend` 语义下，销毁路径在同步挂起返回之后调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功才视为工作区已持久化；确认以 `(run_id, generation, lease_id)` 幂等。
+- `workspace`：在预配与认领时调用 `BindingService.Bind` 绑定工作区，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`，把绑定交给沙箱；k8s 共享文件系统模式下 `Ensure` 由节点挂载代理执行，挂载根不进入任何 Pod，只有该运行实例的子目录经绑定挂载出现在沙箱 Pod 内（[ADR-per-run-workspace-mount](../../../adr/adr-per-run-workspace-mount.md)）；`lease_id` 取自 `ProvisionRequest.LeaseID`，由 `runcontroller` 建立租约后随请求传入，不来自绑定，提供者把它写入引导记录；引导接口在领取时调用 `LeaseService.SetHolderKey(run_id, lease_id, generation, instance_jkt)`，把实例公钥指纹登记为租约的 `holder_jkt`，CAS 条件为 `lease_id` 与代匹配、租约未释放、`holder_jkt` 为空或相等；工作区持久化按提供者选择，k8s 子模块以共享文件系统为默认、块存储为退化配置，substrate 子模块优先外部 CSI 卷、`durableDir` 为退化配置（[ADR-workspace-persistence-per-provider](../../../adr/adr-workspace-persistence-per-provider.md)）。本模块不持有租约，续约与接管由 `workspace` 与看守进程完成；`on_suspend` 语义下，以挂起为目的的整代销毁在同步挂起返回之后，以 `DestroyRequest.SuspendID` 调用 `workspace.Confirm(Mode=suspend_upload, run_id, generation, lease_id, suspend_id)`，确认成功才视为工作区已持久化；确认以 `(run_id, generation, lease_id)` 幂等。
 - `secrets`：引导接口在领取时调用 `IssueRunToken(run_id, generation, instance_jkt)` 签发按受众划分的首个令牌组，并调用 `AccessTicketKeys` 取得接入票据公钥集合（可缓存）随领取响应下发；调用经控制面 mTLS 发出，`sandboxprovider` 的调用方身份在 `secrets` 的 `IssueRunToken` 与 `AccessTicketKeys` 白名单内，不允许任何凭据换取目标。令牌不持久化；轮换由 `runcontroller` 调用 `IssueRunToken`，不经过本模块。
 - `agentprotocol`：恢复触发使用 `/readyz` 与 `/wake` 入站端点；`/readyz` 是就绪探针，不以领取为条件；`/wake` 返回表示看守进程的出站流已重建。k8s 预热认领以 `/wake` 通知看守进程领取，提供者不等待其返回。入站端点不承载事件内容，投递只在出站流上进行。
 - k8s 提供者层：agent-sandbox 控制器管理 Sandbox、SandboxClaim 与 SandboxWarmPool；节点冻结代理是特权 DaemonSet，经容器运行时解析 Pod 与容器 cgroup，在容器 cgroup 下维护子 cgroup `agent`，写 `agent/cgroup.freeze` 执行冻结与解冻（[REF-linux-cgroup-v2](../../../references.md)）；`Freeze` 与 `Thaw` 只接受本模块的 SPIFFE 调用并按 Pod 归属与代授权，看守进程的移入请求经按 Pod 的 Unix 域套接字提交，cgroup 路径只由代理解析，规则见 [k8s 子模块](design-sandboxprovider-k8s.md#节点冻结代理的调用方认证与目标授权)。节点挂载代理是特权 DaemonSet，同时是 CSI 节点插件（驱动 `workspace.castworks.io`），在节点上挂载共享文件系统的挂载根；冷启动在卷发布时经 `NodePublishVolume`、认领时经 `BindWorkspace` 执行 `Ensure` 并把运行实例子目录绑定挂载进 Pod，`BindWorkspace` 只接受本模块调用，规则见 [k8s 子模块](design-sandboxprovider-k8s.md#节点挂载代理与工作区绑定挂载)。原地缩放依赖 Kubernetes In-Place Pod Resize（[REF-k8s-in-place-pod-resize](../../../references.md)），需要 `pods/resize` 子资源的 patch 权限；引导接口以 `TokenReview` 校验沙箱 Pod 的投射 ServiceAccount 令牌，需要 `tokenreviews` 的 `create` 权限；k8s 入站路由 wake-router 以 SPIFFE mTLS 认证全部入口，`/terminal` 只接受 `humanchannel`，`/files` 只接受 `workspace`，`/wake` 只接受本模块，不承载事件投递，事件驱动的恢复由控制面直调提供者。
@@ -274,7 +280,7 @@ classDiagram
         +Snapshot(req) SnapshotReceipt
         +RevokeSnapshot(suspendID) error
         +RestoreSnapshot(req) SandboxHandle
-        +Destroy(ref) DestroyReceipt
+        +Destroy(req) DestroyReceipt
         +DestroySandbox(ref) error
         +ReleaseRun(runID) error
         +ListSandboxes(filter) SandboxInfoList
@@ -346,12 +352,12 @@ sequenceDiagram
     R->>P: Provision(run_id, generation, attempt_id, lease_id)
     P->>W: 绑定工作区
     W-->>P: 挂载路径、RunUID、StorageMode、Durability、Placement
-    P->>L: 创建沙箱，substrate 的 actor 处于挂起态
+    P->>L: 创建沙箱，substrate 首代创建处于挂起态的 actor
     L-->>P: k8s 返回 sandbox_id、placement 与 Pod UID，substrate 返回 sandbox_id 与 actor UID
     P->>P: 按沙箱实例身份写入引导记录，claimed=false
     P->>P: 落地该代出口策略
     opt substrate 提供者
-        P->>L: ResumeActor 激活 actor，分配到剩余容量足够的 worker 并从模板快照恢复
+        P->>L: ResumeActor 激活 actor，分配到剩余容量足够的 worker，首代从模板快照恢复
         L-->>P: ResumeActor 成功，返回 worker 分配作为 placement
     end
     P-->>R: SandboxHandle
@@ -447,10 +453,10 @@ sequenceDiagram
         R-->>D: HelloAck
     else cold_start，substrate 提供者
         R->>P: Provision(run_id, generation, attempt_id, lease_id)
-        P->>L: CreateActor 登记挂起态 actor
-        L-->>P: sandbox_id, actor UID
-        P->>P: 按 actor 名写入引导记录，claimed=false，落地该代出口策略
-        P->>L: ResumeActor 分配到剩余容量足够的 worker 并从模板快照恢复
+        P->>L: 运行实例的 actor 不处于挂起态时 RevertActor，按需改挂另一个模板槽位
+        L-->>P: actor 处于挂起态，下一次恢复为冷启动
+        P->>P: 记录 actor 承载的代与 sandbox_id，替换为该代出口策略，按 actor 名写入本代引导记录，claimed=false
+        P->>L: ResumeActor 分配到剩余容量足够的 worker，只恢复卷与 durableDir 并冷启动
         L-->>P: ResumeActor 成功，返回 worker 分配作为 placement
         P-->>R: SandboxHandle
         D->>P: 领取，请求体 {instance_key}
@@ -464,7 +470,7 @@ sequenceDiagram
     end
 ```
 
-时序图固定预配、冻结与恢复的消息顺序：预配先保存出口策略并绑定工作区，`Provision` 在取得沙箱实例身份之后写入引导记录，substrate 子模块在激活 actor 之前写入并在出口策略落地之后激活，k8s 子模块在观察到 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试；k8s 子模块的 `Claim` 在认领之后依次写 Pod 注解、经节点挂载代理绑定运行实例子目录、写入引导记录，再通知看守进程，冷启动 Pod 的运行实例子目录在卷发布时绑定；看守进程携带实例公钥领取，引导接口先登记实例公钥指纹再签发令牌组，看守进程以持有证明首次续约成功后建立出站流，收到 `Challenge` 并按其 `server_now` 校时，再发送携带 `instance_key` 与 `holder_proof` 的 `Hello`，`HelloAck` 之后握手完成；提供者不等待领取与 `Hello`。冻结先由提供者执行 `Freeze{cgroup}`，解冻返回后由 `runcontroller` 经出站流发送协议消息 `Thaw{freeze_id}`；恢复按提供者分流，substrate 子模块的 `MEMORY` 快照恢复经路由器 `/wake` 恢复同一 actor 并等待 `/readyz`，沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变，看守进程不重新领取，恢复后的顺序为先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试，期间不建立传输）、续约成功后重建出站流、收到 `Challenge` 并按 `server_now` 再校时、发送 `Hello`，首次续约成功后才发 `Hello` 的规则对初次领取与快照恢复相同；快照与 worker 运行时不兼容且没有兼容 worker 时降级为 `ROOTFS` 冷启动，进程内存与令牌丢失；substrate 子模块的销毁态重建只走 `cold_start`，`Provision` 以 `ResumeActor` 把新 actor 分配到剩余容量足够的 worker 并从模板快照恢复，actor 模板尚无模板快照时冷启动；k8s 子模块解冻、把 Sandbox CR 改回 `Running` 或认领预热 Pod，看守进程领取后连接。substrate 子模块快照恢复的 `/wake` 返回即表示出站流已重建；k8s 预热认领经 wake-router 调用 `/wake` 只作通知，`/wake` 失败由看守进程的退避领取兜底；k8s 路径的事件驱动恢复由控制面直调提供者，不经入站路由。每步之后的持久化结果见走查。
+时序图固定预配、冻结与恢复的消息顺序：预配先保存出口策略并绑定工作区，`Provision` 在取得沙箱实例身份之后写入引导记录，substrate 子模块在激活 actor 之前写入并在出口策略落地之后激活，k8s 子模块在观察到 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试；k8s 子模块的 `Claim` 在认领之后依次写 Pod 注解、经节点挂载代理绑定运行实例子目录、写入引导记录，再通知看守进程，冷启动 Pod 的运行实例子目录在卷发布时绑定；看守进程携带实例公钥领取，引导接口先登记实例公钥指纹再签发令牌组，看守进程以持有证明首次续约成功后建立出站流，收到 `Challenge` 并按其 `server_now` 校时，再发送携带 `instance_key` 与 `holder_proof` 的 `Hello`，`HelloAck` 之后握手完成；提供者不等待领取与 `Hello`。冻结先由提供者执行 `Freeze{cgroup}`，解冻返回后由 `runcontroller` 经出站流发送协议消息 `Thaw{freeze_id}`；恢复按提供者分流，substrate 子模块的 `MEMORY` 快照恢复经路由器 `/wake` 恢复同一 actor 并等待 `/readyz`，沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变，看守进程不重新领取，恢复后的顺序为先调用 `RenewLease`（时窗不符时按返回的服务端时刻校时后重试，连续被拒时按可重试错误退避重试，期间不建立传输）、续约成功后重建出站流、收到 `Challenge` 并按 `server_now` 再校时、发送 `Hello`，首次续约成功后才发 `Hello` 的规则对初次领取与快照恢复相同；快照与 worker 运行时不兼容且没有兼容 worker 时降级为 `ROOTFS` 冷启动，进程内存与令牌丢失；substrate 子模块的销毁态重建只走 `cold_start`，不新建 actor：`Provision` 先结束 actor 上遗留的沙箱并按需切换[模板槽位](design-sandboxprovider-substrate.md#术语表)，再替换出口策略、写入本代引导记录，以 `ResumeActor` 把运行实例的 actor 分配到剩余容量足够的 worker 并冷启动；k8s 子模块解冻、把 Sandbox CR 改回 `Running` 或认领预热 Pod，看守进程领取后连接。substrate 子模块快照恢复的 `/wake` 返回即表示出站流已重建；k8s 预热认领经 wake-router 调用 `/wake` 只作通知，`/wake` 失败由看守进程的退避领取兜底；k8s 路径的事件驱动恢复由控制面直调提供者，不经入站路由。每步之后的持久化结果见走查。
 
 ### 能力集合与机制映射图
 
@@ -511,7 +517,7 @@ flowchart LR
     SUB -.-> EI
 ```
 
-能力集合与挂起机制都是闭合集合。`Freeze{cgroup}` 与 `Freeze{signal}` 都映射到冻结，`Freeze{cgroup}` 与 `InPlaceResize` 组合映射到冻结加原地缩小；`Freeze{signal}` 只允许短冻结，不能与原地缩小组合；`Snapshot` 映射到快照；`Destroy` 映射到销毁重建，销毁重建的恢复路径是 `cold_start`，由 `Provision` 新建沙箱。`WarmPool` 不产生新的挂起机制，它为销毁重建增加 `warm_claim` 路径，池空时退化为 `cold_start`；`EgressInject` 也不产生挂起机制，它只影响出口策略的落地方式。k8s 提供者声明冻结、销毁、原地缩小与预热池；Substrate 提供者声明快照、销毁与出口注入，不声明预热池，`Provision` 新建的 actor 从模板快照恢复，快照与 worker 运行时不兼容时降级为 `ROOTFS` 冷启动。缺失的能力由 `suspendpolicy` 降级，图中不画不可选的机制。`InPlaceResize` 的结果不跨 Pod 重建保留：重建出的新代 Pod 以创建时的原始 CPU request 运行，缩小只作用于冻结中的 `freeze_id` 所属的 Pod，不重放到新 Pod。
+能力集合与挂起机制都是闭合集合。`Freeze{cgroup}` 与 `Freeze{signal}` 都映射到冻结，`Freeze{cgroup}` 与 `InPlaceResize` 组合映射到冻结加原地缩小；`Freeze{signal}` 只允许短冻结，不能与原地缩小组合；`Snapshot` 映射到快照；`Destroy` 映射到销毁重建，销毁重建的恢复路径是 `cold_start`，由 `Provision` 为新的一代建立沙箱实例。`WarmPool` 不产生新的挂起机制，它为销毁重建增加 `warm_claim` 路径，池空时退化为 `cold_start`；`EgressInject` 也不产生挂起机制，它只影响出口策略的落地方式。k8s 提供者声明冻结、销毁、原地缩小与预热池；Substrate 提供者声明快照、销毁与出口注入，不声明预热池，每个运行实例只用一个 actor，`Provision` 首代从模板快照恢复，此后每代是该 actor 的一次冷启动，快照与 worker 运行时不兼容时降级为 `ROOTFS` 冷启动。缺失的能力由 `suspendpolicy` 降级，图中不画不可选的机制。`InPlaceResize` 的结果不跨 Pod 重建保留：重建出的新代 Pod 以创建时的原始 CPU request 运行，缩小只作用于冻结中的 `freeze_id` 所属的 Pod，不重放到新 Pod。
 
 ## 核心数据结构
 
@@ -527,7 +533,7 @@ flowchart LR
 | `running` | 沙箱实例存在并可执行 | 等待冻结、快照、销毁或查询 | 房间在使用中 |
 | `frozen` | Agent 子 cgroup 已冻结，内存保留 | 重复 `Freeze` 返回首次 `FreezeReceipt` 且不重复写 cgroup；解冻之后到达的冻结与缩小由冻结墓碑拒绝 | 房间灯关了，家具原位 |
 | `snapshotted` | 内存已持久化，快照有保留期限 | 保存快照标识与到期时刻，等待恢复或销毁 | 房间拍照存档，房间清空 |
-| `destroyed` | 沙箱实例已删除，运行实例级资源保留 | 保留创建墓碑，拒绝该代及更早代的创建 | 房间退租，仓库里还留着柜子 |
+| `destroyed` | 该代沙箱实例已结束（k8s 删除 Pod，Substrate 挂起或退回 actor 并切换模板槽位），运行实例级资源保留 | 保留创建墓碑，拒绝该代及更早代的创建 | 房间退租，仓库里还留着柜子 |
 | `released` | 运行实例级资源已释放 | 保留释放墓碑，拒绝该运行实例的一切创建 | 仓库清空，钥匙收回 |
 
 状态转移由提供者操作驱动：`creating` 成功后进入 `running`；`Freeze{cgroup}` 使 `running` 进入 `frozen`，`Thaw` 使其回到 `running`；`Snapshot` 使 `running` 进入 `snapshotted`；`frozen` 先经 `Thaw` 回到 `running` 才能快照；快照恢复经 `creating` 回到 `running`；整代销毁使当前状态进入 `destroyed`；`ReleaseRun` 使 `destroyed` 进入 `released`。`destroyed` 之后的创建只允许更大的代，同一代与更早代由创建墓碑拒绝；`released` 是运行实例级资源的终态。
@@ -541,7 +547,7 @@ flowchart LR
 | `Snapshot` | 持久化沙箱内存并释放资源，恢复在同一代内进行 | 不具备 | 具备 | 回合中冻结到上限后由 `suspendpolicy` 选择 `DRAIN`；长等待释放内存只能走回合边界销毁重建 |
 | `Destroy` | 按代销毁与按运行实例释放，携带墓碑 | 具备 | 具备 | 无法销毁重建；k8s 子模块与 substrate 子模块都具备该能力 |
 | `InPlaceResize` | 冻结后缩小 CPU request，恢复时放大；不缩内存 request | 具备（启动自检通过时） | 不具备 | 冻结只释放 CPU 用量，不释放调度额度；恢复不涉及放大 |
-| `WarmPool` | 预创建可认领的沙箱，缩短销毁重建的恢复时延 | 具备 | 不具备；`Provision` 新建的 actor 从模板快照恢复，actor 模板尚无模板快照或快照与运行时不兼容时冷启动 | 销毁重建只走 `cold_start`，由 `Provision` 新建沙箱，受冷启动并发上限约束；`Claim` 以参数非法拒绝 |
+| `WarmPool` | 预创建可认领的沙箱，缩短销毁重建的恢复时延 | 具备 | 不具备；`Provision` 首代从模板快照恢复，此后每代冷启动运行实例的 actor | 销毁重建只走 `cold_start`，由 `Provision` 建立新一代的沙箱实例，受冷启动并发上限约束；`Claim` 以参数非法拒绝 |
 | `EgressInject` | 提供者按运行实例落地允许主机与请求头凭据占位符替换 | 不具备 | 具备 | k8s 路径由 `connectorhub` 的平台出口代理做占位符替换与逐请求代校验，提供者只落地代理配置与 NetworkPolicy |
 
 能力集合是闭合集合，`suspendpolicy` 不得选择提供者未声明支持的机制。`Freeze{signal}` 只允许短冻结；`FREEZE_SHRINK` 只与 `Freeze{cgroup}` 和 `InPlaceResize` 组合。`WarmPool` 与 `EgressInject` 不是挂起机制，不出现在挂起机制闭集中。
@@ -564,14 +570,14 @@ flowchart LR
 
 ### 引导记录的写入与删除
 
-引导记录的写入与删除时机穷举如下；领取在 `claimed` 为假时把它置真并写 `claimed_at` 与 `instance_jkt`，规则见[引导接口](#引导接口)。引导记录只在该沙箱实例身份尚无记录时插入；`Provision` 与 `Claim` 的重驱动、重复调用与迟到调用遇到已存在的记录时不改写，任何路径都不把 `claimed` 由真改回假。看守进程领取之后 Agent 进程已在运行，记录若被改回未领取，Agent 进程可经引导接口再次领取到运行实例令牌。快照恢复沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变；看守进程不重新领取。
+引导记录的写入与删除时机穷举如下；领取在 `claimed` 为假时把它置真并写 `claimed_at` 与 `instance_jkt`，规则见[引导接口](#引导接口)。引导记录只在该沙箱实例身份尚无本代记录时写入；`Provision` 与 `Claim` 的重驱动、重复调用与迟到调用遇到已存在的本代记录时不改写，任何路径都不把同一代记录的 `claimed` 由真改回假。看守进程领取之后 Agent 进程已在运行，记录若被改回未领取，Agent 进程可经引导接口再次领取到运行实例令牌。substrate 子模块的沙箱实例身份是 actor 名，跨代不变：新一代的 `Provision` 在上一代沙箱实例结束之后才以本代记录替换上一代的记录，此时上一代的 Agent 进程已不存在。快照恢复沿用原沙箱实例及其引导记录，不写入新的引导记录，`sandbox_id` 与代保持不变；看守进程不重新领取。
 
 | 操作 | 动作与时机 | 写入时的 `claimed` |
 | --- | --- | --- |
-| `Provision` | substrate 子模块在激活 actor 之前写入；k8s 子模块在 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试 | 假 |
+| `Provision` | substrate 子模块在结束上一代沙箱实例之后、激活 actor 之前写入，替换上一代仍在的记录；k8s 子模块在 Pod 创建之后按 Pod UID 写入，写入之前看守进程的领取得到 404 并退避重试 | 假 |
 | `Claim` | k8s 子模块在认领、写 Pod 注解并经节点挂载代理绑定运行实例子目录成功之后，经 `/wake` 通知看守进程之前按认领 Pod 的 UID 写入 | 假 |
-| `Destroy(run_id, generation)` | 写入创建墓碑之后删除该代的引导记录 | — |
-| `DestroySandbox(generation, sandbox_id)` | 删除该沙箱实例的引导记录 | — |
+| `Destroy(run_id, generation)` | 写入创建墓碑之后删除该代的引导记录；substrate 子模块只删除仍属于该代的记录 | — |
+| `DestroySandbox(generation, sandbox_id)` | 删除该沙箱实例的引导记录；substrate 子模块只删除仍属于该代的记录 | — |
 | `ReleaseRun(run_id)` | 写入释放墓碑之后删除该运行实例的引导记录 | — |
 
 ### 墓碑与保留
@@ -608,22 +614,22 @@ flowchart LR
 1. `runcontroller` 读取 `Capabilities`，把能力集合作为上下文传给 `suspendpolicy.decide` 与 `review`。
 2. `suspendpolicy` 只在能力集合允许的机制中返回一个机制；没有可用机制时返回不挂起。机制闭集为不挂起、冻结、冻结加原地缩小、快照、销毁重建。
 3. `runcontroller` 把机制映射为提供者调用：不挂起不调用；冻结调用 `Freeze{cgroup}`，或在只有 `Freeze{signal}` 时由看守进程执行短冻结；冻结加原地缩小先调用 `Freeze{cgroup}`，再以同一 `freeze_id` 调用 `Shrink`；快照调用 `Snapshot`；销毁重建先经看守进程的安全点检查，再调用 `Destroy`。
-4. 能力缺失时 `suspendpolicy` 选择降级机制：substrate 子模块在回合中只有不挂起与快照，回合边界可销毁重建；k8s 子模块在回合中冻结到上限后选择 `DRAIN`，回合边界可销毁重建；没有 `InPlaceResize` 时冻结只释放 CPU 用量；没有 `WarmPool` 时销毁重建的 `resume_mode` 只取 `cold_start`，`runcontroller` 调用 `Provision`，substrate 子模块的 `Provision` 从模板快照恢复新 actor；没有 `EgressInject` 时出口路径由平台出口代理与 NetworkPolicy 承担。
+4. 能力缺失时 `suspendpolicy` 选择降级机制：substrate 子模块在回合中只有不挂起与快照，回合边界可销毁重建；k8s 子模块在回合中冻结到上限后选择 `DRAIN`，回合边界可销毁重建；没有 `InPlaceResize` 时冻结只释放 CPU 用量；没有 `WarmPool` 时销毁重建的 `resume_mode` 只取 `cold_start`，`runcontroller` 调用 `Provision`，substrate 子模块的 `Provision` 冷启动运行实例的 actor；没有 `EgressInject` 时出口路径由平台出口代理与 NetworkPolicy 承担。
 5. `WarmPool` 与 `EgressInject` 不进入 `decide` 的机制选择：`WarmPool` 影响恢复路径，`EgressInject` 影响出口路径。把能力集合之外的机制传给提供者属于调用方缺陷，提供者以参数非法拒绝。
 
 ### 子模块共性与差异
 
 | 维度 | k8s 子模块 | substrate 子模块 |
 | --- | --- | --- |
-| 底座 | agent-sandbox 的 Sandbox、SandboxClaim 与 SandboxWarmPool | Substrate actor 模板、模板快照与 WorkerPool；actor 由 `CreateActor` 登记，`ResumeActor` 把它分配到剩余容量足够的 worker |
+| 底座 | agent-sandbox 的 Sandbox、SandboxClaim 与 SandboxWarmPool | Substrate actor 模板槽位、模板快照与 WorkerPool；每个运行实例一个 actor，由首代的 `CreateActor` 登记、`ReleaseRun` 删除，`ResumeActor` 每次激活时把它分配到剩余容量足够的 worker |
 | 能力集合 | `Freeze{cgroup}`、`Freeze{signal}`、`Destroy`、`WarmPool`、`InPlaceResize` | `Snapshot`、`Destroy`、`EgressInject` |
 | 冻结执行 | 节点冻结代理对 Agent 子 cgroup 执行，看守进程留在父 cgroup；`Freeze{signal}` 由看守进程执行 | 不具备冻结能力 |
-| 恢复触发 | 解冻、Sandbox CR 改回 `Running` 或认领预热池；冻结态的看守进程自行重连，新建或认领的 Pod 中看守进程先领取再连接 | 快照恢复经路由器 `/wake` 恢复 actor，请求停泊到 `/readyz` 就绪；停泊预算只约束新的恢复重试，客户端被持有的上限是预算加 5 s；销毁态重建由 `Provision` 新建 actor 并从模板快照恢复，actor 模板尚无模板快照或快照与运行时不兼容时冷启动，看守进程先领取再连接 |
-| 引导认证与触发 | 投射 ServiceAccount 令牌，`TokenReview` 校验后按 Pod UID 查引导记录；预热认领经 wake-router 调用 `/wake` 通知领取 | 出口网关注入的 actor JWT，经 OIDC 发现验签后按 actor 名查引导记录并核对 actor UID；新 actor 被 `wakeupProbe` 探测时看守进程读到 `actor-name` 变化即领取一次，actor 处于 `RESUMING` 时出口已放行，领取可以在 `ResumeActor` 返回之前成功；`MEMORY` 快照恢复的 actor 名不变，不重新领取 |
-| 工作区 | 共享文件系统为默认，块存储为退化配置；挂载根只在节点上，预热 Pod 只带空的工作区挂载点，认领时由节点挂载代理绑定运行实例子目录 | 外部 CSI 卷优先，`durableDir` 为退化配置；外部 CSI 卷在 actor 分配到 worker 时挂载；退化配置下回合边界销毁使用同步挂起 |
+| 恢复触发 | 解冻、Sandbox CR 改回 `Running` 或认领预热池；冻结态的看守进程自行重连，新建或认领的 Pod 中看守进程先领取再连接 | 快照恢复经路由器 `/wake` 恢复 actor，请求停泊到 `/readyz` 就绪；停泊预算只约束新的恢复重试，客户端被持有的上限是预算加 5 s；销毁态重建由 `Provision` 冷启动同一 actor，只恢复卷与 `durableDir`，看守进程从头启动，先领取再连接 |
+| 引导认证与触发 | 投射 ServiceAccount 令牌，`TokenReview` 校验后按 Pod UID 查引导记录；预热认领经 wake-router 调用 `/wake` 通知领取 | 出口网关注入的 actor JWT，经 OIDC 发现验签后按 actor 名查引导记录并核对 actor UID，记录保存 actor 当前承载的代；首代从模板快照恢复，被 `wakeupProbe` 探测时看守进程读到 `actor-name` 变化即领取一次，此后各代冷启动的看守进程启动即领取，actor 处于 `RESUMING` 时出口已放行，领取可以在 `ResumeActor` 返回之前成功；`MEMORY` 快照恢复的 actor 名不变，不重新领取 |
+| 工作区 | 共享文件系统为默认，块存储为退化配置；挂载根只在节点上，预热 Pod 只带空的工作区挂载点，认领时由节点挂载代理绑定运行实例子目录 | 外部 CSI 卷优先，`durableDir` 为退化配置，两者随运行实例的 actor 跨代保留；外部 CSI 卷在 actor 分配到 worker 时挂载；`durableDir` 随回合边界销毁的同步挂起上传 |
 | 出口 | 平台出口代理配置加 NetworkPolicy；NetworkPolicy 只放行到面向沙箱的端点的 TCP，Pod 内按 uid 的出站规则使非 root uid 只到回环；平台出口代理逐请求校验代，按代撤销为空操作 | EgressPolicy 以 MITM 与 `replaceHeaders` 落地，`PlaintextHosts` 只落地 `http` 规则，面向沙箱的端点主机以 `tls_passthrough` 透传；按 uid 的出站收敛、非 TCP 限制与 DNS 中继不递归为部署前提；按代撤销即墓碑，新请求最多再滞后一个策略缓存 TTL |
-| 快照 | 不具备 | 内存快照，恢复在同一代内进行；恢复的是同一 actor，actor 名、actor UID 与 `sandbox_id` 不变，可能换到另一个 worker；恢复后先续约租约（时窗不符时按返回的服务端时刻校时），再重建出站流并以 `Challenge.server_now` 再校时，并清理旧连接 |
-| 预热 | SandboxWarmPool 与 SandboxClaim；认领过的 Pod 不回收复用 | 不具备 `WarmPool`，没有可认领的 actor；计算容量由 WorkerPool 中的[预热 worker](design-sandboxprovider-substrate.md#术语表)提供，新建 actor 从模板快照恢复 |
+| 快照 | 不具备 | 内存快照，恢复在同一代内进行；恢复的是同一 actor，不改挂模板，actor 名、actor UID 与 `sandbox_id` 不变，可能换到另一个 worker；恢复后先续约租约（时窗不符时按返回的服务端时刻校时），再重建出站流并以 `Challenge.server_now` 再校时，并清理旧连接 |
+| 预热 | SandboxWarmPool 与 SandboxClaim；认领过的 Pod 不回收复用 | 不具备 `WarmPool`，没有可认领的 actor；计算容量由 WorkerPool 中的[预热 worker](design-sandboxprovider-substrate.md#术语表)提供，首代从模板快照恢复 |
 
 共性：k8s 子模块与 substrate 子模块实现同一 `Provider` 接口，共用看守进程、协议与控制面，遵循同一套墓碑、幂等与按代销毁语义，共用引导接口的领取语义，接受同一出口策略推送与工作区绑定抽象。差异留在各自子模块：k8s 的 Sandbox CR、节点冻结代理、节点挂载代理、原地缩放、沙箱 Pod 安全基线、NetworkPolicy、投射 ServiceAccount 令牌与 wake-router 见 [k8s 子模块](design-sandboxprovider-k8s.md)；substrate 的 actor 模板、Suspend 与 Resume、路由器唤醒、EgressPolicy、actor JWT、`systemInfo` 卷与 credential provider 见 [substrate 子模块](design-sandboxprovider-substrate.md)。
 
@@ -632,9 +638,9 @@ flowchart LR
 1. `runcontroller` 在效果记录提交后调用 `Provision` 或 `Claim`，请求携带 `run_id`、`generation`、`attempt_id`、`lease_id` 与工作区绑定；`attempt_id` 取 `resume_id`。`Claim` 只在 `resume_mode` 为 `warm_claim` 时调用，`suspendpolicy` 只对具备 `WarmPool` 的提供者返回该取值；不具备 `WarmPool` 的提供者收到 `Claim` 时以参数非法拒绝。请求不携带运行实例令牌，令牌在看守进程经引导接口领取时签发（见[引导接口](#引导接口)）。
 2. 提供者先检查创建墓碑：代不大于该运行实例最近整代销毁的代，或释放墓碑已存在时，返回确定性拒绝，不创建沙箱。
 3. 提供者调用 `workspace` 绑定工作区，取得挂载路径、`RunUID`、`StorageMode`、`Durability` 与 `Placement`；`lease_id` 取自请求，工作区租约归 `workspace`；提供者把绑定交给沙箱，k8s 共享文件系统模式下沙箱内只出现该运行实例的子目录，由节点挂载代理在卷发布时或认领时绑定。
-4. 提供者创建沙箱或认领预热池，并写入 `claimed` 为假的引导记录（`lease_id` 取自请求）。`Provision` 由 substrate 子模块以 `(run_id, generation, attempt_id)` 派生的 actor 名经 `CreateActor` 登记挂起态 actor，在激活之前写入引导记录，激活时 `ResumeActor` 把 actor 分配到剩余容量足够的 worker 并从模板快照恢复，actor 模板尚无模板快照时冷启动，快照与 worker 运行时不兼容时降级为 `ROOTFS` 冷启动；本子模块不传 `sourceTag`，初始快照由 actor 模板决定；没有 worker 有余量时 `ResumeActor` 返回 `RESOURCE_EXHAUSTED`，`Provision` 返回暂时性错误，调用方按同一幂等键退避重试。由 k8s 子模块创建 Sandbox CR 或把其 `operatingMode` 改回 `Running`，Pod UID 由 API server 在创建时分配，k8s 子模块在观察到 Pod 创建之后按其 UID 写入引导记录，写入之前看守进程的领取得到 404 并退避重试，Agent 主进程在领取成功之前不启动；冷启动 Pod 的工作区卷由节点挂载代理在卷发布时执行 `Ensure` 并直接发布运行实例子目录。`Claim` 由 k8s 子模块发起 SandboxClaim，认领顺序固定为：写 Pod 注解 `castworks.io/run-id` 与 `castworks.io/run-uid`，调用节点挂载代理 `BindWorkspace` 把运行实例子目录绑定挂载进该 Pod，绑定成功后按认领 Pod 的 UID 写入引导记录，再经 wake-router 调用该 Pod 的 `/wake` 通知看守进程领取，不等待其返回，`/wake` 失败由看守进程的退避领取兜底；绑定失败时不写引导记录，`Claim` 按同一幂等键重试；substrate 子模块在出口策略副本落地之后激活 actor，领取的触发见 [substrate 子模块](design-sandboxprovider-substrate.md)。
+4. 提供者创建沙箱或认领预热池，并写入 `claimed` 为假的引导记录（`lease_id` 取自请求）。`Provision` 由 substrate 子模块执行时，每个运行实例只用一个 actor：首代以 `run_id` 派生的 actor 名经 `CreateActor` 登记挂起态 actor，此后各代先结束 actor 上遗留的沙箱并按需切换模板槽位；在激活之前写入本代引导记录，激活时 `ResumeActor` 把 actor 分配到剩余容量足够的 worker，首代从模板快照恢复（actor 模板尚无模板快照时冷启动），此后各代冷启动，快照与 worker 运行时不兼容时降级为 `ROOTFS` 冷启动；本子模块不传 `sourceTag`，初始快照由 actor 模板决定；没有 worker 有余量时 `ResumeActor` 返回 `RESOURCE_EXHAUSTED`，`Provision` 返回暂时性错误，调用方按同一幂等键退避重试。由 k8s 子模块创建 Sandbox CR 或把其 `operatingMode` 改回 `Running`，Pod UID 由 API server 在创建时分配，k8s 子模块在观察到 Pod 创建之后按其 UID 写入引导记录，写入之前看守进程的领取得到 404 并退避重试，Agent 主进程在领取成功之前不启动；冷启动 Pod 的工作区卷由节点挂载代理在卷发布时执行 `Ensure` 并直接发布运行实例子目录。`Claim` 由 k8s 子模块发起 SandboxClaim，认领顺序固定为：写 Pod 注解 `castworks.io/run-id` 与 `castworks.io/run-uid`，调用节点挂载代理 `BindWorkspace` 把运行实例子目录绑定挂载进该 Pod，绑定成功后按认领 Pod 的 UID 写入引导记录，再经 wake-router 调用该 Pod 的 `/wake` 通知看守进程领取，不等待其返回，`/wake` 失败由看守进程的退避领取兜底；绑定失败时不写引导记录，`Claim` 按同一幂等键重试；substrate 子模块在出口策略副本落地之后激活 actor，领取的触发见 [substrate 子模块](design-sandboxprovider-substrate.md)。
 5. 提供者在 `(run_id, generation)` 上落地出口策略副本；该代已被撤销时跳过落地，已撤销的代拒绝此后的落地与更新。
-6. k8s 子模块在创建或认领之前持久化以 `(run_id, generation, attempt_id)` 为键的占有记录，或把该键标注到预热 Pod 上使认领可按同一键重放，重驱动识别已认领的 Pod 而不重复认领；substrate 子模块按派生的 actor 名幂等创建 actor，重驱动遇到同名 actor 时取回已创建的 actor，不重复创建。重驱动遇到已存在的引导记录时不改写。完成后补全 `OperationRecord` 并返回 `SandboxHandle`；看守进程随后领取、首次续约并发送 `Hello`，`runcontroller` 在 `Hello` 通过校验后完成预配。提供者不等待领取与 `Hello`，也不把二者作为预配成功的前提。
+6. k8s 子模块在创建或认领之前持久化以 `(run_id, generation, attempt_id)` 为键的占有记录，或把该键标注到预热 Pod 上使认领可按同一键重放，重驱动识别已认领的 Pod 而不重复认领；substrate 子模块按派生的 actor 名幂等创建 actor，重驱动遇到同名 actor 时取回已创建的 actor，不重复创建，并按持久化的 actor 当前代判定哪些步骤已完成。重驱动遇到已存在的本代引导记录时不改写。完成后补全 `OperationRecord` 并返回 `SandboxHandle`；看守进程随后领取、首次续约并发送 `Hello`，`runcontroller` 在 `Hello` 通过校验后完成预配。提供者不等待领取与 `Hello`，也不把二者作为预配成功的前提。
 7. 同一 `(run_id, generation, attempt_id)` 的重复调用返回首次结果；响应丢失后的重驱动不会创建重复沙箱。认领的预热 Pod 在认领之后不回收复用；k8s 预热 Pod 只带空的工作区挂载点，认领时绑定运行实例子目录。
 
 ### 冻结与解冻
@@ -661,19 +667,19 @@ flowchart LR
 
 恢复按提供者分述如下；`runcontroller` 按 `resume_mode` 选择调用，`sandboxprovider` 不决定恢复方式。
 
-- **substrate 子模块**：`runcontroller` 按 `resume_mode` 只调用 `RestoreSnapshot` 或 `Provision`：`snapshot_restore` 由 `resume` 效果调用 `RestoreSnapshot`，`cold_start` 由 `provision` 效果调用 `Provision`；substrate 子模块不具备 `WarmPool`，`suspendpolicy` 对销毁态返回 `cold_start`。快照恢复经 Substrate 路由器以 `ate-target-actor: <atespace>/<actor>` 头调用 `/wake`，路由器恢复同一 actor 并停泊请求到 `/readyz` 就绪，actor 名与 actor UID 不变，可能换到另一个 worker；停泊预算只约束新的恢复重试，客户端被持有的上限是预算加 5 s；`/wake` 返回即表示看守进程的出站流已重建。销毁态重建由 `Provision` 以派生的 actor 名登记挂起态 actor，写入引导记录并落地出口策略副本之后以 `ResumeActor` 激活，Substrate 把 actor 分配到剩余容量足够的 worker 并从模板快照恢复，快照与运行时不兼容时降级为 `ROOTFS` 冷启动；看守进程随后领取并发送 `Hello`。快照恢复与重建在没有 worker 有余量时得到 `RESOURCE_EXHAUSTED`，`RestoreSnapshot` 与 `Provision` 返回暂时性错误，调用方按同一幂等键退避重试，不改走其他恢复路径。`CRASHED` actor 由 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败，先 `RevertActor` 再重试。调用方必须持有 SPIFFE 身份且在路由器的入站白名单内；`parked-request-budget` 按冷恢复时延调大，并同时设置 `drain-timeout` 与 `terminationGracePeriodSeconds`。
+- **substrate 子模块**：`runcontroller` 按 `resume_mode` 只调用 `RestoreSnapshot` 或 `Provision`：`snapshot_restore` 由 `resume` 效果调用 `RestoreSnapshot`，`cold_start` 由 `provision` 效果调用 `Provision`；substrate 子模块不具备 `WarmPool`，`suspendpolicy` 对销毁态返回 `cold_start`。快照恢复经 Substrate 路由器以 `ate-target-actor: <atespace>/<actor>` 头调用 `/wake`，路由器恢复同一 actor 并停泊请求到 `/readyz` 就绪，actor 名与 actor UID 不变，可能换到另一个 worker；停泊预算只约束新的恢复重试，客户端被持有的上限是预算加 5 s；`/wake` 返回即表示看守进程的出站流已重建。销毁态重建由 `Provision` 冷启动运行实例的 actor：结束 actor 上遗留的沙箱并按需切换模板槽位，替换出口策略副本、写入本代引导记录之后以 `ResumeActor` 激活，Substrate 把 actor 分配到剩余容量足够的 worker，只恢复卷与 `durableDir`，容器冷启动；看守进程随后领取并发送 `Hello`，Agent 以 `claude -p --resume` 续接。快照恢复与重建在没有 worker 有余量时得到 `RESOURCE_EXHAUSTED`，`RestoreSnapshot` 与 `Provision` 返回暂时性错误，调用方按同一幂等键退避重试，不改走其他恢复路径。`CRASHED` actor 由 `ResumeActor` 返回 `FAILED_PRECONDITION`，路由器立即以 503 失败；快照恢复只在 `durableDir` 承载工作区时先 `RevertActor` 再重试，外部 CSI 卷承载工作区时转重建，由下一代冷启动承接（见 [substrate 子模块](design-sandboxprovider-substrate.md)）。调用方必须持有 SPIFFE 身份且在路由器的入站白名单内；`parked-request-budget` 按冷恢复时延调大，并同时设置 `drain-timeout` 与 `terminationGracePeriodSeconds`。
 - **k8s 子模块，冻结态**：`runcontroller` 调用 `Thaw`，节点冻结代理清除 `agent/cgroup.freeze`；看守进程不重新创建，出站流保持或重连。
 - **k8s 子模块，销毁态**：`runcontroller` 调用 `Provision` 新建沙箱、把 Sandbox CR 的 `operatingMode` 改回 `Running`，或调用 `Claim` 从预热池认领；看守进程领取后连接并发送新代 `Hello`。预热认领时提供者经 wake-router 调用该 Pod 的 `/wake` 通知看守进程立即领取，不等待其返回。事件驱动的恢复由控制面直调提供者；wake-router 服务 `humanchannel` 发起的 `/terminal` 与 `workspace` 发起的 `/files`，并只为预热认领转发本模块发出的 `/wake`，不承载事件投递。
 - 解冻以 `Thawed` 为完成观察；快照恢复与销毁态重建以同代或新代 `Hello` 为完成观察；恢复准入的放行由 `runcontroller` 与 `suspendpolicy` 完成，提供者只执行调用并返回确认或确定性错误。`EstimateResume` 返回提供者侧的恢复时延估计，`runcontroller` 把它与排队位置一起用于 `AdmissionState.EstimatedResume`。
 
 ### 按代销毁、墓碑与幂等
 
-1. **整代销毁**：`Destroy(run_id, generation)` 删除该代的沙箱实例。k8s 子模块把 Sandbox CR 的 `operatingMode` 置为 `Suspended`，删除 Pod、保留 PVC 与 Service；substrate 子模块在 `durableDir` 退化配置下的回合边界销毁中先同步挂起 actor，其余整代销毁直接删除 actor。提供者在返回删除确认之前写入创建墓碑，拒绝该代及更早代的 `Provision`、`Claim` 与 `RestoreSnapshot`；删除确认携带被删除的代，证明该代此后不再出现沙箱实例。整代销毁在写入创建墓碑之后删除该代的引导记录。
+1. **整代销毁**：`Destroy(run_id, generation, suspend_id)` 结束该代的沙箱实例。k8s 子模块把 Sandbox CR 的 `operatingMode` 置为 `Suspended`，删除 Pod、保留 PVC 与 Service；substrate 子模块不删除 actor：携带 `suspend_id` 的以挂起为目的的销毁同步挂起 actor，其余整代销毁在 actor 运行中或崩溃时以 `RevertActor` 终止，随后都切换模板槽位，使 actor 的下一次恢复只能是冷启动；actor 已承载更新的代时不触动 actor。提供者在返回删除确认之前写入创建墓碑，拒绝该代及更早代的 `Provision`、`Claim` 与 `RestoreSnapshot`；删除确认携带被删除的代，证明该代此后不再出现沙箱实例。整代销毁在写入创建墓碑之后删除该代的引导记录。
 2. **单个销毁**：`DestroySandbox(generation, sandbox_id)` 只删除该代的指定沙箱实例，携带代，不删除更新的代；它用于完成事务校验失败后的清理、对账器按列举结果回收，以及 `sandbox_id` 核对不符的单个销毁。单个销毁删除该沙箱实例的引导记录，不写入该代的创建墓碑，因为它不证明该代不再出现沙箱实例。
-3. **按运行实例释放**：`ReleaseRun(run_id)` 删除运行实例级资源，k8s 子模块删除 Sandbox CR、Service 与 PVC，substrate 子模块释放 actor 相关资源；释放幂等，释放之前写入释放墓碑，释放之后拒绝该运行实例的一切创建，含沙箱、运行实例级资源与出口策略；释放在写入释放墓碑之后删除该运行实例的引导记录。
+3. **按运行实例释放**：`ReleaseRun(run_id)` 删除运行实例级资源，k8s 子模块删除 Sandbox CR、Service 与 PVC，substrate 子模块删除运行实例的 actor，其外部 CSI 卷与保存 `durableDir` 的快照随之删除；释放幂等，释放之前写入释放墓碑，释放之后拒绝该运行实例的一切创建，含沙箱、运行实例级资源与出口策略；释放在写入释放墓碑之后删除该运行实例的引导记录。
 4. **正确性不依赖到达顺序**：整代销毁与单个销毁都携带代，只作用于该代的沙箱实例，不作用于更新的代；新代沙箱不会被迟到执行的旧代销毁删除。整代销毁之后的迟到预配被创建墓碑拒绝；释放之后的迟到预配被释放墓碑拒绝；出口策略撤销之后的迟到落地与更新被撤销墓碑拒绝。
 5. **幂等**：同一 `(run_id, generation)` 的整代销毁返回首次确认；同一 `(generation, sandbox_id)` 的单个销毁重复执行返回成功；同一 `run_id` 的释放重复执行返回成功；同一 `freeze_id` 的解冻、同一 `suspend_id` 的快照撤销重复执行不产生第二次副作用。提供者按到达顺序串行执行同一运行实例的调用，重复调用返回首次结果。
-6. **创建墓碑与工作区租约**：整代销毁的删除确认携带的代等于工作区租约所属的代时，可作为 `workspace` 接管租约的 `proof`；创建墓碑保证删除确认之后该代不再出现沙箱实例，因而该证明成立。`DestroySandbox` 的单个沙箱删除确认不写创建墓碑，不证明该代不再出现沙箱实例，因而不构成 `proof`。
+6. **创建墓碑与工作区租约**：整代销毁的删除确认携带的代等于工作区租约所属的代时，可作为 `workspace` 接管租约的 `proof`；创建墓碑保证删除确认之后该代不再出现沙箱实例，因而该证明成立。substrate 子模块上这一保证另依赖 actor 同一时刻只有一个沙箱，以及切换模板槽位之后 actor 的恢复只能是冷启动，冷启动的看守进程领取不到已销毁代的引导记录。`DestroySandbox` 的单个沙箱删除确认不写创建墓碑，不证明该代不再出现沙箱实例，因而不构成 `proof`。
 
 ### 预热池容量与分片
 
@@ -694,16 +700,16 @@ substrate 子模块不具备 `WarmPool`，不维护预热池分片记录。Worke
 | 预热池认领 | 准入放行，认领，写 Pod 注解与工作区子目录绑定挂载，看守进程领取与 `Hello`，重投 | 小于 10 s | 共享文件系统；Agent 二进制与依赖缓存在镜像内；启动期外联快速失败；池非空 |
 | 冷启动 | 准入放行，放置与资源挂接，沙箱启动，工作区挂载，看守进程启动与 `Hello`，重投 | 共享文件系统小于 20 s；块存储小于 60 s | k8s 子模块；共享文件系统；块存储退化配置有节点或可用区亲和 |
 
-substrate 子模块的 `cold_start` 由 `Provision` 以 `CreateActor` 登记 actor、以 `ResumeActor` 分配 worker 并从模板快照恢复，组成步骤为准入放行、actor 登记、worker 分配与模板快照恢复、看守进程领取与 `Hello`、重投；上表冷启动行的前提不适用于它，`EstimateResume` 对它返回模板快照恢复的时延，actor 模板尚无模板快照时返回冷启动时延，快照降级为 `ROOTFS` 冷启动时也按冷启动时延返回。
+substrate 子模块的 `cold_start` 由 `Provision` 冷启动运行实例的 actor，组成步骤为准入放行、按需退回 actor 与切换模板槽位、worker 分配与卷挂接、容器冷启动、看守进程领取与 `Hello`、`claude -p --resume` 续接、重投；首代以 `CreateActor` 登记 actor 并从模板快照恢复。上表冷启动行的前提不适用于它，`EstimateResume` 对它返回同一 actor 冷启动的时延，快照降级为 `ROOTFS` 冷启动时也按冷启动时延返回；该时延列入[技术验证](../../../milestone/verification.md)。
 
 ### 出口策略落地与按代撤销
 
 1. `connectorhub` 经 `PutEgressPolicy` 推送每运行实例出口策略；`sandboxprovider` 按 `run_id` 保存，策略内容不解释。
 2. 预配与认领时，提供者按 `(run_id, generation)` 生成本代副本并落地；快照恢复沿用同代副本；推送的更新只同步到尚未撤销的代。
-3. substrate 子模块把副本落地为 EgressPolicy：`PlaintextHosts` 中的主机落地为 `http` 规则并带其注入规则，其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` 规则并显式列出端口；`https` 规则以 MITM 与 `replaceHeaders` 替换请求头凭据占位符，默认拒绝未列入的主机；规则上限 256 条，单条规则主机上限 256，`replaceHeaders` 上限 16；出口网关按策略缓存 TTL（默认 10 s）生效。落地时另行追加不属于 `connectorhub` 策略内容的规则：引导接口主机的 `actorJwt` 注入规则，以及只列面向沙箱的端点主机名（`stream`、`lease`、`llm`、`connector`、`human`）的 `tls_passthrough` 规则，控制面内部监听器的主机名不进入任何规则（actor 除 DNS 之外的全部 TCP 出口都经出口网关，非 TCP 出站受到限制，属于部署前提）；actor 经 `systemInfo` 卷的 `trustBundle` 数据源取得出口网关 CA，CA 不预置进镜像，凭据来源为按 `ate-secret://` URI 的 host 路由的 credential provider，可以配置多个提供者。
+3. substrate 子模块把副本落地为 actor 唯一的 EgressPolicy，每代预配在上一代沙箱实例结束之后以本代副本替换它，撤销只在它仍承载该代副本时删除：`PlaintextHosts` 中的主机落地为 `http` 规则并带其注入规则，其余有注入规则的主机只落地 `https` 规则，无注入规则的主机落地 `tls_passthrough` 规则并显式列出端口；`https` 规则以 MITM 与 `replaceHeaders` 替换请求头凭据占位符，默认拒绝未列入的主机；规则上限 256 条，单条规则主机上限 256，`replaceHeaders` 上限 16；出口网关按策略缓存 TTL（默认 10 s）生效。落地时另行追加不属于 `connectorhub` 策略内容的规则：引导接口主机的 `actorJwt` 注入规则，以及只列面向沙箱的端点主机名（`stream`、`lease`、`llm`、`connector`、`human`）的 `tls_passthrough` 规则，控制面内部监听器的主机名不进入任何规则（actor 除 DNS 之外的全部 TCP 出口都经出口网关，非 TCP 出站受到限制，属于部署前提）；actor 经 `systemInfo` 卷的 `trustBundle` 数据源取得出口网关 CA，CA 不预置进镜像，凭据来源为按 `ate-secret://` URI 的 host 路由的 credential provider，可以配置多个提供者。
 4. k8s 子模块落地平台出口代理配置与 NetworkPolicy；NetworkPolicy 对全部协议默认拒绝出口，只放行到面向沙箱的端点地址与端口的 TCP，不放行集群 DNS、节点冻结代理与节点挂载代理；平台出口代理对每个出口请求按附带的运行实例令牌经代查询接口校验代、终态与作废状态，不使用缓存；按代撤销为空操作。
 5. `RevokeEgressPolicy(run_id, generation)` 写入撤销墓碑并返回；已撤销的代拒绝此后的落地与更新。撤销由 `runcontroller` 在代递增、进入 `Degraded`、放弃、显式结束、本代沙箱作废与回合边界销毁的提供者确认的事务内写入 `revoke_egress` 效果，提供者在效果执行时撤销。
-6. 撤销在效果记录的截止之前生效时，残余窗口不超过该截止；截止前未能生效时，例如 Substrate 控制面不可达，窗口延续到撤销生效或该代沙箱删除完成。k8s 路径的逐请求代校验不依赖撤销，按代撤销为空操作。
+6. 撤销在效果记录的截止之前生效时，残余窗口不超过该截止；截止前未能生效时，例如 Substrate 控制面不可达，窗口延续到撤销生效或该代沙箱销毁完成。k8s 路径的逐请求代校验不依赖撤销，按代撤销为空操作。
 
 ### 串行化与幂等
 
@@ -735,7 +741,7 @@ substrate 子模块的 `cold_start` 由 `Provision` 以 `CreateActor` 登记 act
 | 原地放大进入 `Deferred` | 解冻与放大并行；`Deferred` 超过阈值且处于回合边界时销毁重建迁移，回合中以低权重继续运行 |
 | `ReleaseRun` 之后的迟到预配 | 释放墓碑拒绝；不创建沙箱或运行实例级资源 |
 | 预配已创建沙箱但响应丢失 | 重驱动返回首次 `SandboxHandle`；完成事务校验失败时 `runcontroller` 写单个销毁，遗留沙箱由列举结果回收 |
-| 出口策略撤销在截止前未生效 | 残余窗口延续到撤销生效或该代沙箱删除完成；调用方按效果截止告警，不用缓存的代放行 |
+| 出口策略撤销在截止前未生效 | 残余窗口延续到撤销生效或该代沙箱销毁完成；调用方按效果截止告警，不用缓存的代放行 |
 | 提供者能力缺失 | `suspendpolicy` 不选择该机制；调用方仍传入能力之外的机制，或向不具备 `WarmPool` 的提供者调用 `Claim` 时，提供者以参数非法拒绝 |
 | 领取被拒绝或失败 | 按[引导接口](#引导接口)的错误码处置 |
 | 领取已提交但响应丢失 | 看守进程的重试得到 409，停止领取且不启动 Agent 主进程；`runcontroller` 按沙箱丢失以新代重建 |

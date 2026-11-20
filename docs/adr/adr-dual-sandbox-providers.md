@@ -2,7 +2,7 @@
 
 ## 背景
 
-没有单一沙箱提供者同时覆盖冻结与快照：k8s 提供者基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../references.md)），可以冻结、销毁、使用预热池与原地缩小 CPU request（[REF-k8s-in-place-pod-resize](../references.md)），但不能快照。Substrate 提供者（[REF-substrate](../references.md)）可以快照、销毁与落地出口策略，新建 actor 从[模板快照](../glossary.md)恢复，但没有轻量冻结。
+没有单一沙箱提供者同时覆盖冻结与快照：k8s 提供者基于 kubernetes-sigs/agent-sandbox（[REF-agent-sandbox](../references.md)），可以冻结、销毁、使用预热池与原地缩小 CPU request（[REF-k8s-in-place-pod-resize](../references.md)），但不能快照。Substrate 提供者（[REF-substrate](../references.md)）可以快照、销毁与落地出口策略，每个运行实例只用一个 actor，首代从[模板快照](../glossary.md)恢复，此后每代是该 actor 的一次冷启动（[ADR-substrate-actor-per-run](adr-substrate-actor-per-run.md)），但没有轻量冻结。
 
 系统的恢复时延与资源利用率目标需要冻结与快照两类挂起机制：短等待用冻结，恢复时延在百毫秒级且保留进程状态；长等待用快照，释放内存且保留进程状态。回合边界用销毁重建，释放全部资源。只有其中一类机制时，另一类等待只能选择代价更高的路径。
 
@@ -28,7 +28,7 @@ Substrate 发布 v1.0.0，1.0.0 起的 patch 与 minor 版本相互兼容，跨�
 
 ## 决策
 
-采用两个沙箱提供者并存：k8s 提供者覆盖冻结、销毁、预热池与原地缩小 CPU request，Substrate 提供者覆盖快照、销毁与出口策略，新建 actor 从模板快照恢复。两个提供者共用看守进程、协议与控制面，挂起策略按提供者能力分层（[ADR-capability-tiered-suspension](adr-capability-tiered-suspension.md)）。
+采用两个沙箱提供者并存：k8s 提供者覆盖冻结、销毁、预热池与原地缩小 CPU request，Substrate 提供者覆盖快照、销毁与出口策略，每个运行实例只用一个 actor，每代是它的一次冷启动。两个提供者共用看守进程、协议与控制面，挂起策略按提供者能力分层（[ADR-capability-tiered-suspension](adr-capability-tiered-suspension.md)）。
 
 ## 后果
 

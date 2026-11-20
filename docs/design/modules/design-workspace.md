@@ -6,14 +6,14 @@
 
 ## 核心概念
 
-工作区租约是每个运行实例在控制面唯一的一行租约记录，也是工作区写权限的唯一依据。工作区跨代挂载进每一[代](../../glossary.md)沙箱，挂载本身不阻止多个沙箱同时写入；运行实例重建时，旧代与新代的沙箱可能短暂并存。只有持有租约的看守进程可以写；续约、接管与释放都以租约行的条件更新判定，持有者不匹配、租约已释放或已到期时写入被拒绝。租约同时规定换手条件：新代接管必须等旧租约到期，或等[沙箱提供者](../../glossary.md)确认旧沙箱已删除，使“旧代已不再运行”成为可判定的事实，而不是重建路径上的假设。
+工作区租约是每个运行实例在控制面唯一的一行租约记录，也是工作区写权限的唯一依据。工作区跨代挂载进每一[代](../../glossary.md)沙箱，挂载本身不阻止多个沙箱同时写入；运行实例重建时，旧代与新代的沙箱可能短暂并存。只有持有租约的看守进程可以写；续约、接管与释放都以租约行的条件更新判定，持有者不匹配、租约已释放或已到期时写入被拒绝。租约同时规定换手条件：新代接管必须等旧租约到期，或等[沙箱提供者](../../glossary.md)确认旧代沙箱已销毁（k8s 删除 Pod；Substrate 结束该代在 actor 上的沙箱实例，并使 actor 的下一次恢复只能是冷启动），使“旧代已不再运行”成为可判定的事实，而不是重建路径上的假设。
 
 ## 职责
 
 `workspace` 是工作区绑定、持久化确认、沙箱外访问与工作区租约的唯一所有者。职责穷举如下，每条先写本模块执行的动作，再写产生的结果或边界；具体接口、字段与失败处置见后续章节。
 
 - **建立工作区绑定**：在首次预配前为运行实例选择存储模式，分配全局唯一且固定的运行实例 uid，确定各代逐字一致的挂载路径与每运行实例配额，写入绑定记录；绑定在运行实例生命周期内稳定，同一 `run_id` 不能重绑定，换存储模式需要新的运行实例与新的绑定。
-- **选择存储模式与退化**：k8s 提供者优先使用 RWX 共享文件系统，块存储为退化配置；Substrate 提供者优先使用每 actor 一卷的外部 CSI 卷（[REF-substrate](../../references.md)），`durableDir` 为退化配置；退化在绑定时决定，不在运行中静默切换持久化语义（[ADR-workspace-persistence-per-provider](../../adr/adr-workspace-persistence-per-provider.md)）。
+- **选择存储模式与退化**：k8s 提供者优先使用 RWX 共享文件系统，块存储为退化配置；Substrate 提供者优先使用运行实例所属 actor 的外部 CSI 卷（[REF-substrate](../../references.md)），`durableDir` 为退化配置，两者随该 actor 跨代保留，每个运行实例只用一个 actor（[ADR-substrate-actor-per-run](../../adr/adr-substrate-actor-per-run.md)）；退化在绑定时决定，不在运行中静默切换持久化语义（[ADR-workspace-persistence-per-provider](../../adr/adr-workspace-persistence-per-provider.md)）。
 - **维护工作区租约**：以 `CreateLease` 建立首代租约，以 `TakeoverLease` 在旧租约到期或删除确认到达时把租约交给新代，以 `SetHolderKey` 登记领取沙箱实例的[实例密钥](../../glossary.md)公钥指纹，以 `RenewLease` 接受看守进程附[持有证明](../../glossary.md)的周期续约并绑定持有者，以 `HoldLease` 在[快照](../../glossary.md)期间延长到期时刻并清空持有者，以 `ReleaseLease` 释放当前代租约，以 `ReleaseRunLease` 释放租约并留下墓碑。
 - **拒绝非持有者写入**：以租约的 `lease_id`、代与 `holder` 为 CAS 条件，并以 `holder_jkt` 核对续约的持有证明，使同一运行实例在同一时刻只有一个可写沙箱；持有者不匹配、持有证明无效、租约已释放或已到期时拒绝续约与文件写入（[ADR-generation-fencing](../../adr/adr-generation-fencing.md)、[ADR-run-token-audience-and-holder-binding](../../adr/adr-run-token-audience-and-holder-binding.md)）。
 - **确认持久化**：在销毁沙箱前按持久化语义执行持久化确认；`sync` 等待工作区写入的 fsync 完成，`on_suspend` 等待同步挂起的对象存储上传完成；确认失败时不产生可销毁的结论。
@@ -45,7 +45,7 @@
 | 绑定 | binding | workspace | 运行实例到存储模式、卷或导出标识、挂载路径、运行实例 uid、配额与持久化语义的映射，跨代稳定 |
 | 存储模式 | storage mode | workspace | 工作区承载方式的闭集：`shared_fs`、`block`、`external_csi`、`durable_dir` |
 | 沙箱外访问 | out-of-sandbox access | workspace | 沙箱不运行或人在平台界面时对工作区文件的访问，由 `humanchannel` 以接入票据调用本模块，按存储模式读取导出或经入站路由到达看守进程的文件 API |
-| 删除确认 | delete confirmation | workspace | 沙箱提供者整代销毁某一代沙箱后返回的确认（`sandboxprovider` 的 `DestroyReceipt`），携带 `run_id` 与被删除的代；作为接管 `proof` 时其 `run_id` 必须等于租约的 `run_id`，其代必须等于租约所属的代；`DestroySandbox` 的单个沙箱删除确认不构成 `proof` |
+| 删除确认 | delete confirmation | workspace | 沙箱提供者整代销毁某一代沙箱后返回的确认（`sandboxprovider` 的 `DestroyReceipt`），携带 `run_id` 与被删除的代；Substrate 提供者不删除 actor，确认的是该代的沙箱实例已结束；作为接管 `proof` 时其 `run_id` 必须等于租约的 `run_id`，其代必须等于租约所属的代；`DestroySandbox` 的单个沙箱删除确认不构成 `proof` |
 | 释放墓碑 | release tombstone | workspace | `ReleaseRunLease` 留下的运行实例级标记，此后拒绝该 `run_id` 的一切租约创建与接管 |
 
 ## 外部接口契约
@@ -274,7 +274,7 @@ type ReadCapability struct {
 }
 ```
 
-- `Capability` 报告绑定的读取能力：`external_csi` 的导出在可直接读取时 `Direct` 为真；`shared_fs` 只挂载在沙箱节点池、控制面没有该挂载，`block` 为 RWO 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级读取接口，三者的 `Direct` 均为假。`Direct` 为假时 `RequiresFileAttach` 为真。
+- `Capability` 报告绑定的读取能力：`external_csi` 的导出在可直接读取时 `Direct` 为真，导出随 actor 存在，`ReleaseRun` 删除 actor 之后不再可读；`shared_fs` 只挂载在沙箱节点池、控制面没有该挂载，`block` 为 RWO 在沙箱挂接期间不能由控制面同时读取，`durable_dir` 没有存储级读取接口，三者的 `Direct` 均为假。`Direct` 为假时 `RequiresFileAttach` 为真。
 - `humanchannel` 在调用前校验用户身份、项目归属与[项目角色](../../glossary.md)，写入 `file` 接入事实并取得接入票据；本模块校验运行实例、代与绑定的归属，不信任调用方传入的路径根。读取方法（`List`、`Read`、`Stream`）要求 `Ticket` 非空并原样转发。
 - 直接读取沿用文件 API 的路径解析：以运行实例子目录为根逐段解析，拒绝 `..`、绝对路径与指向根外的符号链接，越界返回 `ErrPathOutsideWorkspace`。读取在 `Direct` 为真且沙箱无需参与时直接读取存储导出；其余情形经沙箱提供者的入站路由转发到当前代看守进程的文件 API，必要时唤醒沙箱。写入不走直接导出；`ToolExec` 的文件写只由控制面循环驱动器使用，在租约持有者内执行。
 - 接入票据由 `humanchannel` 经 `secrets.IssueAccessTicket` 签发，`workspace` 不持有签名密钥，只原样转发；经看守进程的读取由看守进程验签，直接读取的授权由唯一调用方 `humanchannel` 的 SPIFFE 身份与其在调用前完成的项目角色判定保证（[ADR-user-facing-authorization](../../adr/adr-user-facing-authorization.md)）。
@@ -287,7 +287,7 @@ type ReadCapability struct {
 - **PostgreSQL**：保存绑定记录、租约行与释放墓碑；租约的建立、接管、续约、持有者清空与释放都在数据库事务内以条件 UPDATE 完成。
 - **RWX 共享文件系统**：k8s 提供者的默认工作区承载，例如 CephFS、JuiceFS、NFS 或 EFS 类。挂载根只由[节点挂载代理](../../glossary.md)在节点上挂载，不进入任何沙箱 Pod 与预热 Pod；Pod 以 CSI 内联临时卷 `castworks-workspace` 挂载工作区挂载路径（`Binding.MountPath`，各代逐字一致），`mountPropagation: HostToContainer`。预热池与认领由 SandboxWarmPool 与 SandboxClaim 承担（[REF-agent-sandbox](../../references.md)）。
 - **RWO 块存储**：k8s 提供者的退化配置，有节点或可用区亲和，不能预绑定预热池；挂接与强制分离需要等待，重建时延高于共享文件系统。
-- **Substrate actor 卷**：actor 只接受 `durableDir`、`external`、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷。`external` 即外部 CSI 卷，每 actor 一卷；`durableDir` 在挂起时上传对象存储。
+- **Substrate actor 卷**：actor 只接受 `durableDir`、`external`、`image` 与 `systemInfo` 卷，不能直挂 PVC 或透传 worker Pod 的卷。`external` 即外部 CSI 卷，每 actor 一卷；`durableDir` 保存在 actor 的快照里，在挂起时上传对象存储。两者都与 actor 同寿命，删除 actor 时随之删除；每个运行实例只用一个 actor，工作区因而跨代保留。
 - **对象存储**：承载 `durableDir` 的上传数据；同步挂起上传完成后，工作区才可被判定为持久化。
 - **沙箱提供者的入站路由**：运行时把沙箱外文件访问转发到当前代看守进程的文件 API；k8s 路径为 `wake-router`，Substrate 路径为路由器。本模块不区分路由实现。
 - **看守进程**：文件 API 在沙箱侧执行，`ToolExec` 的文件写由控制面循环驱动器经出站流发起、在沙箱侧执行；`fsync` 确认由看守进程执行，`on_suspend` 确认在销毁路径执行。看守进程还承担周期续约与 `LeaseLost` 上报，本模块只维护租约本身。
@@ -341,9 +341,9 @@ flowchart TB
         rwo[("RWO 块存储，退化<br/>节点或可用区亲和")]
     end
     subgraph sub["Substrate 提供者"]
-        actor["actor<br/>看守进程为 PID 1"]
+        actor["运行实例的 actor<br/>看守进程为 PID 1，跨代存续"]
         srouter["Substrate 路由器"]
-        csi[("外部 CSI 卷<br/>每 actor 一卷")]
+        csi[("外部 CSI 卷<br/>每 actor 一卷，与 actor 同寿命")]
         obj[("对象存储<br/>durableDir 上传")]
     end
     ws --> pg
@@ -362,7 +362,7 @@ flowchart TB
     srouter -->|"/files，携带接入票据，必要时唤醒"| actor
 ```
 
-k8s 路径上，共享文件系统的挂载根只由节点挂载代理挂载；预热 Pod 在创建时获得空白挂载点，认领时 `sandboxprovider` 调用 `NodeMountAgent.BindWorkspace(ctx, BindTarget{PodUID, RunID, Generation, RunUID, QuotaBytes})`，该接口只接受 `sandboxprovider`；代理执行 `Ensure` 并把 `<挂载根>/<run_id>` 绑定挂载到 Pod 的卷发布目录，经传播出现在容器内；冷启动 Pod 在 `NodePublishVolume` 时执行 `Ensure` 并直接把子目录发布到卷，效果与 `subPath` 相同。块存储退化配置不能预绑定预热池，绑定必须携带节点或可用区亲和。Substrate 路径上，外部 CSI 卷由提供者以每 actor 一卷的方式挂载，内容不进快照、`Revert` 不回滚；`durableDir` 没有存储级导出，挂起时上传对象存储，沙箱外读取必须经路由器唤醒 actor 后到达文件 API。控制面对 k8s 与 Substrate 路径的文件访问按存储模式经存储导出或沙箱提供者的入站路由，不直接访问 Pod 或 actor 内部。
+k8s 路径上，共享文件系统的挂载根只由节点挂载代理挂载；预热 Pod 在创建时获得空白挂载点，认领时 `sandboxprovider` 调用 `NodeMountAgent.BindWorkspace(ctx, BindTarget{PodUID, RunID, Generation, RunUID, QuotaBytes})`，该接口只接受 `sandboxprovider`；代理执行 `Ensure` 并把 `<挂载根>/<run_id>` 绑定挂载到 Pod 的卷发布目录，经传播出现在容器内；冷启动 Pod 在 `NodePublishVolume` 时执行 `Ensure` 并直接把子目录发布到卷，效果与 `subPath` 相同。块存储退化配置不能预绑定预热池，绑定必须携带节点或可用区亲和。Substrate 路径上，每个运行实例只用一个 actor，外部 CSI 卷由提供者以每 actor 一卷的方式挂载，与 actor 同寿命，各代冷启动挂上的是同一卷，内容不进快照、`RevertActor` 不回滚；`durableDir` 保存在 actor 的快照里，没有存储级导出，挂起时上传对象存储，沙箱外读取必须经恢复准入唤醒运行实例后到达文件 API。控制面对 k8s 与 Substrate 路径的文件访问按存储模式经存储导出或沙箱提供者的入站路由，不直接访问 Pod 或 actor 内部。
 
 ### 文件 API 时序图
 
@@ -444,15 +444,15 @@ sequenceDiagram
 
 第 5 步的替代路径：旧租约已到期时 `proof` 可为空；旧租约未到期且 `proof` 为空、不是整代销毁的删除确认或代不匹配时返回 `NotBefore=expires_at`，调用方等待到期后重试，不产生新租约。第 4 步先释放再接管不是必需顺序：第 1 代整代销毁的删除确认也可以直接作为第 5 步的 `proof`，任一顺序都要求 `proof` 的代为租约所属的代。
 
-Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之后：快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)`，持久化结果为 `holder=null`、`holder_jkt=jkt-1`、`expires_at=now+2T_lease`；快照恢复沿用同一沙箱，看守进程以首次续约 `RenewLease(L1, 1, sb-1, proof)` 重新绑定 `holder=sb-1`，续约成功之后才重建出站流并发 `Hello`。k8s 提供者不具备快照能力，不经过这两步；第 2 步起的租约步骤在两个提供者上相同，第 1 步的存储模式按提供者选择，见[绑定与存储模式选择](#绑定与存储模式选择)。
+Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之后：快照前 `HoldLease(R, L1, 1, until=now+2T_lease, holder=sb-1)`，持久化结果为 `holder=null`、`holder_jkt=jkt-1`、`expires_at=now+2T_lease`；快照恢复沿用同一沙箱，看守进程以首次续约 `RenewLease(L1, 1, sb-1, proof)` 重新绑定 `holder=sb-1`，续约成功之后才重建出站流并发 `Hello`。k8s 提供者不具备快照能力，不经过这两步；第 2 步起的租约步骤在两个提供者上相同，第 1 步的存储模式按提供者选择，见[绑定与存储模式选择](#绑定与存储模式选择)。Substrate 上第 4 步的删除确认表示第 1 代在 actor 上的沙箱实例已结束，actor 已挂起并改挂另一个[模板槽位](sandboxprovider/design-sandboxprovider-substrate.md#术语表)；第 2 代是同一 actor 的冷启动，挂上的是同一工作区卷，绑定不变。
 
 ### 绑定与存储模式选择
 
 1. `Bind` 在数据库事务内解析项目策略、选择存储模式、分配 `run_uid` 并写入绑定；`Ensure` 在挂载点就绪后以幂等方式创建运行实例子目录，已存在时校验所有者、权限与配额，不重复创建。k8s 共享文件系统模式下 `Ensure` 由节点挂载代理在发布卷或绑定认领时执行，其余模式由看守进程执行。绑定接口不创建卷，卷或导出由 `sandboxprovider` 提供。
 2. k8s 提供者优先选择 `shared_fs`：共享文件系统无卷挂接步骤、无节点亲和，预热 Pod 在创建时获得空白挂载点，认领时节点挂载代理执行 `Ensure` 并把运行实例子目录绑定挂载进去。`shared_fs` 不可用时选择 `block`，绑定携带节点或可用区亲和；块存储不能预绑定预热池，认领与重建都受挂接等待约束。
-3. Substrate 提供者优先选择 `external_csi`：每 actor 一卷，写穿持久、崩溃不丢，内容不进快照、`Revert` 不回滚；外部 CSI 不可用时选择 `durable_dir`，持久化语义变为 `on_suspend`，绑定时即写入，运行中不切换。
+3. Substrate 提供者优先选择 `external_csi`：卷属于运行实例唯一的 actor，写穿持久、崩溃不丢，内容不进快照、`RevertActor` 不回滚，跨代保留，只在 `ReleaseRun` 删除 actor 时删除；外部 CSI 不可用时选择 `durable_dir`，持久化语义变为 `on_suspend`，绑定时即写入，运行中不切换。
 4. 存储模式在绑定时固定。已绑定 `external_csi` 的运行实例在运行中遇到 CSI 不可用时，提供者错误向上返回，`sandboxprovider` 的预配或恢复按自身规则失败；本模块不静默退化为 `durable_dir`，因为退化会改变持久化语义与安全点的判定。
-5. 退化配置的补偿由绑定携带：`durable_dir` 的回合边界销毁一律使用同步挂起，上传完成才返回；回合中崩溃按“回合被中断”重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失。
+5. 退化配置的补偿由绑定携带：`durable_dir` 的工作区以回合边界销毁的同步挂起上传完成并经 `Confirm(suspend_upload)` 确认为持久化；回合中崩溃按“回合被中断”重投事件，已接受的事件带 `redelivery=true`，该回合的文件改动可能丢失。
 
 ### 工作区租约的建立、续约与接管
 
@@ -492,7 +492,7 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 | 镜像约束 | 镜像内没有 sudo 与 setuid 二进制；Agent 二进制与依赖缓存放在镜像内，不放共享文件系统 |
 | 目录权限 | 运行实例子目录 0700；挂载根 0711，防止其他运行实例枚举 |
 | 配额 | 每运行实例子目录设置配额，写满时返回配额错误，不删除已有文件 |
-| 共享文件系统属主 | `no_root_squash` 只为节点挂载代理以 root 创建运行实例子目录所需；非共享文件系统路径可由看守进程 `seteuid` 后以运行实例 uid 创建目录；两者都不满足时绑定探测失败 |
+| 共享文件系统属主 | `no_root_squash` 只为节点挂载代理以 root 创建运行实例子目录所需；非共享文件系统路径可由看守进程 `seteuid` 后以运行实例 uid 创建目录；Substrate 外部 CSI 卷由 NFS CSI 驱动创建的卷根为 root:root 0755，须以 StorageClass 的 `mountPermissions` 或 chown 使看守进程能建立属于运行实例 uid 的子目录；都不满足时绑定探测失败 |
 | 预热 Pod | 认领过的预热 Pod 不回收复用；每个运行实例获得独立的运行实例子目录 |
 | 可选加固 | `hostUsers: false`：仅在共享文件系统支持 idmapped mount 时启用；不改变按运行实例绑定子目录的基线 |
 | 租户模型 | 单组织内部平台；多租户时改为每租户一个预热池与挂载根，不在本模块内实现 |
@@ -590,7 +590,7 @@ Substrate 提供者的运行实例在快照时多出两步，位于第 3 步之�
 | k8s 共享文件系统 RWX | 未实现 | — |
 | k8s 块存储退化 | 未实现 | — |
 | Substrate 外部 CSI 卷 | 未实现 | — |
-| Substrate `durableDir` 与同步挂起补偿 | 未实现 | — |
+| Substrate `durableDir` 与上传确认 | 未实现 | — |
 | 工作区租约的建立、续约与接管 | 未实现 | — |
 | 释放与运行实例墓碑 | 未实现 | — |
 | 持久化确认与 `durability` 报告 | 未实现 | — |

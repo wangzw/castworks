@@ -6,7 +6,7 @@
 
 运行实例子目录的属主是该运行实例的 uid，权限为 0700；创建这样的子目录需要以 root 写共享文件系统，共享文件系统因此要求 `no_root_squash`。挂载根进入 Pod 时，跨运行实例的隔离只依赖运行实例 uid 与目录权限。容器内一旦取得 root（内核提权，或攻破以 root 运行并解析 Agent 可控输入的[看守进程](../glossary.md)），即可 `seteuid` 到任意运行实例 uid，读写全组织任一运行实例的工作区，包括会话记录、[投递意图日志](../glossary.md)与 Agent 配置。`root_squash` 只映射 uid 0，客户端上报的其他 uid 照样被信任，挡不住这一路径。
 
-Substrate 提供者的工作区卷按 actor 划分：外部 CSI 卷每 actor 一卷，`durableDir` 随 actor 保存；actor 内看不到其他运行实例的工作区。
+Substrate 提供者每个运行实例只用一个 actor（[ADR-substrate-actor-per-run](adr-substrate-actor-per-run.md)），工作区卷随 actor 划分：外部 CSI 卷每 actor 一卷，`durableDir` 随 actor 的快照保存；actor 内看不到其他运行实例的工作区。
 
 ## 考虑过的选项
 

@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | 运行实例 | Run | 一次 Agent 任务的执行实体；拥有工作区、收件箱、等待状态与当前代，生命周期跨越沙箱的多次创建与销毁 |
 | 运行实例创建者 | run creator | 发起创建某运行实例的平台用户，记录于 `run.created_by`；与运行实例所有者租约中的所有者（`runcontroller` 副本）无关 |
-| 沙箱 | Sandbox | 承载 Agent 进程的隔离计算实例（容器或 actor），生命周期短于运行实例 |
+| 沙箱 | Sandbox | 承载 Agent 进程的隔离计算实例，生命周期短于运行实例；k8s 提供者为 Pod；Substrate 提供者为运行实例的 actor 承载某一代的那次激活，actor 本身跨代存续 |
 | 工作区 | Workspace | 运行实例的持久化文件系统目录，在沙箱销毁与重建之间保留 |
 | 收件箱 | Inbox | 运行实例的追加写事件队列，只存放可投递给 Agent 的事件 |
 | 唤醒信号 | wake signal | 不进入收件箱的内部信号，用于满足阻塞条件与代范围的等待条件，例如 LLM 响应完成或失败、定时器触发；审批决定与订阅完成写入收件箱时，在同一事务内派生对应的唤醒信号 |
@@ -19,7 +19,7 @@
 | 回合 | Turn | Agent 从收到一条输入到停下等待下一条输入之间的工作段 |
 | 回合边界 | turn boundary | 回合结束、Agent 等待下一条输入的时刻；L1 与 L2 以挂起为目的销毁沙箱的唯一时点（L0 不以挂起为目的销毁） |
 | 自发回合 | spontaneous turn | 回合边界（`boundary` 阶段）上 Agent 未收到投递就自行开始的回合，由 `session_state_changed: running` 或 assistant 消息触发；`starting` 阶段 Agent 尚未启动，不产生自发回合；其 `turn_started` 的 `delivery_id` 为空 |
-| 安全点 | safe point | 回合边界上不变量 I9 的全部条件同时满足的时点；以挂起为目的的销毁只在此执行，条件由 `runcontroller` 预检、看守进程复核，任一条件不满足的回合边界不构成安全点 |
+| 安全点 | safe point | 回合边界上不变量 I9 的全部条件同时满足的时点；以挂起为目的的销毁只在此执行，条件由 `runcontroller` 预检、看守进程复核，`on_suspend` 持久化语义下的工作区持久化由销毁中的同步挂起完成并确认；任一条件不满足的回合边界不构成安全点 |
 | 回合位置 | turn position | 运行实例在回合中的位置，由 `run` 行的回合字段表达，跨挂起保留 |
 | 代 | generation | 运行实例每次预配沙箱时递增的单调计数 |
 | 代范围 | generation scope | 随代递增作废的等待与定时器范围；代范围条件只对登记它的一代有效 |
@@ -30,7 +30,7 @@
 | 静止冻结 | quiescent freeze | 没有单一等待条件可依（后台作业存活，或回合中多个 Agent 循环并发）时，依据静止证据执行的冻结。静止证据指没有任何 Agent 循环能在不依赖托管侧唤醒的情况下推进。冻结附带探测定时器，由本代 LLM 完成或失败、冻结期间的入站数据、探测定时器、自唤醒到期或冻结上限唤醒，不升级为快照或销毁 |
 | 快照 | snapshot | 把沙箱的内存与文件系统状态持久化后释放全部资源；反向操作为快照恢复 |
 | 模板快照 | golden snapshot | Substrate 的 actor 模板控制器以模板运行一个临时 actor，待 `wakeupProbe` 返回 200 后按模板的 `preferredFidelity` 制作的快照（每个容器都声明探针时跳过约 20 s 暖机）；新 actor 默认从它恢复，actor 模板尚无模板快照，或快照与 worker 运行时不兼容时，新 actor 冷启动或降级为 `ROOTFS` 冷启动（[REF-substrate](references.md)） |
-| 销毁重建 | destroy and recreate | 删除沙箱、保留工作区；恢复时新建沙箱并由 Agent 自身的会话恢复机制续接 |
+| 销毁重建 | destroy and recreate | 结束本代的沙箱实例、保留工作区（k8s 删除 Pod；Substrate 挂起或退回 actor，使其下一次恢复只能是冷启动）；恢复时以新一代沙箱实例承载，由 Agent 自身的会话恢复机制续接 |
 | 沙箱提供者 | SandboxProvider | 以能力集合自描述的沙箱生命周期实现，包括 k8s 提供者与 Substrate 提供者 |
 | 节点冻结代理 | node freeze agent | k8s 提供者中的特权 DaemonSet，对 Agent 子 cgroup（[REF-linux-cgroup-v2](references.md)）执行冻结与解冻 |
 | 节点挂载代理 | node mount agent | k8s 提供者中的特权 DaemonSet（CSI 节点插件），在节点上挂载工作区挂载根，为沙箱 Pod 与预热 Pod 提供工作区挂载点，创建运行实例子目录并设置属主与配额，再把该运行实例的子目录绑定挂载进 Pod；挂载根不进入任何 Pod |
@@ -75,8 +75,8 @@
 | 出口策略 | egress policy | 连接器为每个运行实例生成的允许出口主机集合与请求头凭据占位符替换规则，由沙箱提供者落地；未列入的主机默认拒绝 |
 | 出口代理 | egress proxy | 落地出口策略的托管侧代理，接收本地代理与透明拦截器转来的 Agent 流量，在发往允许主机时把凭据占位符替换为真实凭据；k8s 路径为 connectorhub 的平台出口代理，Substrate 路径为 Substrate 出口网关 |
 | 沙箱侧配置 | SandboxConfig | 由 `connectorhub` 生成、经 `runcontroller` 在出站流上推送给看守进程、由看守进程只读的配置，内容为各主机的网络通道、工具接入声明、该运行实例可用外部系统的等待签名以及情境提示与宿主侧分类的开关。该配置不含密钥，不经过 `sandboxprovider`；字段与语义由 `connectorhub` 定义，`runcontroller` 按运行实例保存并转发，不解释其字段 |
-| 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, holder_jkt, expires_at} 记录；`holder_jkt` 是领取时登记的实例公钥指纹，看守进程以首次续约绑定持有者并周期续约，续约须附持有证明，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期或沙箱提供者确认租约所属代的沙箱已删除后接管工作区 |
-| 持久化确认 | persistence confirmation | 在销毁沙箱前确认工作区写入已持久化的处理；`sync` 为 fsync 完成，`on_suspend` 为同步挂起上传完成 |
+| 工作区租约 | workspace lease | workspace 模块持有的 {run_id, generation, lease_id, holder, holder_jkt, expires_at} 记录；`holder_jkt` 是领取时登记的实例公钥指纹，看守进程以首次续约绑定持有者并周期续约，续约须附持有证明，续约失败即冻结或杀死 Agent 进程树；新代只在旧租约到期或沙箱提供者确认租约所属代的沙箱已销毁后接管工作区 |
+| 持久化确认 | persistence confirmation | 以挂起为目的的销毁完成之前确认工作区写入已持久化的处理；`sync` 为销毁前的 fsync 完成，`on_suspend` 为销毁中同步挂起的上传完成 |
 | 运行实例所有者租约 | run owner lease | `run` 行上的 `owner_id`、`owner_epoch` 与 `owner_lease_expires_at`，决定该运行实例状态机的写者 |
 | 实例密钥 | instance key | 看守进程在领取之前生成、私钥只保存在进程内存中的签名密钥对；公钥随领取请求提交，其指纹写入运行实例令牌的 `cnf.jkt` 与工作区租约的 `holder_jkt` |
 | 持有证明 | holder proof | 看守进程以实例密钥的私钥对用途、运行实例或租约标识、代、沙箱标识，以及 `Hello` 时控制面为该条出站流生成的一次性挑战随机数或 `RenewLease` 时的签名时刻所作的签名，随 `Hello` 与 `RenewLease` 提交；`Hello` 的持有证明不带时窗，`RenewLease` 的持有证明按时窗判定签名时刻。接收方据此确认调用方持有领取时登记的实例密钥 |

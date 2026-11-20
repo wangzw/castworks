@@ -570,7 +570,7 @@ LLM 等待的主信号是本地代理的 `llm.request.started`；驱动器不根
 8. 关闭 stdin，等待进程正常退出并取得退出码。
 9. 终止已声明的第三方 MCP 服务器进程（含其子进程），复核进程树中无剩余进程且外部在途连接计数为 0：`procs_remaining` 为 0。
 10. 核对会话记录 JSONL 末尾已含本回合；transcript 写入是异步的，退出后仍可能滞后，核对在退出码之后执行。
-11. 等待工作区持久化确认：共享文件系统为 fsync 完成；`durableDir` 退化配置下为同步挂起上传完成。
+11. 工作区持久化确认：`sync` 持久化语义（共享文件系统、块存储与外部 CSI 卷）下，驱动器关闭工作区写入并等待 `Confirm(fsync)` 完成；`on_suspend` 语义（`durableDir`）下不在本步等待，上传发生在 `ReadyToSuspend` 之后沙箱提供者的同步挂起中，由销毁路径以 `Confirm(suspend_upload)` 确认（见 [workspace](../design-workspace.md#持久化确认)）。
 
 第 4、5 步保证销毁不丢失 Agent 的运行态：后台任务与 `survives_resume=false` 的自唤醒条目（`wakeup`、`tool_timeout`、`monitor_deadline`）都只存在于当前进程，`--resume` 不恢复它们；`cron` 条目由 Claude Code 经 `--resume` 自行恢复，不阻止销毁。任一步不满足时运行实例只能冻结，冻结的条件由 `runcontroller` 与 `suspendpolicy` 判定。
 

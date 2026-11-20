@@ -128,4 +128,4 @@ AX 与 castworks 使用若干同形词，含义不同。按同形词计分会系
 | `Model` | LLM 网关与密钥库 | 部分：AX 只描述模型提供方与密钥引用，castworks 代理请求、换取凭据并跟踪在途请求 |
 | atespace | 项目与租户维度 | 部分：AX 是扁平命名空间，castworks 是数据模型维度 |
 | suspend / resume | 挂起 / 恢复 | 不同：AX 是快照加暂停，castworks 是冻结、快照与销毁重建的统称 |
-| actor | 沙箱 | 近似：AX 的 actor 是 Substrate 的执行单元，castworks 的沙箱是隔离计算实例 |
+| actor | 沙箱 | 近似：AX 的 actor 是 Substrate 的执行单元，castworks 的沙箱是隔离计算实例；castworks 的 Substrate 提供者每个运行实例只用一个 actor，每代沙箱是它的一次激活 |

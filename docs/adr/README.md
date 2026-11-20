@@ -63,6 +63,7 @@
 | --- |
 | [同时实现 k8s 与 Substrate 两个沙箱提供者](adr-dual-sandbox-providers.md) |
 | [冻结由节点冻结代理对 Agent 子 cgroup 执行](adr-freeze-via-node-agent.md) |
+| [Substrate 上每个运行实例只用一个 actor，每代是它的一次冷启动](adr-substrate-actor-per-run.md) |
 
 ## 挂起与恢复
 
