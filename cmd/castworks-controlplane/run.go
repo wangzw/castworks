@@ -30,8 +30,9 @@ const (
 	httpReadHeaderTimeout = 10 * time.Second
 )
 
-// 关闭顺序的记录点。顺序照接口清单：HTTP 服务端先停，controller.Run 随后
-// 返回，gRPC 服务端最后停，然后释放提供者与连接池。
+// 关闭顺序的记录点。HTTP 服务端先停，使新请求不再进入；controller.Run 随后
+// 返回，等在途的提供者调用结束；gRPC 服务端最后停，因为看守进程的流是长连接，
+// 必须等 controller 不再需要它；然后释放提供者与连接池。
 const (
 	shutdownStepHTTP       = "http"
 	shutdownStepController = "controller"
@@ -78,7 +79,7 @@ func run(ctx context.Context, args []string, ready func(httpAddr, grpcAddr strin
 	return runWithHooks(ctx, args, runHooks{ready: ready})
 }
 
-// runWithHooks 是 run 的实现。启动顺序与关闭顺序照计划“决定”一节：
+// runWithHooks 是 run 的实现。启动按下面的顺序进行：
 //
 //	解析并校验参数 -> 读凭据 -> 连库并 Ping -> Migrate -> 构造提供者 ->
 //	runcontroller.New -> humanchannel.NewHandler -> 监听 HTTP 与 gRPC ->
@@ -225,7 +226,7 @@ func releaseAfterStartupFailure(provider sandboxprovider.Provider) {
 }
 
 // serve 启动两个服务端与控制器，等到 ctx 结束或某个服务意外退出，然后按
-// 接口清单的顺序关闭全部资源。
+// shutdownStep 常量的顺序关闭全部资源。
 func serve(
 	ctx context.Context,
 	cfg *Config,
