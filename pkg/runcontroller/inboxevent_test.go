@@ -27,7 +27,7 @@ func testSubscriptionCompletion() *runcontroller.SubscriptionCompletion {
 		OccurredAt:         testEpoch.Add(3 * time.Minute),
 		Source:             "webhook",
 		Detail:             `{"result":"ok"}`,
-		DetailTruncated:    false,
+		DetailTruncated:    true,
 	}
 }
 
@@ -270,8 +270,12 @@ func TestAppendInboxDedup(t *testing.T) {
 		t.Fatalf("OccurredAt = %v, 想要 %v", decoded.OccurredAt, ev.Subscription.OccurredAt)
 	}
 	if decoded.SubID != ev.Subscription.SubID || decoded.Detail != ev.Subscription.Detail ||
+		decoded.DetailTruncated != ev.Subscription.DetailTruncated ||
 		decoded.Correlation["job_id"] != "job-42" {
 		t.Fatalf("payload 往返不一致: %+v", decoded)
+	}
+	if !decoded.DetailTruncated {
+		t.Fatal("payload 往返后 DetailTruncated = false, 想要 true")
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &fields); err != nil {
@@ -307,17 +311,17 @@ func TestAppendInboxDuplicateWhileSuspendedDoesNotResume(t *testing.T) {
 
 	h := newHarness(t, testConfig())
 	runID, _ := h.stepToBoundary()
+	ctx := context.Background()
+
+	// First suspension: the first write exercises a real wake-up.
 	h.clock.Advance(testConfig().IdleGrace + time.Second)
 	if err := runcontroller.TrySuspendNow(h.ctrl, runID); err != nil {
 		t.Fatalf("TrySuspendNow: %v", err)
 	}
 	h.waitState(runID, runcontroller.StateSuspended, runcontroller.SubstateSnapshotted)
 
-	release := h.provider.Hold(fakeprovider.OpRestore)
-	t.Cleanup(release)
-
 	ev := testSubscriptionEvent("dedup-suspended")
-	seq, duplicate, err := h.ctrl.AppendInbox(context.Background(), runID, ev)
+	seq, duplicate, err := h.ctrl.AppendInbox(ctx, runID, ev)
 	if err != nil {
 		t.Fatalf("首次 AppendInbox: %v", err)
 	}
@@ -325,9 +329,28 @@ func TestAppendInboxDuplicateWhileSuspendedDoesNotResume(t *testing.T) {
 		t.Fatal("首次 AppendInbox 返回 duplicate = true")
 	}
 	h.waitCalls(fakeprovider.OpRestore, 1)
+	h.waitRestoreReturned(runID)
 	h.waitState(runID, runcontroller.StateResuming, runcontroller.SubstateSnapshotted)
 
-	seq2, duplicate, err := h.ctrl.AppendInbox(context.Background(), runID, ev)
+	// The agent reconnects and confirms it already holds the new message, so
+	// the run returns to active/boundary without another delivery. Hello is
+	// valid only as the first frame of a stream, hence a fresh one.
+	helloStream := h.openStream()
+	send(t, helloStream, helloFrame(runID, agentprotocolv1.Phase_PHASE_BOUNDARY, "", seq, nil))
+	h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateBoundary)
+
+	// Suspend again. Here a write that skipped deduplication would transition
+	// suspended to resuming and call RestoreSnapshot, so the assertions below
+	// distinguish deduplication from the state machine's own no-op.
+	h.clock.Advance(testConfig().IdleGrace + time.Second)
+	if err := runcontroller.TrySuspendNow(h.ctrl, runID); err != nil {
+		t.Fatalf("第二次 TrySuspendNow: %v", err)
+	}
+	h.waitState(runID, runcontroller.StateSuspended, runcontroller.SubstateSnapshotted)
+
+	versionBefore, idleBefore := runRowVersionAndIdle(t, h.pool, runID)
+
+	seq2, duplicate, err := h.ctrl.AppendInbox(ctx, runID, ev)
 	if err != nil {
 		t.Fatalf("重复 AppendInbox: %v", err)
 	}
@@ -337,8 +360,74 @@ func TestAppendInboxDuplicateWhileSuspendedDoesNotResume(t *testing.T) {
 	if got := h.callCount(fakeprovider.OpRestore); got != 1 {
 		t.Fatalf("Restore 调用次数 = %d, 重复写入不应再次发起恢复", got)
 	}
-	if state, substate := h.state(runID); state != runcontroller.StateResuming || substate != runcontroller.SubstateSnapshotted {
-		t.Fatalf("重复写入后状态 = %s/%s, 想要 resuming/snapshotted", state, substate)
+	if state, substate := h.state(runID); state != runcontroller.StateSuspended || substate != runcontroller.SubstateSnapshotted {
+		t.Fatalf("重复写入后状态 = %s/%s, 想要 suspended/snapshotted", state, substate)
+	}
+
+	versionAfter, idleAfter := runRowVersionAndIdle(t, h.pool, runID)
+	if versionAfter != versionBefore {
+		t.Fatalf("重复写入后 version = %d, 想要不变（%d）", versionAfter, versionBefore)
+	}
+	if (idleBefore == nil) != (idleAfter == nil) ||
+		(idleBefore != nil && !idleAfter.Equal(*idleBefore)) {
+		t.Fatalf("重复写入后 idle_since = %v, 想要不变（%v）", idleAfter, idleBefore)
+	}
+}
+
+func TestAppendInboxConcurrentDedup(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, testConfig())
+	runID, _ := h.stepToBoundary()
+	ctx := context.Background()
+	ev := testSubscriptionEvent("dedup-concurrent")
+
+	// The first writer takes the row lock and waits inside the after-lock hook.
+	// The second writer then blocks on the same row lock, so the two lookups
+	// run against each other rather than one after the other.
+	gate := newLockGate("append")
+	h.useGate(t, gate)
+
+	type appendResult struct {
+		seq       int64
+		duplicate bool
+		err       error
+	}
+	first := make(chan appendResult, 1)
+	second := make(chan appendResult, 1)
+
+	go func() {
+		seq, duplicate, err := h.ctrl.AppendInbox(ctx, runID, ev)
+		first <- appendResult{seq: seq, duplicate: duplicate, err: err}
+	}()
+	gate.waitEntered(t)
+
+	go func() {
+		seq, duplicate, err := h.ctrl.AppendInbox(ctx, runID, ev)
+		second <- appendResult{seq: seq, duplicate: duplicate, err: err}
+	}()
+	h.waitForLockWaiter()
+
+	gate.open()
+	r1 := <-first
+	r2 := <-second
+	if r1.err != nil || r2.err != nil {
+		t.Fatalf("AppendInbox 错误: %v / %v", r1.err, r2.err)
+	}
+	if r1.seq != r2.seq {
+		t.Fatalf("并发写入的序号 = %d 与 %d, 想要相同", r1.seq, r2.seq)
+	}
+	if r1.seq != 2 {
+		t.Fatalf("并发写入的序号 = %d, 想要 2", r1.seq)
+	}
+	if r1.duplicate == r2.duplicate {
+		t.Fatalf("两个并发写入的 duplicate 都是 %v, 想要一个 false 一个 true", r1.duplicate)
+	}
+	if rows := countInboxDedup(t, h.pool, runID, ev.DedupKey); rows != 1 {
+		t.Fatalf("dedup_key 相同的行数 = %d, 想要 1", rows)
+	}
+	if got := nextInboxSeq(t, h.pool, runID); got != 3 {
+		t.Fatalf("并发写入后 next_inbox_seq = %d, 想要 3", got)
 	}
 }
 
@@ -388,4 +477,15 @@ func countInboxDedup(t *testing.T, pool *pgxpool.Pool, runID, dedupKey string) i
 		t.Fatalf("统计 dedup_key 行数: %v", err)
 	}
 	return n
+}
+
+// runRowVersionAndIdle reads the run columns that a deduplicated write must
+// leave untouched.
+func runRowVersionAndIdle(t *testing.T, pool *pgxpool.Pool, runID string) (version int64, idleSince *time.Time) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		`SELECT version, idle_since FROM run WHERE run_id = $1`, runID).Scan(&version, &idleSince); err != nil {
+		t.Fatalf("查询 version 与 idle_since: %v", err)
+	}
+	return version, idleSince
 }

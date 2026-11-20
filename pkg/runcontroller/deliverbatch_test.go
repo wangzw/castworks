@@ -546,6 +546,9 @@ func TestDeliverSubscriptionCompletedAfterRestore(t *testing.T) {
 	if got == nil {
 		t.Fatal("恢复后投递的项不是 subscription_completed")
 	}
+	if !got.GetDetailTruncated() {
+		t.Fatal("恢复后投递的 DetailTruncated = false, 想要 true")
+	}
 	if want := subscriptionProto(ev.Subscription); !proto.Equal(got, want) {
 		t.Fatalf("恢复后投递的字段 = %v, 想要 %v", got, want)
 	}

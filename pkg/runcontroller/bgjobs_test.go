@@ -48,6 +48,8 @@ func (h *e2eHarness) assertAtBoundary(runID string) {
 // TestE2EBgJobsPreventSuspension 覆盖“回合边界空闲超过 G_idle 而 bg_jobs 非空
 // 时不挂起”，以及报告空集之后从当时起再空闲满 G_idle 才挂起。
 func TestE2EBgJobsPreventSuspension(t *testing.T) {
+	t.Parallel()
+
 	h := newE2E(t, e2eConfig())
 	h.setWardenInit(func(w *fakewarden.Warden) {
 		w.SetBgJobs([]string{"job-1"})
@@ -79,6 +81,8 @@ func TestE2EBgJobsPreventSuspension(t *testing.T) {
 // TestE2EBgJobsReconcileOnReconnect 覆盖断线期间丢失 bg_jobs_changed 后，重连的
 // Hello.bg_jobs 替换已保存的集合。
 func TestE2EBgJobsReconcileOnReconnect(t *testing.T) {
+	t.Parallel()
+
 	h := newE2E(t, e2eConfig())
 	h.startRun()
 
@@ -100,6 +104,8 @@ func TestE2EBgJobsReconcileOnReconnect(t *testing.T) {
 
 // TestE2EExitedHelloKeepsBgJobs 覆盖 phase 为 exited 的 Hello 不更新集合。
 func TestE2EExitedHelloKeepsBgJobs(t *testing.T) {
+	t.Parallel()
+
 	h := newE2E(t, e2eConfig())
 	h.startRun()
 
