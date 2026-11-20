@@ -129,6 +129,12 @@ type criteriaCase struct {
 	// of the same criterion still runs on the real records.
 	DryRun bool
 
+	// SuspensionDisabled marks a real run whose control plane runs with
+	// --provider local, which forces suspension off. The judges then skip
+	// exactly the suspension checks, as they do for DryRun; unlike DryRun,
+	// every other check still runs against a real run's records.
+	SuspensionDisabled bool
+
 	// RunState and RunFailureReason are the run row's state and failure_reason
 	// at verdict time.
 	RunState         string
@@ -170,6 +176,13 @@ type criteriaJobFact struct {
 // ---------------------------------------------------------------------------
 // The seven criteria
 
+// checksSuspensions reports whether a judge must look at the run's suspension
+// records. Both the dry run and a local-mode run have no suspension to check;
+// every other criterion still applies.
+func (c criteriaCase) checksSuspensions() bool {
+	return !c.DryRun && !c.SuspensionDisabled
+}
+
 // judgeRoundTrip is pass criterion 1: two round trips, each waiting through a
 // suspension, with the first submission failing and the second succeeding.
 func judgeRoundTrip(c criteriaCase) string {
@@ -205,7 +218,7 @@ func judgeRoundTrip(c criteriaCase) string {
 		}
 	}
 
-	if !c.DryRun {
+	if c.checksSuspensions() {
 		if len(c.Suspensions) != 2 {
 			return fmt.Sprintf("run has %d suspension records, want 2", len(c.Suspensions))
 		}
@@ -483,7 +496,7 @@ func judgeRestartWhileSuspended(c criteriaCase) string {
 		c.Times.WebhookListeningAt.IsZero() {
 		return "the criterion input is missing the control plane stop, restart or webhook listening moment"
 	}
-	if !c.DryRun {
+	if c.checksSuspensions() {
 		if c.Times.RunStateAtStop == "" {
 			return fmt.Sprintf("the run state at the control plane stop at %s was not recorded",
 				criteriaFormatTime(c.Times.ControlPlaneStoppedAt))
@@ -544,7 +557,7 @@ func judgeRestartWhileSuspended(c criteriaCase) string {
 			criteriaFormatTime(rows[0].CreatedAt), criteriaFormatTime(c.Times.ControlPlaneRestartedAt))
 	}
 
-	if !c.DryRun {
+	if c.checksSuspensions() {
 		suspendedBefore := false
 		for _, record := range c.Suspensions {
 			if record.StartedAt.Before(c.Times.ControlPlaneStoppedAt) {
@@ -576,7 +589,7 @@ func judgeBackgroundJob(c criteriaCase) string {
 		resolution = defaultBGJobsInterval
 	}
 
-	if !c.DryRun {
+	if c.checksSuspensions() {
 		for i, record := range c.Suspensions {
 			jobs, ok := criteriaBGJobsAt(c.BGJobs, record.StartedAt)
 			if !ok {
@@ -626,7 +639,7 @@ func judgeBackgroundJob(c criteriaCase) string {
 		return fmt.Sprintf("the spontaneous turn %s started after bg_jobs became empty at %s, but it has not ended",
 			spontaneous.TurnID, criteriaFormatTime(emptiedAt))
 	}
-	if !c.DryRun {
+	if c.checksSuspensions() {
 		suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt)
 		if !ok {
 			return fmt.Sprintf("no suspension started after bg_jobs became empty at %s", criteriaFormatTime(emptiedAt))

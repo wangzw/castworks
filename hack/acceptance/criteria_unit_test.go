@@ -1137,6 +1137,31 @@ func TestJudgeBackgroundJob(t *testing.T) {
 	}
 }
 
+// TestJudgeBackgroundJobSuspensionDisabled covers the local-mode setting: the
+// judges skip the suspension checks only. A missing suspension is fine, but
+// every other check still runs on the same records.
+func TestJudgeBackgroundJobSuspensionDisabled(t *testing.T) {
+	t.Run("suspension checks are skipped", func(t *testing.T) {
+		c := criteriaBackgroundJobCase(t)
+		c.SuspensionDisabled = true
+		c.Suspensions = nil
+		if mismatch := judgeBackgroundJob(c); mismatch != "" {
+			t.Fatalf("suspension checks ran with SuspensionDisabled set: %s", mismatch)
+		}
+	})
+	t.Run("another failed condition still fails", func(t *testing.T) {
+		c := criteriaBackgroundJobCase(t)
+		c.SuspensionDisabled = true
+		c.Subscriptions = []subscriptionRecord{
+			criteriaTestSubscription("sub-unexpected", "job-unexpected",
+				criteriaTerminalSucceeded, criteriaTestBase(), 1),
+		}
+		if mismatch := judgeBackgroundJob(c); mismatch == "" {
+			t.Fatal("SuspensionDisabled also skipped the no-subscription check")
+		}
+	})
+}
+
 // TestJudgeBackgroundJobHoldIgnoresTrailingTurn guards the sampling
 // resolution: the observer records the empty set up to one interval after it
 // happened, so the spontaneous turn can start and end just before the
@@ -1156,7 +1181,7 @@ func TestJudgeBackgroundJobHoldIgnoresTrailingTurn(t *testing.T) {
 		},
 		Turns: []turn{
 			criteriaTestTurn("turn-1", "delivery-1", base, base.Add(10*time.Second), "started the background watch"),
-			criteriaTestTurn("turn-2", "delivery-2", base.Add(59500*time.Millisecond), base.Add(59900*time.Millisecond), "reported the result"),
+			criteriaTestTurn("turn-2", "", base.Add(59500*time.Millisecond), base.Add(59900*time.Millisecond), "reported the result"),
 		},
 	}
 	if mismatch := judgeBackgroundJob(c); mismatch != "" {

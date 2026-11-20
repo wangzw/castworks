@@ -138,13 +138,24 @@ type suspendObservationTimeline struct {
 	Source string `json:"source"`
 }
 
+// criteriaEvidence holds the raw record values a criterion used, so a verdict
+// can be checked from measurements.json without the database.
+type criteriaEvidence map[string]any
+
 // suspendScenarioMeasurement is everything one scenario recorded.
 type suspendScenarioMeasurement struct {
-	Scenario            string                         `json:"scenario"`
-	RunID               string                         `json:"run_id,omitempty"`
-	Actor               string                         `json:"actor,omitempty"`
-	ActorImage          string                         `json:"actor_image,omitempty"`
+	Scenario   string `json:"scenario"`
+	RunID      string `json:"run_id,omitempty"`
+	Actor      string `json:"actor,omitempty"`
+	ActorImage string `json:"actor_image,omitempty"`
+	// ActorImageCommit is the source commit the actor image was built from.
+	// RepoHead is the tested repository's HEAD for this run. RepoCommit is kept
+	// for the v0.1.0 shape and carries RepoHead, never the image commit.
+	ActorImageCommit    string                         `json:"actor_image_commit,omitempty"`
+	RepoHead            string                         `json:"repo_head,omitempty"`
 	RepoCommit          string                         `json:"repo_commit,omitempty"`
+	Criteria            criteriaEvidence               `json:"criteria_evidence,omitempty"`
+	Written             bool                           `json:"-"`
 	StartedAt           time.Time                      `json:"started_at"`
 	FinishedAt          time.Time                      `json:"finished_at"`
 	Notes               []string                       `json:"notes,omitempty"`
@@ -322,6 +333,178 @@ func (m *suspendScenarioMeasurement) addNote(format string, args ...any) {
 	m.Notes = append(m.Notes, fmt.Sprintf(format, args...))
 }
 
+// addCriteria records one raw value a judge read.
+func (m *suspendScenarioMeasurement) addCriteria(key string, value any) {
+	if m.Criteria == nil {
+		m.Criteria = criteriaEvidence{}
+	}
+	m.Criteria[key] = value
+}
+
+// subscriptionRowEvidence is the subscription fields the judges read.
+type subscriptionRowEvidence struct {
+	SubID       string     `json:"sub_id"`
+	JobID       string     `json:"job_id,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	SinceCursor int64      `json:"since_cursor"`
+	CompletedAt *time.Time `json:"completed_at"`
+	Status      string     `json:"status"`
+	Terminal    string     `json:"terminal"`
+}
+
+func subscriptionRowEvidenceOf(subs []subscriptionRecord) []subscriptionRowEvidence {
+	out := make([]subscriptionRowEvidence, 0, len(subs))
+	for _, sub := range subs {
+		out = append(out, subscriptionRowEvidence{
+			SubID:       sub.SubID,
+			JobID:       criteriaJobID(sub),
+			CreatedAt:   sub.CreatedAt,
+			SinceCursor: sub.SinceCursor,
+			CompletedAt: sub.CompletedAt,
+			Status:      sub.Status,
+			Terminal:    sub.Terminal,
+		})
+	}
+	return out
+}
+
+// connectorEventRowEvidence is the connector_event fields the judges read.
+type connectorEventRowEvidence struct {
+	AppendSeq   int64             `json:"append_seq"`
+	DeliveryID  string            `json:"delivery_id"`
+	ReceivedAt  time.Time         `json:"received_at"`
+	Correlation map[string]string `json:"correlation,omitempty"`
+}
+
+func connectorEventRowEvidenceOf(events []connectorEventRecord) []connectorEventRowEvidence {
+	out := make([]connectorEventRowEvidence, 0, len(events))
+	for _, event := range events {
+		out = append(out, connectorEventRowEvidence{
+			AppendSeq:   event.AppendSeq,
+			DeliveryID:  event.DeliveryID,
+			ReceivedAt:  event.ReceivedAt,
+			Correlation: event.Correlation,
+		})
+	}
+	return out
+}
+
+// inboxRowEvidence is the inbox fields the judges read, with the completion
+// payload's source, terminal and job id pulled out for direct inspection.
+type inboxRowEvidence struct {
+	Seq       int64     `json:"seq"`
+	Kind      string    `json:"kind"`
+	CreatedAt time.Time `json:"created_at"`
+	Source    string    `json:"source,omitempty"`
+	Terminal  string    `json:"terminal,omitempty"`
+	JobID     string    `json:"job_id,omitempty"`
+}
+
+func inboxRowEvidenceOf(rows []inboxRecord) []inboxRowEvidence {
+	out := make([]inboxRowEvidence, 0, len(rows))
+	for _, row := range rows {
+		evidence := inboxRowEvidence{Seq: row.Seq, Kind: row.Kind, CreatedAt: row.CreatedAt}
+		if completion, err := criteriaParseCompletion(row.Payload); err == nil {
+			evidence.Source = completion.Source
+			evidence.Terminal = completion.Terminal
+			evidence.JobID = completion.Correlation["job.id"]
+		}
+		out = append(out, evidence)
+	}
+	return out
+}
+
+// extsimDeliveryEvidence is one callback attempt as extsim recorded it.
+type extsimDeliveryEvidence struct {
+	DeliveryID string    `json:"delivery_id"`
+	Attempt    int       `json:"attempt"`
+	SentAt     time.Time `json:"sent_at"`
+	StatusCode int       `json:"status_code"`
+	Error      string    `json:"error,omitempty"`
+}
+
+func extsimDeliveryEvidenceOf(deliveries []extsimDelivery) []extsimDeliveryEvidence {
+	out := make([]extsimDeliveryEvidence, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		out = append(out, extsimDeliveryEvidence(delivery))
+	}
+	return out
+}
+
+// turnRecordEvidence is one turn as the judges read it.
+type turnRecordEvidence struct {
+	TurnID     string     `json:"turn_id"`
+	DeliveryID string     `json:"delivery_id,omitempty"`
+	StartedAt  time.Time  `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at"`
+	IsError    bool       `json:"is_error"`
+}
+
+func turnRecordEvidenceOf(turns []turn) []turnRecordEvidence {
+	out := make([]turnRecordEvidence, 0, len(turns))
+	for _, record := range turns {
+		out = append(out, turnRecordEvidence{
+			TurnID:     record.TurnID,
+			DeliveryID: record.DeliveryID,
+			StartedAt:  record.StartedAt,
+			EndedAt:    record.EndedAt,
+			IsError:    record.IsError,
+		})
+	}
+	return out
+}
+
+// suspensionRecordEvidence is one suspension as the judges read it.
+type suspensionRecordEvidence struct {
+	StartedAt         time.Time  `json:"started_at"`
+	SnapshotMS        *int64     `json:"snapshot_ms"`
+	RestoreMS         *int64     `json:"restore_ms"`
+	HelloMS           *int64     `json:"hello_ms"`
+	Error             string     `json:"error"`
+	RestoreReturnedAt *time.Time `json:"restore_returned_at,omitempty"`
+}
+
+func suspensionRecordEvidenceOf(records []suspension) []suspensionRecordEvidence {
+	out := make([]suspensionRecordEvidence, 0, len(records))
+	for _, record := range records {
+		out = append(out, suspensionRecordEvidence{
+			StartedAt:         record.StartedAt,
+			SnapshotMS:        record.SnapshotMS,
+			RestoreMS:         record.RestoreMS,
+			HelloMS:           record.HelloMS,
+			Error:             record.Error,
+			RestoreReturnedAt: record.RestoreReturnedAt,
+		})
+	}
+	return out
+}
+
+// recordCriteriaRecords writes the raw record lists every criterion reads.
+func recordCriteriaRecords(m *suspendScenarioMeasurement, c criteriaCase, jobID string) {
+	m.addCriteria("subscriptions", subscriptionRowEvidenceOf(c.Subscriptions))
+	m.addCriteria("inbox", inboxRowEvidenceOf(c.Inbox))
+	m.addCriteria("completion_delivery_rows", len(c.CompletionDeliveries))
+	if jobID == "" {
+		return
+	}
+	m.addCriteria("connector_events", connectorEventRowEvidenceOf(criteriaEventsForJob(c.ConnectorEvents, jobID)))
+	m.addCriteria("extsim_deliveries", extsimDeliveryEvidenceOf(c.ExtsimDeliveries[jobID]))
+}
+
+// callbackCompletionSource returns the source of the first subscription
+// completion row in the inbox, or "" when there is none.
+func callbackCompletionSource(c criteriaCase) string {
+	rows := criteriaCompletionInbox(c.Inbox)
+	if len(rows) == 0 {
+		return ""
+	}
+	completion, err := criteriaParseCompletion(rows[0].Payload)
+	if err != nil {
+		return ""
+	}
+	return completion.Source
+}
+
 // suspendStatValues gathers every raw sample in a scenario. It is split out so
 // the per-scenario summary and the combined summary use the same rules.
 type suspendStatValues struct {
@@ -439,6 +622,7 @@ func (m *suspendScenarioMeasurement) finish(t *testing.T, workDir string) {
 	m.FinishedAt = time.Now().UTC()
 	m.computeSummaries()
 	suspendWriteJSON(t, filepath.Join(workDir, "measurements.json"), m)
+	m.Written = true
 }
 
 // suspendWriteCombined writes the combined file at the run root. It runs even
