@@ -18,6 +18,7 @@
 | 订阅 | Subscription | 运行实例对某外部系统事件的持久登记，含所属项目、过滤条件、关联键、完成条件与生命周期；只匹配 `project_ids` 包含其 `project_id` 的事件 |
 | 回合 | Turn | Agent 从收到一条输入到停下等待下一条输入之间的工作段 |
 | 回合边界 | turn boundary | 回合结束、Agent 等待下一条输入的时刻；L1 与 L2 以挂起为目的销毁沙箱的唯一时点（L0 不以挂起为目的销毁） |
+| 自发回合 | spontaneous turn | 回合边界上 Agent 未收到投递就自行开始的回合，由 `session_state_changed: running` 或 assistant 消息触发；其 `turn_started` 的 `delivery_id` 为空 |
 | 安全点 | safe point | 回合边界上不变量 I9 的全部条件同时满足的时点；以挂起为目的的销毁只在此执行，条件由 `runcontroller` 预检、看守进程复核，任一条件不满足的回合边界不构成安全点 |
 | 回合位置 | turn position | 运行实例在回合中的位置，由 `run` 行的回合字段表达，跨挂起保留 |
 | 代 | generation | 运行实例每次预配沙箱时递增的单调计数 |
