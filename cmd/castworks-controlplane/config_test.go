@@ -679,6 +679,132 @@ func TestConfigDatabaseURLNotLeaked(t *testing.T) {
 	}
 }
 
+// configConnectorHubArgs returns a valid command line for provider with the
+// extra connectorhub flags appended.
+func configConnectorHubArgs(provider string, extra ...string) []string {
+	base := configBaseArgs(provider)
+	if provider == ProviderSubstrate {
+		base = append(base, "--substrate-image", configTestImage)
+	}
+	return append(base, extra...)
+}
+
+func TestConfigConnectorHubDefaults(t *testing.T) {
+	cfg := configMustParse(t, configBaseArgs(ProviderLocal)...)
+	if cfg.ConnectorHubConfig != "" {
+		t.Errorf("ConnectorHubConfig = %q, want empty", cfg.ConnectorHubConfig)
+	}
+	if cfg.ConnectorAddr != "" {
+		t.Errorf("ConnectorAddr = %q, want empty", cfg.ConnectorAddr)
+	}
+	if cfg.WebhookAddr != defaultWebhookAddr {
+		t.Errorf("WebhookAddr = %q, want %q", cfg.WebhookAddr, defaultWebhookAddr)
+	}
+}
+
+func TestConfigWebhookAddr(t *testing.T) {
+	accepted := []string{
+		"127.0.0.1:9092",
+		"127.0.0.1:0",
+		"[::1]:9092",
+		"[::1]:0",
+	}
+	rejected := []string{
+		"127.0.0.2:9092",
+		"0.0.0.0:9092",
+		":9092",
+		"[::]:9092",
+		"10.12.72.11:9092",
+		"localhost:9092",
+		"example.com:80",
+		"127.0.0.1",
+		"127.0.0.1:65536",
+		"127.0.0.1:-1",
+		"127.0.0.1:notaport",
+	}
+	for _, addr := range accepted {
+		t.Run("accept/"+addr, func(t *testing.T) {
+			cfg := configMustParse(t, append(configBaseArgs(ProviderLocal), "--webhook-addr", addr)...)
+			if cfg.WebhookAddr != addr {
+				t.Errorf("WebhookAddr = %q, want %q", cfg.WebhookAddr, addr)
+			}
+		})
+	}
+	for _, addr := range rejected {
+		t.Run("reject/"+addr, func(t *testing.T) {
+			args := append(configBaseArgs(ProviderLocal), "--webhook-addr", addr)
+			configWantError(t, args, "--webhook-addr")
+		})
+	}
+}
+
+func TestConfigConnectorAddrRequiredWithConfig(t *testing.T) {
+	for _, provider := range []string{ProviderLocal, ProviderSubstrate} {
+		t.Run(provider, func(t *testing.T) {
+			configWantError(t,
+				configConnectorHubArgs(provider, "--connectorhub-config", "/tmp/connectorhub.yaml"),
+				"--connector-addr")
+		})
+	}
+}
+
+func TestConfigConnectorAddrSubstrate(t *testing.T) {
+	argsFor := func(addr string) []string {
+		return configConnectorHubArgs(ProviderSubstrate,
+			"--connectorhub-config", "/tmp/connectorhub.yaml",
+			"--connector-addr", addr)
+	}
+	accepted := []string{"10.12.72.11:9091"}
+	rejected := []string{
+		"127.0.0.1:9091",
+		"[::1]:9091",
+		"0.0.0.0:9091",
+		"[::]:9091",
+		"localhost:9091",
+		"example.com:9091",
+		"10.12.72.11:0",
+		"10.12.72.11",
+	}
+	for _, addr := range accepted {
+		t.Run("accept/"+addr, func(t *testing.T) {
+			configMustParse(t, argsFor(addr)...)
+		})
+	}
+	for _, addr := range rejected {
+		t.Run("reject/"+addr, func(t *testing.T) {
+			configWantError(t, argsFor(addr), "--connector-addr")
+		})
+	}
+}
+
+// TestConfigConnectorAddrLocal covers the local provider, where the connector
+// endpoint only has to be bindable: no advertised-address rule applies.
+func TestConfigConnectorAddrLocal(t *testing.T) {
+	for _, addr := range []string{
+		"127.0.0.1:0",
+		"127.0.0.1:9091",
+		"10.12.72.11:9091",
+	} {
+		t.Run("accept/"+addr, func(t *testing.T) {
+			cfg := configMustParse(t, configConnectorHubArgs(ProviderLocal,
+				"--connectorhub-config", "/tmp/connectorhub.yaml",
+				"--connector-addr", addr)...)
+			if cfg.ConnectorAddr != addr {
+				t.Errorf("ConnectorAddr = %q, want %q", cfg.ConnectorAddr, addr)
+			}
+		})
+	}
+}
+
+// TestConfigConnectorAddrWithoutConfig asserts that --connector-addr alone is
+// accepted: the flag only matters when --connectorhub-config is set.
+func TestConfigConnectorAddrWithoutConfig(t *testing.T) {
+	cfg := configMustParse(t, append(configBaseArgs(ProviderLocal), "--connector-addr", "127.0.0.1:0")...)
+	if cfg.ConnectorAddr != "127.0.0.1:0" {
+		t.Errorf("ConnectorAddr = %q, want %q", cfg.ConnectorAddr, "127.0.0.1:0")
+	}
+}
+
 // silenceStderr points os.Stderr at the null device while the test runs, so
 // runMain's logger and the flag package's usage text do not clutter the test
 // output. It restores the original file on cleanup.

@@ -707,6 +707,220 @@ func TestRunSubstrateConstructionFailure(t *testing.T) {
 	}
 }
 
+// connectorHubTestDefinition is the extsim definition from
+// pkg/connectorhub/testdata, inlined so LoadConfig accepts the test config.
+const connectorHubTestDefinition = `kind: ExternalSystem
+name: extsim
+access:
+  mode: passthrough
+  upstreams: [extsim.castworks-system.svc.cluster.local]
+events:
+  sources:
+    - type: webhook
+      path: /hooks/extsim
+      signature: hmac-sha256
+      delivery_id: X-Extsim-Delivery
+      event_types: [job.completed]
+  correlation_keys: [job.project, job.id]
+  identity_keys: [job.id]
+  project_binding: job.project
+  dedup_key: [event_type, job.id, job.conclusion]
+  ordering: {occurred_at: job.updated_at}
+  completions:
+    - event: job.completed
+      verify: {api: extsim-job, terminal: [succeeded, failed]}
+`
+
+// writeConnectorHubTestConfig writes one extsim definition and a connectorhub
+// config that references it, returning the config path.
+func writeConnectorHubTestConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "extsim.yaml"), []byte(connectorHubTestDefinition), 0o600); err != nil {
+		t.Fatalf("write extsim definition: %v", err)
+	}
+	config := `project: default
+systems:
+  - definition: extsim.yaml
+    api_base_url: http://127.0.0.1:9100
+bindings:
+  extsim: [demo]
+`
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatalf("write connectorhub config: %v", err)
+	}
+	return path
+}
+
+// TestRunConnectorHubDisabledDoesNotListen asserts that without
+// --connectorhub-config the module neither binds its addresses nor logs its
+// listening lines. The webhook address is deliberately occupied: starting
+// successfully proves nothing is listening on it.
+func TestRunConnectorHubDisabledDoesNotListen(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	credentialFile := runTestCredentialFile(t, "connectorhub-disabled-token")
+
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a loopback port: %v", err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	args := append(runTestLiveArgs(pool.Config().ConnString(), credentialFile),
+		"--webhook-addr", occupied.Addr().String())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	connectorReadyCalled := false
+	logStart := len(testLogs.String())
+
+	go func() {
+		done <- runWithHooks(ctx, args, runHooks{
+			ready:          func(string, string) { ready <- struct{}{} },
+			connectorReady: func(string, string) { connectorReadyCalled = true },
+		})
+	}()
+
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("run exited before it listened: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not become ready within 30s")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned %v on shutdown, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after shutdown")
+	}
+
+	if connectorReadyCalled {
+		t.Error("connectorReady was called although --connectorhub-config was not given")
+	}
+	logs := logsSince(logStart)
+	for _, msg := range []string{"connector listening", "webhook listening"} {
+		if strings.Contains(logs, msg) {
+			t.Errorf("captured logs contain %q although connectorhub is disabled:\n%s", msg, logs)
+		}
+	}
+}
+
+// TestRunConnectorHubListensAndLogs starts the control plane with connectorhub
+// enabled on :0 addresses. It asserts that both listening lines name the bound
+// addresses and that shutdown records the required step order.
+func TestRunConnectorHubListensAndLogs(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	credentialFile := runTestCredentialFile(t, "connectorhub-listening-token")
+	configPath := writeConnectorHubTestConfig(t)
+
+	args := append(runTestLiveArgs(pool.Config().ConnString(), credentialFile),
+		"--connectorhub-config", configPath,
+		"--connector-addr", "127.0.0.1:0",
+		"--webhook-addr", "127.0.0.1:0",
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan struct{}, 1)
+	hubReady := make(chan [2]string, 1)
+	done := make(chan error, 1)
+	steps := &stepRecorder{}
+	logStart := len(testLogs.String())
+
+	go func() {
+		done <- runWithHooks(ctx, args, runHooks{
+			ready: func(string, string) { ready <- struct{}{} },
+			connectorReady: func(connectorAddr, webhookAddr string) {
+				hubReady <- [2]string{connectorAddr, webhookAddr}
+			},
+			shutdownStep: steps.record,
+		})
+	}()
+
+	var addrs [2]string
+	select {
+	case addrs = <-hubReady:
+	case err := <-done:
+		t.Fatalf("run exited before connectorhub listened: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("connectorhub did not listen within 30s")
+	}
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("run exited before it was ready: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("run did not become ready within 30s")
+	}
+
+	connectorAddr, webhookAddr := addrs[0], addrs[1]
+	for name, addr := range map[string]string{"connector": connectorAddr, "webhook": webhookAddr} {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			t.Fatalf("%s address %q: %v", name, addr, err)
+		}
+		if port == "0" {
+			t.Errorf("%s listening address %q still has port 0", name, addr)
+		}
+	}
+
+	logs := logsSince(logStart)
+	for _, check := range []struct {
+		msg  string
+		addr string
+	}{
+		{"connector listening", connectorAddr},
+		{"webhook listening", webhookAddr},
+	} {
+		if !strings.Contains(logs, check.msg) {
+			t.Errorf("captured logs do not contain %q:\n%s", check.msg, logs)
+		}
+		if !strings.Contains(logs, "addr="+check.addr) {
+			t.Errorf("captured logs do not report addr=%s for %q:\n%s", check.addr, check.msg, logs)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned %v on shutdown, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("run did not return after shutdown")
+	}
+
+	wantSteps := []string{
+		shutdownStepHTTP,
+		shutdownStepWebhook,
+		shutdownStepConnector,
+		shutdownStepHub,
+		shutdownStepController,
+		shutdownStepGRPC,
+		shutdownStepProvider,
+		shutdownStepPool,
+	}
+	gotSteps := steps.snapshot()
+	if len(gotSteps) != len(wantSteps) {
+		t.Fatalf("shutdown steps = %v, want %v", gotSteps, wantSteps)
+	}
+	for i := range wantSteps {
+		if gotSteps[i] != wantSteps[i] {
+			t.Fatalf("shutdown steps = %v, want %v", gotSteps, wantSteps)
+		}
+	}
+}
+
 // replaceFlag returns args with the value of name replaced.
 func replaceFlag(t *testing.T, args []string, name, value string) []string {
 	t.Helper()
