@@ -1,6 +1,6 @@
 //go:build acceptance
 
-// Record-level tests for the six v0.2.0 pass criteria. Every criterion has at
+// Record-level tests for the seven v0.2.0 pass criteria. Every criterion has at
 // least one set of records it accepts and at least one counterexample aimed at
 // its decisive check. The records are built in memory; no database, cluster or
 // LLM is involved, so these run in acceptance-dryrun.
@@ -133,6 +133,10 @@ func criteriaTestCompletionDelivery(t testing.TB, runID, subID string, createdAt
 
 func criteriaTestBGChange(at time.Time, jobs ...string) bgJobsChange {
 	return bgJobsChange{At: at, Jobs: jobs}
+}
+
+func criteriaTestBool(value bool) *bool {
+	return &value
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,5 +1161,145 @@ func TestJudgeBackgroundJobHoldIgnoresTrailingTurn(t *testing.T) {
 	}
 	if mismatch := judgeBackgroundJob(c); mismatch != "" {
 		t.Fatalf("satisfied records were rejected: %s", mismatch)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Criterion 7: the actor crashed
+
+func criteriaActorCrashCase(t testing.TB) criteriaCase {
+	t.Helper()
+	base := criteriaTestBase()
+	at := func(d time.Duration) time.Time { return base.Add(d) }
+
+	return criteriaCase{
+		RunState:         criteriaStateFailed,
+		RunFailureReason: "actor cw-run-crash is crashed",
+		ActorExists:      criteriaTestBool(true),
+		Times: criteriaTimes{
+			ActorCrashedAt: at(40 * time.Second),
+			RunFailedAt:    at(60 * time.Second),
+		},
+	}
+}
+
+func TestJudgeActorCrash(t *testing.T) {
+	t.Run("satisfied", func(t *testing.T) {
+		if mismatch := judgeActorCrash(criteriaActorCrashCase(t)); mismatch != "" {
+			t.Fatalf("satisfied records were rejected: %s", mismatch)
+		}
+	})
+
+	t.Run("satisfied when the actor is not found", func(t *testing.T) {
+		c := criteriaActorCrashCase(t)
+		c.RunFailureReason = "actor cw-run-crash is not found"
+		if mismatch := judgeActorCrash(c); mismatch != "" {
+			t.Fatalf("a not-found actor was rejected: %s", mismatch)
+		}
+	})
+
+	t.Run("satisfied exactly at the limit", func(t *testing.T) {
+		c := criteriaActorCrashCase(t)
+		c.Times.RunFailedAt = c.Times.ActorCrashedAt.Add(criteriaReconnectTimeout).Add(criteriaScanPeriod)
+		if mismatch := judgeActorCrash(c); mismatch != "" {
+			t.Fatalf("a failure exactly at the limit was rejected: %s", mismatch)
+		}
+	})
+
+	t.Run("satisfied with the configured reconnect timeout and scan period", func(t *testing.T) {
+		c := criteriaActorCrashCase(t)
+		c.ReconnectTimeout = 10 * time.Second
+		c.ScanPeriod = 2 * time.Second
+		c.Times.RunFailedAt = c.Times.ActorCrashedAt.Add(12 * time.Second)
+		if mismatch := judgeActorCrash(c); mismatch != "" {
+			t.Fatalf("a failure within the configured limit was rejected: %s", mismatch)
+		}
+	})
+
+	counterexamples := []struct {
+		name   string
+		mutate func(*testing.T, *criteriaCase)
+		want   string
+	}{
+		{
+			name: "the run is not failed",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.RunState = "active"
+			},
+			want: "want \"failed\"",
+		},
+		{
+			name: "the failure reason does not start with actor",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.RunFailureReason = "cw-run-crash is crashed"
+			},
+			want: "does not start with \"actor \"",
+		},
+		{
+			name: "the failure reason names neither crashed nor not found",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.RunFailureReason = "actor cw-run-crash is stopped"
+			},
+			want: "names neither",
+		},
+		{
+			name: "the run turned failed after T_reconnect plus P_scan",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.Times.RunFailedAt = c.Times.ActorCrashedAt.Add(
+					criteriaReconnectTimeout + criteriaScanPeriod + time.Second)
+			},
+			want: "after the actor crash",
+		},
+		{
+			name: "the configured reconnect timeout plus scan period was exceeded",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.ReconnectTimeout = 10 * time.Second
+				c.ScanPeriod = 2 * time.Second
+				c.Times.RunFailedAt = c.Times.ActorCrashedAt.Add(13 * time.Second)
+			},
+			want: "after the actor crash",
+		},
+		{
+			name: "the actor was deleted",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.ActorExists = criteriaTestBool(false)
+			},
+			want: "was deleted",
+		},
+		{
+			name: "the actor existence was not recorded",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.ActorExists = nil
+			},
+			want: "does not record whether the actor still exists",
+		},
+		{
+			name: "the crash moment was not recorded",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.Times.ActorCrashedAt = time.Time{}
+			},
+			want: "missing the actor crash moment",
+		},
+		{
+			name: "the failure moment was not recorded",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.Times.RunFailedAt = time.Time{}
+			},
+			want: "missing the moment the run turned failed",
+		},
+	}
+
+	for _, tc := range counterexamples {
+		t.Run(tc.name, func(t *testing.T) {
+			c := criteriaActorCrashCase(t)
+			tc.mutate(t, &c)
+			mismatch := judgeActorCrash(c)
+			if mismatch == "" {
+				t.Fatal("counterexample was accepted")
+			}
+			if !strings.Contains(mismatch, tc.want) {
+				t.Fatalf("mismatch %q does not contain %q", mismatch, tc.want)
+			}
+		})
 	}
 }

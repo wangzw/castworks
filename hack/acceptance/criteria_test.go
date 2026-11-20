@@ -60,6 +60,7 @@ const (
 	criteriaTerminalSucceeded         = "succeeded"
 	criteriaStatusOK                  = 200
 	criteriaStateSuspended            = "suspended"
+	criteriaStateFailed               = "failed"
 )
 
 // criteriaTimes holds the moments a real run observes that no record carries.
@@ -80,6 +81,12 @@ type criteriaTimes struct {
 	// delivery observation window.
 	ObservationStartedAt time.Time
 	ObservationEndedAt   time.Time
+
+	// ActorCrashedAt is when the test made the actor crash. RunFailedAt is
+	// when the control plane turned the run failed, read from the run row's
+	// ended_at or observed by polling the state.
+	ActorCrashedAt time.Time
+	RunFailedAt    time.Time
 }
 
 // criteriaExpectations holds the values the scenario generated and the judge
@@ -122,6 +129,21 @@ type criteriaCase struct {
 	// of the same criterion still runs on the real records.
 	DryRun bool
 
+	// RunState and RunFailureReason are the run row's state and failure_reason
+	// at verdict time.
+	RunState         string
+	RunFailureReason string
+	// ActorExists is the provider's answer to whether the crashed actor still
+	// exists. Nil means the test did not check, which fails the crash
+	// criterion instead of passing it without evidence.
+	ActorExists *bool
+	// ReconnectTimeout overrides criteriaReconnectTimeout when positive. It is
+	// the T_reconnect the control plane under judgement was started with.
+	ReconnectTimeout time.Duration
+	// ScanPeriod overrides criteriaScanPeriod when positive. It is the P_scan
+	// the control plane under judgement was started with.
+	ScanPeriod time.Duration
+
 	Times  criteriaTimes
 	Expect criteriaExpectations
 }
@@ -146,7 +168,7 @@ type criteriaJobFact struct {
 }
 
 // ---------------------------------------------------------------------------
-// The six criteria
+// The seven criteria
 
 // judgeRoundTrip is pass criterion 1: two round trips, each waiting through a
 // suspension, with the first submission failing and the second succeeding.
@@ -622,6 +644,53 @@ func judgeBackgroundJob(c criteriaCase) string {
 				criteriaFormatTime(suspension.StartedAt), suspension.StartedAt.Sub(*spontaneous.EndedAt),
 				spontaneous.TurnID, criteriaFormatTime(*spontaneous.EndedAt), criteriaIdleGrace)
 		}
+	}
+	return ""
+}
+
+// judgeActorCrash is pass criterion 7: the actor crashed while the run was
+// active. The control plane must turn the run failed within T_reconnect plus
+// one P_scan, name the crash in failure_reason, and leave the actor in place
+// for investigation.
+func judgeActorCrash(c criteriaCase) string {
+	if c.Times.ActorCrashedAt.IsZero() {
+		return "the criterion input is missing the actor crash moment"
+	}
+	if c.Times.RunFailedAt.IsZero() {
+		return "the criterion input is missing the moment the run turned failed"
+	}
+	if c.RunState != criteriaStateFailed {
+		return fmt.Sprintf("run state is %q, want %q", c.RunState, criteriaStateFailed)
+	}
+	if !strings.HasPrefix(c.RunFailureReason, criteriaActorFailurePrefix) {
+		return fmt.Sprintf("failure_reason %q does not start with %q", c.RunFailureReason, criteriaActorFailurePrefix)
+	}
+	if !strings.Contains(c.RunFailureReason, criteriaActorCrashedWord) &&
+		!strings.Contains(c.RunFailureReason, criteriaActorNotFoundWord) {
+		return fmt.Sprintf("failure_reason %q names neither %q nor %q",
+			c.RunFailureReason, criteriaActorCrashedWord, criteriaActorNotFoundWord)
+	}
+
+	reconnect := c.ReconnectTimeout
+	if reconnect <= 0 {
+		reconnect = criteriaReconnectTimeout
+	}
+	scan := c.ScanPeriod
+	if scan <= 0 {
+		scan = criteriaScanPeriod
+	}
+	limit := c.Times.ActorCrashedAt.Add(reconnect).Add(scan)
+	if c.Times.RunFailedAt.After(limit) {
+		return fmt.Sprintf("the run turned failed at %s, after the actor crash at %s plus T_reconnect %s and P_scan %s (limit %s)",
+			criteriaFormatTime(c.Times.RunFailedAt), criteriaFormatTime(c.Times.ActorCrashedAt),
+			reconnect, scan, criteriaFormatTime(limit))
+	}
+
+	if c.ActorExists == nil {
+		return "the criterion input does not record whether the actor still exists"
+	}
+	if !*c.ActorExists {
+		return "the crashed actor was deleted; it must remain for investigation"
 	}
 	return ""
 }

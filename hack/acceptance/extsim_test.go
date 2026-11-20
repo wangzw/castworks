@@ -519,11 +519,13 @@ type inboxRecord struct {
 
 // runRecord is the part of the run table the v0.2.0 criteria read.
 type runRecord struct {
-	RunID     string
-	State     string
-	Substate  string
-	BGJobs    []string
-	IdleSince *time.Time
+	RunID         string
+	State         string
+	Substate      string
+	BGJobs        []string
+	IdleSince     *time.Time
+	FailureReason string
+	EndedAt       *time.Time
 }
 
 // subscriptionRecord is one row of the subscription table.
@@ -662,10 +664,16 @@ func (h *harness) readRun(ctx context.Context, runID string) (runRecord, error) 
 	}
 	defer pool.Close()
 
-	var record runRecord
+	var (
+		record        runRecord
+		failureReason sql.NullString
+	)
 	err = pool.QueryRow(ctx,
-		`SELECT run_id, state, substate, bg_jobs, idle_since FROM run WHERE run_id = $1`, runID).
-		Scan(&record.RunID, &record.State, &record.Substate, &record.BGJobs, &record.IdleSince)
+		`SELECT run_id, state, substate, bg_jobs, idle_since, failure_reason, ended_at
+		   FROM run WHERE run_id = $1`, runID).
+		Scan(&record.RunID, &record.State, &record.Substate, &record.BGJobs, &record.IdleSince,
+			&failureReason, &record.EndedAt)
+	record.FailureReason = failureReason.String
 	return record, err
 }
 
