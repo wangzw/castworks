@@ -1,7 +1,8 @@
 # A selectorless Service: its endpoints are the EndpointSlice in
 # endpointslice.yaml, which points at the development host. Actors reach the
 # control plane through this name, so it must stay
-# castworks-dev.castworks-system.svc.cluster.local.
+# castworks-dev.castworks-system.svc.cluster.local. Port 9090 is the gRPC
+# (h2c) port; port 9091 is the connector endpoint.
 apiVersion: v1
 kind: Service
 metadata:
@@ -15,4 +16,8 @@ spec:
   - name: grpc
     port: 9090
     targetPort: 9090
+    protocol: TCP
+  - name: connector
+    port: 9091
+    targetPort: 9091
     protocol: TCP

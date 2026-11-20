@@ -73,7 +73,25 @@ kubectl_ctx apply -f "$script_dir/k8s/namespace.yaml"
 kubectl_ctx apply -f "$script_dir/k8s/serviceaccount.yaml"
 kubectl_ctx apply -f "$script_dir/k8s/service.yaml"
 kubectl_ctx apply -f "$script_dir/k8s/endpointslice.yaml"
+kubectl_ctx apply -f "$script_dir/k8s/extsim-service.yaml"
+kubectl_ctx apply -f "$script_dir/k8s/extsim-endpointslice.yaml"
 kubectl_ctx apply -f "$script_dir/k8s/workerpool.yaml"
+
+# webhook 签名密钥：控制面与 extsim 读取同一个文件。文件不存在时生成 32 字节
+# 随机数的十六进制加一个换行；已存在时保持内容不变，重复执行 setup.sh 不会换掉
+# 正在使用的密钥。
+echo "==> 确保 webhook 签名密钥文件存在"
+signing_key_file="$HOME/.config/castworks/extsim-signing-key"
+if [[ -e "$signing_key_file" ]]; then
+  echo "签名密钥文件已存在，未改动：$signing_key_file"
+else
+  mkdir -p -- "$(dirname -- "$signing_key_file")"
+  (
+    umask 077
+    printf '%s\n' "$(od -An -vtx1 -N32 /dev/urandom | tr -d ' \n')" >"$signing_key_file"
+  )
+  echo "已生成签名密钥文件（权限 0600）：$signing_key_file"
+fi
 
 echo "==> 确保 atespace $atespace 存在"
 status=0

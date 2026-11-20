@@ -90,8 +90,12 @@ if [[ -z "$ns_name" ]]; then
   echo "命名空间 $namespace 不存在，跳过"
 else
   echo "==> 删除命名空间 $namespace 中的对象"
+  # 签名密钥文件 ~/.config/castworks/extsim-signing-key 留在开发机上，不随这些
+  # 对象删除。
   kubectl_ctx delete -f "$script_dir/k8s/workerpool.yaml" --ignore-not-found --timeout=180s
+  kubectl_ctx delete -f "$script_dir/k8s/extsim-endpointslice.yaml" --ignore-not-found
   kubectl_ctx delete -f "$script_dir/k8s/endpointslice.yaml" --ignore-not-found
+  kubectl_ctx delete -f "$script_dir/k8s/extsim-service.yaml" --ignore-not-found
   kubectl_ctx delete -f "$script_dir/k8s/service.yaml" --ignore-not-found
   kubectl_ctx delete -f "$script_dir/k8s/serviceaccount.yaml" --ignore-not-found
 

@@ -1,0 +1,18 @@
+# A selectorless Service: its endpoints are the EndpointSlice in
+# extsim-endpointslice.yaml, which points at the development host. Actors reach
+# the external-system simulator through this name, so it must stay
+# extsim.castworks-system.svc.cluster.local.
+apiVersion: v1
+kind: Service
+metadata:
+  name: extsim
+  namespace: castworks-system
+  labels:
+    app.kubernetes.io/part-of: castworks
+spec:
+  type: ClusterIP
+  ports:
+  - name: jobs
+    port: 9100
+    targetPort: 9100
+    protocol: TCP
