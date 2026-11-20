@@ -1,0 +1,7 @@
+project: default
+systems:
+  - definition: extsim.yaml
+    signing_key_file: ~/.config/castworks/extsim-signing-key
+    api_base_url: http://127.0.0.1:9100
+bindings:
+  extsim: [demo]
