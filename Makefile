@@ -96,7 +96,7 @@ gate: check-jobs gen-check lint test
 # unit tests rather than replacing them: `go test -tags integration` runs both,
 # so it needs the test database (make db-up) as well as the cluster.
 test-integration: check-jobs
-	$(GO) test -tags integration -p $(JOBS) -parallel $(JOBS) ./...
+	$(GO) test -tags integration -p $(JOBS) -parallel $(JOBS) -timeout 20m ./...
 
 # 测试连 postgres-test，开发机上运行的控制面连 postgres。两者用途的区别见
 # deploy/dev/README.md。测试读取的连接串示例：

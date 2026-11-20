@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -119,7 +122,7 @@ func TestReporterSendsReportsOverH2C(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		got := reports[i]
 		want.Counter = int64(i + 1)
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("report %d = %+v, want %+v", i, got, want)
 		}
 	}
@@ -252,6 +255,115 @@ func TestReporterRereadsStateFileEveryReport(t *testing.T) {
 	}
 	// The write is trimmed on read, so the report carries the bare content.
 	waitForContent("second-content")
+}
+
+// TestProbeEgress checks both outcomes a report can carry: a target that
+// answers the probe path is reachable, and a closed port is not.
+func TestProbeEgress(t *testing.T) {
+	reachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != probePath {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(reachable.Close)
+
+	// Listen and close again so the port is definitely not accepting
+	// connections when the probe dials it.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unreachable := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	targets := []string{strings.TrimPrefix(reachable.URL, "http://"), unreachable}
+	results := probeEgress(context.Background(), newProbeClient(), targets, time.Second)
+	if len(results) != len(targets) {
+		t.Fatalf("got %d probe results, want %d", len(results), len(targets))
+	}
+	for i, target := range targets {
+		if results[i].Target != target {
+			t.Errorf("result %d target = %q, want %q", i, results[i].Target, target)
+		}
+	}
+	if !results[0].OK || results[0].Error != "" {
+		t.Errorf("reachable target result = %+v, want OK with no error", results[0])
+	}
+	if results[1].OK || results[1].Error == "" {
+		t.Errorf("unreachable target result = %+v, want a failure with an error", results[1])
+	}
+}
+
+// TestReporterCarriesEgressProbes checks that every report includes the probe
+// results, which is how the integration test learns whether an actor could
+// reach the control plane's connector port and extsim.
+func TestReporterCarriesEgressProbes(t *testing.T) {
+	probeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != probePath {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(probeServer.Close)
+
+	reports := make(chan Report, 8)
+	server := newH2CTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var rep Report
+		if err := json.NewDecoder(r.Body).Decode(&rep); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		select {
+		case reports <- rep:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	statePath := filepath.Join(t.TempDir(), "state")
+	if err := os.WriteFile(statePath, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := strings.TrimPrefix(probeServer.URL, "http://")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runReporter(ctx, reporterConfig{
+			URL:          server.URL + reportPath,
+			ActorName:    "cw-testactor",
+			StartupID:    "startup",
+			StatePath:    statePath,
+			PID:          1,
+			Interval:     20 * time.Millisecond,
+			BackoffMin:   5 * time.Millisecond,
+			BackoffMax:   20 * time.Millisecond,
+			ProbeTargets: []string{target},
+		})
+	}()
+	defer func() {
+		cancel()
+		waitForDone(t, done)
+	}()
+
+	select {
+	case rep := <-reports:
+		if len(rep.Probes) != 1 {
+			t.Fatalf("report carried %d probes, want 1: %+v", len(rep.Probes), rep.Probes)
+		}
+		got := rep.Probes[0]
+		if got.Target != target || !got.OK || got.Error != "" {
+			t.Errorf("probe result = %+v, want target %q reachable", got, target)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no report arrived")
+	}
 }
 
 func TestReadyzHandler(t *testing.T) {

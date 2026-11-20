@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,6 +46,15 @@ const (
 	integrationDefaultListen  = "10.12.72.11:9090"
 	integrationReportPath     = "/report"
 
+	// integrationExtsim is the extsim address the development environment's
+	// Service points at. The actor template carries only the control-plane and
+	// connector addresses, so the test image probes this name unconditionally
+	// and the test controls reachability through Config.EgressHTTP.
+	integrationExtsim = "extsim.castworks-system.svc.cluster.local:9100"
+
+	// integrationProbePath is served on the connector and extsim ports.
+	integrationProbePath = "/probe"
+
 	// integrationOtherConnector differs from integrationConnector in the port
 	// only, so a test can change nothing but Config.Connector. Nothing dials it;
 	// it exists to give the content-derived template name a different input.
@@ -53,13 +63,26 @@ const (
 	integrationReportBodyLimit = 1 << 20
 )
 
+// integrationProbePorts are the extra ports the test process serves on the
+// development machine's address: the control plane's connector port and
+// extsim's jobs port.
+var integrationProbePorts = []string{"9091", "9100"}
+
 // integrationReport is the body hack/providertest posts for every tick.
 type integrationReport struct {
-	ActorName   string `json:"actor_name"`
-	StartupID   string `json:"startup_id"`
-	Counter     int64  `json:"counter"`
-	FileContent string `json:"file_content"`
-	PID         int    `json:"pid"`
+	ActorName   string             `json:"actor_name"`
+	StartupID   string             `json:"startup_id"`
+	Counter     int64              `json:"counter"`
+	FileContent string             `json:"file_content"`
+	PID         int                `json:"pid"`
+	Probes      []integrationProbe `json:"probes"`
+}
+
+// integrationProbe is one egress probe result from hack/providertest.
+type integrationProbe struct {
+	Target string `json:"target"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
 }
 
 // integrationState is built once per test binary: it holds the provider
@@ -71,6 +94,7 @@ type integrationState struct {
 	templateExisted bool
 	hub             *reportHub
 	server          *http.Server
+	probeServers    []*http.Server
 }
 
 var (
@@ -140,8 +164,15 @@ func newIntegrationState() (*integrationState, error) {
 		}
 	}()
 
+	probeServers, err := listenEgressProbes(listen)
+	if err != nil {
+		_ = server.Close()
+		return nil, err
+	}
+
 	existed, err := templateExists(cfg, templateName)
 	if err != nil {
+		closeServers(probeServers)
 		_ = server.Close()
 		return nil, err
 	}
@@ -152,7 +183,57 @@ func newIntegrationState() (*integrationState, error) {
 		templateExisted: existed,
 		hub:             hub,
 		server:          server,
+		probeServers:    probeServers,
 	}, nil
+}
+
+// listenEgressProbes serves the egress probe endpoint on the development
+// machine's address, taken from the report listener, on the control plane's
+// connector port and extsim's jobs port. The actors reach them by Service name
+// through the egress gateway, so the real control plane and extsim are not
+// needed.
+func listenEgressProbes(reportListen string) ([]*http.Server, error) {
+	host, _, err := net.SplitHostPort(reportListen)
+	if err != nil {
+		return nil, fmt.Errorf("parse the report listener address %q: %w", reportListen, err)
+	}
+	if host == "" {
+		return nil, fmt.Errorf("the report listener address %q has no host; the egress probe listeners need the development machine's address", reportListen)
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != integrationProbePath {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok\n")
+	})
+
+	servers := make([]*http.Server, 0, len(integrationProbePorts))
+	for _, port := range integrationProbePorts {
+		addr := net.JoinHostPort(host, port)
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			closeServers(servers)
+			return nil, fmt.Errorf("listen on %s for the egress probe: %w; stop whatever is using this port", addr, err)
+		}
+		srv := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+		go func(srv *http.Server, listener net.Listener) {
+			if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Default().Warn("egress probe server stopped", "addr", listener.Addr().String(), "error", err)
+			}
+		}(srv, listener)
+		servers = append(servers, srv)
+	}
+	return servers, nil
+}
+
+// closeServers shuts down probe listeners started before a setup failure.
+func closeServers(servers []*http.Server) {
+	for _, srv := range servers {
+		_ = srv.Close()
+	}
 }
 
 // templateExists checks the template without creating it, so the test knows
@@ -192,6 +273,7 @@ func (s *integrationState) teardown() {
 	if s.server != nil {
 		_ = s.server.Close()
 	}
+	closeServers(s.probeServers)
 	if s.templateExisted {
 		return
 	}
@@ -529,6 +611,127 @@ func TestFullCycle(t *testing.T) {
 
 	t.Logf("timing provision=%s snapshot=%s restore=%s snapshot_uri=%s",
 		provision.Duration, snapshot.Duration, restore.Duration, snapshotURI)
+}
+
+// TestEgress shows that an actor reaches the control plane's connector port
+// and extsim by their fully qualified names through the egress gateway when
+// both are configured, and that extsim stays unreachable when
+// Config.EgressHTTP omits it.
+func TestEgress(t *testing.T) {
+	state := integrationFor(t)
+
+	t.Run("configured", func(t *testing.T) {
+		cfg := state.cfg
+		cfg.EgressHTTP = []string{integrationExtsim}
+		runID := randomRunID(t, "egress")
+		actor := sandboxprovider.ActorName(runID)
+		reports, unsubscribe := state.hub.subscribe(actor)
+		t.Cleanup(unsubscribe)
+
+		// The provider cleanup is registered before the destroy cleanup, so the
+		// actor is deleted before the connection closes.
+		p := newProviderFor(t, cfg, 2*time.Minute)
+		destroyOnCleanup(t, p, actor)
+		provisionActor(t, p, runID)
+
+		report := waitForProbeState(t, reports, 5*time.Minute, 1, func(r integrationReport) bool {
+			return probeReachable(r, cfg.Connector) && probeReachable(r, integrationExtsim)
+		})
+		t.Logf("egress reachable: %+v", report.Probes)
+	})
+
+	t.Run("extsim omitted", func(t *testing.T) {
+		cfg := state.cfg
+		runID := randomRunID(t, "noextsim")
+		actor := sandboxprovider.ActorName(runID)
+		reports, unsubscribe := state.hub.subscribe(actor)
+		t.Cleanup(unsubscribe)
+
+		p := newProviderFor(t, cfg, 2*time.Minute)
+		destroyOnCleanup(t, p, actor)
+		provisionActor(t, p, runID)
+
+		// Three consecutive reports with the connector reachable and extsim
+		// rejected by the egress gateway show that the rejection is stable, not a
+		// transient failure while the egress policy propagates.
+		report := waitForProbeState(t, reports, 5*time.Minute, 3, func(r integrationReport) bool {
+			return probeReachable(r, cfg.Connector) && probeRejectedByEgress(r, integrationExtsim)
+		})
+		t.Logf("extsim unreachable: %+v", report.Probes)
+	})
+}
+
+// provisionActor provisions the run's actor and fails the test on error.
+func provisionActor(t *testing.T, p *Provider, runID string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := p.Provision(ctx, runID); err != nil {
+		t.Fatalf("Provision(%s): %v", runID, err)
+	}
+}
+
+// waitForProbeState returns the report that completes a streak of consecutive
+// matching reports. Reports arrive every few seconds; a non-matching report
+// restarts the streak.
+func waitForProbeState(t *testing.T, reports <-chan integrationReport, timeout time.Duration, consecutive int, match func(integrationReport) bool) integrationReport {
+	t.Helper()
+	deadline := time.After(timeout)
+	streak := 0
+	var last integrationReport
+	for {
+		select {
+		case report := <-reports:
+			last = report
+			if match(report) {
+				streak++
+				if streak >= consecutive {
+					return report
+				}
+			} else {
+				streak = 0
+			}
+		case <-deadline:
+			t.Fatalf("no %d consecutive matching actor reports within %s; last probes: %+v",
+				consecutive, timeout, last.Probes)
+			return integrationReport{}
+		}
+	}
+}
+
+// findProbe returns the report's result for target.
+func findProbe(report integrationReport, target string) (integrationProbe, bool) {
+	for _, probe := range report.Probes {
+		if probe.Target == target {
+			return probe, true
+		}
+	}
+	return integrationProbe{}, false
+}
+
+func probeReachable(report integrationReport, target string) bool {
+	probe, found := findProbe(report, target)
+	return found && probe.OK
+}
+
+// egressDeniedPrefix is how a probe reports a non-2xx answer; the egress
+// gateway returns 403 for a host the policy does not list.
+const egressDeniedPrefix = "target answered 403"
+
+// probeRejectedByEgress reports whether target failed because the egress
+// gateway rejected it: the DNS relay answered NXDOMAIN or REFUSED for a name
+// the policy does not list, or the gateway returned 403. Any other failure
+// (a timeout, a refused connection, an upstream 5xx) does not count, because
+// it could come from a transient fault rather than the policy.
+func probeRejectedByEgress(report integrationReport, target string) bool {
+	probe, found := findProbe(report, target)
+	if !found || probe.OK {
+		return false
+	}
+	if strings.Contains(probe.Error, "no such host") || strings.Contains(probe.Error, "server misbehaving") {
+		return true
+	}
+	return strings.HasPrefix(probe.Error, egressDeniedPrefix)
 }
 
 // TestCrash provisions an actor whose wakeup probe never passes. ResumeActor

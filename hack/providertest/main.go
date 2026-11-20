@@ -10,13 +10,16 @@
 //   - reads its actor name from /run/ate/actor-name;
 //   - writes a file with random content to the root filesystem on the first
 //     start and re-reads it before every report;
+//   - probes the connector endpoint and extsim by name through the egress
+//     gateway before every report;
 //   - POSTs a report to CASTWORKS_CONTROL_PLANE every two seconds over
 //     cleartext HTTP/2 with prior knowledge.
 //
 // A report is a JSON object with these fields:
 //
 //	{"actor_name":"cw-...","startup_id":"<hex>","counter":1,
-//	 "file_content":"<hex>","pid":1}
+//	 "file_content":"<hex>","pid":1,
+//	 "probes":[{"target":"host:port","ok":true}]}
 //
 // The counter only grows while the process keeps its memory, so a report after
 // RestoreSnapshot with the same startup ID, the same file content and a larger
@@ -44,6 +47,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -64,6 +68,16 @@ const (
 	// reportPath is the endpoint the integration test server serves.
 	reportPath = "/report"
 
+	// probePath is served by the integration test's probe listeners, which
+	// stand in for the control plane's connector endpoint and extsim.
+	probePath = "/probe"
+
+	// defaultExtsimTarget is the development environment's extsim address. The
+	// actor template carries the control-plane and connector addresses only, so
+	// the probe target for extsim is fixed here; the integration test uses the
+	// same name in its egress configuration.
+	defaultExtsimTarget = "extsim.castworks-system.svc.cluster.local:9100"
+
 	// crashActorPrefix marks an actor that must fail its wakeup probe.
 	crashActorPrefix = "cw-crash"
 
@@ -71,15 +85,25 @@ const (
 	defaultBackoffMin     = 1 * time.Second
 	defaultBackoffMax     = 10 * time.Second
 	defaultReportTimeout  = 10 * time.Second
+	defaultProbeTimeout   = 2 * time.Second
 )
+
+// Probe is the result of one egress probe. Target is the host:port the probe
+// dialed by name through the egress gateway.
+type Probe struct {
+	Target string `json:"target"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+}
 
 // Report is the JSON body of one report POST.
 type Report struct {
-	ActorName   string `json:"actor_name"`
-	StartupID   string `json:"startup_id"`
-	Counter     int64  `json:"counter"`
-	FileContent string `json:"file_content"`
-	PID         int    `json:"pid"`
+	ActorName   string  `json:"actor_name"`
+	StartupID   string  `json:"startup_id"`
+	Counter     int64   `json:"counter"`
+	FileContent string  `json:"file_content"`
+	PID         int     `json:"pid"`
+	Probes      []Probe `json:"probes,omitempty"`
 }
 
 func main() {
@@ -100,37 +124,48 @@ func main() {
 	if controlPlane == "" {
 		log.Fatal("providertest: CASTWORKS_CONTROL_PLANE is not set")
 	}
+	// The connector endpoint shares the control-plane host and runs on 9091.
+	// The template always sets it, but an empty value only drops the probe.
+	var probeTargets []string
+	if connector := os.Getenv("CASTWORKS_CONNECTOR"); connector != "" {
+		probeTargets = append(probeTargets, connector)
+	}
+	probeTargets = append(probeTargets, defaultExtsimTarget)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go serveReady(ctx, readyAddr, actorName)
 
-	log.Printf("providertest: actor=%s startup=%s control_plane=%s crash=%t",
-		actorName, startupID, controlPlane, strings.HasPrefix(actorName, crashActorPrefix))
+	log.Printf("providertest: actor=%s startup=%s control_plane=%s probes=%v crash=%t",
+		actorName, startupID, controlPlane, probeTargets, strings.HasPrefix(actorName, crashActorPrefix))
 
 	runReporter(ctx, reporterConfig{
-		URL:       "http://" + controlPlane + reportPath,
-		ActorName: actorName,
-		StartupID: startupID,
-		StatePath: defaultStatePath,
-		PID:       os.Getpid(),
-		Client:    newH2CClient(),
+		URL:          "http://" + controlPlane + reportPath,
+		ActorName:    actorName,
+		StartupID:    startupID,
+		StatePath:    defaultStatePath,
+		PID:          os.Getpid(),
+		Client:       newH2CClient(),
+		ProbeTargets: probeTargets,
 	})
 }
 
 // reporterConfig carries everything runReporter needs. The zero timeouts fall
 // back to the defaults so tests only override what they care about.
 type reporterConfig struct {
-	URL        string
-	ActorName  string
-	StartupID  string
-	StatePath  string
-	PID        int
-	Interval   time.Duration
-	BackoffMin time.Duration
-	BackoffMax time.Duration
-	Client     *http.Client
+	URL          string
+	ActorName    string
+	StartupID    string
+	StatePath    string
+	PID          int
+	Interval     time.Duration
+	BackoffMin   time.Duration
+	BackoffMax   time.Duration
+	Client       *http.Client
+	ProbeTargets []string
+	ProbeClient  *http.Client
+	ProbeTimeout time.Duration
 }
 
 func (c reporterConfig) withDefaults() reporterConfig {
@@ -145,6 +180,12 @@ func (c reporterConfig) withDefaults() reporterConfig {
 	}
 	if c.Client == nil {
 		c.Client = newH2CClient()
+	}
+	if c.ProbeClient == nil {
+		c.ProbeClient = newProbeClient()
+	}
+	if c.ProbeTimeout <= 0 {
+		c.ProbeTimeout = defaultProbeTimeout
 	}
 	return c
 }
@@ -172,6 +213,7 @@ func runReporter(ctx context.Context, cfg reporterConfig) {
 				Counter:     next,
 				FileContent: content,
 				PID:         cfg.PID,
+				Probes:      probeEgress(ctx, cfg.ProbeClient, cfg.ProbeTargets, cfg.ProbeTimeout),
 			})
 		} else {
 			err = fmt.Errorf("read state file: %w", err)
@@ -212,6 +254,56 @@ func newH2CClient() *http.Client {
 		Transport: &http.Transport{Protocols: &protocols},
 		Timeout:   defaultReportTimeout,
 	}
+}
+
+// newProbeClient returns the HTTP/1.1 client the egress probes use. The egress
+// gateway evaluates an http rule per request, so either HTTP version works;
+// HTTP/1.1 keeps the probe servers free of an h2c setup.
+func newProbeClient() *http.Client {
+	return &http.Client{Timeout: defaultProbeTimeout}
+}
+
+// probeEgress probes every target concurrently and returns the results in the
+// order of targets. Probes run before every report so a target that becomes
+// reachable after the egress policy propagates shows up in a later report.
+func probeEgress(ctx context.Context, client *http.Client, targets []string, timeout time.Duration) []Probe {
+	if len(targets) == 0 {
+		return nil
+	}
+	results := make([]Probe, len(targets))
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = probeTarget(ctx, client, target, timeout)
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+// probeTarget sends one cleartext HTTP GET to target by name. Any 2xx answer
+// counts as reachable. A failure is recorded, not logged: the report carries
+// it back to the test.
+func probeTarget(ctx context.Context, client *http.Client, target string, timeout time.Duration) Probe {
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+target+probePath, nil)
+	if err != nil {
+		return Probe{Target: target, Error: err.Error()}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return Probe{Target: target, Error: err.Error()}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return Probe{Target: target, Error: "target answered " + resp.Status}
+	}
+	return Probe{Target: target, OK: true}
 }
 
 func sendReport(ctx context.Context, client *http.Client, url string, rep Report) error {
