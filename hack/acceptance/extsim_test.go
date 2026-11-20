@@ -261,7 +261,7 @@ func (h *harness) waitLoggedListenerAddr(ctx context.Context, name string) strin
 		filepath.Join(h.workDir, "extsim.stderr.log"),
 		filepath.Join(h.workDir, "extsim.stdout.log"),
 	}
-	listenerAddr, err := waitForListenerAddr(ctx, paths, name)
+	listenerAddr, err := waitForListenerAddr(ctx, h.extsim, paths, name)
 	if err != nil {
 		h.t.Fatalf("acceptance: read extsim %s address: %v", name, err)
 	}
@@ -269,8 +269,10 @@ func (h *harness) waitLoggedListenerAddr(ctx context.Context, name string) strin
 }
 
 // waitForListenerAddr polls log files until one holds a listening line whose
-// listener attribute equals name, and returns that line's addr.
-func waitForListenerAddr(ctx context.Context, paths []string, name string) (string, error) {
+// listener attribute equals name, and returns that line's addr. It fails as
+// soon as the child that writes those logs exits, so a child that dies before
+// logging is reported with its exit status instead of waiting for the context.
+func waitForListenerAddr(ctx context.Context, child *childProcess, paths []string, name string) (string, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -280,6 +282,8 @@ func waitForListenerAddr(ctx context.Context, paths []string, name string) (stri
 			}
 		}
 		select {
+		case <-child.doneChan():
+			return "", fmt.Errorf("waiting for extsim listener %q in %s: %w", name, strings.Join(paths, ", "), child.exitError())
 		case <-ctx.Done():
 			return "", fmt.Errorf("waiting for extsim listener %q in %s: %w", name, strings.Join(paths, ", "), ctx.Err())
 		case <-ticker.C:
@@ -1103,6 +1107,29 @@ var _ = (*harness).collectCriteria
 
 // ---------------------------------------------------------------------------
 // 不依赖真实二进制的框架测试
+
+// TestWaitForListenerAddrReportsChildExit covers extsim dying before it logs
+// its listeners: the helper must return the child's exit status right away
+// instead of polling until the context deadline.
+func TestWaitForListenerAddrReportsChildExit(t *testing.T) {
+	child := startExitedChild(t, "extsim", 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, err := waitForListenerAddr(ctx, child, []string{filepath.Join(t.TempDir(), "extsim.stderr.log")}, "jobs")
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("waitForListenerAddr returned no error for a child that exited")
+	}
+	if !strings.Contains(err.Error(), "status 4") {
+		t.Fatalf("waitForListenerAddr error %q does not carry the child's exit status", err)
+	}
+	if elapsed > 5*pollInterval {
+		t.Fatalf("waitForListenerAddr took %s to report the exit; want at most %s", elapsed, 5*pollInterval)
+	}
+}
 
 // TestJudgeFrameworkSigningKey covers the per-run key generation and the
 // newline rule connectorhub applies when it reads the same file.

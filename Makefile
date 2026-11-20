@@ -152,7 +152,7 @@ CLAUDE_BIN ?=
 KUBE_CONTEXT ?=
 RUN ?=
 
-.PHONY: acceptance-dryrun acceptance-local acceptance-local-subscription acceptance-substrate acceptance-suspend acceptance-ballast acceptance-clean check-database-url
+.PHONY: acceptance-dryrun acceptance-local acceptance-local-subscription acceptance-substrate acceptance-subscription acceptance-suspend acceptance-ballast acceptance-clean check-database-url
 
 ACCEPTANCE_ENV = CASTWORKS_ACC_CREDENTIAL_FILE="$(CREDENTIAL_FILE)" CASTWORKS_ACC_ACTOR_IMAGE="$(ACTOR_IMAGE)" CASTWORKS_ACC_ACTOR_COMMIT="$(ACTOR_COMMIT)" CASTWORKS_ACC_CLAUDE_BIN="$(CLAUDE_BIN)" CASTWORKS_ACC_KUBE_CONTEXT="$(KUBE_CONTEXT)"
 
@@ -252,6 +252,44 @@ acceptance-substrate: check-jobs check-database-url
 	status=$$(cat "$$code"); \
 	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
 		echo "acceptance-substrate: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	exit "$$status"
+
+# acceptance-subscription runs the Substrate demonstration scenario and the
+# seven pass criteria. The subtests run in order and stop at the first
+# failure; RUN=<name> runs one of them. It needs the development host's
+# callback addresses, the extsim Service and the connector port, which are
+# checked before any process starts, and it spends LLM quota.
+acceptance-subscription: check-jobs check-database-url
+	@if [ -z "$(CREDENTIAL_FILE)" ]; then \
+		echo "CREDENTIAL_FILE is not set; run make acceptance-subscription JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(ACTOR_IMAGE)" ]; then \
+		echo "ACTOR_IMAGE is not set; run make acceptance-subscription JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(ACTOR_COMMIT)" ]; then \
+		echo "ACTOR_COMMIT is not set; run make acceptance-subscription JOBS=<n> CREDENTIAL_FILE=<path> ACTOR_IMAGE=<ref> ACTOR_COMMIT=<sha>" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$(RUN)" ]; then run='^TestSubscriptionScenario$$'; else run='^TestSubscriptionScenario$$/^$(RUN)$$'; fi; \
+	mkdir -p /tmp/castworks-acceptance; \
+	log=/tmp/castworks-acceptance/acceptance-subscription-$$(date -u +%Y%m%dT%H%M%SZ).log; code=$$(mktemp); \
+	trap 'rm -f "$$code"' EXIT INT TERM HUP; \
+	( $(ACCEPTANCE_ENV) $(GO) test -tags acceptance -count=1 -v -p $(JOBS) -parallel $(JOBS) -timeout 180m -run "$$run" ./hack/acceptance/; echo $$? > "$$code" ) | tee "$$log"; \
+	status=$$(cat "$$code"); \
+	if [ "$$status" -eq 0 ] && ! grep -q '^=== RUN' "$$log"; then \
+		echo "acceptance-subscription: the -run pattern matched no test; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$status" -eq 0 ] && [ -n "$(RUN)" ] && ! grep -q "TestSubscriptionScenario/$(RUN)" "$$log"; then \
+		echo "acceptance-subscription: RUN=$(RUN) matched no subtest; failing instead of reporting success" >&2; \
+		exit 1; \
+	fi; \
+	if [ "$$status" -eq 0 ] && [ -z "$(RUN)" ] && [ "$$(grep -c '^=== RUN.*TestSubscriptionScenario/' "$$log")" -lt 7 ]; then \
+		echo "acceptance-subscription: fewer than 7 subtests ran; failing instead of reporting success" >&2; \
 		exit 1; \
 	fi; \
 	exit "$$status"

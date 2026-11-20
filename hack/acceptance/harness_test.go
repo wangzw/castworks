@@ -354,6 +354,30 @@ func (c *childProcess) exited() bool {
 	}
 }
 
+// doneChan returns the channel closed when the child exits. It is nil for a
+// nil child, so a caller without a process handle can still wait on a select
+// case that simply never fires.
+func (c *childProcess) doneChan() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.done
+}
+
+// exitError describes how the child ended, including its exit status. It is
+// called after doneChan fires, so the goroutine that ran cmd.Wait has already
+// stored waitErr.
+func (c *childProcess) exitError() error {
+	status := 0
+	if c.cmd != nil && c.cmd.ProcessState != nil {
+		status = c.cmd.ProcessState.ExitCode()
+	}
+	if c.waitErr == nil {
+		return fmt.Errorf("%s exited with status %d", c.name, status)
+	}
+	return fmt.Errorf("%s exited with status %d: %w", c.name, status, c.waitErr)
+}
+
 // childEnvNames lists the only environment variables an acceptance child
 // inherits. The control plane and warden are started with an explicit
 // environment instead of os.Environ(): an LLM credential exported in the
@@ -452,6 +476,28 @@ func (h *harness) startChildEnv(name, bin string, args, env []string) *childProc
 	return child
 }
 
+// startExitedChild starts a child that exits immediately with code and waits
+// for it, so a test can hand a wait helper a process that has already gone.
+func startExitedChild(t *testing.T, name string, code int) *childProcess {
+	t.Helper()
+	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("exit %d", code))
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", name, err)
+	}
+	child := &childProcess{name: name, cmd: cmd, done: make(chan struct{})}
+	go func() {
+		child.waitErr = cmd.Wait()
+		close(child.done)
+	}()
+	select {
+	case <-child.done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("%s did not exit", name)
+	}
+	return child
+}
+
 // waitChild waits for a child to exit and returns its wait error.
 func (h *harness) waitChild(child *childProcess, timeout time.Duration) error {
 	if child == nil {
@@ -545,6 +591,29 @@ func TestWaitLoggedAddrReadsEveryLog(t *testing.T) {
 	}
 }
 
+// TestWaitForAddrReportsChildExit covers a control plane that dies before it
+// logs its address: the helper must return the child's exit status right away
+// instead of polling until the context deadline.
+func TestWaitForAddrReportsChildExit(t *testing.T) {
+	child := startExitedChild(t, "controlplane", 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, err := waitForAddr(ctx, child, []string{filepath.Join(t.TempDir(), "controlplane.stderr.log")}, "http listening")
+	elapsed := time.Since(started)
+
+	if err == nil {
+		t.Fatal("waitForAddr returned no error for a child that exited")
+	}
+	if !strings.Contains(err.Error(), "status 3") {
+		t.Fatalf("waitForAddr error %q does not carry the child's exit status", err)
+	}
+	if elapsed > 5*pollInterval {
+		t.Fatalf("waitForAddr took %s to report the exit; want at most %s", elapsed, 5*pollInterval)
+	}
+}
+
 // TestDoSetsJSONContentTypeOnBodylessPost covers cleanup's end-run request:
 // it carries no body, but the control plane's guard rejects any POST without
 // application/json, so the header must be set for the method, not the body.
@@ -615,7 +684,7 @@ func (h *harness) waitLoggedAddr(ctx context.Context, message string) string {
 		filepath.Join(h.workDir, "controlplane.stderr.log"),
 		filepath.Join(h.workDir, "controlplane.stdout.log"),
 	}
-	addr, err := waitForAddr(ctx, paths, message)
+	addr, err := waitForAddr(ctx, h.control, paths, message)
 	if err != nil {
 		h.t.Fatalf("acceptance: read control plane address: %v", err)
 	}
@@ -623,8 +692,10 @@ func (h *harness) waitLoggedAddr(ctx context.Context, message string) string {
 }
 
 // waitForAddr polls the log files until one holds a line containing message
-// with an addr attribute, and returns that address.
-func waitForAddr(ctx context.Context, paths []string, message string) (string, error) {
+// with an addr attribute, and returns that address. It fails as soon as the
+// child that writes those logs exits, so a child that dies before logging is
+// reported with its exit status instead of running into the context deadline.
+func waitForAddr(ctx context.Context, child *childProcess, paths []string, message string) (string, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
@@ -634,6 +705,8 @@ func waitForAddr(ctx context.Context, paths []string, message string) (string, e
 			}
 		}
 		select {
+		case <-child.doneChan():
+			return "", fmt.Errorf("waiting for %q in %s: %w", message, strings.Join(paths, ", "), child.exitError())
 		case <-ctx.Done():
 			return "", fmt.Errorf("waiting for %q in %s: %w", message, strings.Join(paths, ", "), ctx.Err())
 		case <-ticker.C:

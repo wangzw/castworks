@@ -654,12 +654,12 @@ func (h *harness) suspendStartControlPlane(ctx context.Context, name, credential
 		filepath.Join(h.workDir, name+".stderr.log"),
 		filepath.Join(h.workDir, name+".stdout.log"),
 	}
-	httpAddr, err := waitForAddr(ctx, paths, "http listening")
+	httpAddr, err := waitForAddr(ctx, child, paths, "http listening")
 	if err != nil {
 		h.t.Fatalf("acceptance: read control plane HTTP address: %v", err)
 	}
 	h.setControlPlaneHTTPAddr(httpAddr)
-	grpcAddr, err := waitForAddr(ctx, paths, "grpc listening")
+	grpcAddr, err := waitForAddr(ctx, child, paths, "grpc listening")
 	if err != nil {
 		h.t.Fatalf("acceptance: read control plane gRPC address: %v", err)
 	}

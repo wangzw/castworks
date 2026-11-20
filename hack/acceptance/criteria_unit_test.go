@@ -10,6 +10,7 @@ package acceptance
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -1090,6 +1091,18 @@ func TestJudgeBackgroundJob(t *testing.T) {
 			want: "suspension 1 failed",
 		},
 		{
+			// The failing suspension is not the run's first one, so the
+			// message must name the suspension the judge selected.
+			name: "a later suspension record carries an error",
+			mutate: func(_ *testing.T, c *criteriaCase) {
+				c.Suspensions = append([]suspension{
+					criteriaTestSuspension(criteriaTestBase().Add(time.Second), 5000, 5000, 1000),
+				}, c.Suspensions...)
+				c.Suspensions[1].Error = "snapshot failed"
+			},
+			want: "suspension 2 failed",
+		},
+		{
 			name: "the spontaneous turn has a delivery id",
 			mutate: func(_ *testing.T, c *criteriaCase) {
 				c.Turns[1].DeliveryID = "delivery-2"
@@ -1326,5 +1339,143 @@ func TestJudgeActorCrash(t *testing.T) {
 				t.Fatalf("mismatch %q does not contain %q", mismatch, tc.want)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Evidence the measurement writer records
+
+// TestCriteriaCallbackFirstEvidencePicksMatchedEvent covers the callback-first
+// evidence: the writer must record the connector event the judge matched, not
+// the first event in the log.
+func TestCriteriaCallbackFirstEvidencePicksMatchedEvent(t *testing.T) {
+	base := criteriaTestBase()
+	jobID := "job-evidence"
+	createdAt := base.Add(100 * time.Second)
+	c := criteriaCase{
+		Expect: criteriaExpectations{JobID: jobID},
+		Subscriptions: []subscriptionRecord{
+			criteriaTestSubscription("sub-1", jobID, criteriaTerminalSucceeded, createdAt, 10),
+		},
+		ConnectorEvents: []connectorEventRecord{
+			// Arrived after registration and sits above the cursor, so it
+			// did not complete the registration.
+			criteriaTestConnectorEvent(20, jobID, base.Add(110*time.Second), nil),
+			// The event that did.
+			criteriaTestConnectorEvent(3, jobID, base.Add(50*time.Second), nil),
+		},
+	}
+
+	used := criteriaCallbackFirstEvidence(c)
+	if used.Subscription == nil {
+		t.Fatal("the subscription was not found")
+	}
+	if used.Event == nil {
+		t.Fatal("the matched event was not found")
+	}
+	if used.Event.AppendSeq != 3 {
+		t.Fatalf("matched event append_seq = %d, want 3", used.Event.AppendSeq)
+	}
+
+	c.ConnectorEvents = c.ConnectorEvents[:1]
+	if used := criteriaCallbackFirstEvidence(c); used.Event != nil {
+		t.Fatalf("an event with no match was reported: append_seq %d", used.Event.AppendSeq)
+	}
+}
+
+// TestCriteriaBackgroundJobEvidencePicksSuspensionAfterEmpty covers the
+// background-job evidence: the writer must record the first suspension that
+// started after bg_jobs became empty, not the first suspension of the run.
+func TestCriteriaBackgroundJobEvidencePicksSuspensionAfterEmpty(t *testing.T) {
+	c := criteriaBackgroundJobCase(t)
+	first := criteriaTestSuspension(criteriaTestBase().Add(time.Second), 5000, 5000, 1000)
+	second := criteriaTestSuspension(criteriaTestBase().Add(100*time.Second), 5000, 5000, 1000)
+	c.Suspensions = []suspension{first, second}
+
+	used := criteriaBackgroundJobEvidence(c)
+	if !used.EmptiedAt.Equal(criteriaTestBase().Add(60 * time.Second)) {
+		t.Fatalf("emptied_at = %s, want the 60s change", criteriaFormatTime(used.EmptiedAt))
+	}
+	if used.Spontaneous == nil || used.Spontaneous.TurnID != "turn-2" {
+		t.Fatalf("spontaneous turn = %+v, want turn-2", used.Spontaneous)
+	}
+	if used.Suspension == nil || !used.Suspension.StartedAt.Equal(second.StartedAt) {
+		t.Fatalf("suspension = %+v, want the one at %s", used.Suspension, criteriaFormatTime(second.StartedAt))
+	}
+	if got := criteriaSuspensionNumber(c.Suspensions, used.Suspension); got != "2" {
+		t.Fatalf("suspension number = %q, want 2", got)
+	}
+}
+
+// TestCriteriaTurnsInWindow covers the duplicate-delivery evidence: only turns
+// that started inside the observation window are returned.
+func TestCriteriaTurnsInWindow(t *testing.T) {
+	start := criteriaTestBase()
+	end := start.Add(100 * time.Second)
+	turns := []turn{
+		criteriaTestTurn("turn-before", "", start, start.Add(time.Second), ""),
+		criteriaTestTurn("turn-inside", "delivery-1", start.Add(50*time.Second), start.Add(60*time.Second), ""),
+		criteriaTestTurn("turn-after", "", end.Add(time.Second), end.Add(2*time.Second), ""),
+	}
+
+	window := criteriaTurnsInWindow(turns, start, end)
+	if len(window) != 1 || window[0].TurnID != "turn-inside" {
+		t.Fatalf("turns in window = %+v, want only turn-inside", window)
+	}
+	if window[0].DeliveryID != "delivery-1" {
+		t.Fatalf("delivery id = %q, want delivery-1", window[0].DeliveryID)
+	}
+}
+
+// TestSubscriptionActorCrashEvidenceOmitsZeroLastRunning covers a poll that
+// never saw the actor RUNNING: the evidence map must omit the moment rather
+// than write a zero time.
+func TestSubscriptionActorCrashEvidenceOmitsZeroLastRunning(t *testing.T) {
+	crashedAt := criteriaTestBase()
+	record := runRecord{State: criteriaStateFailed, FailureReason: "actor crashed"}
+	disconnect := subscriptionDisconnectLog{DisconnectedAt: crashedAt, Line: "logged"}
+	processStartedAt := crashedAt.Add(-time.Minute)
+
+	unseen := subscriptionActorCrashEvidence(subscriptionCrashObservation{CrashedAt: crashedAt}, disconnect, processStartedAt, record, crashedAt, true)
+	if value, ok := unseen["last_running_poll_at"]; ok {
+		t.Fatalf("last_running_poll_at = %v, want the key omitted", value)
+	}
+
+	seenAt := crashedAt.Add(-time.Second)
+	seen := subscriptionActorCrashEvidence(subscriptionCrashObservation{
+		LastRunningAt: seenAt,
+		CrashedAt:     crashedAt,
+	}, disconnect, processStartedAt, record, crashedAt, true)
+	value, ok := seen["last_running_poll_at"]
+	if !ok || !value.(time.Time).Equal(seenAt) {
+		t.Fatalf("last_running_poll_at = %v, want %s", value, criteriaFormatTime(seenAt))
+	}
+}
+
+// TestSubscriptionResolveCommit covers the actor-commit ancestor check: HEAD
+// and a branch name must resolve to the same full SHA as the commit itself.
+func TestSubscriptionResolveCommit(t *testing.T) {
+	root := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	git("init", "-q")
+	git("config", "user.email", "acceptance@example.com")
+	git("config", "user.name", "Acceptance Test")
+	git("commit", "--allow-empty", "-q", "-m", "first")
+	want := git("rev-parse", "HEAD")
+	git("branch", "release-candidate")
+
+	for _, revision := range []string{"HEAD", want, "release-candidate"} {
+		if got := subscriptionResolveCommit(t, root, revision); got != want {
+			t.Fatalf("subscriptionResolveCommit(%q) = %s, want %s", revision, got, want)
+		}
 	}
 }

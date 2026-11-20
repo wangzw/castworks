@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -313,6 +314,43 @@ func judgeRoundTrip(c criteriaCase) string {
 	return ""
 }
 
+// callbackFirstEvidence is what judgeCallbackFirst reads: the job's
+// subscription and the connector event that completed it during registration.
+// The measurement writer records Event, so the evidence is the event the
+// judge actually matched rather than the first event in the log.
+type callbackFirstEvidence struct {
+	Subscription *subscriptionRecord
+	Event        *connectorEventRecord
+}
+
+// criteriaCallbackFirstEvidence derives callbackFirstEvidence from the same
+// records judgeCallbackFirst checks.
+func criteriaCallbackFirstEvidence(c criteriaCase) callbackFirstEvidence {
+	var used callbackFirstEvidence
+	if c.Expect.JobID == "" {
+		return used
+	}
+	sub, ok := criteriaSubscriptionForJob(c.Subscriptions, c.Expect.JobID)
+	if !ok {
+		return used
+	}
+	used.Subscription = &sub
+	events := criteriaEventsForJob(c.ConnectorEvents, c.Expect.JobID)
+	for i := range events {
+		event := &events[i]
+		// The registration completes the subscription itself by
+		// backtracking to an event that arrived before created_at and sits
+		// below since_cursor. Both halves are necessary: completed_at
+		// falling close to created_at is not enough, because a later scan
+		// could have completed it.
+		if event.ReceivedAt.Before(sub.CreatedAt) && event.AppendSeq < sub.SinceCursor {
+			used.Event = event
+			break
+		}
+	}
+	return used
+}
+
 // judgeCallbackFirst is pass criterion 2: the job completed and its callback
 // arrived before the subscription was registered. Registration backtracks,
 // matches the event and completes the subscription itself.
@@ -320,10 +358,11 @@ func judgeCallbackFirst(c criteriaCase) string {
 	if c.Expect.JobID == "" {
 		return "the criterion input has no job id"
 	}
-	sub, ok := criteriaSubscriptionForJob(c.Subscriptions, c.Expect.JobID)
-	if !ok {
+	used := criteriaCallbackFirstEvidence(c)
+	if used.Subscription == nil {
 		return fmt.Sprintf("no subscription for job %s", c.Expect.JobID)
 	}
+	sub := *used.Subscription
 	if sub.Status != "completed" {
 		return fmt.Sprintf("subscription %s has status %q at registration, want completed", sub.SubID, sub.Status)
 	}
@@ -340,14 +379,7 @@ func judgeCallbackFirst(c criteriaCase) string {
 	// an event that arrived before created_at and sits below since_cursor.
 	// Both halves are necessary: completed_at falling close to created_at is
 	// not enough, because a later scan could have completed it.
-	backtracked := false
-	for _, event := range events {
-		if event.ReceivedAt.Before(sub.CreatedAt) && event.AppendSeq < sub.SinceCursor {
-			backtracked = true
-			break
-		}
-	}
-	if !backtracked {
+	if used.Event == nil {
 		return fmt.Sprintf("subscription %s did not complete during its registration: no connector_event for job %s both arrived before the subscription was created at %s and has append_seq below since_cursor %d",
 			sub.SubID, c.Expect.JobID, criteriaFormatTime(sub.CreatedAt), sub.SinceCursor)
 	}
@@ -470,13 +502,10 @@ func judgeDuplicateDelivery(c criteriaCase) string {
 		return fmt.Sprintf("the observation window lasted %s, want at least G_idle + P_scan + P_deliver = %s",
 			window, criteriaDuplicateWindow)
 	}
-	for _, observed := range c.Turns {
-		if observed.StartedAt.After(c.Times.ObservationStartedAt) &&
-			!observed.StartedAt.After(c.Times.ObservationEndedAt) {
-			return fmt.Sprintf("turn %s started at %s, inside the observation window starting at %s; the turn count must not grow",
-				observed.TurnID, criteriaFormatTime(observed.StartedAt),
-				criteriaFormatTime(c.Times.ObservationStartedAt))
-		}
+	for _, observed := range criteriaTurnsInWindow(c.Turns, c.Times.ObservationStartedAt, c.Times.ObservationEndedAt) {
+		return fmt.Sprintf("turn %s started at %s, inside the observation window starting at %s; the turn count must not grow",
+			observed.TurnID, criteriaFormatTime(observed.StartedAt),
+			criteriaFormatTime(c.Times.ObservationStartedAt))
 	}
 
 	if mismatch := criteriaTurnInboxMismatch(c.Turns, c.Inbox); mismatch != "" {
@@ -576,6 +605,53 @@ func judgeRestartWhileSuspended(c criteriaCase) string {
 	return ""
 }
 
+// backgroundJobEvidence is what judgeBackgroundJob reads after the hold
+// precondition: when bg_jobs first became empty, the first spontaneous turn
+// that started afterwards, and the first suspension that started after the
+// same moment. The measurement writer records these records, not the first
+// entries of each slice, so both sides see the same evidence.
+type backgroundJobEvidence struct {
+	EmptiedAt   time.Time
+	Spontaneous *turn
+	Suspension  *suspension
+}
+
+// criteriaBackgroundJobEvidence derives backgroundJobEvidence from the same
+// records judgeBackgroundJob checks, using the same sampling resolution.
+func criteriaBackgroundJobEvidence(c criteriaCase) backgroundJobEvidence {
+	var used backgroundJobEvidence
+	resolution := c.BGJobsResolution
+	if resolution <= 0 {
+		resolution = defaultBGJobsInterval
+	}
+	emptiedAt, ok := criteriaFirstEmptyAfterNonEmpty(c.BGJobs)
+	if !ok {
+		return used
+	}
+	used.EmptiedAt = emptiedAt
+	// See the comment in judgeBackgroundJob for why resolution is subtracted.
+	spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedAt.Add(-resolution))
+	if !ok {
+		return used
+	}
+	used.Spontaneous = spontaneous
+	if suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt); ok {
+		used.Suspension = suspension
+	}
+	return used
+}
+
+// criteriaSuspensionNumber returns the 1-based position of target in
+// suspensions, or "?" when it is not from that slice.
+func criteriaSuspensionNumber(suspensions []suspension, target *suspension) string {
+	for i := range suspensions {
+		if &suspensions[i] == target || suspensions[i].StartedAt.Equal(target.StartedAt) {
+			return strconv.Itoa(i + 1)
+		}
+	}
+	return "?"
+}
+
 // judgeBackgroundJob is pass criterion 6: a background job keeps the run from
 // suspending; after it ends and a spontaneous turn appears, the run suspends
 // only after the idle grace. The run has no subscription.
@@ -612,22 +688,23 @@ func judgeBackgroundJob(c criteriaCase) string {
 			held, criteriaBackgroundHold)
 	}
 
-	emptiedAt, ok := criteriaFirstEmptyAfterNonEmpty(c.BGJobs)
-	if !ok {
+	used := criteriaBackgroundJobEvidence(c)
+	if used.EmptiedAt.IsZero() {
 		return "bg_jobs never became empty after being non-empty"
 	}
-	// The observer timestamps a change when it reads it, so the transition
-	// happened after the previous read, which is at most one sampling
-	// interval before the recorded empty time. A turn the driver started right
-	// after the empty push can therefore carry a start time just before the
-	// recorded empty time; the previous read is the strictest moment the
-	// observation supports.
-	emptiedNoEarlierThan := emptiedAt.Add(-resolution)
-	spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedNoEarlierThan)
-	if !ok {
+	emptiedAt := used.EmptiedAt
+	if used.Spontaneous == nil {
+		// The observer timestamps a change when it reads it, so the transition
+		// happened after the previous read, which is at most one sampling
+		// interval before the recorded empty time. A turn the driver started
+		// right after the empty push can therefore carry a start time just
+		// before the recorded empty time; the previous read is the strictest
+		// moment the observation supports.
+		emptiedNoEarlierThan := emptiedAt.Add(-resolution)
 		return fmt.Sprintf("no spontaneous turn started after bg_jobs became empty (observed at %s, not before %s)",
 			criteriaFormatTime(emptiedAt), criteriaFormatTime(emptiedNoEarlierThan))
 	}
+	spontaneous := used.Spontaneous
 	// A turn the control plane starts from a background task notification is
 	// not answering an inbox row, so it carries no delivery_id. A turn with
 	// one is an ordinary delivered turn and cannot be the spontaneous turn.
@@ -640,8 +717,8 @@ func judgeBackgroundJob(c criteriaCase) string {
 			spontaneous.TurnID, criteriaFormatTime(emptiedAt))
 	}
 	if c.checksSuspensions() {
-		suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt)
-		if !ok {
+		suspension := used.Suspension
+		if suspension == nil {
 			return fmt.Sprintf("no suspension started after bg_jobs became empty at %s", criteriaFormatTime(emptiedAt))
 		}
 		if !suspension.StartedAt.After(emptiedAt) {
@@ -649,7 +726,8 @@ func judgeBackgroundJob(c criteriaCase) string {
 				criteriaFormatTime(suspension.StartedAt), criteriaFormatTime(emptiedAt))
 		}
 		if suspension.Error != "" {
-			return fmt.Sprintf("suspension 1 failed: %s", suspension.Error)
+			return fmt.Sprintf("suspension %s failed (started at %s): %s",
+				criteriaSuspensionNumber(c.Suspensions, suspension), criteriaFormatTime(suspension.StartedAt), suspension.Error)
 		}
 		grace := spontaneous.EndedAt.Add(criteriaIdleGrace)
 		if suspension.StartedAt.Before(grace) {
@@ -918,6 +996,20 @@ func criteriaLastTurnStartedAtOrAfter(turns []turn, at time.Time) (*turn, bool) 
 		}
 	}
 	return latest, latest != nil
+}
+
+// criteriaTurnsInWindow returns the turns that started inside the duplicate
+// delivery observation window, which judgeDuplicateDelivery forbids. The
+// measurement writer records them through this function, so it lists exactly
+// the turns the judge rejected on.
+func criteriaTurnsInWindow(turns []turn, start, end time.Time) []turn {
+	var window []turn
+	for _, observed := range turns {
+		if observed.StartedAt.After(start) && !observed.StartedAt.After(end) {
+			window = append(window, observed)
+		}
+	}
+	return window
 }
 
 // criteriaFirstTurnStartedAfter returns the earliest turn that started strictly
