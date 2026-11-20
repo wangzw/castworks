@@ -65,11 +65,11 @@ AppendInbox(ctx context.Context, runID string, ev InboxEvent) (inboxSeq int64, d
 
 ### 后台作业与挂起
 
-- 每次收到 `Hello`，以其中的 `bg_jobs` 替换 `run.bg_jobs`，不论运行实例处于哪个状态。
+- 运行实例处于非终态时，每次处理 `Hello` 都以其中的 `bg_jobs` 替换 `run.bg_jobs`，包括只登记流的 `suspending` 与 `suspended`；`phase` 为 `exited` 的 `Hello` 按 v0.1.0 把运行实例转为 `failed`，不更新集合。
 - 收到 `bg_jobs_changed` 时以 `job_ids` 替换 `run.bg_jobs`。运行实例处于 `active`、`boundary`，且集合由非空变为空时，`idle_since` 置为当前时刻。
 - 挂起扫描的条件在 v0.1.0 的基础上增加 `bg_jobs` 为空：挂起的候选查询与事务内的重新检查都加上这一条。
 
-后台作业存活时，设计只允许静止冻结，Substrate 不提供冻结，所以不挂起，见 [v0.2.0 的后台作业](README.md#后台作业)。集合变空时重新开始空闲计时，是因为后台任务结束后 Claude Code 通常紧接着开始一个任务通知回合；重新计时避免在两者之间挂起。
+后台作业存活时，设计只允许静止冻结，Substrate 不提供冻结，所以不挂起，见 [v0.2.0 的后台作业](README.md#后台作业)。集合变空时重新开始空闲计时，是因为后台任务结束后 Claude Code 通常紧接着开始一个[自发回合](../../glossary.md)处理任务通知；重新计时避免在两者之间挂起。
 
 ## 与设计的差异
 

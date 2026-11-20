@@ -52,13 +52,13 @@ v0.1.0 的范围、组成、偏离与安全让步在 v0.2.0 中继续有效，�
 
 ## 后台作业
 
-v0.1.0 中，Claude Code 的后台任务会随快照一起停住。v0.2.0 中，看守进程按 Claude Code 的 `background_tasks_changed` 维护后台作业集合，不计 `ambient` 为真的任务，集合变化时以 `bg_jobs_changed` 上报；后台作业集合非空时，控制面不挂起运行实例。设计规定后台作业存活时只允许[静止冻结](../../glossary.md)，Substrate 不提供冻结，所以在 Substrate 上的做法是不挂起。后台任务照常运行，Agent 的功能不受限制，只是这段时间不释放计算资源。后台任务结束后 Claude Code 自行开始的回合，按 v0.1.0 的规则处理。
+v0.1.0 中，Claude Code 的后台任务会随快照一起停住。v0.2.0 中，看守进程按 Claude Code 的 `background_tasks_changed` 维护后台作业集合，不计 `ambient` 为真的任务，集合变化时以 `bg_jobs_changed` 上报；后台作业集合非空时，控制面不挂起运行实例。设计规定后台作业存活时只允许[静止冻结](../../glossary.md)，Substrate 不提供冻结，所以在 Substrate 上的做法是不挂起。后台任务照常运行，Agent 的功能不受限制，只是这段时间不释放计算资源。后台任务结束后 Claude Code 开始的[自发回合](../../glossary.md)，按 v0.1.0 的规则处理。
 
 ## 组成
 
 | 组成部分 | 运行位置与内容 |
 | --- | --- |
-| 控制面进程 | 开发机上的普通进程，在 v0.1.0 的基础上加入 `connectorhub`：webhook 接收端只监听 `127.0.0.1`，`connector` 端点监听开发机网卡地址 |
+| 控制面进程 | 开发机上的普通进程，在 v0.1.0 的基础上加入 `connectorhub`：webhook 接收端只监听回环地址，`connector` 端点监听开发机网卡地址 |
 | 模拟外部系统 | 开发机上的独立进程 `extsim` |
 | PostgreSQL | 同 v0.1.0；`connectorhub` 的表与 `runcontroller` 的表在同一数据库中 |
 | 命令行 | 同 v0.1.0 |
@@ -89,7 +89,7 @@ EgressPolicy `default` 在 v0.1.0 的基础上变化如下：
 
 ## 安全
 
-保留 v0.1.0 的三项，增加一项：webhook 接收端只监听 `127.0.0.1`，校验 HMAC-SHA256 签名与投递标识；签名密钥放在开发机上的本地文件中，不进代码仓库，控制面与 `extsim` 读取同一文件。
+保留 v0.1.0 的三项，增加一项：webhook 接收端只监听回环地址，校验 HMAC-SHA256 签名与投递标识；签名密钥放在开发机上的本地文件中，不进代码仓库，控制面与 `extsim` 读取同一文件。
 
 在 v0.1.0 的让步之外增加：
 
