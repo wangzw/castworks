@@ -65,6 +65,10 @@ type ledgerEntry struct {
 	Provider string    `json:"provider,omitempty"`
 	Process  string    `json:"process,omitempty"`
 	PID      int       `json:"pid,omitempty"`
+	// Files lists generated files such as the per-run signing key and the
+	// connectorhub configuration. Cleanup removes them, and acceptance-clean
+	// removes what a killed run left behind.
+	Files []string `json:"files,omitempty"`
 }
 
 var (
@@ -171,6 +175,27 @@ func repoRoot(t testing.TB) string {
 	return filepath.Dir(filepath.Dir(filepath.Dir(file)))
 }
 
+// subscriptionRequireCleanRepo refuses to run on a dirty worktree and returns
+// the tested commit. The evidence a real run leaves must belong to a commit.
+func subscriptionRequireCleanRepo(t *testing.T) string {
+	t.Helper()
+	root := repoRoot(t)
+
+	status, err := exec.Command("git", "-C", root, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("acceptance: git status: %v\n%s", err, status)
+	}
+	if strings.TrimSpace(string(status)) != "" {
+		t.Fatalf("acceptance: the worktree has uncommitted changes; a real run must start from a clean commit:\n%s", status)
+	}
+
+	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("acceptance: git rev-parse HEAD: %v", err)
+	}
+	return strings.TrimSpace(string(head))
+}
+
 // harnessOptions carries what a test needs before the harness starts anything.
 type harnessOptions struct {
 	// DatabaseURL is passed to the control plane as --database-url.
@@ -185,6 +210,9 @@ type harness struct {
 	repoRoot string
 	workDir  string
 	binDir   string
+	// httpMu guards httpAddr. The suspension watcher reads it from its own
+	// goroutine while a restart rewrites it in startControlPlane.
+	httpMu   sync.RWMutex
 	httpAddr string
 	grpcAddr string
 	provider string
@@ -195,6 +223,16 @@ type harness struct {
 	runID    string
 	control  *childProcess
 	warden   *childProcess
+	extsim   *childProcess
+
+	// connectorAddr and webhookAddr are the connectorhub endpoints the
+	// control plane reported. They are empty until the control plane is
+	// started with a connectorhub configuration.
+	connectorAddr string
+	webhookAddr   string
+
+	// generatedFiles are removed by cleanup and recorded in the ledger.
+	generatedFiles []string
 
 	// hooks replaces cleanup's side-effecting steps in tests that only check
 	// their order. A nil hooks or nil field means the real implementation.
@@ -239,7 +277,22 @@ func newHarness(t *testing.T, opts harnessOptions) *harness {
 	return h
 }
 
-// buildBinaries builds the three real binaries into the working directory.
+// controlPlaneHTTPAddr returns the control plane's HTTP address. A restart may
+// replace it while the suspension watcher is reading the run.
+func (h *harness) controlPlaneHTTPAddr() string {
+	h.httpMu.RLock()
+	defer h.httpMu.RUnlock()
+	return h.httpAddr
+}
+
+// setControlPlaneHTTPAddr replaces the control plane's HTTP address.
+func (h *harness) setControlPlaneHTTPAddr(addr string) {
+	h.httpMu.Lock()
+	h.httpAddr = addr
+	h.httpMu.Unlock()
+}
+
+// buildBinaries builds the four real binaries into the working directory.
 func (h *harness) buildBinaries() {
 	h.t.Helper()
 	binDir := filepath.Join(h.workDir, "bin")
@@ -254,6 +307,7 @@ func (h *harness) buildBinaries() {
 		{"castworks-controlplane", "./cmd/castworks-controlplane"},
 		{"warden", "./cmd/warden"},
 		{"castworks", "./cmd/castworks"},
+		{"extsim", "./cmd/extsim"},
 	}
 	for _, target := range targets {
 		cmd := exec.Command("go", "build", "-o", filepath.Join(binDir, target.name), target.pkg)
@@ -311,10 +365,17 @@ func childEnv() []string {
 // It is separate from startChild so that a test can inspect the environment
 // and the process attributes without starting anything.
 func childCommand(bin string, args []string, stdout, stderr io.Writer) *exec.Cmd {
+	return childCommandEnv(bin, args, stdout, stderr, childEnv())
+}
+
+// childCommandEnv is childCommand with an explicit environment. Callers that
+// add a variable still build the list from childEnv, so a child never
+// inherits the whole environment.
+func childCommandEnv(bin string, args []string, stdout, stderr io.Writer, env []string) *exec.Cmd {
 	cmd := exec.Command(bin, args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = childEnv()
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Pdeathsig: syscall.SIGTERM,
 		Setpgid:   true,
@@ -325,6 +386,11 @@ func childCommand(bin string, args []string, stdout, stderr io.Writer) *exec.Cmd
 // startChild starts bin in the background, sending stdout and stderr to
 // separate log files under the working directory.
 func (h *harness) startChild(name, bin string, args []string) *childProcess {
+	return h.startChildEnv(name, bin, args, childEnv())
+}
+
+// startChildEnv is startChild with an explicit environment.
+func (h *harness) startChildEnv(name, bin string, args, env []string) *childProcess {
 	h.t.Helper()
 
 	stdoutPath := filepath.Join(h.workDir, name+".stdout.log")
@@ -339,7 +405,7 @@ func (h *harness) startChild(name, bin string, args []string) *childProcess {
 		h.t.Fatalf("acceptance: create %s: %v", stderrPath, err)
 	}
 
-	cmd := childCommand(bin, args, stdout, stderr)
+	cmd := childCommandEnv(bin, args, stdout, stderr, env)
 
 	if err := cmd.Start(); err != nil {
 		_ = stdout.Close()
@@ -578,7 +644,9 @@ func loggedAddrIn(path, message string) string {
 }
 
 // startControlPlane starts castworks-controlplane and waits until both
-// listeners report their actual addresses.
+// listeners report their actual addresses. When the control plane is given a
+// connectorhub configuration, the connector endpoint and webhook receiver are
+// waited for as well.
 func (h *harness) startControlPlane(ctx context.Context, args ...string) {
 	h.t.Helper()
 	full := args
@@ -586,11 +654,29 @@ func (h *harness) startControlPlane(ctx context.Context, args ...string) {
 		full = append(full, "--database-url", h.database)
 	}
 	h.control = h.startChild("controlplane", filepath.Join(h.binDir, "castworks-controlplane"), full)
-	h.httpAddr = h.waitLoggedAddr(ctx, "http listening")
+	h.setControlPlaneHTTPAddr(h.waitLoggedAddr(ctx, "http listening"))
 	h.grpcAddr = h.waitLoggedAddr(ctx, "grpc listening")
+	if hasFlag(args, "--connectorhub-config") {
+		h.webhookAddr = h.waitLoggedAddr(ctx, "webhook listening")
+		h.connectorAddr = h.waitLoggedAddr(ctx, "connector listening")
+	}
 }
 
-// startWardenLocal starts warden in local mode against the control plane.
+// hasFlag reports whether args contains name, either alone or as name=value.
+func hasFlag(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name || strings.HasPrefix(arg, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// startWardenLocal starts warden in local mode against the control plane. When
+// the control plane exposes a connector endpoint, it is passed as --connector.
+// The directory holding the extsim binary is prepended to the warden process's
+// PATH: local mode passes that PATH on to Claude Code, whose extsim command
+// line therefore finds the binary the harness built.
 func (h *harness) startWardenLocal(runID, claudeBin string) {
 	h.t.Helper()
 	args := []string{
@@ -599,7 +685,37 @@ func (h *harness) startWardenLocal(runID, claudeBin string) {
 		"--home", filepath.Join(h.workDir, "home"),
 		"--claude-bin", claudeBin,
 	}
-	h.warden = h.startChild("warden", filepath.Join(h.binDir, "warden"), args)
+	if h.connectorAddr != "" {
+		args = append(args, "--connector", h.connectorAddr)
+	}
+
+	env := childEnv()
+	if h.binDir != "" {
+		if info, err := os.Stat(filepath.Join(h.binDir, "extsim")); err == nil && info.Mode().IsRegular() {
+			env = withPathPrefix(env, h.binDir)
+		}
+	}
+	h.warden = h.startChildEnv("warden", filepath.Join(h.binDir, "warden"), args, env)
+}
+
+// withPathPrefix returns env with dir prepended to PATH. A missing PATH entry
+// becomes exactly dir, which is still an explicit environment: no variable
+// other than the ones childEnv lists is added.
+func withPathPrefix(env []string, dir string) []string {
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			out = append(out, "PATH="+dir+":"+strings.TrimPrefix(entry, "PATH="))
+			replaced = true
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !replaced {
+		out = append(out, "PATH="+dir)
+	}
+	return out
 }
 
 // httpStatusError is a non-2xx response from the control plane API.
@@ -622,7 +738,7 @@ func (h *harness) do(ctx context.Context, method, path string, in, out any) erro
 		body = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, "http://"+h.httpAddr+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, "http://"+h.controlPlaneHTTPAddr()+path, body)
 	if err != nil {
 		return err
 	}
@@ -922,7 +1038,7 @@ func (h *harness) cleanup() {
 		saveActorState(context.Background(), actor)
 	}
 
-	if h.runID != "" && h.httpAddr != "" && h.control != nil && !h.control.exited() {
+	if h.runID != "" && h.controlPlaneHTTPAddr() != "" && h.control != nil && !h.control.exited() {
 		endCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := endRun(endCtx, h.runID)
 		cancel()
@@ -952,8 +1068,20 @@ func (h *harness) cleanup() {
 	if err := stopChild(h.warden, stopTimeout); err != nil {
 		h.t.Errorf("cleanup: stop warden: %v", err)
 	}
+	if err := stopChild(h.extsim, stopTimeout); err != nil {
+		h.t.Errorf("cleanup: stop extsim: %v", err)
+	}
 	if err := stopChild(h.control, stopTimeout); err != nil {
 		h.t.Errorf("cleanup: stop control plane: %v", err)
+	}
+
+	// The signing key is secret and per-run, and the connectorhub
+	// configuration is generated for this run only. Remove both once the
+	// processes that read them have stopped.
+	for _, path := range h.generatedFiles {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			h.t.Errorf("cleanup: remove generated file %s: %v", path, err)
+		}
 	}
 }
 
@@ -1012,6 +1140,8 @@ func expectedExecutable(entry ledgerEntry) string {
 		binary = "castworks-controlplane"
 	case "warden":
 		binary = "warden"
+	case "extsim":
+		binary = "extsim"
 	default:
 		return ""
 	}
@@ -1071,6 +1201,31 @@ func stopRecordedProcess(t *testing.T, entry ledgerEntry) {
 	}
 }
 
+// removeRecordedFiles deletes the generated files a run recorded in the
+// ledger. It only removes paths below acceptanceRoot, so a damaged or
+// hand-edited ledger cannot make it delete anything outside the acceptance
+// work area.
+func removeRecordedFiles(t *testing.T, entries []ledgerEntry) {
+	t.Helper()
+	seen := make(map[string]struct{})
+	for _, entry := range entries {
+		for _, path := range entry.Files {
+			clean := filepath.Clean(path)
+			if _, ok := seen[clean]; ok {
+				continue
+			}
+			seen[clean] = struct{}{}
+			if !strings.HasPrefix(clean, acceptanceRoot+string(os.PathSeparator)) {
+				t.Logf("clean: recorded file %q is outside %s; skipping", clean, acceptanceRoot)
+				continue
+			}
+			if err := os.Remove(clean); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("clean: remove recorded file %s: %v", clean, err)
+			}
+		}
+	}
+}
+
 // TestClean removes what a killed run left behind: actors recorded for
 // substrate runs and the child processes recorded in the ledger. It needs
 // neither the database nor a control plane.
@@ -1109,6 +1264,8 @@ func TestClean(t *testing.T) {
 	for _, entry := range recordedProcesses(entries) {
 		stopRecordedProcess(t, entry)
 	}
+
+	removeRecordedFiles(t, entries)
 
 	// The ledger only describes work that still needs cleaning. Once every
 	// entry has been handled, truncate it so a later clean cannot act on a PID

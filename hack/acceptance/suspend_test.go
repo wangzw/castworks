@@ -658,7 +658,7 @@ func (h *harness) suspendStartControlPlane(ctx context.Context, name, credential
 	if err != nil {
 		h.t.Fatalf("acceptance: read control plane HTTP address: %v", err)
 	}
-	h.httpAddr = httpAddr
+	h.setControlPlaneHTTPAddr(httpAddr)
 	grpcAddr, err := waitForAddr(ctx, paths, "grpc listening")
 	if err != nil {
 		h.t.Fatalf("acceptance: read control plane gRPC address: %v", err)
@@ -686,7 +686,7 @@ func suspendStopControlPlane(t *testing.T, h *harness, child *childProcess) {
 // suspendRunCLI runs the castworks CLI against this harness's HTTP API.
 func suspendRunCLI(ctx context.Context, h *harness, args ...string) string {
 	h.t.Helper()
-	full := append([]string{"--server", "http://" + h.httpAddr}, args...)
+	full := append([]string{"--server", "http://" + h.controlPlaneHTTPAddr()}, args...)
 	cmd := exec.CommandContext(ctx, filepath.Join(h.binDir, "castworks"), full...)
 	cmd.Env = childEnv()
 	var stdout, stderr bytes.Buffer

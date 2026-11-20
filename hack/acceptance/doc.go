@@ -42,6 +42,14 @@
 //
 // Every run works under /tmp/castworks-acceptance/<UTC timestamp>/ and never
 // writes inside the repository. That root also holds the ledger, which
-// records each created run and child process so acceptance-clean can remove
-// what a killed test left behind.
+// records each created run, child process and generated file so
+// acceptance-clean can remove what a killed test left behind.
+//
+// The v0.2.0 tests in the same package drive cmd/extsim as a child process.
+// Each run generates its own signing key and connectorhub configuration under
+// the working directory; neither is shared with deploy/dev, and both are
+// removed by cleanup. The extsim jobs interface is fixed at 127.0.0.1:9100 in
+// local runs and dry runs because Claude Code's extsim command line falls back
+// to that address, so those runs cannot overlap with a Substrate acceptance
+// run or a connectorhub integration test that uses the same port.
 package acceptance
