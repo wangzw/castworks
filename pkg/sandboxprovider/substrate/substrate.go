@@ -23,6 +23,7 @@ import (
 	"sync"
 
 	"go.ate.dev/substrate/api/ateapi/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
@@ -30,13 +31,14 @@ import (
 // Config configures a Provider. The zero Config is invalid; New checks every
 // field before it opens a connection.
 type Config struct {
-	Kubeconfig     string // 空则用默认加载规则
-	KubeContext    string // 空则用当前 context
-	Atespace       string // castworks-dev
-	Image          string // name@sha256:...
-	ControlPlane   string // 写进模板 env 的 CASTWORKS_CONTROL_PLANE，host:port
-	Connector      string // 写进模板 env 的 CASTWORKS_CONNECTOR，host:port
-	ServiceAccount string // castworks-system/sandboxprovider
+	Kubeconfig     string   // 空则用默认加载规则
+	KubeContext    string   // 空则用当前 context
+	Atespace       string   // castworks-dev
+	Image          string   // name@sha256:...
+	ControlPlane   string   // 写进模板 env 的 CASTWORKS_CONTROL_PLANE，host:port
+	Connector      string   // 写进模板 env 的 CASTWORKS_CONNECTOR，host:port
+	EgressHTTP     []string // 额外的明文 HTTP 出口，host:port，主机必须是全限定名
+	ServiceAccount string   // castworks-system/sandboxprovider
 }
 
 // Provider is a sandboxprovider.Provider backed by ate-api. It is safe for
@@ -98,7 +100,7 @@ func newProvider(ctx context.Context, cfg Config, deps providerDeps) (*Provider,
 
 	return &Provider{
 		client:  client,
-		manager: newActorManager(client, cfg.Atespace, template, cfg.ControlPlane),
+		manager: newActorManager(client, cfg.Atespace, template, cfg.ControlPlane, cfg.Connector, cfg.EgressHTTP),
 		close:   closeClient,
 	}, nil
 }
@@ -147,10 +149,13 @@ func validateConfig(cfg Config) error {
 	if err := validateImage(cfg.Image); err != nil {
 		return err
 	}
-	if err := validateAddress("Config.ControlPlane", cfg.ControlPlane); err != nil {
+	if err := validateEndpoint("Config.ControlPlane", cfg.ControlPlane); err != nil {
 		return err
 	}
-	if err := validateAddress("Config.Connector", cfg.Connector); err != nil {
+	if err := validateEndpoint("Config.Connector", cfg.Connector); err != nil {
+		return err
+	}
+	if err := validateEgressHTTP(cfg.EgressHTTP); err != nil {
 		return err
 	}
 	if _, _, err := splitServiceAccount(cfg.ServiceAccount); err != nil {
@@ -179,22 +184,85 @@ func validateImage(image string) error {
 	return nil
 }
 
-// validateAddress requires field to be host:port with a non-empty host and a
-// numeric port.
-func validateAddress(field, address string) error {
+// validateEndpoint requires field to be host:port with a fully qualified host
+// name and a numeric port. It validates the control-plane and connector
+// addresses; validateEgressHTTP applies the same validateFullyQualifiedHost to
+// every EgressHTTP entry, so all three fields accept exactly the same hosts.
+// They must, because all of them become egress rules that match the request
+// authority.
+func validateEndpoint(field, address string) error {
+	host, _, err := splitHostPort(field, address)
+	if err != nil {
+		return err
+	}
+	return validateFullyQualifiedHost(field, host)
+}
+
+// splitHostPort parses host:port and checks that the host is non-empty and the
+// port is a number from 1 to 65535. Both the configuration checks and the
+// policy builder use it so that they accept exactly the same addresses.
+func splitHostPort(field, address string) (string, int32, error) {
 	if address == "" {
-		return fmt.Errorf("substrate: %s is empty", field)
+		return "", 0, fmt.Errorf("substrate: %s is empty", field)
 	}
 	host, portText, err := net.SplitHostPort(address)
 	if err != nil {
-		return fmt.Errorf("substrate: %s %q is not host:port: %w", field, address, err)
+		return "", 0, fmt.Errorf("substrate: %s %q is not host:port: %w", field, address, err)
 	}
 	if host == "" {
-		return fmt.Errorf("substrate: %s %q has an empty host", field, address)
+		return "", 0, fmt.Errorf("substrate: %s %q has an empty host", field, address)
 	}
 	port, err := strconv.ParseInt(portText, 10, 32)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("substrate: %s %q has port %q, want a number from 1 to 65535", field, address, portText)
+		return "", 0, fmt.Errorf("substrate: %s %q has port %q, want a number from 1 to 65535", field, address, portText)
+	}
+	return host, int32(port), nil
+}
+
+// validateEgressHTTP checks every Config.EgressHTTP entry: host:port with a
+// fully qualified host name and no repeated entry. A repeated entry is
+// rejected because it almost certainly means the same address was listed
+// twice, while the same host with different ports is meaningful and allowed.
+func validateEgressHTTP(entries []string) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i, entry := range entries {
+		field := fmt.Sprintf("Config.EgressHTTP[%d]", i)
+		host, port, err := splitHostPort(field, entry)
+		if err != nil {
+			return err
+		}
+		if err := validateFullyQualifiedHost(field, host); err != nil {
+			return err
+		}
+		// Compare the parsed pair, so 9100 and 09100 count as the same port.
+		key := fmt.Sprintf("%s:%d", host, port)
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("substrate: %s %q is repeated", field, entry)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// validateFullyQualifiedHost requires host to be a fully qualified domain
+// name. The egress policy matches the request authority and the actor's DNS
+// relay only forwards names listed in the policy, so a short name would depend
+// on search-domain completion; an IP literal has no name to match at all.
+// A name ending in ".svc" is still a short name: the DNS search domain
+// completes it to "<name>.svc.cluster.local", which is not what the policy
+// matches.
+func validateFullyQualifiedHost(field, host string) error {
+	if net.ParseIP(host) != nil {
+		return fmt.Errorf("substrate: %s host %q is an IP address, want a fully qualified domain name", field, host)
+	}
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("substrate: %s host %q is not a fully qualified domain name", field, host)
+	}
+	if strings.HasSuffix(strings.ToLower(host), ".svc") {
+		return fmt.Errorf("substrate: %s host %q ends in .svc and relies on search-domain completion, want a fully qualified domain name", field, host)
+	}
+	if errs := validation.IsDNS1123Subdomain(host); len(errs) > 0 {
+		return fmt.Errorf("substrate: %s host %q is not a valid fully qualified domain name: %s", field, host, strings.Join(errs, "; "))
 	}
 	return nil
 }

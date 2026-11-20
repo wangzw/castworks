@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
@@ -23,6 +24,7 @@ const (
 	actorTestAtespace     = "castworks-dev"
 	actorTestTemplate     = "cw-0123456789ab"
 	actorTestControlPlane = "castworks-dev.castworks-system.svc.cluster.local:9090"
+	actorTestConnector    = "castworks-dev.castworks-system.svc.cluster.local:9091"
 )
 
 // fakeControlClient embeds the ControlClient interface and overrides only the
@@ -168,7 +170,7 @@ func (c *actorTestClock) slept() []time.Duration {
 }
 
 func newTestActorManager(client ateapi.ControlClient, clock *actorTestClock) *actorManager {
-	m := newActorManager(client, actorTestAtespace, actorTestTemplate, actorTestControlPlane)
+	m := newActorManager(client, actorTestAtespace, actorTestTemplate, actorTestControlPlane, actorTestConnector, nil)
 	m.now = clock.Now
 	m.sleep = clock.Sleep
 	return m
@@ -230,7 +232,7 @@ func matchingEgressPolicy() *ateapi.EgressPolicy {
 			{
 				Http: &ateapi.HttpRule{
 					Hostnames: []string{"castworks-dev.castworks-system.svc.cluster.local"},
-					Ports:     &ateapi.Ports{Numbers: []int32{9090}},
+					Ports:     &ateapi.Ports{Numbers: []int32{9090, 9091}},
 				},
 			},
 		},
@@ -311,7 +313,7 @@ func TestProvisionCallsInOrderAndBuildsEgressRules(t *testing.T) {
 	if got, want := httpRule.GetHostnames(), []string{"castworks-dev.castworks-system.svc.cluster.local"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("http hostnames = %v, want %v", got, want)
 	}
-	if got, want := httpRule.GetPorts().GetNumbers(), []int32{9090}; !reflect.DeepEqual(got, want) {
+	if got, want := httpRule.GetPorts().GetNumbers(), []int32{9090, 9091}; !reflect.DeepEqual(got, want) {
 		t.Errorf("http ports = %v, want %v", got, want)
 	}
 
@@ -319,6 +321,111 @@ func TestProvisionCallsInOrderAndBuildsEgressRules(t *testing.T) {
 	for _, method := range []string{"CreateActor", "CreateActorEgressPolicy", "ResumeActor"} {
 		if got := fake.countCall(method); got != 1 {
 			t.Errorf("%s calls = %d, want 1", method, got)
+		}
+	}
+}
+
+// TestEgressPolicyFromDevConfig checks the generated policy against the table
+// in sandboxprovider.md's "网络" section for the development configuration:
+// the control plane on 9090 and the connector on 9091 share a host and merge
+// into one rule, and extsim gets its own rule.
+func TestEgressPolicyFromDevConfig(t *testing.T) {
+	extsim := "extsim.castworks-system.svc.cluster.local:9100"
+	m := newActorManager(&fakeControlClient{}, actorTestAtespace, actorTestTemplate,
+		actorTestControlPlane, actorTestConnector, []string{extsim})
+
+	policy, err := m.buildEgressPolicy()
+	if err != nil {
+		t.Fatalf("buildEgressPolicy: %v", err)
+	}
+	if got, want := policy.GetMetadata().GetName(), "default"; got != want {
+		t.Errorf("policy name = %q, want %q", got, want)
+	}
+	rules := policy.GetRules()
+	if len(rules) != 3 {
+		t.Fatalf("rules = %d, want 3: %v", len(rules), egressRuleKeys(rules))
+	}
+
+	tls := rules[0].GetTlsPassthrough()
+	if tls == nil {
+		t.Fatalf("rule 0 = %v, want tls_passthrough", rules[0])
+	}
+	if got, want := tls.GetHostnames(), []string{"api.anthropic.com"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("tls_passthrough hostnames = %v, want %v", got, want)
+	}
+	if got, want := tls.GetPorts().GetNumbers(), []int32{443}; !reflect.DeepEqual(got, want) {
+		t.Errorf("tls_passthrough ports = %v, want %v", got, want)
+	}
+
+	controlPlaneHost := "castworks-dev.castworks-system.svc.cluster.local"
+	merged := rules[1].GetHttp()
+	if merged == nil {
+		t.Fatalf("rule 1 = %v, want http", rules[1])
+	}
+	if got, want := merged.GetHostnames(), []string{controlPlaneHost}; !reflect.DeepEqual(got, want) {
+		t.Errorf("rule 1 hostnames = %v, want %v", got, want)
+	}
+	if got, want := merged.GetPorts().GetNumbers(), []int32{9090, 9091}; !reflect.DeepEqual(got, want) {
+		t.Errorf("rule 1 ports = %v, want %v (the two control-plane hosts merge)", got, want)
+	}
+
+	extsimRule := rules[2].GetHttp()
+	if extsimRule == nil {
+		t.Fatalf("rule 2 = %v, want http", rules[2])
+	}
+	if got, want := extsimRule.GetHostnames(), []string{"extsim.castworks-system.svc.cluster.local"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("rule 2 hostnames = %v, want %v", got, want)
+	}
+	if got, want := extsimRule.GetPorts().GetNumbers(), []int32{9100}; !reflect.DeepEqual(got, want) {
+		t.Errorf("rule 2 ports = %v, want %v", got, want)
+	}
+
+	again, err := m.buildEgressPolicy()
+	if err != nil {
+		t.Fatalf("second buildEgressPolicy: %v", err)
+	}
+	if !proto.Equal(policy, again) {
+		t.Errorf("two builds of the same configuration differ:\n%v\n%v", policy, again)
+	}
+}
+
+// TestEgressPolicyMergesPortsAcrossSources checks that a host listed by the
+// connector and again by EgressHTTP becomes one rule with its ports in
+// ascending order, and that rules are ordered by host name.
+func TestEgressPolicyMergesPortsAcrossSources(t *testing.T) {
+	m := newActorManager(&fakeControlClient{}, actorTestAtespace, actorTestTemplate,
+		actorTestControlPlane, "aaa.example.com:8443", []string{
+			"extsim.castworks-system.svc.cluster.local:9100",
+			"aaa.example.com:8080",
+		})
+
+	policy, err := m.buildEgressPolicy()
+	if err != nil {
+		t.Fatalf("buildEgressPolicy: %v", err)
+	}
+	rules := policy.GetRules()
+	if len(rules) != 4 {
+		t.Fatalf("rules = %d, want 4: %v", len(rules), egressRuleKeys(rules))
+	}
+
+	wantHTTP := []struct {
+		host  string
+		ports []int32
+	}{
+		{"aaa.example.com", []int32{8080, 8443}},
+		{"castworks-dev.castworks-system.svc.cluster.local", []int32{9090}},
+		{"extsim.castworks-system.svc.cluster.local", []int32{9100}},
+	}
+	for i, want := range wantHTTP {
+		rule := rules[i+1].GetHttp()
+		if rule == nil {
+			t.Fatalf("rule %d = %v, want http", i+1, rules[i+1])
+		}
+		if got := rule.GetHostnames(); !reflect.DeepEqual(got, []string{want.host}) {
+			t.Errorf("rule %d hostnames = %v, want %v", i+1, got, []string{want.host})
+		}
+		if got := rule.GetPorts().GetNumbers(); !reflect.DeepEqual(got, want.ports) {
+			t.Errorf("rule %d (%s) ports = %v, want %v", i+1, want.host, got, want.ports)
 		}
 	}
 }
@@ -341,8 +448,10 @@ func TestProvisionRejectsInvalidRunIDBeforeCallingAteAPI(t *testing.T) {
 func TestProvisionTreatsAlreadyExistsAsDone(t *testing.T) {
 	alreadyExists := status.Error(codes.AlreadyExists, "exists")
 	policy := matchingEgressPolicy()
-	// Rules are an unordered set on the server, so return them reversed.
+	// Rules and ports are an unordered set on the server, so return them
+	// reversed.
 	slices.Reverse(policy.Rules)
+	slices.Reverse(policy.Rules[0].GetHttp().Ports.Numbers)
 	fake := &fakeControlClient{
 		createActorFn: func(context.Context, *ateapi.CreateActorRequest) (*ateapi.Actor, error) {
 			return nil, alreadyExists

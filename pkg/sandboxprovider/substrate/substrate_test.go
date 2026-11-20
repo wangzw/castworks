@@ -3,6 +3,7 @@ package substrate
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,6 +24,7 @@ func providerTestConfig() Config {
 		Image:          providerTestImage,
 		ControlPlane:   "castworks-dev.castworks-system.svc.cluster.local:9090",
 		Connector:      "castworks-dev.castworks-system.svc.cluster.local:9091",
+		EgressHTTP:     []string{"extsim.castworks-system.svc.cluster.local:9100"},
 		ServiceAccount: "castworks-system/sandboxprovider",
 	}
 }
@@ -71,9 +73,10 @@ func (d *providerTestDeps) deps() providerDeps {
 
 func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 	tests := []struct {
-		name      string
-		mutate    func(*Config)
-		wantField string
+		name       string
+		mutate     func(*Config)
+		wantField  string
+		wantDetail string
 	}{
 		{
 			name:      "empty atespace",
@@ -137,6 +140,12 @@ func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 			wantField: "Config.ControlPlane",
 		},
 		{
+			name:       "control plane with a .svc short name",
+			mutate:     func(c *Config) { c.ControlPlane = "castworks-dev.castworks-system.svc:9090" },
+			wantField:  "Config.ControlPlane",
+			wantDetail: "fully qualified domain name",
+		},
+		{
 			name:      "empty connector",
 			mutate:    func(c *Config) { c.Connector = "" },
 			wantField: "Config.Connector",
@@ -165,6 +174,80 @@ func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 			name:      "connector with port above 65535",
 			mutate:    func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc.cluster.local:70000" },
 			wantField: "Config.Connector",
+		},
+		{
+			name:       "connector with a .svc short name",
+			mutate:     func(c *Config) { c.Connector = "castworks-dev.castworks-system.svc:9091" },
+			wantField:  "Config.Connector",
+			wantDetail: "fully qualified domain name",
+		},
+		{
+			name:      "egress http without port",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"extsim.castworks-system.svc.cluster.local"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:      "egress http with empty host",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{":9100"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:      "egress http with port zero",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"extsim.castworks-system.svc.cluster.local:0"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:      "egress http with port above 65535",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"extsim.castworks-system.svc.cluster.local:70000"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:      "egress http with non-numeric port",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"extsim.castworks-system.svc.cluster.local:http"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:      "egress http with a short host name",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"extsim:9100"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name:       "egress http with a .svc short name",
+			mutate:     func(c *Config) { c.EgressHTTP = []string{"extsim.castworks-system.svc:9100"} },
+			wantField:  "Config.EgressHTTP",
+			wantDetail: "fully qualified domain name",
+		},
+		{
+			name:      "egress http with an IP address",
+			mutate:    func(c *Config) { c.EgressHTTP = []string{"10.0.0.1:9100"} },
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name: "egress http with an invalid host name",
+			mutate: func(c *Config) {
+				c.EgressHTTP = []string{"extsim.Castworks-System.svc.cluster.local:9100"}
+			},
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name: "egress http with a repeated entry",
+			mutate: func(c *Config) {
+				c.EgressHTTP = []string{
+					"extsim.castworks-system.svc.cluster.local:9100",
+					"extsim.castworks-system.svc.cluster.local:9100",
+				}
+			},
+			wantField: "Config.EgressHTTP",
+		},
+		{
+			name: "egress http with a repeated entry in another spelling",
+			mutate: func(c *Config) {
+				c.EgressHTTP = []string{
+					"extsim.castworks-system.svc.cluster.local:9100",
+					"extsim.castworks-system.svc.cluster.local:09100",
+				}
+			},
+			wantField: "Config.EgressHTTP",
 		},
 		{
 			name:      "service account without namespace",
@@ -196,6 +279,9 @@ func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 			if !strings.Contains(err.Error(), tt.wantField) {
 				t.Errorf("error %q does not name %s", err, tt.wantField)
 			}
+			if tt.wantDetail != "" && !strings.Contains(err.Error(), tt.wantDetail) {
+				t.Errorf("error %q does not explain %q", err, tt.wantDetail)
+			}
 			if got := deps.newClientCalls.Load(); got != 0 {
 				t.Errorf("newClient called %d times for an invalid Config, want 0", got)
 			}
@@ -203,6 +289,44 @@ func TestNewRejectsInvalidConfigBeforeAnyNetworkCall(t *testing.T) {
 				t.Errorf("ensureTemplate called %d times for an invalid Config, want 0", got)
 			}
 		})
+	}
+}
+
+// TestNewAcceptsFullyQualifiedHosts checks that a name ending in
+// .svc.cluster.local passes the shared check on all three address fields. Only
+// the shorter .svc form is rejected as a search-domain short name.
+func TestNewAcceptsFullyQualifiedHosts(t *testing.T) {
+	cfg := providerTestConfig()
+	cfg.ControlPlane = "castworks-dev.castworks-system.svc.cluster.local:9090"
+	cfg.Connector = "castworks-dev.castworks-system.svc.cluster.local:9091"
+	cfg.EgressHTTP = []string{"extsim.castworks-system.svc.cluster.local:9100"}
+	deps := &providerTestDeps{client: &fakeControlClient{}, template: providerTestTemplate}
+
+	p, err := newProvider(context.Background(), cfg, deps.deps())
+	if err != nil {
+		t.Fatalf("newProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+}
+
+// TestNewAcceptsEgressHTTPWithSharedHost checks that EgressHTTP may list the
+// same host more than once with different ports, because those ports merge
+// into one rule; only an identical entry is a duplicate.
+func TestNewAcceptsEgressHTTPWithSharedHost(t *testing.T) {
+	cfg := providerTestConfig()
+	cfg.EgressHTTP = []string{
+		"extsim.castworks-system.svc.cluster.local:9100",
+		"extsim.castworks-system.svc.cluster.local:9101",
+	}
+	deps := &providerTestDeps{client: &fakeControlClient{}, template: providerTestTemplate}
+
+	p, err := newProvider(context.Background(), cfg, deps.deps())
+	if err != nil {
+		t.Fatalf("newProvider: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	if !slices.Equal(p.manager.egressHTTP, cfg.EgressHTTP) {
+		t.Errorf("manager egressHTTP = %v, want %v", p.manager.egressHTTP, cfg.EgressHTTP)
 	}
 }
 
@@ -231,6 +355,12 @@ func TestNewWiresProviderAndManager(t *testing.T) {
 	}
 	if p.manager.controlPlane != cfg.ControlPlane {
 		t.Errorf("manager controlPlane = %q, want %q", p.manager.controlPlane, cfg.ControlPlane)
+	}
+	if p.manager.connector != cfg.Connector {
+		t.Errorf("manager connector = %q, want %q", p.manager.connector, cfg.Connector)
+	}
+	if !slices.Equal(p.manager.egressHTTP, cfg.EgressHTTP) {
+		t.Errorf("manager egressHTTP = %v, want %v", p.manager.egressHTTP, cfg.EgressHTTP)
 	}
 	if deps.gotAtespace != cfg.Atespace || deps.gotImage != cfg.Image ||
 		deps.gotControlPlane != cfg.ControlPlane || deps.gotConnector != cfg.Connector {

@@ -10,9 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -56,7 +54,9 @@ type actorManager struct {
 	client       ateapi.ControlClient
 	atespace     string
 	template     string
-	controlPlane string // host:port written to the template env
+	controlPlane string   // host:port written to the template env
+	connector    string   // host:port written to the template env
+	egressHTTP   []string // additional host:port cleartext HTTP egress rules
 
 	// now and sleep are seams for the retry tests. Production uses the real
 	// clock and sleepContext.
@@ -64,12 +64,14 @@ type actorManager struct {
 	sleep func(ctx context.Context, d time.Duration) bool
 }
 
-func newActorManager(client ateapi.ControlClient, atespace, template, controlPlane string) *actorManager {
+func newActorManager(client ateapi.ControlClient, atespace, template, controlPlane, connector string, egressHTTP []string) *actorManager {
 	return &actorManager{
 		client:       client,
 		atespace:     atespace,
 		template:     template,
 		controlPlane: controlPlane,
+		connector:    connector,
+		egressHTTP:   slices.Clone(egressHTTP),
 		now:          time.Now,
 		sleep:        sleepContext,
 	}
@@ -273,9 +275,9 @@ func (m *actorManager) checkExistingActor(a *ateapi.Actor, actor string) error {
 	return errors.Join(errs...)
 }
 
-// createEgressPolicy allows Anthropic over TLS passthrough and the control
-// plane as cleartext HTTP/2. The http rule matches the request authority, so
-// the warden must dial the same host name.
+// createEgressPolicy allows Anthropic over TLS passthrough and the configured
+// hosts over cleartext HTTP/2. The http rules match the request authority, so
+// the warden must dial the same host names.
 func (m *actorManager) createEgressPolicy(ctx context.Context, actor string) error {
 	want, err := m.buildEgressPolicy()
 	if err != nil {
@@ -304,33 +306,72 @@ func (m *actorManager) createEgressPolicy(ctx context.Context, actor string) err
 	return checkEgressPolicy(existing, want, actor)
 }
 
-// buildEgressPolicy returns the policy Provision creates for an actor.
+// buildEgressPolicy returns the policy Provision creates for an actor: the
+// fixed TLS passthrough rule for Anthropic, then one cleartext HTTP rule per
+// configured host. HTTP rules are grouped by host so that the control-plane
+// and connector addresses, which share a host in the development setup, merge
+// into a single rule. Ports are sorted ascending and rules are ordered by
+// host name, so the same configuration always yields the same policy.
 func (m *actorManager) buildEgressPolicy() (*ateapi.EgressPolicy, error) {
-	host, portText, err := net.SplitHostPort(m.controlPlane)
+	httpRules, err := m.httpEgressRules()
 	if err != nil {
-		return nil, fmt.Errorf("invalid control-plane address %q: %w", m.controlPlane, err)
+		return nil, err
 	}
-	port, err := strconv.ParseInt(portText, 10, 32)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("invalid control-plane address %q: port must be 1-65535", m.controlPlane)
-	}
+	rules := make([]*ateapi.EgressRule, 0, len(httpRules)+1)
+	rules = append(rules, &ateapi.EgressRule{
+		TlsPassthrough: &ateapi.TlsPassthroughRule{
+			Hostnames: []string{anthropicHostname},
+			Ports:     &ateapi.Ports{Numbers: []int32{anthropicPort}},
+		},
+	})
+	rules = append(rules, httpRules...)
 	return &ateapi.EgressPolicy{
 		Metadata: &ateapi.ResourceMetadata{Atespace: m.atespace, Name: egressPolicyName},
-		Rules: []*ateapi.EgressRule{
-			{
-				TlsPassthrough: &ateapi.TlsPassthroughRule{
-					Hostnames: []string{anthropicHostname},
-					Ports:     &ateapi.Ports{Numbers: []int32{anthropicPort}},
-				},
-			},
-			{
-				Http: &ateapi.HttpRule{
-					Hostnames: []string{host},
-					Ports:     &ateapi.Ports{Numbers: []int32{int32(port)}},
-				},
-			},
-		},
+		Rules:    rules,
 	}, nil
+}
+
+// httpEgressRules groups the control-plane, connector and extra addresses by
+// host and returns one rule per host with its ports in ascending order. Rules
+// are sorted by host name.
+func (m *actorManager) httpEgressRules() ([]*ateapi.EgressRule, error) {
+	addresses := make([]string, 0, 2+len(m.egressHTTP))
+	addresses = append(addresses, m.controlPlane, m.connector)
+	addresses = append(addresses, m.egressHTTP...)
+
+	portsByHost := make(map[string]map[int32]struct{}, len(addresses))
+	for _, address := range addresses {
+		host, port, err := splitHostPort("egress address", address)
+		if err != nil {
+			return nil, err
+		}
+		if portsByHost[host] == nil {
+			portsByHost[host] = make(map[int32]struct{})
+		}
+		portsByHost[host][port] = struct{}{}
+	}
+
+	hosts := make([]string, 0, len(portsByHost))
+	for host := range portsByHost {
+		hosts = append(hosts, host)
+	}
+	slices.Sort(hosts)
+
+	rules := make([]*ateapi.EgressRule, 0, len(hosts))
+	for _, host := range hosts {
+		ports := make([]int32, 0, len(portsByHost[host]))
+		for port := range portsByHost[host] {
+			ports = append(ports, port)
+		}
+		slices.Sort(ports)
+		rules = append(rules, &ateapi.EgressRule{
+			Http: &ateapi.HttpRule{
+				Hostnames: []string{host},
+				Ports:     &ateapi.Ports{Numbers: ports},
+			},
+		})
+	}
+	return rules, nil
 }
 
 // checkEgressPolicy compares an already existing policy with the one Provision
