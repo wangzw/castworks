@@ -24,6 +24,7 @@ v0.1.0 的范围、组成、偏离与安全让步在 v0.2.0 中继续有效，�
 - 同一回调重复投递：Agent 只收到一次订阅完成事件。
 - 运行实例已挂起、订阅尚未完成时重启控制面：停机期间的回调由 `extsim` 重试送达，运行实例恢复并处理该事件。
 - Agent 在后台运行 `extsim job watch` 等待作业时，运行实例不挂起；后台作业结束、回合结束并空闲满 30 s 之后照常挂起。
+- actor 在运行实例处于 `active` 时崩溃：运行实例在 `T_reconnect`（30 s）加一个挂起扫描周期之内转为失败，失败原因写明 actor 已崩溃，见 [runcontroller](runcontroller.md#actor-崩溃的检测)。
 
 ## 模拟外部系统
 
@@ -73,7 +74,7 @@ v0.1.0 中，Claude Code 的后台任务会随快照一起停住。v0.2.0 中，
 | `connectorhub` | 外部系统定义与一个项目的项目绑定配置的装载；webhook 接收与连接器事件日志；`once` 订阅的登记、回溯匹配与登记时的状态核对；事件目录；完成事件投递记录与经 `AppendInbox` 的写入；运行实例结束时取消订阅 | 状态式轮询、订阅对账扫描、`until_cancelled` 订阅、订阅超时、附件、出口策略与沙箱侧配置的生成和推送、等待签名、工具接入声明、多项目、核对的合并与公平调度、令牌校验 |
 | `warden` | 平台 MCP 服务器的 `list_events` 与 `subscribe_event`；后台作业集合的维护 | `wait_for`、`sleep_until`、附件取回、等待意图与情境提示、自唤醒源镜像、孤儿进程判定 |
 | `agentprotocol` | `AgentEvent` 增加 `bg_jobs_changed{job_ids}`；`Hello` 携带当前的后台作业集合 | `subscription_created` 等其余订阅相关事件 |
-| `runcontroller` | 收件箱区分人类消息与订阅完成事件，以 `(run_id, dedup_key)` 去重；后台作业集合非空时不挂起 | 唤醒谓词的一般形式、等待行、订阅在唤醒集合中的登记 |
+| `runcontroller` | 收件箱区分人类消息与订阅完成事件，以 `(run_id, dedup_key)` 去重；后台作业集合非空时不挂起；`active` 状态下 actor 崩溃时转为失败 | 唤醒谓词的一般形式、等待行、订阅在唤醒集合中的登记 |
 | `sandboxprovider` | EgressPolicy 放行 `extsim` 与控制面的 `connector` 端点，规则改为按配置生成；actor 模板增加 `connector` 端点的地址，模板名改由模板内容派生 | 由 `connectorhub` 生成与推送出口策略 |
 
 ## 网络
@@ -98,7 +99,7 @@ EgressPolicy `default` 在 v0.1.0 的基础上变化如下：
 
 ## 已知限制
 
-v0.1.0 的已知限制仍然成立，其中关于后台任务的一条缩小为：会话内定时（`CronCreate`、`ScheduleWakeup`）随快照停住，到点不会唤醒 actor。另有以下限制：
+v0.1.0 的已知限制仍然成立，其中两条缩小：actor 崩溃后运行实例仍无法恢复，但 `active` 状态下的崩溃会被发现并转为失败；关于后台任务的一条缩小为会话内定时（`CronCreate`、`ScheduleWakeup`）随快照停住，到点不会唤醒 actor。另有以下限制：
 
 - 订阅登记之后回调丢失时，没有状态式轮询兜底，运行实例一直等到有人发来消息。
 - 订阅没有超时，作业一直不结束时，运行实例一直处于挂起状态。
@@ -115,9 +116,9 @@ v0.1.0 的已知限制仍然成立，其中关于后台任务的一条缩小为�
 各模块按冻结的接口并行开发，各自以替身测试；在真实环境上的验收按编号顺序进行，前一步通过之后再做下一步：
 
 1. `extsim`：服务、命令行、测试控制接口与它的外部系统定义，测试不依赖控制面。
-2. `connectorhub`、`runcontroller` 与 `agentprotocol`：控制面进程接入 `connectorhub`，以真实的 `extsim`、假的沙箱提供者与假的看守进程，测试订阅登记、回调、重复投递、控制面重启与后台作业规则。
+2. `connectorhub`、`runcontroller` 与 `agentprotocol`：控制面进程接入 `connectorhub`，以真实的 `extsim`、假的沙箱提供者与假的看守进程，测试订阅登记、回调、重复投递、控制面重启、后台作业规则与 actor 崩溃的检测。
 3. 看守进程的本地模式：在开发机上连接真实的控制面与 `extsim`，驱动真实的 Claude Code 完成提交作业、登记订阅、结束回合、收到订阅完成事件的完整循环，此时不挂起；同时录制含平台 MCP 调用与后台任务的 stream-json 样本。
-4. Substrate：建立新增的 Service 与端口，actor 镜像加入 `extsim` 命令行，打开挂起扫描，跑通演示场景并逐条检查通过标准。
+4. Substrate：建立新增的 Service 与端口，actor 镜像加入 `extsim` 命令行，打开挂起扫描，跑通演示场景并逐条检查通过标准；崩溃检测一条以运行超出内存上限的进程等方式让 actor 崩溃来检查。
 
 ## 开发环境需求
 
