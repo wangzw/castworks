@@ -32,9 +32,10 @@ Supplements the `commit-convention` skill.
 - `references`: `docs/references.md`
 - `milestone`: `docs/milestone/`
 - `faq`: `docs/faq/`
-- a module name for that module's code as well, located at `pkg/<module>`: `runcontroller`, `agentprotocol`, `warden`, `sandboxprovider`, `humanchannel`
+- a module name for that module's code as well, located at `pkg/<module>`: `runcontroller`, `agentprotocol`, `warden`, `sandboxprovider`, `humanchannel`, `connectorhub`
 - `controlplane`: `cmd/castworks-controlplane`
 - `cli`: `cmd/castworks`
+- `extsim`: `cmd/extsim`
 - `deploy`: `deploy/`
 - `build`: `Makefile`, `go.mod`, lint and code generation configuration, `images/`
 - `repo`: `CLAUDE.md`, `.markdownlint.jsonc` and other repository-level configuration
