@@ -5,7 +5,7 @@
 | 版本 | 目标 | 覆盖的技术验证 | 状态 |
 | --- | --- | --- | --- |
 | [v0.1.0](v0.1.0/README.md) | 概念验证：在 Substrate 上，Agent 等人时以快照挂起沙箱，人回复后恢复，Agent 带着原有上下文继续 | [Substrate 试点的 go 判定](verification.md#substrate-试点的-go-判定)中的“驱动 Claude Code”与“快照恢复”两项；观察“恢复后状态”中 MEMORY 快照恢复后的时钟与旧连接 | 已完成（2026-11-19） |
-| [v0.2.0](v0.2.0/README.md) | 概念验证：在 Substrate 上，Agent 等外部系统时以快照挂起沙箱，外部事件经订阅写入收件箱后恢复；外部系统是自建的模拟外部系统 | [技术验证清单](verification.md#技术验证清单)中 CLI 以 stream-json 输出后台任务消息一项的部分内容：观察 `background_tasks_changed` 的输出与 `ambient` 的取值 | 进行中 |
+| [v0.2.0](v0.2.0/README.md) | 概念验证：在 Substrate 上，Agent 等外部系统时以快照挂起沙箱，外部事件经订阅写入收件箱后恢复；外部系统是自建的模拟外部系统 | [技术验证清单](verification.md#技术验证清单)中 CLI 以 stream-json 输出后台任务消息一项的部分内容：观察 `background_tasks_changed` 的输出与 `ambient` 的取值 | 已完成（2026-11-20） |
 
 后续版本在 v0.2.0 完成后规划。
 
