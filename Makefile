@@ -115,7 +115,7 @@ ACTOR_IMAGE_REPO ?= registry.zhanwei.wang/castworks/actor
 .PHONY: actor-image actor-image-push
 
 actor-image:
-	images/actor/build.sh --tag $(ACTOR_IMAGE)
+	images/actor/build.sh $(if $(ACTOR_IMAGE),--tag $(ACTOR_IMAGE))
 
 actor-image-push:
 	@if [ -n "$$(git status --porcelain)" ]; then \
@@ -125,12 +125,14 @@ actor-image-push:
 	fi
 	images/actor/build.sh --push --tag $(ACTOR_IMAGE_REPO):$$(git rev-parse --short HEAD)
 
-# actor-image-smoke 在本地镜像上验证 Claude Code 版本、actor 模式的就绪探针、
-# PID 1 与运行用户、关停耗时和退出码，以及非法 actor-name 的退出状态。
+# actor-image-smoke 在本地镜像上验证 Claude Code 版本、extsim 命令行与配置、
+# actor 模式的就绪探针、PID 1 与运行用户、关停耗时和退出码，以及非法
+# actor-name 的退出状态。未指定 ACTOR_IMAGE 时两个目标都用 build.sh 的本地
+# 标签 castworks/actor:dev。
 .PHONY: actor-image-smoke
 
 actor-image-smoke: actor-image
-	images/actor/smoke.sh --image $(ACTOR_IMAGE)
+	images/actor/smoke.sh $(if $(ACTOR_IMAGE),--image $(ACTOR_IMAGE))
 
 # Real-environment acceptance. These targets stay outside test-integration:
 # they need the developer machine, an LLM credential, and for the substrate

@@ -6,6 +6,7 @@
 # 检查项：
 #   - 镜像是 linux/arm64，装有 git；
 #   - claude --version 为 2.1.328；
+#   - extsim job --help 可执行，/etc/extsim.json 内容正确；
 #   - actor 模式下 /readyz 在 10 s 内返回 200；
 #   - 容器里的 PID 1 是看守进程；
 #   - 看守进程以非 root 用户 agent（uid 10001）运行，其主目录与工作目录为 /home/agent；
@@ -79,6 +80,27 @@ case "${version}" in
     ;;
 esac
 echo "-- claude --version: ${version}"
+
+echo "==> 检查 extsim 命令行与配置"
+expected_config='{"url": "http://extsim.castworks-system.svc.cluster.local:9100", "project": "demo"}'
+actual_config="$(docker run --rm --entrypoint cat "${image}" /etc/extsim.json)"
+[[ "${actual_config}" == "${expected_config}" ]] || {
+  echo "错误：/etc/extsim.json 内容不符：${actual_config}" >&2
+  exit 1
+}
+echo "-- /etc/extsim.json: ${actual_config}"
+
+# 当前的命令行没有 --help 开关，job --help 被当作未知子命令拒绝并打印用法行；
+# 输出里有这一行就说明二进制在镜像里可以执行，并分派到了 job 子命令。
+set +e
+job_help="$(docker run --rm --entrypoint extsim "${image}" job --help 2>&1)"
+job_help_rc=$?
+set -e
+if ! grep -q 'want submit, get or watch' <<<"${job_help}"; then
+  echo "错误：extsim job --help 不可执行或输出异常（退出码 ${job_help_rc}）：${job_help}" >&2
+  exit 1
+fi
+echo "-- extsim job --help 可执行（退出码 ${job_help_rc}）"
 
 echo "==> 启动 actor 模式容器"
 printf 'cw-smoke-%s-%s' "$(date +%s)" "$$" >"${work}/actor-name"

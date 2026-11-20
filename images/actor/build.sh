@@ -43,8 +43,9 @@ fi
 build_ctx="$(mktemp -d)"
 trap 'rm -rf "${build_ctx}"' EXIT INT TERM HUP
 
-echo "==> 编译 linux/arm64 的 warden"
+echo "==> 编译 linux/arm64 的 warden 与 extsim"
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${repo_root}" build -trimpath -o "${build_ctx}/warden" ./cmd/warden
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go -C "${repo_root}" build -trimpath -o "${build_ctx}/extsim" ./cmd/extsim
 
 echo "==> 构建 linux/arm64 的 actor 镜像 ${tag}"
 build_args=(
