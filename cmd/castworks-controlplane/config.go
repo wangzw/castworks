@@ -33,6 +33,7 @@ const (
 	defaultIdleGrace               = 30 * time.Second
 	defaultScanPeriod              = 5 * time.Second
 	defaultHelloTimeout            = 60 * time.Second
+	defaultReconnectTimeout        = 30 * time.Second
 	defaultShutdownTimeout         = 10 * time.Second
 	defaultSubstrateAtespace       = "castworks-dev"
 	defaultSubstrateControlPlane   = "castworks-dev.castworks-system.svc.cluster.local:9090"
@@ -56,6 +57,7 @@ type Config struct {
 	IdleGrace               time.Duration
 	ScanPeriod              time.Duration
 	HelloTimeout            time.Duration
+	ReconnectTimeout        time.Duration
 	ShutdownTimeout         time.Duration
 	SubstrateKubeconfig     string
 	SubstrateContext        string
@@ -186,6 +188,7 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 	fs.DurationVar(&cfg.IdleGrace, "idle-grace", defaultIdleGrace, "空闲多久后挂起（G_idle）")
 	fs.DurationVar(&cfg.ScanPeriod, "scan-period", defaultScanPeriod, "挂起扫描周期（P_scan）")
 	fs.DurationVar(&cfg.HelloTimeout, "hello-timeout", defaultHelloTimeout, "等待 Hello 的超时（T_hello）")
+	fs.DurationVar(&cfg.ReconnectTimeout, "reconnect-timeout", defaultReconnectTimeout, "actor 断线后等待重连的时限（T_reconnect）")
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", defaultShutdownTimeout, "优雅退出的上限")
 	fs.StringVar(&cfg.SubstrateKubeconfig, "substrate-kubeconfig", "", "kubeconfig 路径，空则用默认加载规则")
 	fs.StringVar(&cfg.SubstrateContext, "substrate-context", "", "kubeconfig context，空则用当前 context")
@@ -237,11 +240,12 @@ func (c *Config) RunControllerConfig() (cfg runcontroller.Config, suspendForcedO
 		suspendForcedOff = true
 	}
 	return runcontroller.Config{
-		IdleGrace:      c.IdleGrace,
-		ScanPeriod:     c.ScanPeriod,
-		HelloTimeout:   c.HelloTimeout,
-		SuspendEnabled: suspend,
-		Credential:     runcontroller.LLMCredential{Kind: c.LLMCredentialKind},
+		IdleGrace:        c.IdleGrace,
+		ScanPeriod:       c.ScanPeriod,
+		HelloTimeout:     c.HelloTimeout,
+		ReconnectTimeout: c.ReconnectTimeout,
+		SuspendEnabled:   suspend,
+		Credential:       runcontroller.LLMCredential{Kind: c.LLMCredentialKind},
 	}, suspendForcedOff
 }
 
@@ -276,6 +280,7 @@ func (c *Config) validate(visited map[string]bool) error {
 		{"idle-grace", c.IdleGrace},
 		{"scan-period", c.ScanPeriod},
 		{"hello-timeout", c.HelloTimeout},
+		{"reconnect-timeout", c.ReconnectTimeout},
 		{"shutdown-timeout", c.ShutdownTimeout},
 	}
 	for _, d := range durations {

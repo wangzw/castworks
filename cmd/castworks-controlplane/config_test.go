@@ -99,6 +99,7 @@ func TestConfigDefaults(t *testing.T) {
 		{"IdleGrace", cfg.IdleGrace, 30 * time.Second},
 		{"ScanPeriod", cfg.ScanPeriod, 5 * time.Second},
 		{"HelloTimeout", cfg.HelloTimeout, 60 * time.Second},
+		{"ReconnectTimeout", cfg.ReconnectTimeout, 30 * time.Second},
 		{"ShutdownTimeout", cfg.ShutdownTimeout, 10 * time.Second},
 		{"SubstrateKubeconfig", cfg.SubstrateKubeconfig, ""},
 		{"SubstrateContext", cfg.SubstrateContext, ""},
@@ -537,7 +538,7 @@ func TestConfigSubstrateServiceAccount(t *testing.T) {
 }
 
 func TestConfigDurations(t *testing.T) {
-	flags := []string{"idle-grace", "scan-period", "hello-timeout", "shutdown-timeout"}
+	flags := []string{"idle-grace", "scan-period", "hello-timeout", "reconnect-timeout", "shutdown-timeout"}
 	for _, name := range flags {
 		for _, value := range []string{"0s", "-1s"} {
 			t.Run(name+"/"+value, func(t *testing.T) {
@@ -602,6 +603,7 @@ func TestConfigRunControllerConfig(t *testing.T) {
 		"--idle-grace", "45s",
 		"--scan-period", "7s",
 		"--hello-timeout", "90s",
+		"--reconnect-timeout", "45s",
 	)
 	cfg := configMustParse(t, args...)
 	rc, forced := cfg.RunControllerConfig()
@@ -616,6 +618,9 @@ func TestConfigRunControllerConfig(t *testing.T) {
 	}
 	if rc.HelloTimeout != 90*time.Second {
 		t.Errorf("HelloTimeout = %v, want 90s", rc.HelloTimeout)
+	}
+	if rc.ReconnectTimeout != 45*time.Second {
+		t.Errorf("ReconnectTimeout = %v, want 45s", rc.ReconnectTimeout)
 	}
 	if rc.Credential.Kind != runcontroller.LLMCredentialOAuthToken {
 		t.Errorf("Credential.Kind = %q, want %q", rc.Credential.Kind, runcontroller.LLMCredentialOAuthToken)
