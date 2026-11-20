@@ -2,9 +2,11 @@
 
 v0.2.0 仍是概念验证，不上生产。它在 [v0.1.0](../v0.1.0/README.md) 的基础上证明：Agent 等外部系统时，castworks 同样能把沙箱挂起，外部事件到达后由控制面恢复运行实例，Agent 带着原有上下文处理结果。外部唤醒源由托管侧持有：Agent 登记[订阅](../../glossary.md)后结束回合，外部系统的回调由控制面接收，经收件箱唤醒运行实例（[ADR-host-owns-external-wake-sources](../../adr/adr-host-owns-external-wake-sources.md)）。
 
-外部系统不接 GitHub，改用自建的[模拟外部系统](../../glossary.md) `extsim`。直接对接第三方系统，开发、测试与部署都要依赖公网 webhook 入口、CI runner 与第三方凭据；`extsim` 运行在开发机上，回调的时机与作业的结论都可以由测试控制。`extsim` 按[外部系统定义](../../glossary.md)接入 `connectorhub`，`connectorhub` 中没有针对它的代码，以后接入 GitHub，是多装载一份定义并实现 GitHub 的状态查询。
+外部系统不接 GitHub，改用自建的[模拟外部系统](../../glossary.md) `extsim`。直接对接第三方系统，开发、测试与部署都要依赖公网 webhook 入口、CI runner 与第三方凭据；`extsim` 运行在开发机上，回调的时机与作业的结论都可以由测试控制。`extsim` 按[外部系统定义](../../glossary.md)接入 `connectorhub`。`connectorhub` 的通用部分不含针对它的代码，针对它的只有一个连接器，负责签名头、事件类型、结论字段与状态查询；以后接入 GitHub，是多装载一份定义并实现 GitHub 的连接器。
 
 v0.1.0 的范围、组成、偏离与安全让步在 v0.2.0 中继续有效，下文只写变化。[设计文档](../../design/README.md)仍是长期目标，v0.2.0 的代码同样不声称满足[架构不变量](../../design/architecture.md#架构不变量)。
+
+各模块在 v0.2.0 中的细化：[extsim](extsim.md)、[connectorhub](connectorhub.md)，以及在 v0.1.0 基础上的增量 [runcontroller](runcontroller.md)、[agentprotocol](agentprotocol.md)、[warden](warden.md)、[sandboxprovider](sandboxprovider.md)。
 
 ## 演示场景
 
@@ -43,7 +45,7 @@ v0.1.0 的范围、组成、偏离与安全让步在 v0.2.0 中继续有效，�
 
 - 平台 MCP 服务器在看守进程中运行，只提供 `list_events` 与 `subscribe_event`，把调用转发到控制面的[面向沙箱的端点](../../glossary.md) `connector`；请求以 `run_id` 标识运行实例，不带令牌。工具描述与 MCP 初始化应答中的 `instructions` 按设计说明等待方式的选择，平台不强制 Agent 使用订阅。
 - 订阅登记按设计执行：在同一事务中写入订阅，并对[连接器事件日志](../../glossary.md)回溯匹配；没有命中时，按定义的状态查询核对作业，作业已经结束就直接生成订阅完成事件。
-- webhook 接收端校验签名与投递标识，按项目归属键确定事件所属项目，把事件写入连接器事件日志并提交之后才应答 200；同一投递标识再次到达时直接应答 200。随后匹配活动订阅。
+- webhook 接收端校验签名与投递标识，按项目归属键确定事件所属项目，把事件写入连接器事件日志并提交，再匹配活动订阅，之后才应答 200；同一投递标识再次到达时不重复写入，重新匹配后应答 200，匹配是幂等的。
 - 订阅命中后，`connectorhub` 在同一事务中把订阅置为已完成，并写入一条待投递的完成事件投递记录；提交后经汇入契约的 `AppendInbox` 写入收件箱，成功后把记录置为已投递。控制面启动时与运行期间周期性地重投待投递的记录。收件箱以 `(run_id, dedup_key)` 去重，重复的回调与重投只留下一行。
 - 写入收件箱之后的处理沿用 v0.1.0：运行实例已挂起时转为恢复中并发起恢复，挂起中时由挂起完成后的检查接手，消息在回合边界投递。订阅完成事件与人类消息在同一收件箱中按 `inbox_seq` 排序，可以出现在同一批投递中；看守进程把订阅完成事件写成一条用户消息，内容包括订阅标识、作业标识、结论与原因。
 - 运行实例结束时，它的活动订阅置为已取消。
@@ -72,7 +74,7 @@ v0.1.0 中，Claude Code 的后台任务会随快照一起停住。v0.2.0 中，
 | `warden` | 平台 MCP 服务器的 `list_events` 与 `subscribe_event`；后台作业集合的维护 | `wait_for`、`sleep_until`、附件取回、等待意图与情境提示、自唤醒源镜像、孤儿进程判定 |
 | `agentprotocol` | `AgentEvent` 增加 `bg_jobs_changed{job_ids}`；`Hello` 携带当前的后台作业集合 | `subscription_created` 等其余订阅相关事件 |
 | `runcontroller` | 收件箱区分人类消息与订阅完成事件，以 `(run_id, dedup_key)` 去重；后台作业集合非空时不挂起 | 唤醒谓词的一般形式、等待行、订阅在唤醒集合中的登记 |
-| `sandboxprovider` | EgressPolicy 放行 `extsim` 与控制面的 `connector` 端点 | 由 `connectorhub` 生成与推送出口策略 |
+| `sandboxprovider` | EgressPolicy 放行 `extsim` 与控制面的 `connector` 端点，规则改为按配置生成；actor 模板增加 `connector` 端点的地址，模板名改由模板内容派生 | 由 `connectorhub` 生成与推送出口策略 |
 
 ## 网络
 
