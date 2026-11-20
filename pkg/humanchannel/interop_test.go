@@ -79,8 +79,8 @@ func TestInteropSuccessRoundTrip(t *testing.T) {
 				},
 			}, nil
 		},
-		AppendInboxFunc: func(_ context.Context, _ string, _ string) (int64, error) {
-			return 42, nil
+		AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+			return 42, false, nil
 		},
 		EndFunc: func(_ context.Context, _ string) error { return nil },
 	}
@@ -206,8 +206,10 @@ func TestInteropRunIDWithSlash(t *testing.T) {
 		GetFunc: func(_ context.Context, id string) (runcontroller.RunDetail, error) {
 			return runcontroller.RunDetail{RunSummary: runcontroller.RunSummary{RunID: id}}, nil
 		},
-		AppendInboxFunc: func(_ context.Context, _ string, _ string) (int64, error) { return 1, nil },
-		EndFunc:         func(_ context.Context, _ string) error { return nil },
+		AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+			return 1, false, nil
+		},
+		EndFunc: func(_ context.Context, _ string) error { return nil },
 	}
 	c := newInteropClient(t, svc)
 	ctx := context.Background()
@@ -289,10 +291,10 @@ func TestInteropSentinelErrorMapping(t *testing.T) {
 		wantText   string
 	}{
 		{
-			name: "ErrInvalidText 映射 400",
+			name: "ErrInvalidEvent 映射 400",
 			svc: &FakeRunService{
 				CreateFunc: func(_ context.Context, _ string) (string, error) {
-					return "", runcontroller.ErrInvalidText
+					return "", runcontroller.ErrInvalidEvent
 				},
 			},
 			call: func(ctx context.Context, c *client.Client) error {
@@ -319,8 +321,8 @@ func TestInteropSentinelErrorMapping(t *testing.T) {
 		{
 			name: "ErrTerminated 映射 409",
 			svc: &FakeRunService{
-				AppendInboxFunc: func(_ context.Context, _ string, _ string) (int64, error) {
-					return 0, runcontroller.ErrTerminated
+				AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+					return 0, false, runcontroller.ErrTerminated
 				},
 			},
 			call: func(ctx context.Context, c *client.Client) error {

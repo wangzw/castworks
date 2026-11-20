@@ -59,22 +59,62 @@ type RunDetail struct {
 	Suspensions   []Suspension // 按 StartedAt 升序
 }
 
+// InboxKind 是收件箱事件的种类。
+type InboxKind string
+
+const (
+	// KindHumanMessage 是人在 humanchannel 写入的消息。
+	KindHumanMessage InboxKind = "human_message"
+	// KindSubscriptionCompleted 是外部系统完成订阅后的通知。
+	KindSubscriptionCompleted InboxKind = "subscription_completed"
+)
+
+// InboxEvent 是写入收件箱的一次事件。字段按种类使用，含义见
+// docs/milestone/v0.2.0/runcontroller.md“接口”一节。
+type InboxEvent struct {
+	Kind         InboxKind
+	Text         string                  // human_message：1 字节至 MaxTextBytes
+	EventID      string                  // subscription_completed：必填
+	DedupKey     string                  // subscription_completed：必填
+	Subscription *SubscriptionCompletion // subscription_completed：必填
+}
+
+// SubscriptionCompletion 是订阅完成事件的负载，由 connectorhub 构造。
+type SubscriptionCompletion struct {
+	SubID              string
+	System             string
+	Event              string
+	SubscriptionStatus string
+	Terminal           string
+	Correlation        map[string]string
+	OccurredAt         time.Time
+	Source             string
+	Detail             string
+	DetailTruncated    bool
+}
+
 type RunService interface {
 	Create(ctx context.Context, prompt string) (runID string, err error)
 	Get(ctx context.Context, runID string) (RunDetail, error)
 	List(ctx context.Context) ([]RunSummary, error) // 按 CreatedAt 降序
 	End(ctx context.Context, runID string) error
-	AppendInbox(ctx context.Context, runID string, text string) (inboxSeq int64, err error)
+	AppendInbox(ctx context.Context, runID string, ev InboxEvent) (inboxSeq int64, duplicate bool, err error)
 }
 
 // MaxTextBytes 是单条 inbox 消息文本的最大字节数。它与
 // agentprotocol 的校验上限含义相同，两处必须保持一致。
 const MaxTextBytes = 64 << 10
 
+// MaxDetailBytes 是订阅完成事件 Detail 字段的最大字节数。
+const MaxDetailBytes = 48 << 10
+
+// MaxCorrelationBytes 是订阅完成事件 Correlation 的键与值总字节数上限。
+const MaxCorrelationBytes = 4 << 10
+
 var (
-	ErrNotFound    = errors.New("runcontroller: run not found")
-	ErrTerminated  = errors.New("runcontroller: run ended or failed")
-	ErrInvalidText = errors.New("runcontroller: text empty or longer than 64 KiB")
+	ErrNotFound     = errors.New("runcontroller: run not found")
+	ErrTerminated   = errors.New("runcontroller: run ended or failed")
+	ErrInvalidEvent = errors.New("runcontroller: invalid inbox event")
 )
 
 type Config struct {

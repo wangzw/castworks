@@ -275,7 +275,7 @@ func (t *storeTx) insertRun(r runRow, firstText string, now time.Time) error {
 	if err != nil {
 		return fmt.Errorf("runcontroller: insert run %s: %w", r.RunID, err)
 	}
-	if err := t.insertInbox(r.RunID, 1, firstText, now); err != nil {
+	if err := t.insertInbox(r.RunID, inboxInsert{Seq: 1, Kind: KindHumanMessage, Text: firstText}, now); err != nil {
 		return err
 	}
 	return nil
@@ -326,16 +326,52 @@ func (t *storeTx) updateRun(r runRow) error {
 	return nil
 }
 
+// inboxInsert 是 insertInbox 要写入的一行。Payload 只有
+// subscription_completed 事件才有，按 JSON 存入 jsonb 列 payload。
+type inboxInsert struct {
+	Seq      int64
+	Kind     InboxKind
+	Text     string
+	EventID  string
+	DedupKey string
+	Payload  []byte
+}
+
 // insertInbox 写入一条收件箱消息。它只新增行，不读取已有行的内容，
 // 序号由调用方给出，因此不要求先 lockRun。
-func (t *storeTx) insertInbox(runID string, seq int64, text string, now time.Time) error {
+func (t *storeTx) insertInbox(runID string, m inboxInsert, now time.Time) error {
+	// A nil interface becomes SQL NULL; a non-nil string is encoded as jsonb
+	// raw JSON by pgx's JSON codec.
+	var payload any
+	if len(m.Payload) > 0 {
+		payload = string(m.Payload)
+	}
 	_, err := t.tx.Exec(t.ctx,
-		`INSERT INTO inbox (run_id, inbox_seq, text, created_at) VALUES ($1, $2, $3, $4)`,
-		runID, seq, text, now)
+		`INSERT INTO inbox (run_id, inbox_seq, kind, text, event_id, dedup_key, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		runID, m.Seq, string(m.Kind), m.Text, m.EventID, m.DedupKey, payload, now)
 	if err != nil {
-		return fmt.Errorf("runcontroller: insert inbox %s/%d: %w", runID, seq, err)
+		return fmt.Errorf("runcontroller: insert inbox %s/%d: %w", runID, m.Seq, err)
 	}
 	return nil
+}
+
+// inboxSeqByDedupKey 返回该运行实例中 dedup_key 匹配的收件箱行的序号。
+// 没有匹配时 found 为 false。调用方必须已用 lockRun 锁定运行实例行。
+func (t *storeTx) inboxSeqByDedupKey(runID, dedupKey string) (seq int64, found bool, err error) {
+	if err := t.requireLock(runID); err != nil {
+		return 0, false, err
+	}
+	err = t.tx.QueryRow(t.ctx,
+		`SELECT inbox_seq FROM inbox WHERE run_id = $1 AND dedup_key = $2`,
+		runID, dedupKey).Scan(&seq)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("runcontroller: look up inbox dedup key %s/%s: %w", runID, dedupKey, err)
+	}
+	return seq, true, nil
 }
 
 // inboxRange 按 inbox_seq 升序取 [from, through] 内的消息。累计文本字节数超过

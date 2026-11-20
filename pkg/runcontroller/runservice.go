@@ -3,8 +3,11 @@ package runcontroller
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
@@ -89,25 +92,107 @@ func (c *Controller) End(ctx context.Context, runID string) error {
 }
 
 // AppendInbox implements RunService.
-func (c *Controller) AppendInbox(ctx context.Context, runID string, text string) (int64, error) {
-	if err := validateText(text); err != nil {
-		return 0, err
+//
+// A subscription_completed event is deduplicated by (run_id, DedupKey): when
+// the row already exists, the existing inbox sequence is returned with
+// duplicate set and the run is not changed.
+func (c *Controller) AppendInbox(ctx context.Context, runID string, ev InboxEvent) (int64, bool, error) {
+	if err := validateInboxEvent(ev); err != nil {
+		return 0, false, err
 	}
-	effects, err := c.applyEvent(ctx, runID, evAppend{text: text}, applyOpts{})
+	appendEv, err := newAppendEvent(ev)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	for _, effect := range effects {
+	res, err := c.applyEvent(ctx, runID, appendEv, applyOpts{})
+	if err != nil {
+		return 0, false, err
+	}
+	if res.duplicate {
+		return res.duplicateSeq, true, nil
+	}
+	for _, effect := range res.effects {
 		if in, ok := effect.(insertInbox); ok {
-			return in.seq, nil
+			return in.seq, false, nil
 		}
 	}
-	return 0, errors.New("runcontroller: append produced no inbox sequence")
+	return 0, false, errors.New("runcontroller: append produced no inbox sequence")
+}
+
+// validateInboxEvent applies the constraints of the AppendInbox interface.
+func validateInboxEvent(ev InboxEvent) error {
+	switch ev.Kind {
+	case KindHumanMessage:
+		if len(ev.Text) == 0 || len(ev.Text) > MaxTextBytes {
+			return ErrInvalidEvent
+		}
+	case KindSubscriptionCompleted:
+		if ev.EventID == "" || ev.DedupKey == "" || ev.Subscription == nil {
+			return ErrInvalidEvent
+		}
+		return validateSubscriptionCompletion(ev.Subscription)
+	default:
+		return ErrInvalidEvent
+	}
+	return nil
+}
+
+// validateSubscriptionCompletion applies the same constraints as the
+// agentprotocol validation of a subscription_completed inbox message, so an
+// event accepted here always passes ValidateControlFrame.
+func validateSubscriptionCompletion(sc *SubscriptionCompletion) error {
+	for _, value := range []string{
+		sc.SubID, sc.System, sc.Event, sc.SubscriptionStatus, sc.Terminal, sc.Source,
+	} {
+		if value == "" {
+			return ErrInvalidEvent
+		}
+	}
+	if sc.OccurredAt.IsZero() || timestamppb.New(sc.OccurredAt).CheckValid() != nil {
+		return ErrInvalidEvent
+	}
+	correlationBytes := 0
+	for key, value := range sc.Correlation {
+		if key == "" {
+			return ErrInvalidEvent
+		}
+		correlationBytes += len(key) + len(value)
+	}
+	if correlationBytes > MaxCorrelationBytes {
+		return ErrInvalidEvent
+	}
+	if len(sc.Detail) > MaxDetailBytes {
+		return ErrInvalidEvent
+	}
+	return nil
+}
+
+// newAppendEvent converts a validated inbox event into its rule event.
+// Human messages carry only text; subscription completions carry the
+// identity fields and the JSON-encoded payload stored in inbox.payload.
+func newAppendEvent(ev InboxEvent) (evAppend, error) {
+	switch ev.Kind {
+	case KindHumanMessage:
+		return evAppend{kind: KindHumanMessage, text: ev.Text}, nil
+	case KindSubscriptionCompleted:
+		payload, err := json.Marshal(ev.Subscription)
+		if err != nil {
+			return evAppend{}, fmt.Errorf("runcontroller: encode subscription completion: %w", err)
+		}
+		return evAppend{
+			kind:     KindSubscriptionCompleted,
+			eventID:  ev.EventID,
+			dedupKey: ev.DedupKey,
+			payload:  payload,
+		}, nil
+	default:
+		return evAppend{}, ErrInvalidEvent
+	}
 }
 
 func validateText(text string) error {
 	if len(text) == 0 || len(text) > MaxTextBytes {
-		return ErrInvalidText
+		return ErrInvalidEvent
 	}
 	return nil
 }

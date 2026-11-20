@@ -200,7 +200,7 @@ func (h *e2eHarness) createRun(prompt string) string {
 }
 
 func (h *e2eHarness) appendInbox(runID, text string) (int64, error) {
-	return h.controller().AppendInbox(context.Background(), runID, text)
+	return appendHuman(h.controller(), context.Background(), runID, text)
 }
 
 func (h *e2eHarness) detail(runID string) (runcontroller.RunDetail, error) {
@@ -972,7 +972,7 @@ func TestE2EStreamClosedVsHello(t *testing.T) {
 		h := newHarness(t, testConfig())
 		runID, _, cancel1 := stepToBoundaryCancelable(t, h)
 
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "second"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "second"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 		h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateDelivering)
@@ -1013,7 +1013,7 @@ func TestE2EStreamClosedVsHello(t *testing.T) {
 		h := newHarness(t, testConfig())
 		runID, _, cancel1 := stepToBoundaryCancelable(t, h)
 
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "second"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "second"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 		h.waitState(runID, runcontroller.StateActive, runcontroller.SubstateDelivering)
@@ -1062,7 +1062,7 @@ func TestE2EHelloVsAppend(t *testing.T) {
 
 		appendDone := make(chan appendResult, 1)
 		go func() {
-			seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 			appendDone <- appendResult{seq: seq, err: err}
 		}()
 		awaitLockWaiter(t, h.pool)
@@ -1096,7 +1096,7 @@ func TestE2EHelloVsAppend(t *testing.T) {
 
 		appendDone := make(chan appendResult, 1)
 		go func() {
-			seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 			appendDone <- appendResult{seq: seq, err: err}
 		}()
 		gate.waitEntered(t)
@@ -1170,7 +1170,7 @@ func TestE2EAppendVsTurnEnded(t *testing.T) {
 
 		appendDone := make(chan appendResult, 1)
 		go func() {
-			seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 			appendDone <- appendResult{seq: seq, err: err}
 		}()
 		gate.waitEntered(t)
@@ -1204,7 +1204,7 @@ func TestE2EAppendVsTurnEnded(t *testing.T) {
 
 		appendDone := make(chan appendResult, 1)
 		go func() {
-			seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 			appendDone <- appendResult{seq: seq, err: err}
 		}()
 		awaitLockWaiter(t, h.pool)

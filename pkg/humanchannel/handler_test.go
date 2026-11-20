@@ -287,7 +287,9 @@ func TestGetNilSlicesEncodedAsEmptyArrays(t *testing.T) {
 func TestSendSuccess(t *testing.T) {
 	t.Parallel()
 	svc := &FakeRunService{
-		AppendInboxFunc: func(_ context.Context, _ string, _ string) (int64, error) { return 7, nil },
+		AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+			return 7, false, nil
+		},
 	}
 	srv := newTestServer(t, svc)
 
@@ -302,6 +304,9 @@ func TestSendSuccess(t *testing.T) {
 	calls := svc.AppendCalls()
 	if len(calls) != 1 || calls[0].RunID != "r1" || calls[0].Text != "你好" {
 		t.Fatalf("AppendInbox 调用记录 = %+v", calls)
+	}
+	if calls[0].Event.Kind != runcontroller.KindHumanMessage {
+		t.Fatalf("AppendInbox 事件种类 = %q, 想要 human_message", calls[0].Event.Kind)
 	}
 }
 
@@ -427,7 +432,9 @@ func TestTextSizeBoundary(t *testing.T) {
 
 	t.Run("send 恰好上限通过", func(t *testing.T) {
 		t.Parallel()
-		svc := &FakeRunService{AppendInboxFunc: func(_ context.Context, _, _ string) (int64, error) { return 1, nil }}
+		svc := &FakeRunService{AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+			return 1, false, nil
+		}}
 		srv := newTestServer(t, svc)
 		body := `{"text":"` + exact + `"}`
 		status, _, respBody := do(t, http.MethodPost, srv.URL+"/v1/runs/r1/messages", body)
@@ -494,7 +501,9 @@ func TestTextSizeBoundary(t *testing.T) {
 
 	t.Run("send 多字节恰好上限通过", func(t *testing.T) {
 		t.Parallel()
-		svc := &FakeRunService{AppendInboxFunc: func(_ context.Context, _, _ string) (int64, error) { return 1, nil }}
+		svc := &FakeRunService{AppendInboxFunc: func(_ context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+			return 1, false, nil
+		}}
 		srv := newTestServer(t, svc)
 		body := `{"text":"` + multiExact + `"}`
 		status, _, respBody := do(t, http.MethodPost, srv.URL+"/v1/runs/r1/messages", body)
@@ -527,9 +536,9 @@ func TestServiceErrorMapping(t *testing.T) {
 		status  int
 		message string
 	}{
-		"not found":    {runcontroller.ErrNotFound, http.StatusNotFound, "run not found"},
-		"terminated":   {runcontroller.ErrTerminated, http.StatusConflict, "run ended or failed"},
-		"invalid text": {runcontroller.ErrInvalidText, http.StatusBadRequest, "text empty or longer than 64 KiB"},
+		"not found":     {runcontroller.ErrNotFound, http.StatusNotFound, "run not found"},
+		"terminated":    {runcontroller.ErrTerminated, http.StatusConflict, "run ended or failed"},
+		"invalid event": {runcontroller.ErrInvalidEvent, http.StatusBadRequest, "text empty or longer than 64 KiB"},
 	}
 
 	cases := []struct {
@@ -540,9 +549,9 @@ func TestServiceErrorMapping(t *testing.T) {
 		sentinel string
 		wrapped  bool
 	}{
-		{"create invalid text", http.MethodPost, "/v1/runs", `{"prompt":"hi"}`, "invalid text", false},
-		{"create wrapped invalid text", http.MethodPost, "/v1/runs", `{"prompt":"hi"}`, "invalid text", true},
-		{"send invalid text", http.MethodPost, "/v1/runs/r1/messages", `{"text":"hi"}`, "invalid text", false},
+		{"create invalid event", http.MethodPost, "/v1/runs", `{"prompt":"hi"}`, "invalid event", false},
+		{"create wrapped invalid event", http.MethodPost, "/v1/runs", `{"prompt":"hi"}`, "invalid event", true},
+		{"send invalid event", http.MethodPost, "/v1/runs/r1/messages", `{"text":"hi"}`, "invalid event", false},
 		{"get not found", http.MethodGet, "/v1/runs/r1", "", "not found", false},
 		{"get wrapped not found", http.MethodGet, "/v1/runs/r1", "", "not found", true},
 		{"send not found", http.MethodPost, "/v1/runs/r1/messages", `{"text":"hi"}`, "not found", false},
@@ -564,7 +573,7 @@ func TestServiceErrorMapping(t *testing.T) {
 				GetFunc:         func(context.Context, string) (runcontroller.RunDetail, error) { return runcontroller.RunDetail{}, err },
 				ListFunc:        func(context.Context) ([]runcontroller.RunSummary, error) { return nil, err },
 				EndFunc:         func(context.Context, string) error { return err },
-				AppendInboxFunc: func(context.Context, string, string) (int64, error) { return 0, err },
+				AppendInboxFunc: func(context.Context, string, runcontroller.InboxEvent) (int64, bool, error) { return 0, false, err },
 			}
 			srv := newTestServer(t, svc)
 
@@ -895,7 +904,10 @@ func TestContextCancellation(t *testing.T) {
 		{
 			name: "messages", method: http.MethodPost, path: "/v1/runs/r1/messages", body: `{"text":"x"}`,
 			setup: func(f *FakeRunService, observe func(context.Context)) {
-				f.AppendInboxFunc = func(ctx context.Context, _, _ string) (int64, error) { observe(ctx); return 1, nil }
+				f.AppendInboxFunc = func(ctx context.Context, _ string, _ runcontroller.InboxEvent) (int64, bool, error) {
+					observe(ctx)
+					return 1, false, nil
+				}
 			},
 		},
 		{

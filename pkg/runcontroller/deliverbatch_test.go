@@ -114,7 +114,7 @@ func TestDeliverBatchThroughSeqMatchesFrame(t *testing.T) {
 	const wantMessages = 17
 	for i := 0; i < wantMessages-1; i++ {
 		text := strings.Repeat(string(rune('a'+i)), runcontroller.MaxTextBytes)
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, text); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, text); err != nil {
 			t.Fatalf("AppendInbox %d: %v", i+2, err)
 		}
 	}
@@ -205,7 +205,7 @@ func TestHelloBeforeRestoreLeavesHelloMSUnmeasured(t *testing.T) {
 	release := h.provider.Hold(fakeprovider.OpRestore)
 	t.Cleanup(release)
 
-	if _, err := h.ctrl.AppendInbox(context.Background(), runID, "wake"); err != nil {
+	if _, err := appendHuman(h.ctrl, context.Background(), runID, "wake"); err != nil {
 		t.Fatalf("AppendInbox: %v", err)
 	}
 	h.waitState(runID, runcontroller.StateResuming, runcontroller.SubstateSnapshotted)

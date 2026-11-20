@@ -214,6 +214,16 @@ type pendingClose struct {
 	st   *status.Status
 }
 
+// applyResult is the outcome of one applied event after the transaction
+// commits. duplicate is set when the event matched an existing dedup key; the
+// run row was then left untouched and duplicateSeq is the existing inbox
+// sequence.
+type applyResult struct {
+	effects      []machineEffect
+	duplicate    bool
+	duplicateSeq int64
+}
+
 // applyEvent runs one rule: it locks the run row, computes the transition and
 // writes the resulting state and effects in a single transaction. Stream
 // frames are reserved in order while the row lock is held and released after
@@ -229,17 +239,19 @@ func (c *Controller) applyEvent(
 	runID string,
 	ev machineEvent,
 	opts applyOpts,
-) ([]machineEffect, error) {
+) (applyResult, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return applyResult{}, err
 	}
 	now := c.clock.Now()
 
 	var (
-		effects []machineEffect
-		pending []pendingProvider
-		frames  []*frameSlot
-		closes  []pendingClose
+		effects      []machineEffect
+		duplicate    bool
+		duplicateSeq int64
+		pending      []pendingProvider
+		frames       []*frameSlot
+		closes       []pendingClose
 	)
 
 	// Whatever ends this application, a panic must not leave reserved frames
@@ -270,6 +282,25 @@ func (c *Controller) applyEvent(
 		// written. Tests use it to force the two orders of an interleaving.
 		c.callAfterLock(eventName(ev), runID)
 
+		// A deduplicated event returns the existing row before any sequence is
+		// allocated or any state is changed. The row lock serializes writers of
+		// the same run, so the lookup sees a competing write that committed
+		// while this transaction waited for the lock.
+		if appendEv, ok := ev.(evAppend); ok && appendEv.dedupKey != "" {
+			if stateFromRow(row).terminated() {
+				return ErrTerminated
+			}
+			seq, found, err := tx.inboxSeqByDedupKey(runID, appendEv.dedupKey)
+			if err != nil {
+				return err
+			}
+			if found {
+				duplicate = true
+				duplicateSeq = seq
+				return nil
+			}
+		}
+
 		env, err := c.machineEnv(tx, runID, now)
 		if err != nil {
 			return err
@@ -283,7 +314,14 @@ func (c *Controller) applyEvent(
 		for _, effect := range result.Effects {
 			switch e := effect.(type) {
 			case insertInbox:
-				if err := tx.insertInbox(runID, e.seq, e.text, now); err != nil {
+				if err := tx.insertInbox(runID, inboxInsert{
+					Seq:      e.seq,
+					Kind:     e.kind,
+					Text:     e.text,
+					EventID:  e.eventID,
+					DedupKey: e.dedupKey,
+					Payload:  e.payload,
+				}, now); err != nil {
 					return err
 				}
 			case turnStarted:
@@ -436,7 +474,7 @@ func (c *Controller) applyEvent(
 		for _, p := range pending {
 			c.startProviderCall(runID, p)
 		}
-		return effects, nil
+		return applyResult{effects: effects, duplicate: duplicate, duplicateSeq: duplicateSeq}, nil
 	}
 
 	for _, s := range frames {
@@ -445,7 +483,7 @@ func (c *Controller) applyEvent(
 	for _, p := range pending {
 		p.slot.abandon()
 	}
-	return nil, err
+	return applyResult{}, err
 }
 
 // resolveCommit decides whether the transaction whose Commit returned ce

@@ -30,10 +30,12 @@ type FakeEndCall struct {
 	RunID string
 }
 
-// FakeAppendCall 记录一次 AppendInbox 调用。
+// FakeAppendCall 记录一次 AppendInbox 调用。Text 复制自 Event.Text，
+// 便于既有断言不变。
 type FakeAppendCall struct {
 	Ctx   context.Context
 	RunID string
+	Event runcontroller.InboxEvent
 	Text  string
 }
 
@@ -45,7 +47,7 @@ type FakeRunService struct {
 	GetFunc         func(ctx context.Context, runID string) (runcontroller.RunDetail, error)
 	ListFunc        func(ctx context.Context) ([]runcontroller.RunSummary, error)
 	EndFunc         func(ctx context.Context, runID string) error
-	AppendInboxFunc func(ctx context.Context, runID string, text string) (int64, error)
+	AppendInboxFunc func(ctx context.Context, runID string, ev runcontroller.InboxEvent) (int64, bool, error)
 
 	mu      sync.Mutex
 	creates []FakeCreateCall
@@ -101,15 +103,15 @@ func (f *FakeRunService) End(ctx context.Context, runID string) error {
 	return fn(ctx, runID)
 }
 
-func (f *FakeRunService) AppendInbox(ctx context.Context, runID string, text string) (int64, error) {
+func (f *FakeRunService) AppendInbox(ctx context.Context, runID string, ev runcontroller.InboxEvent) (int64, bool, error) {
 	f.mu.Lock()
-	f.appends = append(f.appends, FakeAppendCall{Ctx: ctx, RunID: runID, Text: text})
+	f.appends = append(f.appends, FakeAppendCall{Ctx: ctx, RunID: runID, Event: ev, Text: ev.Text})
 	fn := f.AppendInboxFunc
 	f.mu.Unlock()
 	if fn == nil {
-		return 0, nil
+		return 0, false, nil
 	}
-	return fn(ctx, runID, text)
+	return fn(ctx, runID, ev)
 }
 
 // CreateCalls 返回已记录的 Create 调用的副本。

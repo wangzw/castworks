@@ -213,21 +213,21 @@ func TestMigrateConstraints(t *testing.T) {
 		}
 
 		err := st.inTx(ctx, func(tx *storeTx) error {
-			return tx.insertInbox(runID, 2, "", now)
+			return tx.insertInbox(runID, inboxInsert{Seq: 2, Kind: KindHumanMessage, Text: ""}, now)
 		})
 		if err == nil {
 			t.Fatal("empty inbox text succeeded, want a CHECK constraint error")
 		}
 
 		err = st.inTx(ctx, func(tx *storeTx) error {
-			return tx.insertInbox(runID, 3, strings.Repeat("x", MaxTextBytes+1), now)
+			return tx.insertInbox(runID, inboxInsert{Seq: 3, Kind: KindHumanMessage, Text: strings.Repeat("x", MaxTextBytes+1)}, now)
 		})
 		if err == nil {
 			t.Fatal("oversized inbox text succeeded, want a CHECK constraint error")
 		}
 
 		err = st.inTx(ctx, func(tx *storeTx) error {
-			return tx.insertInbox(runID, 4, strings.Repeat("x", MaxTextBytes), now)
+			return tx.insertInbox(runID, inboxInsert{Seq: 4, Kind: KindHumanMessage, Text: strings.Repeat("x", MaxTextBytes)}, now)
 		})
 		if err != nil {
 			t.Fatalf("inbox text of exactly MaxTextBytes failed: %v", err)

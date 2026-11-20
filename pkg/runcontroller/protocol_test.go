@@ -98,7 +98,7 @@ func TestProtocolAppendOnClosingStream(t *testing.T) {
 
 	appendDone := make(chan appendResult, 1)
 	go func() {
-		seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+		seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 		appendDone <- appendResult{seq: seq, err: err}
 	}()
 	gate.waitEntered(t)

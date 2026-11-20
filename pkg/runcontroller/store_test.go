@@ -240,7 +240,7 @@ func TestStoreInboxRange(t *testing.T) {
 		3: "klmnopqrst",
 	} {
 		if err := st.inTx(ctx, func(tx *storeTx) error {
-			return tx.insertInbox("run-inbox", seq, text, now.Add(time.Duration(seq)*time.Second))
+			return tx.insertInbox("run-inbox", inboxInsert{Seq: seq, Kind: KindHumanMessage, Text: text}, now.Add(time.Duration(seq)*time.Second))
 		}); err != nil {
 			t.Fatalf("insert inbox %d: %v", seq, err)
 		}

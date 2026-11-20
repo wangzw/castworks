@@ -98,13 +98,13 @@ func TestReviewFixCommitSucceededDespiteError(t *testing.T) {
 			// Another transaction advances the same run after the error and
 			// before the outcome is judged. It changes the row version, which
 			// makes the version comparison ambiguous.
-			if _, err := h.ctrl.AppendInbox(context.Background(), runID, "advance"); err != nil {
+			if _, err := appendHuman(h.ctrl, context.Background(), runID, "advance"); err != nil {
 				t.Errorf("插入另一个事务: %v", err)
 			}
 		})
 	})
 
-	seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+	seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 	if err != nil {
 		t.Fatalf("提交实际成功时 AppendInbox = %v, 想要 nil", err)
 	}
@@ -161,7 +161,7 @@ func TestReviewFixCommitAbortedDespiteMatchingVersion(t *testing.T) {
 		})
 	})
 
-	if _, err := h.ctrl.AppendInbox(context.Background(), runID, "second"); err == nil {
+	if _, err := appendHuman(h.ctrl, context.Background(), runID, "second"); err == nil {
 		t.Fatal("提交实际回滚时 AppendInbox = nil, 想要错误")
 	}
 
@@ -258,7 +258,7 @@ func TestReviewFixApplyEventPanicReleasesReservations(t *testing.T) {
 					t.Fatal("applyEvent 没有把 panic 传出去")
 				}
 			}()
-			_, _ = h.ctrl.AppendInbox(context.Background(), runID, "second")
+			_, _ = appendHuman(h.ctrl, context.Background(), runID, "second")
 		}()
 
 		// A later End reserves a Shutdown behind the panicked transaction's
@@ -375,7 +375,7 @@ func TestReviewFixRestoreReturnTimeSurvivesRetry(t *testing.T) {
 		})
 	})
 
-	if _, err := h.ctrl.AppendInbox(context.Background(), runID, "wake"); err != nil {
+	if _, err := appendHuman(h.ctrl, context.Background(), runID, "wake"); err != nil {
 		t.Fatalf("AppendInbox: %v", err)
 	}
 	h.waitRestoreReturned(runID)
@@ -452,7 +452,7 @@ func TestReviewFixCallerContextCancelDuringCommit(t *testing.T) {
 		}
 	})
 
-	seq, err := h.ctrl.AppendInbox(ctx, runID, "wake")
+	seq, err := appendHuman(h.ctrl, ctx, runID, "wake")
 	if err != nil {
 		t.Fatalf("调用方 ctx 取消后 AppendInbox = %v, 想要 nil", err)
 	}
@@ -542,7 +542,7 @@ func TestReviewFixAcceptedThroughSeq(t *testing.T) {
 		h := newHarness(t, testConfig())
 		runID := h.createRun("first")
 		h.waitCalls(fakeprovider.OpProvision, 1)
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "second"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "second"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 
@@ -561,7 +561,7 @@ func TestReviewFixAcceptedThroughSeq(t *testing.T) {
 		h := newHarness(t, testConfig())
 		runID := h.createRun("first")
 		h.waitCalls(fakeprovider.OpProvision, 1)
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "second"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "second"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 

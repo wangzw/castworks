@@ -130,7 +130,7 @@ func TestStressManyRuns(t *testing.T) {
 						runLocks[runIndex].Lock()
 						defer runLocks[runIndex].Unlock()
 						before := len(wardens[runID].Written())
-						if _, err := h.controller().AppendInbox(context.Background(), runID,
+						if _, err := appendHuman(h.controller(), context.Background(), runID,
 							fmt.Sprintf("%s-%d-%d", runID, round, a)); err != nil {
 							appendErrs <- fmt.Errorf("AppendInbox(%s): %w", runID, err)
 							return

@@ -5,6 +5,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
 )
 
 // 本文件只把测试需要的内部入口导出给外部测试包 runcontroller_test。
@@ -78,6 +80,21 @@ func TrySuspendNow(c *Controller, runID string) error {
 // scan period.
 func ExpireHelloNow(c *Controller, runID string) error {
 	return c.expireHello(context.Background(), runID)
+}
+
+// DeliverFrameForTest builds the Deliver frame for runID's inbox rows in
+// [from, through] through the same conversion and validation path that
+// delivery uses.
+func DeliverFrameForTest(c *Controller, runID string, from, through int64) (*agentprotocolv1.ControlFrame, error) {
+	var messages []inboxMessage
+	if err := c.store.inTx(context.Background(), func(tx *storeTx) error {
+		var err error
+		messages, err = tx.inboxRange(runID, from, through, maxDeliverBytes)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return c.deliverFrame(runID, messages)
 }
 
 // RegisterClosedStreamForTest registers a stream that is already closed but

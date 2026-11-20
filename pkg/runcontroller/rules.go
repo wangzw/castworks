@@ -48,7 +48,14 @@ type machineSuspension struct {
 // machineEvent 是触发一次状态转移的事件。
 type machineEvent interface{ isMachineEvent() }
 
-type evAppend struct{ text string }
+// evAppend 是写入收件箱的事件。dedupKey 非空时，控制器在分配序号之前先查重。
+type evAppend struct {
+	kind     InboxKind
+	text     string
+	eventID  string
+	dedupKey string
+	payload  []byte
+}
 
 type evProvisionDone struct {
 	// returnedAt is when Provision actually returned. A completion write may
@@ -114,8 +121,12 @@ func (evHelloExpire) isMachineEvent()   {}
 type machineEffect interface{ isMachineEffect() }
 
 type insertInbox struct {
-	seq  int64
-	text string
+	seq      int64
+	kind     InboxKind
+	text     string
+	eventID  string
+	dedupKey string
+	payload  []byte
 }
 
 type turnStarted struct {
@@ -265,7 +276,14 @@ func transitionAppend(cur machineState, e evAppend, env machineEnv) (machineResu
 		seq = 1
 	}
 	cur.NextInboxSeq = seq + 1
-	effects := []machineEffect{insertInbox{seq: seq, text: e.text}}
+	effects := []machineEffect{insertInbox{
+		seq:      seq,
+		kind:     e.kind,
+		text:     e.text,
+		eventID:  e.eventID,
+		dedupKey: e.dedupKey,
+		payload:  e.payload,
+	}}
 
 	switch cur.State {
 	case StateActive:

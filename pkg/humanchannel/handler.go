@@ -141,7 +141,10 @@ func (h *handler) send(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
-	inboxSeq, err := h.svc.AppendInbox(r.Context(), r.PathValue("run_id"), req.Text)
+	inboxSeq, _, err := h.svc.AppendInbox(r.Context(), r.PathValue("run_id"), runcontroller.InboxEvent{
+		Kind: runcontroller.KindHumanMessage,
+		Text: req.Text,
+	})
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -186,7 +189,7 @@ func validateText(s string) string {
 // 响应体不暴露内部错误文本。
 func writeServiceError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, runcontroller.ErrInvalidText):
+	case errors.Is(err, runcontroller.ErrInvalidEvent):
 		writeError(w, http.StatusBadRequest, errTextInvalid)
 	case errors.Is(err, runcontroller.ErrNotFound):
 		writeError(w, http.StatusNotFound, errRunNotFound)

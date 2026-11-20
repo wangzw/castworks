@@ -266,6 +266,17 @@ func (h *harness) createRun(prompt string) string {
 	return runID
 }
 
+// appendHuman writes a human_message event with the v0.2.0 AppendInbox
+// signature and returns the inbox sequence, which is all the pre-v0.2.0 call
+// sites need.
+func appendHuman(ctrl *runcontroller.Controller, ctx context.Context, runID, text string) (int64, error) {
+	seq, _, err := ctrl.AppendInbox(ctx, runID, runcontroller.InboxEvent{
+		Kind: runcontroller.KindHumanMessage,
+		Text: text,
+	})
+	return seq, err
+}
+
 func (h *harness) waitCalls(op fakeprovider.Op, n int) {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -488,28 +499,28 @@ func TestRunServiceErrorConventions(t *testing.T) {
 	if _, err := h.ctrl.Get(ctx, "missing"); !errors.Is(err, runcontroller.ErrNotFound) {
 		t.Fatalf("Get 不存在的运行实例: %v, 想要 ErrNotFound", err)
 	}
-	if _, err := h.ctrl.AppendInbox(ctx, "missing", "text"); !errors.Is(err, runcontroller.ErrNotFound) {
+	if _, err := appendHuman(h.ctrl, ctx, "missing", "text"); !errors.Is(err, runcontroller.ErrNotFound) {
 		t.Fatalf("AppendInbox 不存在的运行实例: %v, 想要 ErrNotFound", err)
 	}
 	if err := h.ctrl.End(ctx, "missing"); !errors.Is(err, runcontroller.ErrNotFound) {
 		t.Fatalf("End 不存在的运行实例: %v, 想要 ErrNotFound", err)
 	}
 
-	if _, err := h.ctrl.Create(ctx, ""); !errors.Is(err, runcontroller.ErrInvalidText) {
-		t.Fatalf("Create 空文本: %v, 想要 ErrInvalidText", err)
+	if _, err := h.ctrl.Create(ctx, ""); !errors.Is(err, runcontroller.ErrInvalidEvent) {
+		t.Fatalf("Create 空文本: %v, 想要 ErrInvalidEvent", err)
 	}
-	if _, err := h.ctrl.Create(ctx, strings.Repeat("a", runcontroller.MaxTextBytes+1)); !errors.Is(err, runcontroller.ErrInvalidText) {
-		t.Fatalf("Create 超长文本: %v, 想要 ErrInvalidText", err)
+	if _, err := h.ctrl.Create(ctx, strings.Repeat("a", runcontroller.MaxTextBytes+1)); !errors.Is(err, runcontroller.ErrInvalidEvent) {
+		t.Fatalf("Create 超长文本: %v, 想要 ErrInvalidEvent", err)
 	}
 
 	runID := h.createRun("first")
-	if _, err := h.ctrl.AppendInbox(ctx, runID, ""); !errors.Is(err, runcontroller.ErrInvalidText) {
-		t.Fatalf("AppendInbox 空文本: %v, 想要 ErrInvalidText", err)
+	if _, err := appendHuman(h.ctrl, ctx, runID, ""); !errors.Is(err, runcontroller.ErrInvalidEvent) {
+		t.Fatalf("AppendInbox 空文本: %v, 想要 ErrInvalidEvent", err)
 	}
-	if _, err := h.ctrl.AppendInbox(ctx, runID, strings.Repeat("b", runcontroller.MaxTextBytes+1)); !errors.Is(err, runcontroller.ErrInvalidText) {
-		t.Fatalf("AppendInbox 超长文本: %v, 想要 ErrInvalidText", err)
+	if _, err := appendHuman(h.ctrl, ctx, runID, strings.Repeat("b", runcontroller.MaxTextBytes+1)); !errors.Is(err, runcontroller.ErrInvalidEvent) {
+		t.Fatalf("AppendInbox 超长文本: %v, 想要 ErrInvalidEvent", err)
 	}
-	if seq, err := h.ctrl.AppendInbox(ctx, runID, strings.Repeat("c", runcontroller.MaxTextBytes)); err != nil || seq != 2 {
+	if seq, err := appendHuman(h.ctrl, ctx, runID, strings.Repeat("c", runcontroller.MaxTextBytes)); err != nil || seq != 2 {
 		t.Fatalf("AppendInbox 恰好 MaxTextBytes: seq=%d err=%v", seq, err)
 	}
 
@@ -517,7 +528,7 @@ func TestRunServiceErrorConventions(t *testing.T) {
 		t.Fatalf("End: %v", err)
 	}
 	h.waitState(runID, runcontroller.StateEnded, runcontroller.SubstateNone)
-	if _, err := h.ctrl.AppendInbox(ctx, runID, "after end"); !errors.Is(err, runcontroller.ErrTerminated) {
+	if _, err := appendHuman(h.ctrl, ctx, runID, "after end"); !errors.Is(err, runcontroller.ErrTerminated) {
 		t.Fatalf("AppendInbox 已结束: %v, 想要 ErrTerminated", err)
 	}
 	if err := h.ctrl.End(ctx, runID); err != nil {
@@ -527,7 +538,7 @@ func TestRunServiceErrorConventions(t *testing.T) {
 	h.provider.FailNext(fakeprovider.OpProvision, errors.New("provision blew up"))
 	failedID := h.createRun("will fail")
 	h.waitState(failedID, runcontroller.StateFailed, runcontroller.SubstateNone)
-	if _, err := h.ctrl.AppendInbox(ctx, failedID, "after fail"); !errors.Is(err, runcontroller.ErrTerminated) {
+	if _, err := appendHuman(h.ctrl, ctx, failedID, "after fail"); !errors.Is(err, runcontroller.ErrTerminated) {
 		t.Fatalf("AppendInbox 已失败: %v, 想要 ErrTerminated", err)
 	}
 }
@@ -725,7 +736,7 @@ func TestRunServiceCallerContext(t *testing.T) {
 		t.Cleanup(release)
 
 		ctx, cancel := context.WithCancel(context.Background())
-		seq, err := h.ctrl.AppendInbox(ctx, runID, "wake up")
+		seq, err := appendHuman(h.ctrl, ctx, runID, "wake up")
 		cancel()
 		if err != nil {
 			t.Fatalf("AppendInbox: %v", err)

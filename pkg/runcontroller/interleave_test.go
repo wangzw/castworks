@@ -82,7 +82,7 @@ func (h *harness) suspendedRun() string {
 func (h *harness) resumingRun() string {
 	h.t.Helper()
 	runID := h.suspendedRun()
-	if _, err := h.ctrl.AppendInbox(context.Background(), runID, "wake"); err != nil {
+	if _, err := appendHuman(h.ctrl, context.Background(), runID, "wake"); err != nil {
 		h.t.Fatalf("AppendInbox: %v", err)
 	}
 	h.waitRestoreReturned(runID)
@@ -130,7 +130,7 @@ func TestInterleaveAppendVsSuspend(t *testing.T) {
 		)
 		appendDone := make(chan struct{})
 		go func() {
-			seq, err = h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err = appendHuman(h.ctrl, context.Background(), runID, "second")
 			close(appendDone)
 		}()
 		gate.waitEntered(t)
@@ -184,7 +184,7 @@ func TestInterleaveAppendVsSuspend(t *testing.T) {
 			err error
 		)
 		go func() {
-			seq, err = h.ctrl.AppendInbox(context.Background(), runID, "second")
+			seq, err = appendHuman(h.ctrl, context.Background(), runID, "second")
 			close(appendDone)
 		}()
 		h.waitForLockWaiter()
@@ -238,7 +238,7 @@ func TestInterleaveAppendVsSnapshotDone(t *testing.T) {
 			err error
 		)
 		go func() {
-			seq, err = h.ctrl.AppendInbox(context.Background(), runID, "during snapshot")
+			seq, err = appendHuman(h.ctrl, context.Background(), runID, "during snapshot")
 			close(appendDone)
 		}()
 		gate.waitEntered(t)
@@ -284,7 +284,7 @@ func TestInterleaveAppendVsSnapshotDone(t *testing.T) {
 			err error
 		)
 		go func() {
-			seq, err = h.ctrl.AppendInbox(context.Background(), runID, "after snapshot")
+			seq, err = appendHuman(h.ctrl, context.Background(), runID, "after snapshot")
 			close(appendDone)
 		}()
 		h.waitForLockWaiter()
@@ -325,13 +325,13 @@ func TestInterleaveTwoAppends(t *testing.T) {
 	second := make(chan appendResult, 1)
 
 	go func() {
-		seq, err := h.ctrl.AppendInbox(context.Background(), runID, "one")
+		seq, err := appendHuman(h.ctrl, context.Background(), runID, "one")
 		first <- appendResult{seq: seq, err: err}
 	}()
 	gate.waitEntered(t)
 
 	go func() {
-		seq, err := h.ctrl.AppendInbox(context.Background(), runID, "two")
+		seq, err := appendHuman(h.ctrl, context.Background(), runID, "two")
 		second <- appendResult{seq: seq, err: err}
 	}()
 	h.waitForLockWaiter()
@@ -376,7 +376,7 @@ func TestInterleaveDeliverReservedBeforeCommit(t *testing.T) {
 
 	appendDone := make(chan appendResult, 1)
 	go func() {
-		seq, err := h.ctrl.AppendInbox(context.Background(), runID, "second")
+		seq, err := appendHuman(h.ctrl, context.Background(), runID, "second")
 		appendDone <- appendResult{seq: seq, err: err}
 	}()
 	gate.waitEntered(t)
@@ -490,7 +490,7 @@ func TestInterleaveEndVsProviderCall(t *testing.T) {
 		release := h.provider.Hold(fakeprovider.OpRestore)
 		t.Cleanup(release)
 
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "wake"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "wake"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 		h.waitCalls(fakeprovider.OpRestore, 1)
@@ -542,7 +542,7 @@ func TestInterleaveEndVsProviderCall(t *testing.T) {
 		release := h.provider.Hold(fakeprovider.OpRestore)
 		t.Cleanup(release)
 
-		if _, err := h.ctrl.AppendInbox(context.Background(), runID, "wake"); err != nil {
+		if _, err := appendHuman(h.ctrl, context.Background(), runID, "wake"); err != nil {
 			t.Fatalf("AppendInbox: %v", err)
 		}
 		h.waitCalls(fakeprovider.OpRestore, 1)
