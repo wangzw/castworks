@@ -777,6 +777,11 @@ type turn struct {
 	EndedAt   *time.Time `json:"ended_at"`
 	Output    string     `json:"output"`
 	IsError   bool       `json:"is_error"`
+
+	// DeliveryID is read from the turn table, not from GET /v1/runs; the API
+	// does not expose it. The v0.2.0 duplicate-delivery criterion uses it to
+	// tie a turn to the inbox row it was started from.
+	DeliveryID string `json:"-"`
 }
 
 // suspension mirrors one suspension record. The timing fields are null while
