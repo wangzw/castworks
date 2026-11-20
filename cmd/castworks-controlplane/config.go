@@ -29,6 +29,7 @@ const envDatabaseURL = "CASTWORKS_DATABASE_URL"
 const (
 	defaultHTTPAddr                = "127.0.0.1:8080"
 	defaultGRPCAddr                = "127.0.0.1:9090"
+	defaultWebhookAddr             = "127.0.0.1:9092"
 	defaultIdleGrace               = 30 * time.Second
 	defaultScanPeriod              = 5 * time.Second
 	defaultHelloTimeout            = 60 * time.Second
@@ -44,6 +45,9 @@ const (
 type Config struct {
 	HTTPAddr                string
 	GRPCAddr                string
+	ConnectorHubConfig      string
+	ConnectorAddr           string
+	WebhookAddr             string
 	DatabaseURL             string
 	LLMCredentialFile       string
 	LLMCredentialKind       runcontroller.LLMCredentialKind
@@ -171,6 +175,9 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 
 	fs.StringVar(&cfg.HTTPAddr, "http-addr", defaultHTTPAddr, "HTTP API 监听地址，只接受 127.0.0.1 或 ::1")
 	fs.StringVar(&cfg.GRPCAddr, "grpc-addr", defaultGRPCAddr, "gRPC 监听地址；--provider substrate 时必须是网卡 IP 字面量，不能是回环或通配地址")
+	fs.StringVar(&cfg.ConnectorHubConfig, "connectorhub-config", "", "connectorhub 配置文件路径；不给出时不启动 connectorhub，不监听 connector 与 webhook 地址")
+	fs.StringVar(&cfg.ConnectorAddr, "connector-addr", "", "connector 端点监听地址；给出 --connectorhub-config 时必填，--provider substrate 时规则同 --grpc-addr")
+	fs.StringVar(&cfg.WebhookAddr, "webhook-addr", defaultWebhookAddr, "webhook 接收端监听地址，只接受 127.0.0.1 或 ::1")
 	fs.StringVar(&databaseURL, "database-url", "", "数据库连接 URL；未给出时取环境变量 "+envDatabaseURL)
 	fs.StringVar(&cfg.LLMCredentialFile, "llm-credential-file", "", "LLM 凭据文件路径（必填）")
 	fs.StringVar(&credentialKind, "llm-credential-kind", "", "LLM 凭据种类：api_key 或 oauth_token（必填）")
@@ -281,6 +288,18 @@ func (c *Config) validate(visited map[string]bool) error {
 		return fmt.Errorf("--http-addr: %w", err)
 	}
 
+	// The webhook receiver only ever binds loopback, whether or not connectorhub
+	// is enabled.
+	if err := validateLoopbackAddr(c.WebhookAddr); err != nil {
+		return fmt.Errorf("--webhook-addr: %w", err)
+	}
+	// --connector-addr has no default because the connector endpoint is
+	// unreachable without a listener. It is only required when the module is
+	// enabled; a stray value on a disabled module is left unused.
+	if c.ConnectorHubConfig != "" && c.ConnectorAddr == "" {
+		return fmt.Errorf("--connector-addr: required when --connectorhub-config is set")
+	}
+
 	if c.Provider == ProviderLocal {
 		for _, name := range substrateFlagNames {
 			if visited[name] {
@@ -293,6 +312,13 @@ func (c *Config) validate(visited map[string]bool) error {
 	// --provider substrate
 	if err := validateGRPCAddr(c.GRPCAddr); err != nil {
 		return fmt.Errorf("--grpc-addr: %w", err)
+	}
+	// Under Substrate the connector endpoint is reached through a Service by
+	// actors, so it must be an advertised network address like --grpc-addr.
+	if c.ConnectorHubConfig != "" {
+		if err := validateGRPCAddr(c.ConnectorAddr); err != nil {
+			return fmt.Errorf("--connector-addr: %w", err)
+		}
 	}
 	if c.SubstrateAtespace == "" {
 		return fmt.Errorf("--substrate-atespace: required when --provider=%s", ProviderSubstrate)

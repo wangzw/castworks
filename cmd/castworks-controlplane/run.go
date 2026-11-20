@@ -15,10 +15,15 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/wangzw/castworks/pkg/connectorhub"
 	"github.com/wangzw/castworks/pkg/humanchannel"
 	"github.com/wangzw/castworks/pkg/runcontroller"
 	"github.com/wangzw/castworks/pkg/sandboxprovider"
 )
+
+// runcontroller.RunService includes every method connectorhub.Runs needs, so
+// the control plane can hand the controller to connectorhub.New directly.
+var _ connectorhub.Runs = runcontroller.RunService(nil)
 
 const (
 	// databaseConnectTimeout bounds the startup Ping. It does not bound the
@@ -30,11 +35,15 @@ const (
 	httpReadHeaderTimeout = 10 * time.Second
 )
 
-// 关闭顺序的记录点。HTTP 服务端先停，使新请求不再进入；controller.Run 随后
-// 返回，等在途的提供者调用结束；gRPC 服务端最后停，因为看守进程的流是长连接，
-// 必须等 controller 不再需要它；然后释放提供者与连接池。
+// 关闭顺序的记录点。HTTP 服务端先停，使新请求不再进入；connectorhub 启用时
+// webhook 与 connector 两个监听器紧随其后关闭，再让 Hub.Run 返回；controller.Run
+// 随后返回，等在途的提供者调用结束；gRPC 服务端最后停，因为看守进程的流是长
+// 连接，必须等 controller 不再需要它；然后释放提供者与连接池。
 const (
 	shutdownStepHTTP       = "http"
+	shutdownStepWebhook    = "webhook"
+	shutdownStepConnector  = "connector"
+	shutdownStepHub        = "hub"
 	shutdownStepController = "controller"
 	shutdownStepGRPC       = "grpc"
 	shutdownStepProvider   = "provider"
@@ -53,6 +62,9 @@ type runHooks struct {
 	// ready 在两个监听器绑定、服务端与 controller.Run 都已启动后调用，
 	// 参数是 HTTP 与 gRPC 实际监听的地址。
 	ready func(httpAddr, grpcAddr string)
+	// connectorReady 在 connector 与 webhook 两个监听器绑定并开始服务后调用，
+	// 参数是两者实际监听的地址。没有配置 --connectorhub-config 时不调用。
+	connectorReady func(connectorAddr, webhookAddr string)
 	// shutdownStep 在关闭流程的每一步完成后调用，参数是上面的 shutdownStep
 	// 常量之一。
 	shutdownStep func(step string)
@@ -118,6 +130,23 @@ func runWithHooks(ctx context.Context, args []string, hooks runHooks) error {
 		return startupResult(ctx, fmt.Errorf("migrate database: %w", err))
 	}
 
+	// connectorhub owns its own migrations and they run after runcontroller's,
+	// on the same pool. The config is loaded and validated before any listener
+	// opens; a bad definition fails startup.
+	hubEnabled := cfg.ConnectorHubConfig != ""
+	var hubCfg connectorhub.Config
+	if hubEnabled {
+		hubCfg, err = connectorhub.LoadConfig(cfg.ConnectorHubConfig)
+		if err != nil {
+			pool.Close()
+			return startupResult(ctx, err)
+		}
+		if err := connectorhub.Migrate(ctx, pool); err != nil {
+			pool.Close()
+			return startupResult(ctx, fmt.Errorf("migrate connectorhub: %w", err))
+		}
+	}
+
 	constructProvider := newProvider
 	if hooks.newProvider != nil {
 		constructProvider = hooks.newProvider
@@ -130,6 +159,16 @@ func runWithHooks(ctx context.Context, args []string, hooks runHooks) error {
 
 	controller := runcontroller.New(runCfg, pool, provider, runcontroller.RealClock())
 	handler := humanchannel.NewHandler(controller)
+
+	var hub *connectorhub.Hub
+	if hubEnabled {
+		hub, err = connectorhub.New(hubCfg, pool, controller)
+		if err != nil {
+			releaseAfterStartupFailure(provider)
+			pool.Close()
+			return startupResult(ctx, err)
+		}
+	}
 
 	httpLn, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -164,7 +203,56 @@ func runWithHooks(ctx context.Context, args []string, hooks runHooks) error {
 	grpcServer := grpc.NewServer(runcontroller.GRPCServerOptions()...)
 	controller.RegisterGRPC(grpcServer)
 
-	return serve(ctx, cfg, hooks, pool, provider, controller, httpServer, grpcServer, httpLn, grpcLn)
+	var connectorhubServers *connectorhubServers
+	if hub != nil {
+		connectorhubServers, err = listenConnectorHub(hub, cfg)
+		if err != nil {
+			_ = httpLn.Close()
+			_ = grpcLn.Close()
+			releaseAfterStartupFailure(provider)
+			pool.Close()
+			return err
+		}
+	}
+
+	return serve(ctx, cfg, hooks, pool, provider, controller, connectorhubServers, httpServer, grpcServer, httpLn, grpcLn)
+}
+
+// connectorhubServers 是启用 connectorhub 时的两个 HTTP 服务端与监听器。
+type connectorhubServers struct {
+	hub             *connectorhub.Hub
+	connectorServer *http.Server
+	webhookServer   *http.Server
+	connectorLn     net.Listener
+	webhookLn       net.Listener
+}
+
+// listenConnectorHub binds the connector endpoint and the webhook receiver.
+// The webhook listener is re-checked after binding: flag validation only saw
+// the requested address, and the bound address is authoritative. Listen
+// failures do not release the provider or the pool; the caller does.
+func listenConnectorHub(hub *connectorhub.Hub, cfg *Config) (*connectorhubServers, error) {
+	connectorLn, err := net.Listen("tcp", cfg.ConnectorAddr)
+	if err != nil {
+		return nil, fmt.Errorf("--connector-addr: listen on %q: %w", cfg.ConnectorAddr, err)
+	}
+	webhookLn, err := net.Listen("tcp", cfg.WebhookAddr)
+	if err != nil {
+		_ = connectorLn.Close()
+		return nil, fmt.Errorf("--webhook-addr: listen on %q: %w", cfg.WebhookAddr, err)
+	}
+	if err := checkLoopbackListener(webhookLn); err != nil {
+		_ = connectorLn.Close()
+		_ = webhookLn.Close()
+		return nil, fmt.Errorf("--webhook-addr: %w", err)
+	}
+	return &connectorhubServers{
+		hub:             hub,
+		connectorServer: &http.Server{Handler: hub.ConnectorHandler(), ReadHeaderTimeout: httpReadHeaderTimeout},
+		webhookServer:   &http.Server{Handler: hub.WebhookHandler(), ReadHeaderTimeout: httpReadHeaderTimeout},
+		connectorLn:     connectorLn,
+		webhookLn:       webhookLn,
+	}, nil
 }
 
 // startupResult reports a startup failure that is only the signal context
@@ -225,8 +313,8 @@ func releaseAfterStartupFailure(provider sandboxprovider.Provider) {
 	}
 }
 
-// serve 启动两个服务端与控制器，等到 ctx 结束或某个服务意外退出，然后按
-// shutdownStep 常量的顺序关闭全部资源。
+// serve 启动 HTTP、gRPC 与可选的 connectorhub 服务端以及后台循环，等到 ctx
+// 结束或某个服务意外退出，然后按 shutdownStep 常量的顺序关闭全部资源。
 func serve(
 	ctx context.Context,
 	cfg *Config,
@@ -234,6 +322,7 @@ func serve(
 	pool *pgxpool.Pool,
 	provider sandboxprovider.Provider,
 	controller *runcontroller.Controller,
+	hubServers *connectorhubServers,
 	httpServer *http.Server,
 	grpcServer *grpc.Server,
 	httpLn, grpcLn net.Listener,
@@ -272,8 +361,50 @@ func serve(
 	grpcErr := make(chan error, 1)
 	go func() { grpcErr <- grpcServer.Serve(grpcLn) }()
 
+	// Hub.Run follows the same lifetime rule as controller.Run: it must keep
+	// delivering until the webhook and connector listeners have closed, so it
+	// does not inherit ctx's cancellation and is stopped by its own step.
+	// The channels stay nil when connectorhub is disabled; receiving from a nil
+	// channel blocks, so the select cases below stay inert.
+	var hubErr, webhookErr, connectorErr chan error
+	cancelHub := func() {}
+	if hubServers != nil {
+		hubCtx, hubCancel := context.WithCancel(context.WithoutCancel(ctx))
+		cancelHub = hubCancel
+		defer cancelHub()
+		hubErr = make(chan error, 1)
+		go func() { hubErr <- hubServers.hub.Run(hubCtx) }()
+
+		webhookErr = make(chan error, 1)
+		go func() {
+			err := hubServers.webhookServer.Serve(hubServers.webhookLn)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			webhookErr <- err
+		}()
+
+		connectorErr = make(chan error, 1)
+		go func() {
+			err := hubServers.connectorServer.Serve(hubServers.connectorLn)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			connectorErr <- err
+		}()
+	}
+
 	slog.Default().Info("http listening", "addr", httpAddr)
 	slog.Default().Info("grpc listening", "addr", grpcAddr)
+	if hubServers != nil {
+		connectorAddr := hubServers.connectorLn.Addr().String()
+		webhookAddr := hubServers.webhookLn.Addr().String()
+		slog.Default().Info("connector listening", "addr", connectorAddr)
+		slog.Default().Info("webhook listening", "addr", webhookAddr)
+		if hooks.connectorReady != nil {
+			hooks.connectorReady(connectorAddr, webhookAddr)
+		}
+	}
 	if hooks.ready != nil {
 		hooks.ready(httpAddr, grpcAddr)
 	}
@@ -282,8 +413,8 @@ func serve(
 	}
 
 	var cause error
-	httpExited, grpcExited := false, false
-	var httpServeErr, grpcServeErr error
+	httpExited, grpcExited, webhookExited, connectorExited := false, false, false, false
+	var httpServeErr, grpcServeErr, webhookServeErr, connectorServeErr error
 	select {
 	case <-ctx.Done():
 	case err := <-httpErr:
@@ -301,6 +432,22 @@ func serve(
 			cause = fmt.Errorf("grpc server: %w", err)
 		} else {
 			cause = errors.New("grpc server stopped unexpectedly")
+		}
+	case err := <-webhookErr:
+		webhookExited = true
+		webhookServeErr = err
+		if err != nil {
+			cause = fmt.Errorf("webhook server: %w", err)
+		} else {
+			cause = errors.New("webhook server stopped unexpectedly")
+		}
+	case err := <-connectorErr:
+		connectorExited = true
+		connectorServeErr = err
+		if err != nil {
+			cause = fmt.Errorf("connector server: %w", err)
+		} else {
+			cause = errors.New("connector server stopped unexpectedly")
 		}
 	}
 	if cause != nil {
@@ -340,7 +487,65 @@ func serve(
 	}
 	recordShutdownStep(hooks, shutdownStepHTTP)
 
-	// 2. Cancel controller.Run and wait for its in-flight provider calls. When
+	// 2-4. When connectorhub is enabled, the webhook and connector listeners
+	// stop next, in that order, and only then does Hub.Run return. Like HTTP,
+	// they run even when Serve has already returned, because an accepted
+	// connection outlives its listener.
+	hubStopped := true
+	var hubStopErr error
+	if hubServers != nil {
+		shutdownHTTPServer(hubServers.webhookServer, deadline, shutdownStepWebhook)
+		if !webhookExited {
+			webhookServeErr = <-webhookErr
+		}
+		if webhookServeErr != nil {
+			slog.Default().Warn("webhook server stopped with an error", "error", webhookServeErr)
+		}
+		recordShutdownStep(hooks, shutdownStepWebhook)
+
+		shutdownHTTPServer(hubServers.connectorServer, deadline, shutdownStepConnector)
+		if !connectorExited {
+			connectorServeErr = <-connectorErr
+		}
+		if connectorServeErr != nil {
+			slog.Default().Warn("connector server stopped with an error", "error", connectorServeErr)
+		}
+		recordShutdownStep(hooks, shutdownStepConnector)
+
+		// Hub.Run shares the pool with controller.Run, so it must return
+		// before the pool can be released. A deadline exhausted earlier means
+		// only an already-finished result may be taken.
+		cancelHub()
+		hubStopped = false
+		if d := remaining(); d <= 0 {
+			logDeadlineExhausted(shutdownStepHub)
+			select {
+			case err := <-hubErr:
+				if err != nil {
+					slog.Default().Warn("connectorhub.Run returned an error", "error", err)
+				}
+				slog.Default().Info("connectorhub stopped")
+				hubStopped = true
+			default:
+				hubStopErr = errors.New("shutdown deadline exhausted before connectorhub.Run stopped")
+			}
+		} else {
+			select {
+			case err := <-hubErr:
+				if err != nil {
+					slog.Default().Warn("connectorhub.Run returned an error", "error", err)
+				}
+				slog.Default().Info("connectorhub stopped")
+				hubStopped = true
+			case <-time.After(d):
+				slog.Default().Error("connectorhub.Run did not stop before the shutdown deadline")
+				hubStopErr = errors.New("connectorhub.Run did not stop before the shutdown deadline")
+			}
+		}
+		recordShutdownStep(hooks, shutdownStepHub)
+	}
+
+	// 5. Cancel controller.Run and wait for its in-flight provider calls. When
 	// an earlier step used up the deadline, do not present the zero-length
 	// wait as a controller timeout: only the already-finished result is
 	// taken, and the reason stays the exhausted deadline.
@@ -374,7 +579,7 @@ func serve(
 	}
 	recordShutdownStep(hooks, shutdownStepController)
 
-	// 3. gRPC last. GracefulStop waits for streams, so the deadline turns it
+	// 6. gRPC last. GracefulStop waits for streams, so the deadline turns it
 	// into Stop: the warden's streams are long-lived and never end by
 	// themselves. Like the HTTP server, this runs even when Serve has already
 	// returned, because closing the listener does not end established streams.
@@ -413,8 +618,13 @@ func serve(
 		slog.Default().Error("shutdown aborted: controller.Run is still running; provider and pool left open")
 		return controllerStopErr
 	}
+	if !hubStopped {
+		// Hub.Run still owns delivery work and reads and writes the pool.
+		slog.Default().Error("shutdown aborted: connectorhub.Run is still running; provider and pool left open")
+		return hubStopErr
+	}
 
-	// 4. Release the provider, then the pool it no longer needs. Both are
+	// 7. Release the provider, then the pool it no longer needs. Both are
 	// bounded by what remains of the overall shutdown deadline. When nothing
 	// remains, skip them rather than racing a zero-length timer.
 	if d := remaining(); d <= 0 {
@@ -440,6 +650,23 @@ func serve(
 // or to close with.
 func logDeadlineExhausted(step string) {
 	slog.Default().Error("shutdown deadline exhausted; skipping step", "step", step)
+}
+
+// shutdownHTTPServer shuts one of the connectorhub HTTP servers down within
+// the remaining shutdown deadline. When the deadline is already exhausted,
+// Close ends established connections immediately.
+func shutdownHTTPServer(server *http.Server, deadline time.Time, step string) {
+	if d := time.Until(deadline); d <= 0 {
+		logDeadlineExhausted(step)
+		_ = server.Close()
+		return
+	}
+	shutdownCtx, cancelShutdown := context.WithDeadline(context.Background(), deadline)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		slog.Default().Warn(step+" shutdown exceeded the deadline", "error", err)
+		_ = server.Close()
+	}
+	cancelShutdown()
 }
 
 // closeProviderWithin releases the provider but does not wait longer than
