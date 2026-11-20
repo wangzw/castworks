@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +39,7 @@ func TestMain(m *testing.M) {
 // 消息，之后每收到一条 stdin 用户消息，就按一个回合结束输出 assistant、
 // result 与 session_state_changed:idle。
 func runFakeClaude() int {
+	recordFakeLaunch()
 	writeFakeLine(map[string]any{
 		"type": "system", "subtype": "init", "session_id": "sess-fake",
 	})
@@ -68,6 +72,56 @@ func writeFakeLine(msg map[string]any) {
 	}
 	data = append(data, '\n')
 	_, _ = os.Stdout.Write(data)
+}
+
+// recordFakeLaunch 把启动参数与环境变量写入 $HOME/.fake，并在给出
+// --mcp-config 时连接其中的地址，记录端点是否可达。测试据此核对看守进程
+// 传给 Claude Code 的内容。
+func recordFakeLaunch() {
+	base := filepath.Join(os.Getenv("HOME"), ".fake")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return
+	}
+	args := os.Args[1:]
+	if data, err := json.Marshal(args); err == nil {
+		_ = os.WriteFile(filepath.Join(base, "args.json"), data, 0o600)
+	}
+	if data, err := json.Marshal(os.Environ()); err == nil {
+		_ = os.WriteFile(filepath.Join(base, "env.json"), data, 0o600)
+	}
+	endpoint := fakeMCPURL(args)
+	if endpoint == "" {
+		return
+	}
+	reachable := false
+	if parsed, err := url.Parse(endpoint); err == nil {
+		if conn, err := net.DialTimeout("tcp", parsed.Host, 2*time.Second); err == nil {
+			reachable = true
+			_ = conn.Close()
+		}
+	}
+	record, err := json.Marshal(map[string]any{"url": endpoint, "reachable": reachable})
+	if err == nil {
+		_ = os.WriteFile(filepath.Join(base, "mcp.json"), record, 0o600)
+	}
+}
+
+// fakeMCPURL 返回 --mcp-config 中 castworks 服务器的 URL，没给出时返回空串。
+func fakeMCPURL(args []string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "--mcp-config" {
+			continue
+		}
+		var config struct {
+			Servers map[string]struct {
+				URL string `json:"url"`
+			} `json:"mcpServers"`
+		}
+		if json.Unmarshal([]byte(args[i+1]), &config) == nil {
+			return config.Servers["castworks"].URL
+		}
+	}
+	return ""
 }
 
 // fakeControlPlane 是进程内的假 AgentStream 服务端。它接受 Hello，回
@@ -243,6 +297,204 @@ func TestLocalModeDeliversTurnAndExitsZero(t *testing.T) {
 	}
 }
 
+// TestLocalModePassesMCPConfig 核对本地模式给出 connector 地址时：Claude
+// Code 收到 --mcp-config 与 --strict-mcp-config，配置里的端口就是平台 MCP
+// 服务器实际监听的端口（假 Claude Code 启动时连得上），且环境变量不包含
+// 看守进程的 EXTSIM_URL。
+func TestLocalModePassesMCPConfig(t *testing.T) {
+	bin := buildWarden(t)
+	server := newFakeControlPlane(t, "run-mcp")
+	home := t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin,
+		"--run-id", "run-mcp",
+		"--control-plane", server.addr,
+		"--home", home,
+		"--claude-bin", fakeClaudePath(t),
+		"--connector", "127.0.0.1:9091",
+		"--mcp-addr", "127.0.0.1:0",
+	)
+	cmd.Env = append(os.Environ(), "EXTSIM_URL=http://127.0.0.1:9100")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("warden exited with %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	args := fakeArgs(t, home)
+	raw, ok := flagValue(args, "--mcp-config")
+	if !ok {
+		t.Fatalf("start args have no --mcp-config: %q", args)
+	}
+	if !containsArg(args, "--strict-mcp-config") {
+		t.Fatalf("start args have no --strict-mcp-config: %q", args)
+	}
+
+	var config struct {
+		Servers map[string]struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		t.Fatalf("decode --mcp-config %q: %v", raw, err)
+	}
+	mcpServer, ok := config.Servers["castworks"]
+	if !ok {
+		t.Fatalf("--mcp-config has no castworks server: %q", raw)
+	}
+	if mcpServer.Type != "http" {
+		t.Fatalf("castworks server type = %q, want http", mcpServer.Type)
+	}
+	parsed, err := url.Parse(mcpServer.URL)
+	if err != nil {
+		t.Fatalf("parse MCP URL %q: %v", mcpServer.URL, err)
+	}
+	if parsed.Scheme != "http" || parsed.Path != "/mcp" {
+		t.Fatalf("MCP URL = %q, want http://<addr>/mcp", mcpServer.URL)
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatalf("split MCP host %q: %v", parsed.Host, err)
+	}
+	if host != "127.0.0.1" {
+		t.Fatalf("MCP host = %q, want 127.0.0.1", host)
+	}
+	if port == "" || port == "0" {
+		t.Fatalf("MCP port = %q, want an assigned port", port)
+	}
+	if !strings.Contains(stdout.String(), "mcp listening") {
+		t.Fatalf("stdout has no MCP listening log:\n%s", stdout.String())
+	}
+
+	// 假 Claude Code 在启动时连上了这个地址：配置里的端口就是服务器实际
+	// 监听的端口。
+	data, err := os.ReadFile(filepath.Join(home, ".fake", "mcp.json"))
+	if err != nil {
+		t.Fatalf("read fake MCP check: %v", err)
+	}
+	var check struct {
+		URL       string `json:"url"`
+		Reachable bool   `json:"reachable"`
+	}
+	if err := json.Unmarshal(data, &check); err != nil {
+		t.Fatalf("decode fake MCP check: %v", err)
+	}
+	if check.URL != mcpServer.URL || !check.Reachable {
+		t.Fatalf("fake Claude Code reached %q (reachable %v), want %q reachable", check.URL, check.Reachable, mcpServer.URL)
+	}
+
+	for _, entry := range fakeEnv(t, home) {
+		if strings.HasPrefix(entry, "EXTSIM_URL=") {
+			t.Fatalf("Claude Code environment carries EXTSIM_URL: %q", entry)
+		}
+	}
+}
+
+// TestLocalModeWithoutConnectorKeepsV010Args 核对没给出 connector 地址时启动
+// 参数与 v0.1.0 逐字相同，不启动平台 MCP 服务器。
+func TestLocalModeWithoutConnectorKeepsV010Args(t *testing.T) {
+	bin := buildWarden(t)
+	server := newFakeControlPlane(t, "run-nomcp")
+	home := t.TempDir()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin,
+		"--run-id", "run-nomcp",
+		"--control-plane", server.addr,
+		"--home", home,
+		"--claude-bin", fakeClaudePath(t),
+		"--mcp-addr", "127.0.0.1:0",
+	)
+	cmd.Env = append(os.Environ(), "EXTSIM_URL=http://127.0.0.1:9100")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("warden exited with %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	want := []string{
+		"-p",
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--dangerously-skip-permissions",
+	}
+	if args := fakeArgs(t, home); !reflect.DeepEqual(args, want) {
+		t.Fatalf("start args = %q, want %q", args, want)
+	}
+	if strings.Contains(stdout.String(), "mcp listening") {
+		t.Fatalf("platform MCP server started without a connector address:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".fake", "mcp.json")); err == nil {
+		t.Fatalf("fake Claude Code was given --mcp-config without a connector address")
+	}
+	for _, entry := range fakeEnv(t, home) {
+		if strings.HasPrefix(entry, "EXTSIM_URL=") {
+			t.Fatalf("Claude Code environment carries EXTSIM_URL: %q", entry)
+		}
+	}
+}
+
+// TestParseConfigPlatformMCP 核对两种模式下 connector 地址与 MCP 监听地址的
+// 来源：actor 模式取环境变量并固定监听地址，本地模式取命令行参数。
+func TestParseConfigPlatformMCP(t *testing.T) {
+	cases := []struct {
+		name          string
+		args          []string
+		env           map[string]string
+		wantConnector string
+		wantMCPAddr   string
+	}{
+		{
+			name:          "actor mode reads CASTWORKS_CONNECTOR",
+			env:           map[string]string{envControlPlane: "127.0.0.1:1", envConnector: "127.0.0.1:9091"},
+			wantConnector: "127.0.0.1:9091",
+			wantMCPAddr:   actorMCPAddr,
+		},
+		{
+			name:        "actor mode without CASTWORKS_CONNECTOR",
+			env:         map[string]string{envControlPlane: "127.0.0.1:1"},
+			wantMCPAddr: actorMCPAddr,
+		},
+		{
+			name:        "local mode defaults the MCP address",
+			args:        []string{"--run-id", "run-1", "--control-plane", "127.0.0.1:1", "--home", "/tmp/home"},
+			wantMCPAddr: localMCPAddr,
+		},
+		{
+			name: "local mode takes both addresses from flags",
+			args: []string{
+				"--run-id", "run-1", "--control-plane", "127.0.0.1:1", "--home", "/tmp/home",
+				"--connector", "127.0.0.1:9091", "--mcp-addr", "127.0.0.1:8082",
+			},
+			wantConnector: "127.0.0.1:9091",
+			wantMCPAddr:   "127.0.0.1:8082",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			getenv := func(key string) string { return tc.env[key] }
+			cfg, err := parseConfigWithOutput(tc.args, getenv, io.Discard)
+			if err != nil {
+				t.Fatalf("parseConfig: %v", err)
+			}
+			if cfg.ConnectorAddr != tc.wantConnector {
+				t.Fatalf("ConnectorAddr = %q, want %q", cfg.ConnectorAddr, tc.wantConnector)
+			}
+			if cfg.MCPAddr != tc.wantMCPAddr {
+				t.Fatalf("MCPAddr = %q, want %q", cfg.MCPAddr, tc.wantMCPAddr)
+			}
+		})
+	}
+}
+
 // TestConfigErrorsExitOne 覆盖参数与模式判定的组合。每种组合都以退出码 1
 // 结束，且错误文本指出缺失或冲突的项。
 func TestConfigErrorsExitOne(t *testing.T) {
@@ -266,6 +518,18 @@ func TestConfigErrorsExitOne(t *testing.T) {
 			args: []string{"--home", t.TempDir()},
 			env:  envWithControlPlane,
 			want: "--home",
+		},
+		{
+			name: "actor mode rejects --connector",
+			args: []string{"--connector", "127.0.0.1:9091"},
+			env:  envWithControlPlane,
+			want: "--connector",
+		},
+		{
+			name: "actor mode rejects --mcp-addr",
+			args: []string{"--mcp-addr", "127.0.0.1:8082"},
+			env:  envWithControlPlane,
+			want: "--mcp-addr",
 		},
 		{
 			name: "local mode requires home",
@@ -355,4 +619,52 @@ func envWithout(env []string, key string) []string {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// fakeArgs 读取假 Claude Code 记录的启动参数。
+func fakeArgs(t *testing.T, home string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(home, ".fake", "args.json"))
+	if err != nil {
+		t.Fatalf("read fake args: %v", err)
+	}
+	var args []string
+	if err := json.Unmarshal(data, &args); err != nil {
+		t.Fatalf("decode fake args: %v", err)
+	}
+	return args
+}
+
+// fakeEnv 读取假 Claude Code 记录的环境变量。
+func fakeEnv(t *testing.T, home string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(home, ".fake", "env.json"))
+	if err != nil {
+		t.Fatalf("read fake env: %v", err)
+	}
+	var env []string
+	if err := json.Unmarshal(data, &env); err != nil {
+		t.Fatalf("decode fake env: %v", err)
+	}
+	return env
+}
+
+// flagValue 返回 name 之后紧跟的参数值；参数不存在时返回 false。
+func flagValue(args []string, name string) (string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+// containsArg 报告 args 中是否有 name 这一项。
+func containsArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name {
+			return true
+		}
+	}
+	return false
 }

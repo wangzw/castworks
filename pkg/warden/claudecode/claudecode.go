@@ -17,6 +17,9 @@
 //
 //	claude -p --output-format stream-json --input-format stream-json --verbose --dangerously-skip-permissions
 //
+// 配置了平台 MCP 服务器的地址时，在固定参数之后追加 --mcp-config 与
+// --strict-mcp-config，使 Claude Code 只使用这一个 MCP 服务器。
+//
 // 注入的环境变量只有 warden.md 表中列出的变量与 PATH：actor 模式注入镜像
 // 里的固定 PATH（与 images/actor/Dockerfile 的 ENV PATH 逐字一致），本地
 // 模式注入看守进程启动时的 PATH。看守进程自己的其他环境变量不传给 Claude
@@ -66,6 +69,33 @@ var claudeArgs = []string{
 	"--dangerously-skip-permissions",
 }
 
+// mcpServerConfig 是 --mcp-config 中单个服务器的配置。
+type mcpServerConfig struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
+}
+
+// mcpConfigFile 是 --mcp-config 的 JSON 内容。
+type mcpConfigFile struct {
+	Servers map[string]mcpServerConfig `json:"mcpServers"`
+}
+
+// args 返回启动 Claude Code 的参数。没有配置 MCP 服务器时就是 v0.1.0 的
+// 固定参数；配置了则在末尾追加 --mcp-config 与 --strict-mcp-config。
+func (d *Driver) args() ([]string, error) {
+	args := append([]string(nil), claudeArgs...)
+	if d.cfg.MCPURL == "" {
+		return args, nil
+	}
+	data, err := json.Marshal(mcpConfigFile{Servers: map[string]mcpServerConfig{
+		"castworks": {Type: "http", URL: d.cfg.MCPURL},
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("claudecode: encode mcp config: %w", err)
+	}
+	return append(args, "--mcp-config", string(data), "--strict-mcp-config"), nil
+}
+
 // Config 是驱动器的配置。ClaudeBin 与 Home 必填。
 type Config struct {
 	// ClaudeBin 是 Claude Code 可执行文件路径。
@@ -77,6 +107,10 @@ type Config struct {
 	ActorMode bool
 	// LocalPATH 是本地模式注入的 PATH；空值取 New 时的 os.Getenv("PATH")。
 	LocalPATH string
+	// MCPURL 是平台 MCP 服务器的地址。非空时以 --mcp-config 与
+	// --strict-mcp-config 启动，只使用这一个 MCP 服务器；为空时启动参数与
+	// v0.1.0 相同。
+	MCPURL string
 	// StdinCloseWait 是关闭 stdin 后等待进程退出的时长，默认 10 s。
 	StdinCloseWait time.Duration
 	// TerminateWait 是发送 SIGTERM 后等待进程退出的时长，默认 5 s。
@@ -501,7 +535,16 @@ func (d *Driver) startLocked(cred agent.Credential) error {
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
-	cmd := exec.Command(d.cfg.ClaudeBin, claudeArgs...)
+	args, err := d.args()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stream.Close()
+		return err
+	}
+	cmd := exec.Command(d.cfg.ClaudeBin, args...)
 	cmd.Dir = workDir
 	cmd.Env = d.environment(cred)
 	cmd.Stdin = stdinR

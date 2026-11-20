@@ -11,16 +11,22 @@ import (
 const (
 	// envControlPlane 是 actor 模式下控制面地址的环境变量。
 	envControlPlane = "CASTWORKS_CONTROL_PLANE"
+	// envConnector 是 actor 模式下 connector 端点地址的环境变量。
+	envConnector = "CASTWORKS_CONNECTOR"
 	// actorNamePath 是 actor 模式下读取 run_id 的文件，由 systemInfo 卷投射。
 	actorNamePath = "/run/ate/actor-name"
 
-	// actor 模式固定的主目录、Claude Code 路径与就绪探针地址。
+	// actor 模式固定的主目录、Claude Code 路径、就绪探针地址与平台 MCP
+	// 服务器的监听地址。
 	actorHome       = "/home/agent"
 	actorClaudeBin  = "/usr/local/bin/claude"
 	actorReadyZAddr = ":8081"
+	actorMCPAddr    = "127.0.0.1:8082"
 
 	// localClaudeBin 是本地模式 --claude-bin 的默认值，从 PATH 中查找。
 	localClaudeBin = "claude"
+	// localMCPAddr 是本地模式 --mcp-addr 的默认值，端口由系统分配。
+	localMCPAddr = "127.0.0.1:0"
 )
 
 // runMode 是看守进程的运行方式。
@@ -53,6 +59,11 @@ type Config struct {
 	RunID string
 	// ControlPlane 是控制面地址 host:port。
 	ControlPlane string
+	// ConnectorAddr 是 connector 端点地址 host:port；为空时不启动平台 MCP
+	// 服务器，Claude Code 的启动参数与 v0.1.0 相同。
+	ConnectorAddr string
+	// MCPAddr 是平台 MCP 服务器的监听地址；只在 ConnectorAddr 非空时使用。
+	MCPAddr string
 	// Home 是 Claude Code 运行用户的主目录。
 	Home string
 	// ClaudeBin 是 Claude Code 可执行文件路径。
@@ -63,7 +74,7 @@ type Config struct {
 
 // localOnlyFlags 是 actor 模式下不接受的参数。--run-id 是模式判定的依据，
 // 因此不在其中。
-var localOnlyFlags = []string{"control-plane", "home", "claude-bin", "readyz-addr"}
+var localOnlyFlags = []string{"control-plane", "home", "claude-bin", "readyz-addr", "connector", "mcp-addr"}
 
 // ParseConfig 解析 args（不含程序名）并校验。getenv 用于读取 actor 模式
 // 的控制面地址，可为 nil，此时视为环境变量为空。
@@ -84,6 +95,8 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 		home         string
 		claudeBin    string
 		readyzAddr   string
+		connector    string
+		mcpAddr      string
 	)
 
 	fs := flag.NewFlagSet("warden", flag.ContinueOnError)
@@ -93,6 +106,8 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 	fs.StringVar(&home, "home", "", "Claude Code 运行用户的主目录；本地模式必填")
 	fs.StringVar(&claudeBin, "claude-bin", localClaudeBin, "Claude Code 可执行文件；本地模式默认在 PATH 中查找 claude")
 	fs.StringVar(&readyzAddr, "readyz-addr", "", "就绪探针监听地址；本地模式为空时不监听")
+	fs.StringVar(&connector, "connector", "", "connector 端点地址 host:port；给出时启动平台 MCP 服务器")
+	fs.StringVar(&mcpAddr, "mcp-addr", localMCPAddr, "平台 MCP 服务器监听地址")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -117,11 +132,13 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 			return nil, fmt.Errorf("%s: required in actor mode", envControlPlane)
 		}
 		return &Config{
-			Mode:         modeActor,
-			ControlPlane: address,
-			Home:         actorHome,
-			ClaudeBin:    actorClaudeBin,
-			ReadyZAddr:   actorReadyZAddr,
+			Mode:          modeActor,
+			ControlPlane:  address,
+			ConnectorAddr: getenv(envConnector),
+			MCPAddr:       actorMCPAddr,
+			Home:          actorHome,
+			ClaudeBin:     actorClaudeBin,
+			ReadyZAddr:    actorReadyZAddr,
 		}, nil
 	}
 
@@ -139,11 +156,13 @@ func parseConfigWithOutput(args []string, getenv func(string) string, output io.
 		return nil, errors.New("--claude-bin: must not be empty")
 	}
 	return &Config{
-		Mode:         modeLocal,
-		RunID:        runID,
-		ControlPlane: controlPlane,
-		Home:         home,
-		ClaudeBin:    claudeBin,
-		ReadyZAddr:   readyzAddr,
+		Mode:          modeLocal,
+		RunID:         runID,
+		ControlPlane:  controlPlane,
+		ConnectorAddr: connector,
+		MCPAddr:       mcpAddr,
+		Home:          home,
+		ClaudeBin:     claudeBin,
+		ReadyZAddr:    readyzAddr,
 	}, nil
 }

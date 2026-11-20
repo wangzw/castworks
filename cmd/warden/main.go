@@ -15,6 +15,7 @@ import (
 	"github.com/wangzw/castworks/pkg/warden/claudecode"
 	"github.com/wangzw/castworks/pkg/warden/controlstream"
 	"github.com/wangzw/castworks/pkg/warden/identity"
+	"github.com/wangzw/castworks/pkg/warden/mcpserver"
 	"github.com/wangzw/castworks/pkg/warden/readyz"
 )
 
@@ -72,6 +73,33 @@ func run(args []string, getenv func(string) string) int {
 		}
 	}
 
+	// 平台 MCP 服务器早于 Claude Code 启动。没有给出 connector 地址时不启动，
+	// Claude Code 的启动参数与 v0.1.0 相同。defer 保证它在 Claude Code 退出
+	// （driver.Shutdown 返回）之后关闭。
+	var (
+		platformMCP *mcpserver.Server
+		mcpURL      string
+	)
+	if cfg.ConnectorAddr != "" {
+		platformMCP, err = mcpserver.Start(mcpserver.Config{
+			RunID:         runID,
+			ConnectorAddr: cfg.ConnectorAddr,
+			Addr:          cfg.MCPAddr,
+			Logger:        logger,
+		})
+		if err != nil {
+			logger.Error("start platform MCP server", "error", err)
+			return 1
+		}
+		defer func() {
+			if closeErr := platformMCP.Close(); closeErr != nil {
+				logger.Warn("close platform MCP server", "error", closeErr)
+			}
+		}()
+		mcpURL = platformMCP.URL()
+		logger.Info("mcp listening", "url", mcpURL)
+	}
+
 	// 是否启用 PID 1 回收器只看进程号是否为 1，与运行方式无关。
 	isPID1 := os.Getpid() == 1
 	runner := selectRunner(isPID1, logger)
@@ -84,6 +112,7 @@ func run(args []string, getenv func(string) string) int {
 		ClaudeBin: cfg.ClaudeBin,
 		Home:      cfg.Home,
 		ActorMode: cfg.Mode == modeActor,
+		MCPURL:    mcpURL,
 		Logger:    logger,
 	}, client.Sink(), runner)
 
