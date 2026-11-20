@@ -262,7 +262,11 @@ func (c *Client) runOnce(ctx context.Context, a agent.Agent) (done, acked bool) 
 				"run_id", c.runID, "reason", body.Shutdown.GetReason())
 			return true, acked
 		case *agentprotocolv1.ControlFrame_Deliver:
-			c.handleDeliver(a, body.Deliver)
+			if err := c.handleDeliver(a, body.Deliver); err != nil {
+				slog.Warn("control frame rejected; reconnecting",
+					"run_id", c.runID, "reason", err.Error())
+				return false, acked
+			}
 		case *agentprotocolv1.ControlFrame_HelloAck:
 			slog.Warn("unexpected hello_ack after the stream opened; reconnecting",
 				"run_id", c.runID)
@@ -338,20 +342,35 @@ func (c *Client) helloFrame(st agent.State) *agentprotocolv1.WardenFrame {
 	}
 }
 
-// handleDeliver 过滤掉已写入 stdin 的消息。没有新消息时直接回 Accepted；
-// 否则交给驱动器写入，Accepted 由驱动器经 Sink 回调发出。驱动器的 Deliver
-// 失败（含 ErrExited）时不补发 Accepted。
-func (c *Client) handleDeliver(a agent.Agent, d *agentprotocolv1.Deliver) {
-	var batch agent.Batch
+// handleDeliver 过滤掉已写入 stdin 的消息，并按各自的 oneof 取出文本。没有
+// 新消息时直接回 Accepted；否则交给驱动器写入，Accepted 由驱动器经 Sink 回调
+// 发出。驱动器的 Deliver 失败（含 ErrExited）时不补发 Accepted。消息既没有
+// text 也没有 subscription_completed 时返回错误，由调用方按校验失败处理，
+// 不投递空文本。
+func (c *Client) handleDeliver(a agent.Agent, d *agentprotocolv1.Deliver) error {
+	var (
+		batch   agent.Batch
+		invalid error
+	)
 	a.Snapshot(func(st agent.State) {
 		batch.DeliveryID = d.GetDeliveryId()
 		batch.ThroughSeq = d.GetThroughSeq()
 		for _, m := range d.GetBatch() {
-			if m.GetInboxSeq() > st.LastAcceptedSeq {
-				batch.Texts = append(batch.Texts, m.GetText())
+			if m.GetInboxSeq() <= st.LastAcceptedSeq {
+				continue
 			}
+			text, ok := inboxMessageText(m)
+			if !ok {
+				invalid = fmt.Errorf("inbox message %d has neither text nor subscription_completed",
+					m.GetInboxSeq())
+				return
+			}
+			batch.Texts = append(batch.Texts, text)
 		}
 	})
+	if invalid != nil {
+		return invalid
+	}
 
 	if len(batch.Texts) == 0 {
 		c.enqueue(&agentprotocolv1.WardenFrame{
@@ -361,7 +380,7 @@ func (c *Client) handleDeliver(a agent.Agent, d *agentprotocolv1.Deliver) {
 				ThroughSeq: d.GetThroughSeq(),
 			}},
 		})
-		return
+		return nil
 	}
 
 	cred := c.credential()
@@ -370,12 +389,13 @@ func (c *Client) handleDeliver(a agent.Agent, d *agentprotocolv1.Deliver) {
 			// ErrExited 是正常的收尾路径：驱动器已按回合外退出补发事件。
 			slog.Info("delivery skipped because Claude Code has exited",
 				"run_id", c.runID, "delivery_id", batch.DeliveryID)
-			return
+			return nil
 		}
 		// 只记投递标识，不记消息文本。
 		slog.Error("delivery failed",
 			"run_id", c.runID, "delivery_id", batch.DeliveryID, "error", err)
 	}
+	return nil
 }
 
 func (c *Client) setCredential(lc *agentprotocolv1.LLMCredential) {
