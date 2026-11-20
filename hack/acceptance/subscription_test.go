@@ -286,30 +286,58 @@ func checkSubscriptionEndpointSlice(t *testing.T, ctx context.Context, kubeConte
 // thing, or accept a commit that is not an ancestor at all.
 func subscriptionRequireActorCommitAncestor(t *testing.T, actorCommit, repoHead string) string {
 	t.Helper()
-	root := repoRoot(t)
-	resolved := subscriptionResolveCommit(t, root, actorCommit)
-	cmd := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", resolved, repoHead)
-	out, err := cmd.CombinedOutput()
+	resolved, err := subscriptionCheckCommitAncestor(repoRoot(t), actorCommit, repoHead)
 	if err != nil {
-		t.Fatalf("acceptance: %s %q resolves to %s, which is not an ancestor of HEAD %s: %v\n%s",
-			suspendActorCommitEnv, actorCommit, resolved, repoHead, err, strings.TrimSpace(string(out)))
+		t.Fatalf("acceptance: %s %q: %v", suspendActorCommitEnv, actorCommit, err)
 	}
 	return resolved
 }
 
-// subscriptionResolveCommit resolves revision to its full 40-character commit
-// SHA, rejecting anything git does not resolve to a commit.
-func subscriptionResolveCommit(t *testing.T, root, revision string) string {
-	t.Helper()
-	out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", revision+"^{commit}").Output()
+// subscriptionCheckCommitAncestor resolves revision to a commit and reports
+// whether that commit is an ancestor of head. A revision git does not resolve
+// to a commit is rejected before the ancestry check.
+func subscriptionCheckCommitAncestor(root, revision, head string) (string, error) {
+	resolved, err := subscriptionResolveCommit(root, revision)
 	if err != nil {
-		t.Fatalf("acceptance: resolve %q to a commit: %v", revision, err)
+		return "", err
+	}
+	if err := subscriptionCheckAncestor(root, resolved, head); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+// subscriptionCheckAncestor reports whether candidate is an ancestor of head.
+func subscriptionCheckAncestor(root, candidate, head string) error {
+	out, err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", candidate, head).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s is not an ancestor of %s: %v\n%s", candidate, head, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// subscriptionResolveCommit resolves revision to its full 40-character commit
+// SHA. It accepts a commit and a ref that points straight at one, such as HEAD,
+// a branch or a lightweight tag. An annotated tag resolves to a tag object and
+// is rejected, as is any other non-commit object, because the actor image's
+// label must name a commit, not something git has to peel first.
+func subscriptionResolveCommit(root, revision string) (string, error) {
+	out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", revision).Output()
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", revision, err)
 	}
 	sha := strings.TrimSpace(string(out))
 	if len(sha) != 40 {
-		t.Fatalf("acceptance: %q resolved to %q, want a 40-character commit SHA", revision, sha)
+		return "", fmt.Errorf("%q resolved to %q, want a 40-character object SHA", revision, sha)
 	}
-	return sha
+	kind, err := exec.Command("git", "-C", root, "cat-file", "-t", sha).Output()
+	if err != nil {
+		return "", fmt.Errorf("read the object type of %q (%s): %w", revision, sha, err)
+	}
+	if got := strings.TrimSpace(string(kind)); got != "commit" {
+		return "", fmt.Errorf("%q resolves to a %s object (%s), not a commit", revision, got, sha)
+	}
+	return sha, nil
 }
 
 // subscriptionControlPlaneArgs returns the v0.1.0 suspend/resume acceptance
@@ -1383,21 +1411,18 @@ func (s *subscriptionScenario) runActorCrash(t *testing.T) {
 	}
 	// The control plane logs the disconnect that starts T_reconnect. Without
 	// that line the crash time is not observable, so fail instead of falling
-	// back to the poll that first saw CRASHED.
-	disconnect := subscriptionFindDisconnectLog(t, s.h, r.id)
+	// back to the poll that first saw CRASHED. A run can log the control stream
+	// closing more than once; the line that starts T_reconnect is the last one
+	// at or before the first crashed poll plus 1 s.
+	disconnect, disconnectLogged := subscriptionFindDisconnectLog(t, s.h, r.id, crashAt.Add(time.Second))
 	if len(detail.Turns) == 0 {
 		t.Fatalf("acceptance: run %s recorded no turns, so the trigger turn's start cannot bound the memory hog process", r.id)
 	}
-	// The first turn delivers subscriptionCrashPrompt; its start is at or
-	// before the memory hog process starts.
+	// The first turn delivers subscriptionCrashPrompt; its start is a lower
+	// bound on when the memory hog process started.
 	processStartedAt := detail.Turns[0].StartedAt.UTC()
-	if processStartedAt.After(disconnect.DisconnectedAt) {
-		t.Fatalf("acceptance: the trigger turn started at %s, after the control plane logged the disconnect at %s; the crash must follow the turn start",
-			processStartedAt.Format(time.RFC3339Nano), disconnect.DisconnectedAt.Format(time.RFC3339Nano))
-	}
-	if limit := crashAt.Add(time.Second); disconnect.DisconnectedAt.After(limit) {
-		t.Fatalf("acceptance: the control plane logged the disconnect at %s, after the first crashed poll at %s plus 1s (limit %s)",
-			disconnect.DisconnectedAt.Format(time.RFC3339Nano), crashAt.Format(time.RFC3339Nano), limit.Format(time.RFC3339Nano))
+	if err := subscriptionCheckCrashTimeline(processStartedAt, disconnect.DisconnectedAt, crashAt, disconnectLogged); err != nil {
+		t.Fatalf("acceptance: %v", err)
 	}
 	c := s.h.collectCriteria(t, ctx, r.id)
 	c.Suspensions = detail.Suspensions
@@ -1448,13 +1473,39 @@ type subscriptionDisconnectLog struct {
 
 const subscriptionDisconnectLogMessage = "runcontroller: control stream closed"
 
+// subscriptionCheckCrashTimeline checks that the observations of one crash
+// agree. The trigger turn started at or before the control plane logged the
+// disconnect, and the disconnect came at most 1 s after the first poll that saw
+// the actor crashed. A missing or unparseable log line leaves no usable
+// disconnect moment, so the parsed flag turns that into an error instead of
+// comparing against a zero time.
+func subscriptionCheckCrashTimeline(triggerTurnStartedAt, disconnectedAt, firstCrashedPollAt time.Time, disconnectLogParsed bool) error {
+	if !disconnectLogParsed {
+		return fmt.Errorf("the control plane log line recording the disconnect is missing or cannot be parsed, so the disconnect moment is not observable")
+	}
+	if triggerTurnStartedAt.After(disconnectedAt) {
+		return fmt.Errorf("the trigger turn started at %s, after the control plane logged the disconnect at %s; the crash must follow the turn start",
+			triggerTurnStartedAt.Format(time.RFC3339Nano), disconnectedAt.Format(time.RFC3339Nano))
+	}
+	if limit := firstCrashedPollAt.Add(time.Second); disconnectedAt.After(limit) {
+		return fmt.Errorf("the control plane logged the disconnect at %s, after the first crashed poll at %s plus 1s (limit %s)",
+			disconnectedAt.Format(time.RFC3339Nano), firstCrashedPollAt.Format(time.RFC3339Nano), limit.Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
 // subscriptionFindDisconnectLog reads the control plane's log files and
-// returns the line recording that runID's control stream closing. The control
-// plane logs through slog's text handler on stderr; stdout is scanned too so
-// the lookup survives a handler change. A run whose line is absent fails the
-// test: the disconnect moment is criterion input, never a guess.
-func subscriptionFindDisconnectLog(t *testing.T, h *harness, runID string) subscriptionDisconnectLog {
+// returns the last line for runID whose disconnected_at is not after notAfter.
+// A run can log the control stream closing more than once, and only the line
+// that starts T_reconnect, at or before the first crashed poll plus 1 s, is the
+// crash moment. The control plane logs through slog's text handler on stderr;
+// stdout is scanned too so the lookup survives a handler change. A run with no
+// qualifying line returns ok=false: the disconnect moment is criterion input,
+// never a guess.
+func subscriptionFindDisconnectLog(t *testing.T, h *harness, runID string, notAfter time.Time) (subscriptionDisconnectLog, bool) {
 	t.Helper()
+	var last subscriptionDisconnectLog
+	var found bool
 	for _, name := range []string{"controlplane.stderr.log", "controlplane.stdout.log"} {
 		data, err := os.ReadFile(filepath.Join(h.workDir, name))
 		if err != nil {
@@ -1473,12 +1524,14 @@ func subscriptionFindDisconnectLog(t *testing.T, h *harness, runID string) subsc
 				t.Fatalf("acceptance: control plane log line for run %s has disconnected_at %q, not RFC3339Nano: %v\n%s",
 					runID, attrs["disconnected_at"], err, line)
 			}
-			return subscriptionDisconnectLog{DisconnectedAt: at.UTC(), Line: line}
+			if at = at.UTC(); at.After(notAfter) {
+				continue
+			}
+			last = subscriptionDisconnectLog{DisconnectedAt: at, Line: line}
+			found = true
 		}
 	}
-	t.Fatalf("acceptance: the control plane logs have no %q line with run_id=%s; the disconnect moment is not observable from the logs",
-		subscriptionDisconnectLogMessage, runID)
-	return subscriptionDisconnectLog{}
+	return last, found
 }
 
 // subscriptionActorCrashEvidence builds the raw values the crash criterion
@@ -1486,17 +1539,20 @@ func subscriptionFindDisconnectLog(t *testing.T, h *harness, runID string) subsc
 // poll that saw CRASHED. last_running_poll_at is omitted when the poll never
 // saw the actor RUNNING: a zero time would look like a real moment.
 func subscriptionActorCrashEvidence(crash subscriptionCrashObservation, disconnect subscriptionDisconnectLog, processStartedAt time.Time, record runRecord, runFailedAt time.Time, exists bool) map[string]any {
+	// trigger_turn_started_at is when the turn that delivered the crash prompt
+	// started. It is a lower bound on when the memory hog process started, not
+	// the process start itself.
 	evidence := map[string]any{
-		"first_crashed_poll_at":         crash.CrashedAt,
-		"crash_state":                   crash.State,
-		"memory_hog_process_started_at": processStartedAt,
-		"disconnected_at":               disconnect.DisconnectedAt,
-		"disconnect_log_line":           disconnect.Line,
-		"run_state":                     record.State,
-		"run_failed_at":                 runFailedAt,
-		"run_ended_at":                  record.EndedAt,
-		"failure_reason":                record.FailureReason,
-		"actor_exists":                  exists,
+		"first_crashed_poll_at":   crash.CrashedAt,
+		"crash_state":             crash.State,
+		"trigger_turn_started_at": processStartedAt,
+		"disconnected_at":         disconnect.DisconnectedAt,
+		"disconnect_log_line":     disconnect.Line,
+		"run_state":               record.State,
+		"run_failed_at":           runFailedAt,
+		"run_ended_at":            record.EndedAt,
+		"failure_reason":          record.FailureReason,
+		"actor_exists":            exists,
 	}
 	if !crash.LastRunningAt.IsZero() {
 		evidence["last_running_poll_at"] = crash.LastRunningAt

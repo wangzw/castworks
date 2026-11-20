@@ -630,11 +630,12 @@ func criteriaBackgroundJobEvidence(c criteriaCase) backgroundJobEvidence {
 	}
 	used.EmptiedAt = emptiedAt
 	// See the comment in judgeBackgroundJob for why resolution is subtracted.
-	spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedAt.Add(-resolution))
-	if !ok {
-		return used
+	// A missing spontaneous turn is a judge mismatch, not a reason to drop the
+	// suspension evidence: the failure report still needs to show whether the
+	// run suspended after the job ended.
+	if spontaneous, ok := criteriaFirstTurnStartedAfter(c.Turns, emptiedAt.Add(-resolution)); ok {
+		used.Spontaneous = spontaneous
 	}
-	used.Spontaneous = spontaneous
 	if suspension, ok := criteriaFirstSuspensionStartedAfter(c.Suspensions, emptiedAt); ok {
 		used.Suspension = suspension
 	}

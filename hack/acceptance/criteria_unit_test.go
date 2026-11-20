@@ -10,7 +10,9 @@ package acceptance
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1407,6 +1409,27 @@ func TestCriteriaBackgroundJobEvidencePicksSuspensionAfterEmpty(t *testing.T) {
 	}
 }
 
+// TestCriteriaBackgroundJobEvidenceKeepsSuspensionWithoutSpontaneousTurn
+// covers the failed run: a suspension that started after bg_jobs became empty
+// is still evidence when no spontaneous turn appeared, so the record says the
+// run never resumed rather than that no suspension was observed.
+func TestCriteriaBackgroundJobEvidenceKeepsSuspensionWithoutSpontaneousTurn(t *testing.T) {
+	c := criteriaBackgroundJobCase(t)
+	// Drop the spontaneous turn; keep the delivered turn that started the watch.
+	c.Turns = c.Turns[:1]
+
+	used := criteriaBackgroundJobEvidence(c)
+	if used.Spontaneous != nil {
+		t.Fatalf("spontaneous turn = %+v, want none", used.Spontaneous)
+	}
+	if used.Suspension == nil {
+		t.Fatal("suspension evidence was dropped because no spontaneous turn appeared")
+	}
+	if got := criteriaSuspensionNumber(c.Suspensions, used.Suspension); got != "1" {
+		t.Fatalf("suspension number = %q, want 1", got)
+	}
+}
+
 // TestCriteriaTurnsInWindow covers the duplicate-delivery evidence: only turns
 // that started inside the observation window are returned.
 func TestCriteriaTurnsInWindow(t *testing.T) {
@@ -1452,9 +1475,111 @@ func TestSubscriptionActorCrashEvidenceOmitsZeroLastRunning(t *testing.T) {
 	}
 }
 
-// TestSubscriptionResolveCommit covers the actor-commit ancestor check: HEAD
-// and a branch name must resolve to the same full SHA as the commit itself.
-func TestSubscriptionResolveCommit(t *testing.T) {
+// TestSubscriptionCheckCrashTimeline covers the crash consistency check: an
+// observed timeline passes, and each disagreement between the trigger turn,
+// the logged disconnect and the first crashed poll is reported.
+func TestSubscriptionCheckCrashTimeline(t *testing.T) {
+	base := criteriaTestBase()
+	trigger := base.Add(-2 * time.Second)
+	disconnected := base
+	crashed := base.Add(500 * time.Millisecond)
+
+	if err := subscriptionCheckCrashTimeline(trigger, disconnected, crashed, true); err != nil {
+		t.Fatalf("the observed timeline was rejected: %v", err)
+	}
+
+	cases := []struct {
+		name             string
+		trigger          time.Time
+		disconnected     time.Time
+		crashed          time.Time
+		disconnectLogged bool
+		want             string
+	}{
+		{
+			name:             "the trigger turn started after the disconnect",
+			trigger:          base.Add(time.Second),
+			disconnected:     disconnected,
+			crashed:          crashed,
+			disconnectLogged: true,
+			want:             "after the control plane logged the disconnect",
+		},
+		{
+			name:             "the disconnect came more than 1s after the first crashed poll",
+			trigger:          trigger,
+			disconnected:     crashed.Add(2 * time.Second),
+			crashed:          crashed,
+			disconnectLogged: true,
+			want:             "plus 1s",
+		},
+		{
+			name:             "the disconnect log line is missing or unparseable",
+			trigger:          trigger,
+			disconnected:     disconnected,
+			crashed:          crashed,
+			disconnectLogged: false,
+			want:             "missing or cannot be parsed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := subscriptionCheckCrashTimeline(tc.trigger, tc.disconnected, tc.crashed, tc.disconnectLogged)
+			if err == nil {
+				t.Fatalf("timeline %s/%s/%s (logged=%t) was accepted",
+					tc.trigger.Format(time.RFC3339Nano), tc.disconnected.Format(time.RFC3339Nano),
+					tc.crashed.Format(time.RFC3339Nano), tc.disconnectLogged)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestSubscriptionFindDisconnectLogTakesLastLineBeforeLimit covers a run that
+// logged the control stream closing more than once: the line that starts
+// T_reconnect is the last one at or before the first crashed poll plus 1 s.
+func TestSubscriptionFindDisconnectLogTakesLastLineBeforeLimit(t *testing.T) {
+	base := criteriaTestBase()
+	line := func(at time.Time, runID string) string {
+		return fmt.Sprintf("time=%s level=INFO msg=%q run_id=%s disconnected_at=%s",
+			at.Format(time.RFC3339Nano), subscriptionDisconnectLogMessage, runID, at.Format(time.RFC3339Nano))
+	}
+	content := strings.Join([]string{
+		line(base.Add(-time.Second), "run-1"),
+		line(base, "another-run"),
+		line(base.Add(time.Second), "run-1"),
+		line(base.Add(5*time.Second), "run-1"),
+	}, "\n") + "\n"
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "controlplane.stderr.log"), []byte(content), 0o600); err != nil {
+		t.Fatalf("write control plane log: %v", err)
+	}
+	h := &harness{workDir: dir}
+
+	got, ok := subscriptionFindDisconnectLog(t, h, "run-1", base.Add(2*time.Second))
+	if !ok {
+		t.Fatal("the disconnect line was not found")
+	}
+	want := base.Add(time.Second)
+	if !got.DisconnectedAt.Equal(want) {
+		t.Fatalf("disconnect at %s, want the last line before the limit at %s",
+			got.DisconnectedAt.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+	if !strings.Contains(got.Line, "disconnected_at="+want.Format(time.RFC3339Nano)) {
+		t.Fatalf("returned line %q does not carry the expected disconnected_at", got.Line)
+	}
+
+	if _, ok := subscriptionFindDisconnectLog(t, h, "run-1", base.Add(-2*time.Second)); ok {
+		t.Fatal("a disconnect line after the limit was returned")
+	}
+}
+
+// subscriptionTestRepo creates a repository with one commit and returns its
+// root and a git helper that fails the test when git fails.
+func subscriptionTestRepo(t *testing.T) (string, func(args ...string) string) {
+	t.Helper()
 	root := t.TempDir()
 	git := func(args ...string) string {
 		t.Helper()
@@ -1470,12 +1595,84 @@ func TestSubscriptionResolveCommit(t *testing.T) {
 	git("config", "user.email", "acceptance@example.com")
 	git("config", "user.name", "Acceptance Test")
 	git("commit", "--allow-empty", "-q", "-m", "first")
+	return root, git
+}
+
+// TestSubscriptionResolveCommit covers the actor-commit resolution: HEAD, a
+// branch name and a lightweight tag resolve to the same full SHA as the commit,
+// while an annotated tag and a non-commit object are rejected.
+func TestSubscriptionResolveCommit(t *testing.T) {
+	root, git := subscriptionTestRepo(t)
 	want := git("rev-parse", "HEAD")
 	git("branch", "release-candidate")
+	git("tag", "lightweight")
+	git("tag", "-a", "annotated", "-m", "annotated tag")
+	tree := git("rev-parse", "HEAD^{tree}")
 
-	for _, revision := range []string{"HEAD", want, "release-candidate"} {
-		if got := subscriptionResolveCommit(t, root, revision); got != want {
+	for _, revision := range []string{"HEAD", want, "release-candidate", "lightweight"} {
+		got, err := subscriptionResolveCommit(root, revision)
+		if err != nil {
+			t.Fatalf("subscriptionResolveCommit(%q): %v", revision, err)
+		}
+		if got != want {
 			t.Fatalf("subscriptionResolveCommit(%q) = %s, want %s", revision, got, want)
 		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		revision string
+	}{
+		{name: "annotated tag", revision: "annotated"},
+		{name: "tree object", revision: tree},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := subscriptionResolveCommit(root, tc.revision); err == nil {
+				t.Fatalf("subscriptionResolveCommit(%q) = %s, want an error", tc.revision, got)
+			}
+		})
+	}
+}
+
+// TestSubscriptionCheckCommitAncestor covers the ancestry check behind the
+// actor-commit precondition: an ancestor commit passes, while an annotated tag
+// or another non-commit object is rejected before the ancestry comparison.
+func TestSubscriptionCheckCommitAncestor(t *testing.T) {
+	root, git := subscriptionTestRepo(t)
+	first := git("rev-parse", "HEAD")
+	git("commit", "--allow-empty", "-q", "-m", "second")
+	head := git("rev-parse", "HEAD")
+	git("tag", "-a", "annotated", "-m", "annotated tag", first)
+	tree := git("rev-parse", "HEAD^{tree}")
+
+	got, err := subscriptionCheckCommitAncestor(root, first, head)
+	if err != nil {
+		t.Fatalf("ancestor commit was rejected: %v", err)
+	}
+	if got != first {
+		t.Fatalf("resolved ancestor = %s, want %s", got, first)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		revision string
+	}{
+		{name: "annotated tag", revision: "annotated"},
+		{name: "tree object", revision: tree},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := subscriptionCheckCommitAncestor(root, tc.revision, head); err == nil {
+				t.Fatalf("subscriptionCheckCommitAncestor(%q, %q) = %s, want an error", tc.revision, head, got)
+			}
+		})
+	}
+
+	// A commit outside the tested history is rejected by the ancestry check
+	// itself, after it resolves to a commit.
+	git("checkout", "-q", "--orphan", "unrelated")
+	git("commit", "--allow-empty", "-q", "-m", "unrelated")
+	unrelated := git("rev-parse", "HEAD")
+	if _, err := subscriptionCheckCommitAncestor(root, unrelated, head); err == nil {
+		t.Fatal("an unrelated commit was accepted as an ancestor")
 	}
 }
