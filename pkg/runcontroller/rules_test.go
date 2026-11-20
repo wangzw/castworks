@@ -1715,3 +1715,77 @@ func TestTransitionStateMatrix(t *testing.T) {
 		}
 	}
 }
+
+// TestTransitionCrashDetected 覆盖崩溃转换的事务内复查：只有 active、流仍
+// 断开且断线版本一致时才转 failed，failure_reason 写明 actor 状态。
+func TestTransitionCrashDetected(t *testing.T) {
+	t.Parallel()
+
+	active := machineState{
+		State:            StateActive,
+		Substate:         SubstateBoundary,
+		NextInboxSeq:     2,
+		DeliveredThrough: 1,
+	}
+	failedWith := func(reason string) machineState {
+		s := active
+		s.State = StateFailed
+		s.Substate = SubstateNone
+		s.FailureReason = reason
+		ended := rulesNow
+		s.EndedAt = &ended
+		return s
+	}
+
+	env := machineEnv{Now: rulesNow, StreamDisconnected: true, DisconnectRev: 5}
+	connected := env
+	connected.StreamConnected = true
+
+	suspended := active
+	suspended.State = StateSuspended
+
+	rulesCheck(t, []rulesCase{
+		{
+			name: "crashed",
+			cur:  active,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "crashed", disconnectRev: 5},
+			env:  env,
+			want: failedWith("actor cw-run-1 is crashed"),
+		},
+		{
+			name: "not found",
+			cur:  active,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "not found", disconnectRev: 5},
+			env:  env,
+			want: failedWith("actor cw-run-1 is not found"),
+		},
+		{
+			name: "reconnected stream",
+			cur:  active,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "crashed", disconnectRev: 5},
+			env:  connected,
+			want: active,
+		},
+		{
+			name: "stale disconnect revision",
+			cur:  active,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "crashed", disconnectRev: 4},
+			env:  env,
+			want: active,
+		},
+		{
+			name: "no disconnect record",
+			cur:  active,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "crashed", disconnectRev: 5},
+			env:  machineEnv{Now: rulesNow},
+			want: active,
+		},
+		{
+			name: "not active",
+			cur:  suspended,
+			ev:   evCrashDetected{actorName: "cw-run-1", actorState: "crashed", disconnectRev: 5},
+			env:  env,
+			want: suspended,
+		},
+	})
+}

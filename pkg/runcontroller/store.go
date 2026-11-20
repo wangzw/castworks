@@ -611,6 +611,20 @@ func (s *store) listRuns(ctx context.Context) ([]RunSummary, error) {
 	return runs, nil
 }
 
+// activeRunIDs 返回全部 active 运行实例的 ID，按 run_id 升序。崩溃扫描用它
+// 缩小内存中断线记录的范围，事务内还会再确认一次状态。
+func (s *store) activeRunIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT run_id FROM run
+		WHERE state = 'active'
+		ORDER BY run_id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("runcontroller: list active runs: %w", err)
+	}
+	defer rows.Close()
+
+	return scanRunIDs(rows, "active runs")
+}
+
 // suspendCandidates 返回 active/boundary、没有后台作业且 idle_since 早于
 // idleBefore 的运行实例。
 func (s *store) suspendCandidates(ctx context.Context, idleBefore time.Time) ([]string, error) {

@@ -25,6 +25,13 @@ func (c *Controller) onHello(ctx context.Context, conn *conn, h *agentprotocolv1
 		lastTurn:        h.GetLastTurn(),
 		bgJobs:          h.GetBgJobs(),
 	}, applyOpts{registerConn: conn})
+	if err == nil {
+		// A new Hello means the warden is connected again and clears any
+		// recorded disconnect time for the crash scan. Only clear it while this
+		// conn is still current, so a late Hello cannot erase a newer stream's
+		// disconnect.
+		c.streams.connectedIfCurrent(conn.runID(), conn)
+	}
 	return err
 }
 
@@ -80,7 +87,9 @@ func (c *Controller) applyFrame(ctx context.Context, conn *conn, ev machineEvent
 // ctx，所以重试必须有界，不能无限进行。
 func (c *Controller) onStreamClosed(_ context.Context, conn *conn) {
 	runID := conn.runID()
-	if c.streams.current(runID) != conn {
+	// Record the disconnect time only while this conn is still the current
+	// stream. A newer stream has already cleared the record through its Hello.
+	if !c.streams.disconnectedIfCurrent(runID, conn, c.clock.Now()) {
 		return
 	}
 	// The stream context is already gone; the close must still be persisted.

@@ -12,10 +12,11 @@ var scanTestEpoch = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 
 func scanTestConfig() Config {
 	return Config{
-		IdleGrace:      30 * time.Second,
-		ScanPeriod:     5 * time.Second,
-		HelloTimeout:   60 * time.Second,
-		SuspendEnabled: true,
+		IdleGrace:        30 * time.Second,
+		ScanPeriod:       5 * time.Second,
+		HelloTimeout:     60 * time.Second,
+		ReconnectTimeout: 30 * time.Second,
+		SuspendEnabled:   true,
 	}
 }
 
@@ -164,6 +165,38 @@ func (s *scanSourceStub) cutoffs() (suspend, hello []time.Time) {
 	return append([]time.Time(nil), s.suspendCuts...), append([]time.Time(nil), s.helloCuts...)
 }
 
+// crashSourceStub 返回预置的崩溃候选。它不向 events 写事件，使既有用例的
+// 事件顺序不变；需要断言候选时读 cuts 与 ids。
+type crashSourceStub struct {
+	mu   sync.Mutex
+	ids  []crashCandidate
+	err  error
+	cuts []time.Time
+	n    int
+}
+
+func newCrashSourceStub() *crashSourceStub { return &crashSourceStub{} }
+
+func (s *crashSourceStub) crashCandidates(_ context.Context, before time.Time) ([]crashCandidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cuts = append(s.cuts, before)
+	s.n++
+	return append([]crashCandidate(nil), s.ids...), s.err
+}
+
+func (s *crashSourceStub) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.n
+}
+
+func (s *crashSourceStub) cutoffList() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.cuts...)
+}
+
 type scanTargetStub struct {
 	mu     sync.Mutex
 	calls  []string
@@ -181,6 +214,10 @@ func (t *scanTargetStub) trySuspend(_ context.Context, runID string) error {
 
 func (t *scanTargetStub) expireHello(_ context.Context, runID string) error {
 	return t.record("hello:"+runID, runID)
+}
+
+func (t *scanTargetStub) tryFailCrashed(_ context.Context, cand crashCandidate) error {
+	return t.record("crash:"+cand.runID, cand.runID)
 }
 
 func (t *scanTargetStub) record(call, runID string) error {
@@ -205,14 +242,14 @@ type scanLoopRun struct {
 	err    error
 }
 
-func startScanLoop(t *testing.T, cfg Config, clock Clock, src scanSource, tgt scanTarget) *scanLoopRun {
+func startScanLoop(t *testing.T, cfg Config, clock Clock, src scanSource, crash crashSource, tgt scanTarget) *scanLoopRun {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &scanLoopRun{cancel: cancel, done: make(chan struct{})}
 	go func() {
 		defer close(r.done)
-		r.err = runScanLoop(ctx, cfg, clock, src, tgt)
+		r.err = runScanLoop(ctx, cfg, clock, src, crash, tgt)
 	}()
 
 	t.Cleanup(func() {
@@ -259,7 +296,7 @@ func TestScanWaitsForPeriod(t *testing.T) {
 	src := newScanSourceStub(events)
 	tgt := newScanTargetStub(events)
 	cfg := scanTestConfig()
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod - time.Second)
@@ -305,7 +342,7 @@ func TestScanCallsCandidatesInOrder(t *testing.T) {
 	src.helloIDs = []string{"run-3", "run-4"}
 	tgt := newScanTargetStub(events)
 	cfg := scanTestConfig()
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod)
@@ -352,7 +389,7 @@ func TestScanSuspendDisabledStillChecksHelloTimeout(t *testing.T) {
 	tgt := newScanTargetStub(events)
 	cfg := scanTestConfig()
 	cfg.SuspendEnabled = false
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod)
@@ -384,7 +421,7 @@ func TestScanRunErrorDoesNotStopRound(t *testing.T) {
 	tgt := newScanTargetStub(events)
 	tgt.errs["bad"] = errors.New("boom")
 	cfg := scanTestConfig()
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod)
@@ -428,7 +465,7 @@ func TestScanCandidateQueryErrorStillChecksOtherKind(t *testing.T) {
 	src.helloIDs = []string{"run-2"}
 	tgt := newScanTargetStub(events)
 	cfg := scanTestConfig()
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod)
@@ -448,7 +485,7 @@ func TestScanStopsOnCancel(t *testing.T) {
 	src := newScanSourceStub(events)
 	tgt := newScanTargetStub(events)
 	cfg := scanTestConfig()
-	run := startScanLoop(t, cfg, clock, src, tgt)
+	run := startScanLoop(t, cfg, clock, src, newCrashSourceStub(), tgt)
 
 	clock.waitForTimer(t)
 	clock.advance(cfg.ScanPeriod)
@@ -486,7 +523,7 @@ func TestScanAlreadyCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := runScanLoop(ctx, cfg, clock, src, tgt); err != nil {
+	if err := runScanLoop(ctx, cfg, clock, src, newCrashSourceStub(), tgt); err != nil {
 		t.Fatalf("runScanLoop() = %v, want nil", err)
 	}
 	if got := clock.timerCount(); got != 0 {
@@ -497,5 +534,69 @@ func TestScanAlreadyCanceled(t *testing.T) {
 	}
 	if got := tgt.callList(); len(got) != 0 {
 		t.Fatalf("target calls = %v, want none", got)
+	}
+}
+
+// TestScanCrashCandidates 确认每轮扫描都查询断开超过 T_reconnect 的候选，并按
+// 候选顺序执行崩溃检查；截止时刻是 now 减 T_reconnect。
+func TestScanCrashCandidates(t *testing.T) {
+	t.Parallel()
+
+	clock := newManualClock(scanTestEpoch)
+	events := make(chan string, 64)
+	src := newScanSourceStub(events)
+	crash := newCrashSourceStub()
+	crash.ids = []crashCandidate{{runID: "run-5", disconnectRev: 9}}
+	tgt := newScanTargetStub(events)
+	cfg := scanTestConfig()
+	run := startScanLoop(t, cfg, clock, src, crash, tgt)
+
+	clock.waitForTimer(t)
+	clock.advance(cfg.ScanPeriod)
+	expectScanEvents(t, events, "suspend", "hello", "crash:run-5")
+
+	if got := crash.callCount(); got != 1 {
+		t.Fatalf("crash source calls = %d, want 1", got)
+	}
+	wantCutoff := scanTestEpoch.Add(cfg.ScanPeriod).Add(-cfg.ReconnectTimeout)
+	cuts := crash.cutoffList()
+	if len(cuts) != 1 || !cuts[0].Equal(wantCutoff) {
+		t.Fatalf("crash cutoff = %v, want %v", cuts, wantCutoff)
+	}
+
+	run.cancel()
+	if err := run.wait(t); err != nil {
+		t.Fatalf("runScanLoop() = %v, want nil", err)
+	}
+}
+
+// TestScanCrashQueryErrorDoesNotStopRound 确认候选查询失败只跳过本轮崩溃检查，
+// 其余扫描照常进行，下一轮再查。
+func TestScanCrashQueryErrorDoesNotStopRound(t *testing.T) {
+	t.Parallel()
+
+	clock := newManualClock(scanTestEpoch)
+	events := make(chan string, 64)
+	src := newScanSourceStub(events)
+	crash := newCrashSourceStub()
+	crash.err = errors.New("query failed")
+	tgt := newScanTargetStub(events)
+	cfg := scanTestConfig()
+	run := startScanLoop(t, cfg, clock, src, crash, tgt)
+
+	clock.waitForTimer(t)
+	clock.advance(cfg.ScanPeriod)
+	expectScanEvents(t, events, "suspend", "hello")
+
+	clock.waitForTimer(t)
+	clock.advance(cfg.ScanPeriod)
+	expectScanEvents(t, events, "suspend", "hello")
+	if got := crash.callCount(); got != 2 {
+		t.Fatalf("crash source calls = %d, want 2", got)
+	}
+
+	run.cancel()
+	if err := run.wait(t); err != nil {
+		t.Fatalf("runScanLoop() = %v, want nil", err)
 	}
 }

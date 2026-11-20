@@ -118,11 +118,12 @@ var (
 )
 
 type Config struct {
-	IdleGrace      time.Duration // G_idle，默认 30s
-	ScanPeriod     time.Duration // P_scan，默认 5s
-	HelloTimeout   time.Duration // T_hello，默认 60s
-	SuspendEnabled bool          // false 时不运行挂起扫描
-	Credential     LLMCredential
+	IdleGrace        time.Duration // G_idle，默认 30s
+	ScanPeriod       time.Duration // P_scan，默认 5s
+	HelloTimeout     time.Duration // T_hello，默认 60s
+	ReconnectTimeout time.Duration // T_reconnect，默认 30s
+	SuspendEnabled   bool          // false 时不运行挂起扫描
+	Credential       LLMCredential
 }
 
 type LLMCredentialKind string

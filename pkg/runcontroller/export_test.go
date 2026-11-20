@@ -2,6 +2,7 @@ package runcontroller
 
 import (
 	"context"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -104,4 +105,35 @@ func RegisterClosedStreamForTest(c *Controller, runID string) {
 	conn := newConn(runID)
 	c.streams.replace(runID, conn)
 	conn.closeWith(status.New(codes.FailedPrecondition, "test: stream already closed"))
+}
+
+// StreamForTest is an opaque handle to a stream registered by NewStreamForTest.
+type StreamForTest struct{ conn *conn }
+
+// NewStreamForTest registers a new stream for runID the way a successful Hello
+// does: it replaces the current stream and clears the disconnect record. The
+// returned handle lets a test close the replaced stream afterwards, modelling
+// an old stream whose handler returns after the new stream's Hello.
+func NewStreamForTest(c *Controller, runID string) *StreamForTest {
+	conn := newConn(runID)
+	if old := c.streams.replace(runID, conn); old != nil {
+		old.closeWith(status.New(codes.Aborted, "test: stream replaced"))
+	}
+	c.streams.connectedIfCurrent(runID, conn)
+	return &StreamForTest{conn: conn}
+}
+
+// CloseStaleStreamForTest runs the close handler of a stream that is no longer
+// current, as the handler of a replaced stream does when it finally returns.
+func CloseStaleStreamForTest(c *Controller, s *StreamForTest) {
+	s.conn.closeWith(status.New(codes.Unavailable, "test: stale stream closed"))
+	c.onStreamClosed(context.Background(), s.conn)
+}
+
+// DisconnectedSinceForTest reports the in-memory disconnect time of runID's
+// outbound stream. ok is false while the stream is connected or was never
+// seen. Tests use it to wait until a stream close has been recorded.
+func DisconnectedSinceForTest(c *Controller, runID string) (since time.Time, ok bool) {
+	since, _, ok = c.streams.disconnectState(runID)
+	return since, ok
 }

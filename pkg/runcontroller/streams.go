@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"google.golang.org/grpc/status"
 
@@ -217,14 +218,28 @@ func closeStatusError(st *status.Status) error {
 	return st.Err()
 }
 
-// streamRegistry holds at most one current conn per run.
+// disconnectRecord 是一个运行实例出站流的断线记录。它只在内存中，不落库。
+// since 为 nil 表示流已重新连上；rev 在每次连接或断开时递增，让扫描在事务
+// 内能判断拿到 GetSandbox 结果之后流是否已经重连过（哪怕随后又断开）。
+type disconnectRecord struct {
+	since *time.Time
+	rev   uint64
+}
+
+// streamRegistry holds at most one current conn per run. It also keeps the
+// in-memory disconnect time of each run's outbound stream, used by the actor
+// crash scan.
 type streamRegistry struct {
 	mu    sync.Mutex
 	conns map[string]*conn
+	disc  map[string]*disconnectRecord
 }
 
 func newStreamRegistry() *streamRegistry {
-	return &streamRegistry{conns: make(map[string]*conn)}
+	return &streamRegistry{
+		conns: make(map[string]*conn),
+		disc:  make(map[string]*disconnectRecord),
+	}
 }
 
 // replace registers c as the current stream of runID and returns the stream it
@@ -256,4 +271,107 @@ func (r *streamRegistry) removeIf(runID string, c *conn) bool {
 	}
 	delete(r.conns, runID)
 	return true
+}
+
+// removeAndDisconnectIfCurrent unregisters c if it is still the current stream
+// of runID and, in the same critical section, records its disconnect time and
+// bumps the revision. The delivery path calls it when it finds the current
+// stream already closed: the stream's own close handler is then a no-op because
+// the conn is no longer current, so this is the only place that can record the
+// disconnect. Without it the run would have neither a stream nor a disconnect
+// record and the crash scan would never select it. It returns true when it did
+// so and false when a newer stream is registered (or none is).
+func (r *streamRegistry) removeAndDisconnectIfCurrent(runID string, c *conn, at time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[runID] != c {
+		return false
+	}
+	delete(r.conns, runID)
+	rec := r.disconnectRecordLocked(runID)
+	rec.since = &at
+	rec.rev++
+	return true
+}
+
+// disconnectedIfCurrent records the disconnect of c only if c is still the
+// current stream of runID. A stream replaced by a newer one must not leave a
+// disconnect time behind. It reports whether it recorded anything.
+func (r *streamRegistry) disconnectedIfCurrent(runID string, c *conn, at time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[runID] != c {
+		return false
+	}
+	rec := r.disconnectRecordLocked(runID)
+	rec.since = &at
+	rec.rev++
+	return true
+}
+
+// connectedIfCurrent clears the disconnect time of c only if c is still the
+// current stream of runID. A Hello for a stream that has already been replaced
+// must not erase the newer stream's disconnect record. The record itself is
+// kept so the revision keeps increasing. It reports whether it cleared
+// anything.
+func (r *streamRegistry) connectedIfCurrent(runID string, c *conn) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[runID] != c {
+		return false
+	}
+	rec := r.disconnectRecordLocked(runID)
+	rec.since = nil
+	rec.rev++
+	return true
+}
+
+// seedDisconnected records at as the disconnect time of an active run found at
+// control-plane startup, unless that run already has a registered stream.
+func (r *streamRegistry) seedDisconnected(runID string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.conns[runID] != nil {
+		return
+	}
+	rec := r.disconnectRecordLocked(runID)
+	rec.since = &at
+	rec.rev++
+}
+
+// disconnectState reports when runID's outbound stream last disconnected and
+// the record revision at that moment. ok is false while the stream is
+// connected, or when the run was never seen.
+func (r *streamRegistry) disconnectState(runID string) (since time.Time, rev uint64, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec := r.disc[runID]
+	if rec == nil || rec.since == nil {
+		return time.Time{}, 0, false
+	}
+	return *rec.since, rec.rev, true
+}
+
+// retainOnly drops disconnect records of runs not in keep. A terminated run no
+// longer needs one, and without this its record would live for the lifetime of
+// the process.
+func (r *streamRegistry) retainOnly(keep map[string]struct{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for runID := range r.disc {
+		if _, ok := keep[runID]; !ok {
+			delete(r.disc, runID)
+		}
+	}
+}
+
+// disconnectRecordLocked returns the run's record, creating it if needed. The
+// caller must hold r.mu.
+func (r *streamRegistry) disconnectRecordLocked(runID string) *disconnectRecord {
+	rec := r.disc[runID]
+	if rec == nil {
+		rec = &disconnectRecord{}
+		r.disc[runID] = rec
+	}
+	return rec
 }

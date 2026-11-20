@@ -1,6 +1,7 @@
 package runcontroller
 
 import (
+	"fmt"
 	"time"
 
 	agentprotocolv1 "github.com/wangzw/castworks/pkg/agentprotocol/v1"
@@ -47,6 +48,11 @@ type machineEnv struct {
 	Now             time.Time
 	StreamConnected bool               // 该运行实例当前是否登记了流
 	Suspension      *machineSuspension // 最近一次挂起记录，没有记录为 nil
+
+	// StreamDisconnected 与 DisconnectRev 是事务内读到的内存断线记录：记录
+	// 存在且版本与扫描决定时一致，才说明流在拿到 actor 状态后没有重连过。
+	StreamDisconnected bool
+	DisconnectRev      uint64
 }
 
 // machineSuspension 是挂起记录中参与规则的两个时刻。
@@ -118,6 +124,14 @@ type evRestoreDone struct {
 
 type evHelloExpire struct{ returnedBefore time.Time }
 
+// evCrashDetected 是崩溃扫描经 GetSandbox 得到的 actor 状态。disconnectRev
+// 是扫描选中该运行实例时断线记录的版本；事务内版本不一致说明期间已重连。
+type evCrashDetected struct {
+	actorName     string
+	actorState    string // "crashed" 或 "not found"
+	disconnectRev uint64
+}
+
 func (evAppend) isMachineEvent()        {}
 func (evProvisionDone) isMachineEvent() {}
 func (evHello) isMachineEvent()         {}
@@ -131,6 +145,7 @@ func (evTrySuspend) isMachineEvent()    {}
 func (evSnapshotDone) isMachineEvent()  {}
 func (evRestoreDone) isMachineEvent()   {}
 func (evHelloExpire) isMachineEvent()   {}
+func (evCrashDetected) isMachineEvent() {}
 
 // machineEffect 是调用方在提交后按顺序执行的一个动作。效果种类是闭集。
 type machineEffect interface{ isMachineEffect() }
@@ -265,6 +280,8 @@ func transition(cur machineState, ev machineEvent, env machineEnv) (machineResul
 		return transitionRestoreDone(cur, e, env)
 	case evHelloExpire:
 		return transitionHelloExpire(cur, e, env)
+	case evCrashDetected:
+		return transitionCrashDetected(cur, e, env)
 	default:
 		return mkResult(cur), nil
 	}
@@ -698,6 +715,24 @@ func transitionHelloExpire(cur machineState, e evHelloExpire, env machineEnv) (m
 	cur.State = StateFailed
 	cur.Substate = SubstateNone
 	cur.FailureReason = "hello timeout"
+	now := env.Now
+	cur.EndedAt = &now
+	return mkResult(cur), nil
+}
+
+// transitionCrashDetected 把 GetSandbox 报告已崩溃或已不存在的 active 运行
+// 实例转为 failed。事务内复查两项：运行实例必须仍是 active，且出站流自扫描
+// 选中以来仍未重连（版本一致且没有登记中的流）。actor 不在这里删除。
+func transitionCrashDetected(cur machineState, e evCrashDetected, env machineEnv) (machineResult, error) {
+	if cur.terminated() || cur.State != StateActive {
+		return mkResult(cur), nil
+	}
+	if env.StreamConnected || !env.StreamDisconnected || env.DisconnectRev != e.disconnectRev {
+		return mkResult(cur), nil
+	}
+	cur.State = StateFailed
+	cur.Substate = SubstateNone
+	cur.FailureReason = fmt.Sprintf("actor %s is %s", e.actorName, e.actorState)
 	now := env.Now
 	cur.EndedAt = &now
 	return mkResult(cur), nil

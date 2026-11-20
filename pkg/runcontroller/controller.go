@@ -23,9 +23,10 @@ import (
 )
 
 const (
-	defaultIdleGrace    = 30 * time.Second
-	defaultScanPeriod   = 5 * time.Second
-	defaultHelloTimeout = 60 * time.Second
+	defaultIdleGrace        = 30 * time.Second
+	defaultScanPeriod       = 5 * time.Second
+	defaultHelloTimeout     = 60 * time.Second
+	defaultReconnectTimeout = 30 * time.Second
 
 	// runIDLength is the number of characters in a run_id and a delivery_id.
 	runIDLength = 12
@@ -65,6 +66,12 @@ type Controller struct {
 	// through export_test.go; zero means streamCloseRetryAttempts. A stream
 	// handler may read it concurrently, so it is atomic.
 	streamCloseAttempts atomic.Int32
+
+	// crashMu guards crashInFlight, the set of runs with a GetSandbox crash
+	// check already queued or running. It stops a slow call from being queued
+	// again on every scan period.
+	crashMu       sync.Mutex
+	crashInFlight map[string]struct{}
 }
 
 // streamCloseRetryAttempts bounds the retries of a stream-close write. The
@@ -76,6 +83,7 @@ const streamCloseRetryAttempts = 5
 var (
 	_ RunService  = (*Controller)(nil)
 	_ scanTarget  = (*Controller)(nil)
+	_ crashSource = (*Controller)(nil)
 	_ agentEvents = (*Controller)(nil)
 	_ scanSource  = (*store)(nil)
 )
@@ -92,6 +100,9 @@ func New(cfg Config, pool *pgxpool.Pool, provider sandboxprovider.Provider, cloc
 	if cfg.HelloTimeout == 0 {
 		cfg.HelloTimeout = defaultHelloTimeout
 	}
+	if cfg.ReconnectTimeout == 0 {
+		cfg.ReconnectTimeout = defaultReconnectTimeout
+	}
 	switch cfg.Credential.Kind {
 	case LLMCredentialAPIKey, LLMCredentialOAuthToken:
 	default:
@@ -102,12 +113,13 @@ func New(cfg Config, pool *pgxpool.Pool, provider sandboxprovider.Provider, cloc
 	}
 
 	return &Controller{
-		cfg:      cfg,
-		store:    newStore(pool),
-		provider: provider,
-		clock:    clock,
-		streams:  newStreamRegistry(),
-		calls:    newProviderQueue(),
+		cfg:           cfg,
+		store:         newStore(pool),
+		provider:      provider,
+		clock:         clock,
+		streams:       newStreamRegistry(),
+		calls:         newProviderQueue(),
+		crashInFlight: make(map[string]struct{}),
 	}
 }
 
@@ -116,8 +128,9 @@ func (c *Controller) RegisterGRPC(s *grpc.Server) {
 	agentprotocolv1.RegisterAgentStreamServer(s, newAgentStreamServer(c, c.streams))
 }
 
-// Run runs the suspension scan and the T_hello checks until ctx ends, then
-// cancels and waits for in-flight provider calls before returning nil.
+// Run runs the suspension scan, the T_hello checks and the actor crash scan
+// until ctx ends, then cancels and waits for in-flight provider calls before
+// returning nil.
 func (c *Controller) Run(ctx context.Context) error {
 	c.runMu.Lock()
 	c.runCtx = ctx
@@ -128,9 +141,31 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.runMu.Unlock()
 	}()
 
-	_ = runScanLoop(ctx, c.cfg, c.clock, c.store, c)
+	// Every run that was active when the control plane started has lost its
+	// warden stream, so it is recorded as disconnected as of startup.
+	c.seedDisconnectedRuns(ctx)
+
+	_ = runScanLoop(ctx, c.cfg, c.clock, c.store, c, c)
 	c.calls.shutdown()
 	return nil
+}
+
+// seedDisconnectedRuns records the current time as the disconnect time of
+// every active run that has no registered stream. A run whose stream is still
+// registered in this process is left alone; in production no stream survives a
+// restart, and in tests it keeps a live connection from looking disconnected.
+func (c *Controller) seedDisconnectedRuns(ctx context.Context) {
+	started := c.clock.Now()
+	runIDs, err := c.store.activeRunIDs(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("runcontroller: seed disconnected runs failed", "error", err)
+		}
+		return
+	}
+	for _, runID := range runIDs {
+		c.streams.seedDisconnected(runID, started)
+	}
 }
 
 // runDone is closed when Run's context ends, or nil when Run is not running.
@@ -193,6 +228,93 @@ func (c *Controller) expireHello(ctx context.Context, runID string) error {
 	returnedBefore := c.clock.Now().Add(-c.cfg.HelloTimeout)
 	_, err := c.applyEvent(ctx, runID, evHelloExpire{returnedBefore: returnedBefore}, applyOpts{})
 	return err
+}
+
+// crashCandidates implements crashSource: it selects the active runs whose
+// outbound stream has been disconnected for longer than disconnectedBefore.
+// The state comes from the database and the disconnect time from memory.
+func (c *Controller) crashCandidates(ctx context.Context, disconnectedBefore time.Time) ([]crashCandidate, error) {
+	runIDs, err := c.store.activeRunIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Drop records of runs that are no longer active. They cannot be crash
+	// candidates and would otherwise stay for the lifetime of the process.
+	active := make(map[string]struct{}, len(runIDs))
+	for _, runID := range runIDs {
+		active[runID] = struct{}{}
+	}
+	c.streams.retainOnly(active)
+
+	candidates := make([]crashCandidate, 0)
+	for _, runID := range runIDs {
+		since, rev, disconnected := c.streams.disconnectState(runID)
+		if !disconnected || !since.Before(disconnectedBefore) {
+			continue
+		}
+		candidates = append(candidates, crashCandidate{runID: runID, disconnectRev: rev})
+	}
+	return candidates, nil
+}
+
+// tryFailCrashed implements scanTarget. It queues GetSandbox on the provider
+// queue, so it stays serial with the run's suspend, restore and destroy calls.
+// The result is applied after the call returns, in a transaction that rechecks
+// the run state and the disconnect revision.
+func (c *Controller) tryFailCrashed(_ context.Context, cand crashCandidate) error {
+	if !c.beginCrashCheck(cand.runID) {
+		// An earlier round's check is still queued or running; its result will
+		// decide this run.
+		return nil
+	}
+
+	actor := sandboxprovider.ActorName(cand.runID)
+	slot := c.calls.reserve(cand.runID)
+	slot.start(providerCallJob(opGetSandbox, cand.runID, func(ctx context.Context) error {
+		defer c.endCrashCheck(cand.runID)
+
+		status, err := c.provider.GetSandbox(ctx, actor)
+		switch {
+		case err == nil && status.State == sandboxprovider.ActorStateCrashed:
+			c.complete(ctx, cand.runID, evCrashDetected{
+				actorName:     actor,
+				actorState:    "crashed",
+				disconnectRev: cand.disconnectRev,
+			})
+			return nil
+		case errors.Is(err, sandboxprovider.ErrNotFound):
+			c.complete(ctx, cand.runID, evCrashDetected{
+				actorName:     actor,
+				actorState:    "not found",
+				disconnectRev: cand.disconnectRev,
+			})
+			return nil
+		default:
+			// Any other state or error leaves the run unchanged; the next scan
+			// asks again.
+			return err
+		}
+	}))
+	return nil
+}
+
+// beginCrashCheck claims the crash check slot of runID. It returns false when a
+// check is already in flight.
+func (c *Controller) beginCrashCheck(runID string) bool {
+	c.crashMu.Lock()
+	defer c.crashMu.Unlock()
+	if _, ok := c.crashInFlight[runID]; ok {
+		return false
+	}
+	c.crashInFlight[runID] = struct{}{}
+	return true
+}
+
+// endCrashCheck releases the crash check slot of runID.
+func (c *Controller) endCrashCheck(runID string) {
+	c.crashMu.Lock()
+	delete(c.crashInFlight, runID)
+	c.crashMu.Unlock()
 }
 
 // applyOpts carries the stream context of an event application.
@@ -405,7 +527,9 @@ func (c *Controller) applyEvent(
 					// closed stream is a disconnected run, not a failed write:
 					// keep the inbox rows, drop the registration and put the
 					// run back at its boundary. The next Hello redelivers.
-					c.streams.removeIf(runID, target)
+					// Record the disconnect here too: the stream's own close
+					// handler will not, because this conn is no longer current.
+					c.streams.removeAndDisconnectIfCurrent(runID, target, env.Now)
 					if result.State.State == StateActive && result.State.Substate == SubstateDelivering {
 						result.State.Substate = SubstateBoundary
 						now := env.Now
@@ -543,6 +667,10 @@ func (c *Controller) machineEnv(tx *storeTx, runID string, now time.Time) (machi
 	env := machineEnv{
 		Now:             now,
 		StreamConnected: c.streams.current(runID) != nil,
+	}
+	if _, rev, disconnected := c.streams.disconnectState(runID); disconnected {
+		env.StreamDisconnected = true
+		env.DisconnectRev = rev
 	}
 	susp, ok, err := tx.latestSuspension(runID)
 	if err != nil {
@@ -881,6 +1009,8 @@ func eventName(ev machineEvent) string {
 		return "restore_done"
 	case evHelloExpire:
 		return "hello_expire"
+	case evCrashDetected:
+		return "crash_detected"
 	default:
 		return fmt.Sprintf("%T", ev)
 	}
